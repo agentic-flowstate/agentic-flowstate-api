@@ -4,14 +4,15 @@ use axum::{
     Json,
     response::{IntoResponse, Response},
 };
-use aws_sdk_dynamodb::types::AttributeValue;
 use serde::Deserialize;
+use serde_json::json;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{
     db::DynamoDbPool,
-    models::Ticket,
+    models::{CreateTicketRequest, UpdateTicketRequest},
+    mcp_wrapper::call_mcp_tool,
 };
 
 #[derive(Debug, Deserialize)]
@@ -21,254 +22,228 @@ pub struct TicketQuery {
 
 // List tickets for an epic or a specific slice
 pub async fn list_tickets(
-    State(pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<DynamoDbPool>>,
     Path(epic_id): Path<String>,
     Query(params): Query<TicketQuery>,
 ) -> Response {
-    let client = pool.client();
-    let table_name = pool.table_name();
-
-    let pk = format!("EPIC#{}", epic_id);
-
-    // Build the query based on whether slice_id is provided
-    let result = if let Some(slice_id) = params.slice_id {
-        // Query for specific slice
-        let sk_prefix = format!("SLICE#{}#TICKET#", slice_id);
-        client
-            .query()
-            .table_name(table_name)
-            .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-            .expression_attribute_values(":pk", AttributeValue::S(pk))
-            .expression_attribute_values(":sk_prefix", AttributeValue::S(sk_prefix))
-            .send()
-            .await
+    let args = if let Some(slice_id) = params.slice_id {
+        json!({
+            "epic_id": epic_id,
+            "slice_id": slice_id
+        })
     } else {
-        // Query for all tickets in the epic
-        client
-            .query()
-            .table_name(table_name)
-            .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-            .expression_attribute_values(":pk", AttributeValue::S(pk))
-            .expression_attribute_values(":sk_prefix", AttributeValue::S("SLICE#".to_string()))
-            .filter_expression("contains(SK, :ticket)")
-            .expression_attribute_values(":ticket", AttributeValue::S("#TICKET#".to_string()))
-            .send()
-            .await
+        json!({ "epic_id": epic_id })
     };
 
-    match result {
-        Ok(output) => {
-            let items = output.items.unwrap_or_default();
-            let mut tickets = Vec::new();
-
-            for item in items {
-                // Manual extraction from DynamoDB item
-                let ticket_id = item.get("ticket_id")
-                        .and_then(|v| v.as_s().ok())
-                        .unwrap_or(&String::new())
-                        .clone();
-
-                let title = item.get("title")
-                        .and_then(|v| v.as_s().ok())
-                        .unwrap_or(&String::new())
-                        .clone();
-
-                let intent = item.get("intent")
-                        .and_then(|v| v.as_s().ok())
-                        .unwrap_or(&String::new())
-                        .clone();
-
-                let slice_id_extracted = item.get("slice_id")
-                        .and_then(|v| v.as_s().ok())
-                        .unwrap_or(&String::new())
-                        .clone();
-
-                if !ticket_id.is_empty() && !title.is_empty() {
-                    tickets.push(Ticket {
-                            ticket_id,
-                            epic_id: epic_id.clone(),
-                            slice_id: slice_id_extracted,
-                            title,
-                            intent,
-                            description: item.get("description").and_then(|v| v.as_s().ok()).cloned(),
-                            ticket_type: item.get("type")
-                                .and_then(|v| v.as_s().ok())
-                                .unwrap_or(&"task".to_string())
-                                .clone(),
-                            status: item.get("status")
-                                .and_then(|v| v.as_s().ok())
-                                .unwrap_or(&"open".to_string())
-                                .clone(),
-                            priority: item.get("priority").and_then(|v| v.as_s().ok()).cloned(),
-                            assignee: item.get("assignee").and_then(|v| v.as_s().ok()).cloned(),
-                            notes: item.get("notes").and_then(|v| v.as_s().ok()).cloned(),
-                            blocks_tickets: item.get("blocks_tickets")
-                                .and_then(|v| v.as_l().ok())
-                                .map(|list| {
-                                    list.iter()
-                                        .filter_map(|v| v.as_s().ok().cloned())
-                                        .collect()
-                                }),
-                            blocked_by_tickets: item.get("blocked_by_tickets")
-                                .and_then(|v| v.as_l().ok())
-                                .map(|list| {
-                                    list.iter()
-                                        .filter_map(|v| v.as_s().ok().cloned())
-                                        .collect()
-                                }),
-                            caused_by_tickets: item.get("caused_by_tickets")
-                                .and_then(|v| v.as_l().ok())
-                                .map(|list| {
-                                    list.iter()
-                                        .filter_map(|v| v.as_s().ok().cloned())
-                                        .collect()
-                                }),
-                            created_at: item.get("created_at")
-                                .and_then(|v| v.as_n().ok())
-                                .and_then(|n| n.parse().ok())
-                                .unwrap_or(0),
-                            updated_at: item.get("updated_at")
-                                .and_then(|v| v.as_n().ok())
-                                .and_then(|n| n.parse().ok())
-                                .unwrap_or(0),
-                            created_at_iso: item.get("created_at_iso")
-                                .and_then(|v| v.as_s().ok())
-                                .unwrap_or(&String::new())
-                                .clone(),
-                            updated_at_iso: item.get("updated_at_iso")
-                                .and_then(|v| v.as_s().ok())
-                                .unwrap_or(&String::new())
-                                .clone(),
-                    });
-                }
-            }
-
-            Json(tickets).into_response()
+    match call_mcp_tool("list_tickets", Some(args)).await {
+        Ok(result) => {
+            (StatusCode::OK, Json(result)).into_response()
         }
         Err(e) => {
-            error!("Failed to query tickets: {:?}", e);
+            error!("Failed to list tickets: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Failed to list tickets" }))
+                Json(json!({ "error": format!("Failed to list tickets: {}", e) }))
             ).into_response()
         }
     }
 }
 
-// List tickets for a specific slice (alternative endpoint)
+// Convenience function for listing tickets specifically in a slice (used by route)
 pub async fn list_slice_tickets(
     State(pool): State<Arc<DynamoDbPool>>,
     Path((epic_id, slice_id)): Path<(String, String)>,
 ) -> Response {
-    let client = pool.client();
-    let table_name = pool.table_name();
+    list_tickets(
+        State(pool),
+        Path(epic_id),
+        Query(TicketQuery { slice_id: Some(slice_id) })
+    ).await
+}
 
-    let pk = format!("EPIC#{}", epic_id);
-    let sk_prefix = format!("SLICE#{}#TICKET#", slice_id);
+pub async fn get_ticket(
+    State(_pool): State<Arc<DynamoDbPool>>,
+    Path(ticket_id): Path<String>,
+) -> Response {
+    let args = json!({ "ticket_id": ticket_id });
 
-    let result = client
-        .query()
-        .table_name(table_name)
-        .key_condition_expression("PK = :pk AND begins_with(SK, :sk_prefix)")
-        .expression_attribute_values(":pk", AttributeValue::S(pk))
-        .expression_attribute_values(":sk_prefix", AttributeValue::S(sk_prefix))
-        .send()
-        .await;
-
-    match result {
-        Ok(output) => {
-            let items = output.items.unwrap_or_default();
-            let mut tickets = Vec::new();
-
-            for item in items {
-                // Manual extraction from DynamoDB item
-                let ticket_id = item.get("ticket_id")
-                    .and_then(|v| v.as_s().ok())
-                    .unwrap_or(&String::new())
-                    .clone();
-
-                let title = item.get("title")
-                    .and_then(|v| v.as_s().ok())
-                    .unwrap_or(&String::new())
-                    .clone();
-
-                let intent = item.get("intent")
-                    .and_then(|v| v.as_s().ok())
-                    .unwrap_or(&String::new())
-                    .clone();
-
-                let slice_id_extracted = item.get("slice_id")
-                    .and_then(|v| v.as_s().ok())
-                    .unwrap_or(&String::new())
-                    .clone();
-
-                if !ticket_id.is_empty() && !title.is_empty() {
-                    tickets.push(Ticket {
-                        ticket_id,
-                        epic_id: epic_id.clone(),
-                        slice_id: slice_id_extracted,
-                        title,
-                        intent,
-                        description: item.get("description").and_then(|v| v.as_s().ok()).cloned(),
-                        ticket_type: item.get("type")
-                            .and_then(|v| v.as_s().ok())
-                            .unwrap_or(&"task".to_string())
-                            .clone(),
-                        status: item.get("status")
-                            .and_then(|v| v.as_s().ok())
-                            .unwrap_or(&"open".to_string())
-                            .clone(),
-                        priority: item.get("priority").and_then(|v| v.as_s().ok()).cloned(),
-                        assignee: item.get("assignee").and_then(|v| v.as_s().ok()).cloned(),
-                        notes: item.get("notes").and_then(|v| v.as_s().ok()).cloned(),
-                        blocks_tickets: item.get("blocks_tickets")
-                            .and_then(|v| v.as_l().ok())
-                            .map(|list| {
-                                list.iter()
-                                    .filter_map(|v| v.as_s().ok().cloned())
-                                    .collect()
-                            }),
-                        blocked_by_tickets: item.get("blocked_by_tickets")
-                            .and_then(|v| v.as_l().ok())
-                            .map(|list| {
-                                list.iter()
-                                    .filter_map(|v| v.as_s().ok().cloned())
-                                    .collect()
-                            }),
-                        caused_by_tickets: item.get("caused_by_tickets")
-                            .and_then(|v| v.as_l().ok())
-                            .map(|list| {
-                                list.iter()
-                                    .filter_map(|v| v.as_s().ok().cloned())
-                                    .collect()
-                            }),
-                        created_at: item.get("created_at")
-                            .and_then(|v| v.as_n().ok())
-                            .and_then(|n| n.parse().ok())
-                            .unwrap_or(0),
-                        updated_at: item.get("updated_at")
-                            .and_then(|v| v.as_n().ok())
-                            .and_then(|n| n.parse().ok())
-                            .unwrap_or(0),
-                        created_at_iso: item.get("created_at_iso")
-                            .and_then(|v| v.as_s().ok())
-                            .unwrap_or(&String::new())
-                            .clone(),
-                        updated_at_iso: item.get("updated_at_iso")
-                            .and_then(|v| v.as_s().ok())
-                            .unwrap_or(&String::new())
-                            .clone(),
-                    });
-                }
-            }
-
-            Json(tickets).into_response()
+    match call_mcp_tool("get_ticket", Some(args)).await {
+        Ok(result) => {
+            (StatusCode::OK, Json(result)).into_response()
         }
         Err(e) => {
-            error!("Failed to query tickets for slice: {:?}", e);
+            error!("Failed to get ticket: {:?}", e);
+            if e.to_string().contains("not found") {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Ticket not found" }))
+                ).into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to get ticket: {}", e) }))
+                ).into_response()
+            }
+        }
+    }
+}
+
+pub async fn create_ticket(
+    State(_pool): State<Arc<DynamoDbPool>>,
+    Path((epic_id, slice_id)): Path<(String, String)>,
+    Json(request): Json<CreateTicketRequest>,
+) -> Response {
+    let args = json!({
+        "epic_id": epic_id,
+        "slice_id": slice_id,
+        "title": request.title,
+        "notes": request.notes,
+        "priority": request.priority,
+        "assignees": request.assignees,
+        "tags": request.tags,
+    });
+
+    match call_mcp_tool("create_ticket", Some(args)).await {
+        Ok(result) => {
+            info!("Created ticket: {:?}", result);
+            (StatusCode::CREATED, Json(result)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to create ticket: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Failed to list tickets" }))
+                Json(json!({ "error": format!("Failed to create ticket: {}", e) }))
+            ).into_response()
+        }
+    }
+}
+
+pub async fn update_ticket(
+    State(_pool): State<Arc<DynamoDbPool>>,
+    Path(ticket_id): Path<String>,
+    Json(request): Json<UpdateTicketRequest>,
+) -> Response {
+    // Determine which update operation to use based on what's being updated
+    if let Some(status) = request.status {
+        let args = json!({
+            "ticket_id": ticket_id,
+            "status": status
+        });
+
+        match call_mcp_tool("update_ticket_status", Some(args)).await {
+            Ok(result) => {
+                info!("Updated ticket status: {:?}", result);
+                (StatusCode::OK, Json(result)).into_response()
+            }
+            Err(e) => {
+                error!("Failed to update ticket: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to update ticket: {}", e) }))
+                ).into_response()
+            }
+        }
+    } else if request.notes.is_some() {
+        let args = json!({
+            "ticket_id": ticket_id,
+            "notes": request.notes
+        });
+
+        match call_mcp_tool("update_ticket_notes", Some(args)).await {
+            Ok(result) => {
+                info!("Updated ticket notes: {:?}", result);
+                (StatusCode::OK, Json(result)).into_response()
+            }
+            Err(e) => {
+                error!("Failed to update ticket: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to update ticket: {}", e) }))
+                ).into_response()
+            }
+        }
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "No fields to update" }))
+        ).into_response()
+    }
+}
+
+pub async fn delete_ticket(
+    State(_pool): State<Arc<DynamoDbPool>>,
+    Path(ticket_id): Path<String>,
+) -> Response {
+    let args = json!({ "ticket_id": ticket_id });
+
+    match call_mcp_tool("delete_ticket", Some(args)).await {
+        Ok(result) => {
+            info!("Deleted ticket: {:?}", result);
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to delete ticket: {:?}", e);
+            if e.to_string().contains("not found") {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Ticket not found" }))
+                ).into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to delete ticket: {}", e) }))
+                ).into_response()
+            }
+        }
+    }
+}
+
+// Add support for ticket relationships
+pub async fn add_ticket_relationship(
+    State(_pool): State<Arc<DynamoDbPool>>,
+    Path(ticket_id): Path<String>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let args = json!({
+        "ticket_id": ticket_id,
+        "related_ticket_id": request["related_ticket_id"],
+        "relationship_type": request["relationship_type"]
+    });
+
+    match call_mcp_tool("add_ticket_relationship", Some(args)).await {
+        Ok(result) => {
+            info!("Added ticket relationship: {:?}", result);
+            (StatusCode::CREATED, Json(result)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to add relationship: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to add relationship: {}", e) }))
+            ).into_response()
+        }
+    }
+}
+
+pub async fn remove_ticket_relationship(
+    State(_pool): State<Arc<DynamoDbPool>>,
+    Path((ticket_id, related_ticket_id)): Path<(String, String)>,
+) -> Response {
+    let args = json!({
+        "ticket_id": ticket_id,
+        "related_ticket_id": related_ticket_id
+    });
+
+    match call_mcp_tool("remove_ticket_relationship", Some(args)).await {
+        Ok(result) => {
+            info!("Removed ticket relationship: {:?}", result);
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to remove relationship: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to remove relationship: {}", e) }))
             ).into_response()
         }
     }

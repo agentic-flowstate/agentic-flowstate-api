@@ -1,9 +1,11 @@
 mod db;
 mod handlers;
 mod models;
+mod utils;
+mod mcp_wrapper;
 
 use axum::{
-    routing::{get},
+    routing::{get, post, patch, delete},
     Router,
 };
 use std::sync::Arc;
@@ -23,6 +25,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Agentic API Server...");
 
+    // Initialize MCP handler
+    mcp_wrapper::init_mcp_handler().await?;
+    tracing::info!("MCP handler initialized");
+
     // Initialize DynamoDB connection pool
     let db_pool = Arc::new(db::DynamoDbPool::new().await?);
     tracing::info!("DynamoDB connection pool initialized");
@@ -30,14 +36,30 @@ async fn main() -> anyhow::Result<()> {
     // Build the application
     let app = Router::new()
         // Epic routes
-        .route("/api/epics", get(handlers::list_epics))
+        .route("/api/epics", get(handlers::list_epics).post(handlers::create_epic))
+        .route("/api/epics/:epic_id", get(handlers::get_epic).delete(handlers::delete_epic))
 
         // Slice routes
-        .route("/api/epics/:epic_id/slices", get(handlers::list_slices))
+        .route("/api/epics/:epic_id/slices",
+            get(handlers::list_slices)
+            .post(handlers::create_slice))
+        .route("/api/epics/:epic_id/slices/:slice_id",
+            get(handlers::get_slice)
+            .delete(handlers::delete_slice))
 
-        // Ticket routes - supports both with and without slice_id
+        // Ticket routes
         .route("/api/epics/:epic_id/tickets", get(handlers::list_tickets))
-        .route("/api/epics/:epic_id/slices/:slice_id/tickets", get(handlers::list_slice_tickets))
+        .route("/api/epics/:epic_id/slices/:slice_id/tickets",
+            get(handlers::list_slice_tickets)
+            .post(handlers::create_ticket))
+        .route("/api/tickets/:ticket_id",
+            get(handlers::get_ticket)
+            .patch(handlers::update_ticket)
+            .delete(handlers::delete_ticket))
+        .route("/api/tickets/:ticket_id/relationships",
+            post(handlers::add_ticket_relationship))
+        .route("/api/tickets/:ticket_id/relationships/:related_ticket_id",
+            delete(handlers::remove_ticket_relationship))
 
         // Health check
         .route("/health", get(|| async { "OK" }))

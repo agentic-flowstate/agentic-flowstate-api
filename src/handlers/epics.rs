@@ -1,90 +1,112 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     Json,
     response::{IntoResponse, Response},
 };
-use aws_sdk_dynamodb::types::AttributeValue;
-use std::collections::HashMap;
+use serde_json::json;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{
     db::DynamoDbPool,
-    models::{Epic, EpicsResponse},
+    models::{CreateEpicRequest},
+    mcp_wrapper::call_mcp_tool,
 };
 
 pub async fn list_epics(
-    State(pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<DynamoDbPool>>,
 ) -> Response {
-    let client = pool.client();
-    let table_name = pool.table_name();
-
-    // Scan for all epics (items where PK starts with "EPIC#" and SK = "META")
-    let result = client
-        .scan()
-        .table_name(table_name)
-        .filter_expression("begins_with(PK, :pk_prefix) AND SK = :sk")
-        .expression_attribute_values(":pk_prefix", AttributeValue::S("EPIC#".to_string()))
-        .expression_attribute_values(":sk", AttributeValue::S("META".to_string()))
-        .send()
-        .await;
-
-    match result {
-        Ok(output) => {
-            let items = output.items.unwrap_or_default();
-            let mut epics = Vec::new();
-
-            for item in items {
-                // Extract fields manually from DynamoDB item
-                let epic_id = item.get("epic_id")
-                        .and_then(|v| v.as_s().ok())
-                        .unwrap_or(&String::new())
-                        .clone();
-
-                let title = item.get("title")
-                    .and_then(|v| v.as_s().ok())
-                    .unwrap_or(&String::new())
-                    .clone();
-
-                if !epic_id.is_empty() && !title.is_empty() {
-                    epics.push(Epic {
-                        epic_id,
-                        title,
-                        notes: item.get("notes").and_then(|v| v.as_s().ok()).cloned(),
-                        assignees: item.get("assignees")
-                            .and_then(|v| v.as_l().ok())
-                            .map(|list| {
-                                list.iter()
-                                    .filter_map(|v| v.as_s().ok().cloned())
-                                    .collect()
-                            }),
-                        created_at_iso: item.get("created_at_iso")
-                            .and_then(|v| v.as_s().ok())
-                            .unwrap_or(&String::new())
-                            .clone(),
-                        updated_at_iso: item.get("updated_at_iso")
-                            .and_then(|v| v.as_s().ok())
-                            .unwrap_or(&String::new())
-                            .clone(),
-                        slice_count: item.get("slice_count")
-                            .and_then(|v| v.as_n().ok())
-                            .and_then(|n| n.parse().ok()),
-                        ticket_count: item.get("ticket_count")
-                            .and_then(|v| v.as_n().ok())
-                            .and_then(|n| n.parse().ok()),
-                    });
-                }
-            }
-
-            Json(EpicsResponse { epics }).into_response()
+    match call_mcp_tool("list_epics", None).await {
+        Ok(result) => {
+            (StatusCode::OK, Json(result)).into_response()
         }
         Err(e) => {
-            error!("Failed to query epics: {:?}", e);
+            error!("Failed to list epics: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "Failed to list epics" }))
+                Json(json!({ "error": format!("Failed to list epics: {}", e) }))
             ).into_response()
+        }
+    }
+}
+
+pub async fn get_epic(
+    State(_pool): State<Arc<DynamoDbPool>>,
+    Path(epic_id): Path<String>,
+) -> Response {
+    let args = json!({ "epic_id": epic_id });
+
+    match call_mcp_tool("get_epic", Some(args)).await {
+        Ok(result) => {
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to get epic: {:?}", e);
+            if e.to_string().contains("not found") {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Epic not found" }))
+                ).into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to get epic: {}", e) }))
+                ).into_response()
+            }
+        }
+    }
+}
+
+pub async fn create_epic(
+    State(_pool): State<Arc<DynamoDbPool>>,
+    Json(request): Json<CreateEpicRequest>,
+) -> Response {
+    let args = json!({
+        "title": request.title,
+        "notes": request.notes,
+        "assignees": request.assignees,
+    });
+
+    match call_mcp_tool("create_epic", Some(args)).await {
+        Ok(result) => {
+            info!("Created epic: {:?}", result);
+            (StatusCode::CREATED, Json(result)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to create epic: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to create epic: {}", e) }))
+            ).into_response()
+        }
+    }
+}
+
+pub async fn delete_epic(
+    State(_pool): State<Arc<DynamoDbPool>>,
+    Path(epic_id): Path<String>,
+) -> Response {
+    let args = json!({ "epic_id": epic_id });
+
+    match call_mcp_tool("delete_epic", Some(args)).await {
+        Ok(result) => {
+            info!("Deleted epic: {:?}", result);
+            (StatusCode::OK, Json(result)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to delete epic: {:?}", e);
+            if e.to_string().contains("not found") {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Epic not found" }))
+                ).into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to delete epic: {}", e) }))
+                ).into_response()
+            }
         }
     }
 }

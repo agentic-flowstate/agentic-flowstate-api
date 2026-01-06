@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -62,10 +61,9 @@ pub struct Ticket {
     pub updated_at_iso: String,
 }
 
-// Request/Response types
+// Request types
 #[derive(Debug, Deserialize)]
 pub struct CreateEpicRequest {
-    pub epic_id: String,
     pub title: String,
     pub notes: Option<String>,
     pub assignees: Option<Vec<String>>,
@@ -73,7 +71,6 @@ pub struct CreateEpicRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSliceRequest {
-    pub slice_id: String,
     pub title: String,
     pub notes: Option<String>,
     pub assignees: Option<Vec<String>>,
@@ -82,14 +79,47 @@ pub struct CreateSliceRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateTicketRequest {
     pub title: String,
-    pub intent: String,
     pub notes: Option<String>,
-    #[serde(rename = "type")]
-    pub ticket_type: Option<String>,
-    pub assignee: Option<String>,
+    pub priority: Option<String>,
+    pub assignees: Option<Vec<String>>,
+    pub tags: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateTicketRequest {
+    pub status: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateTicketStatusRequest {
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddRelationshipRequest {
+    pub relationship_type: String,  // blocks, blocked_by, caused_by
+    pub target_ticket_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoveRelationshipRequest {
+    pub relationship_type: String,  // blocks, blocked_by, caused_by
+    pub target_ticket_id: String,
+}
+
+// Response types
 #[derive(Debug, Serialize)]
 pub struct EpicsResponse {
     pub epics: Vec<Epic>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SlicesResponse {
+    pub slices: Vec<Slice>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TicketsResponse {
+    pub tickets: Vec<Ticket>,
 }
