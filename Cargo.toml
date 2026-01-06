@@ -1,0 +1,47 @@
+[package]
+name = "agentic_api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# AWS SDK
+aws-config = "1.1"
+aws-sdk-dynamodb = "1.9"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_dynamo = "4.2"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utils
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+once_cell = "1.19"
+
+# Git and filesystem operations
+git2 = "0.18"
+fs_extra = "1.3"
+dirs = "5.0"
+which = "6.0"
+tempfile = "3.8"
+
+# Command execution
+tokio-process = "0.2"
+
+[[bin]]
+name = "agentic_api"
+path = "src/main.rs"
