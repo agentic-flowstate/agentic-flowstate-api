@@ -1,23 +1,37 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
     response::{IntoResponse, Response},
 };
+use serde::Deserialize;
 use serde_json::json;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::{
-    db::DynamoDbPool,
-    models::{CreateEpicRequest},
+    models::CreateEpicRequest,
     mcp_wrapper::call_mcp_tool,
 };
 
+#[derive(Debug, Deserialize)]
+pub struct ListEpicsQuery {
+    pub organization: Option<String>,
+}
+
 pub async fn list_epics(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
+    Query(query): Query<ListEpicsQuery>,
 ) -> Response {
-    match call_mcp_tool("list_epics", None).await {
+    // Build args with optional organization filter
+    let args = if let Some(org) = query.organization {
+        Some(json!({ "organization": org }))
+    } else {
+        None
+    };
+
+    match call_mcp_tool("list_epics", args).await {
         Ok(result) => {
             (StatusCode::OK, Json(result)).into_response()
         }
@@ -32,7 +46,7 @@ pub async fn list_epics(
 }
 
 pub async fn get_epic(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
     Path(epic_id): Path<String>,
 ) -> Response {
     let args = json!({ "epic_id": epic_id });
@@ -59,11 +73,13 @@ pub async fn get_epic(
 }
 
 pub async fn create_epic(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
     Json(request): Json<CreateEpicRequest>,
 ) -> Response {
     let args = json!({
+        "epic_id": request.epic_id,
         "title": request.title,
+        "organization": request.organization,
         "notes": request.notes,
         "assignees": request.assignees,
     });
@@ -84,7 +100,7 @@ pub async fn create_epic(
 }
 
 pub async fn delete_epic(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
     Path(epic_id): Path<String>,
 ) -> Response {
     let args = json!({ "epic_id": epic_id });

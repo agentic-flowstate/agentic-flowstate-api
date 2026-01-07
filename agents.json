@@ -1,0 +1,59 @@
+{
+  "models": {
+    "sonnet": "claude-sonnet-4-5-20250929",
+    "opus": "claude-opus-4-5-20251101"
+  },
+  "agents": {
+    "research": {
+      "model": "sonnet",
+      "prompt_file": "research.txt",
+      "tools": [
+        "Read",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "Task"
+      ]
+    },
+    "planning": {
+      "model": "sonnet",
+      "prompt_file": "planning.txt",
+      "tools": [
+        "Read",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "Task"
+      ]
+    },
+    "execution": {
+      "model": "sonnet",
+      "prompt_file": "execution.txt",
+      "tools": [
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "Task",
+        "mcp__agentic-mcp__*"
+      ]
+    },
+    "evaluation": {
+      "model": "sonnet",
+      "prompt_file": "evaluation.txt",
+      "tools": [
+        "Read",
+        "Glob",
+        "Grep",
+        "Bash",
+        "Task"
+      ]
+    }
+  }
+}

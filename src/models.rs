@@ -5,6 +5,8 @@ pub struct Epic {
     pub epic_id: String,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignees: Option<Vec<String>>,
@@ -64,7 +66,9 @@ pub struct Ticket {
 // Request types
 #[derive(Debug, Deserialize)]
 pub struct CreateEpicRequest {
+    pub epic_id: String,
     pub title: String,
+    pub organization: String,
     pub notes: Option<String>,
     pub assignees: Option<Vec<String>>,
 }
@@ -79,6 +83,7 @@ pub struct CreateSliceRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateTicketRequest {
     pub title: String,
+    pub intent: Option<String>,
     pub notes: Option<String>,
     pub priority: Option<String>,
     pub assignees: Option<Vec<String>>,

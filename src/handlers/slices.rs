@@ -5,17 +5,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::json;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::{
-    db::DynamoDbPool,
-    models::{CreateSliceRequest},
+    models::CreateSliceRequest,
     mcp_wrapper::call_mcp_tool,
 };
 
 pub async fn list_slices(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
     Path(epic_id): Path<String>,
 ) -> Response {
     let args = json!({ "epic_id": epic_id });
@@ -35,7 +35,7 @@ pub async fn list_slices(
 }
 
 pub async fn get_slice(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
     Path((epic_id, slice_id)): Path<(String, String)>,
 ) -> Response {
     let args = json!({
@@ -65,7 +65,7 @@ pub async fn get_slice(
 }
 
 pub async fn create_slice(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
     Path(epic_id): Path<String>,
     Json(request): Json<CreateSliceRequest>,
 ) -> Response {
@@ -91,7 +91,7 @@ pub async fn create_slice(
 }
 
 pub async fn delete_slice(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
     Path((epic_id, slice_id)): Path<(String, String)>,
 ) -> Response {
     let args = json!({

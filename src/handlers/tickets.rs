@@ -6,11 +6,11 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::{
-    db::DynamoDbPool,
     models::{CreateTicketRequest, UpdateTicketRequest},
     mcp_wrapper::call_mcp_tool,
 };
@@ -22,7 +22,7 @@ pub struct TicketQuery {
 
 // List tickets for an epic or a specific slice
 pub async fn list_tickets(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
     Path(epic_id): Path<String>,
     Query(params): Query<TicketQuery>,
 ) -> Response {
@@ -51,7 +51,7 @@ pub async fn list_tickets(
 
 // Convenience function for listing tickets specifically in a slice (used by route)
 pub async fn list_slice_tickets(
-    State(pool): State<Arc<DynamoDbPool>>,
+    State(pool): State<Arc<SqlitePool>>,
     Path((epic_id, slice_id)): Path<(String, String)>,
 ) -> Response {
     list_tickets(
@@ -61,11 +61,16 @@ pub async fn list_slice_tickets(
     ).await
 }
 
-pub async fn get_ticket(
-    State(_pool): State<Arc<DynamoDbPool>>,
-    Path(ticket_id): Path<String>,
+// Get ticket with full path (epic_id, slice_id, ticket_id)
+pub async fn get_ticket_nested(
+    State(_pool): State<Arc<SqlitePool>>,
+    Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
 ) -> Response {
-    let args = json!({ "ticket_id": ticket_id });
+    let args = json!({
+        "epic_id": epic_id,
+        "slice_id": slice_id,
+        "ticket_id": ticket_id
+    });
 
     match call_mcp_tool("get_ticket", Some(args)).await {
         Ok(result) => {
@@ -89,7 +94,7 @@ pub async fn get_ticket(
 }
 
 pub async fn create_ticket(
-    State(_pool): State<Arc<DynamoDbPool>>,
+    State(_pool): State<Arc<SqlitePool>>,
     Path((epic_id, slice_id)): Path<(String, String)>,
     Json(request): Json<CreateTicketRequest>,
 ) -> Response {
@@ -97,6 +102,7 @@ pub async fn create_ticket(
         "epic_id": epic_id,
         "slice_id": slice_id,
         "title": request.title,
+        "intent": request.intent.unwrap_or_else(|| request.title.clone()),
         "notes": request.notes,
         "priority": request.priority,
         "assignees": request.assignees,
@@ -118,16 +124,19 @@ pub async fn create_ticket(
     }
 }
 
-pub async fn update_ticket(
-    State(_pool): State<Arc<DynamoDbPool>>,
-    Path(ticket_id): Path<String>,
+// Update ticket with full path (epic_id, slice_id, ticket_id)
+pub async fn update_ticket_nested(
+    State(_pool): State<Arc<SqlitePool>>,
+    Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
     Json(request): Json<UpdateTicketRequest>,
 ) -> Response {
     // Determine which update operation to use based on what's being updated
     if let Some(status) = request.status {
         let args = json!({
+            "epic_id": epic_id,
+            "slice_id": slice_id,
             "ticket_id": ticket_id,
-            "status": status
+            "new_status": status
         });
 
         match call_mcp_tool("update_ticket_status", Some(args)).await {
@@ -145,6 +154,8 @@ pub async fn update_ticket(
         }
     } else if request.notes.is_some() {
         let args = json!({
+            "epic_id": epic_id,
+            "slice_id": slice_id,
             "ticket_id": ticket_id,
             "notes": request.notes
         });
@@ -170,11 +181,16 @@ pub async fn update_ticket(
     }
 }
 
-pub async fn delete_ticket(
-    State(_pool): State<Arc<DynamoDbPool>>,
-    Path(ticket_id): Path<String>,
+// Delete ticket with full path (epic_id, slice_id, ticket_id)
+pub async fn delete_ticket_nested(
+    State(_pool): State<Arc<SqlitePool>>,
+    Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
 ) -> Response {
-    let args = json!({ "ticket_id": ticket_id });
+    let args = json!({
+        "epic_id": epic_id,
+        "slice_id": slice_id,
+        "ticket_id": ticket_id
+    });
 
     match call_mcp_tool("delete_ticket", Some(args)).await {
         Ok(result) => {
@@ -198,16 +214,18 @@ pub async fn delete_ticket(
     }
 }
 
-// Add support for ticket relationships
-pub async fn add_ticket_relationship(
-    State(_pool): State<Arc<DynamoDbPool>>,
-    Path(ticket_id): Path<String>,
+// Add relationship with full path
+pub async fn add_relationship_nested(
+    State(_pool): State<Arc<SqlitePool>>,
+    Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
     Json(request): Json<serde_json::Value>,
 ) -> Response {
     let args = json!({
+        "epic_id": epic_id,
+        "slice_id": slice_id,
         "ticket_id": ticket_id,
-        "related_ticket_id": request["related_ticket_id"],
-        "relationship_type": request["relationship_type"]
+        "relationship_type": request["relationship_type"],
+        "target_ticket_id": request["target_ticket_id"]
     });
 
     match call_mcp_tool("add_ticket_relationship", Some(args)).await {
@@ -225,13 +243,18 @@ pub async fn add_ticket_relationship(
     }
 }
 
-pub async fn remove_ticket_relationship(
-    State(_pool): State<Arc<DynamoDbPool>>,
-    Path((ticket_id, related_ticket_id)): Path<(String, String)>,
+// Remove relationship with full path
+pub async fn remove_relationship_nested(
+    State(_pool): State<Arc<SqlitePool>>,
+    Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
+    Json(request): Json<serde_json::Value>,
 ) -> Response {
     let args = json!({
+        "epic_id": epic_id,
+        "slice_id": slice_id,
         "ticket_id": ticket_id,
-        "related_ticket_id": related_ticket_id
+        "relationship_type": request["relationship_type"],
+        "target_ticket_id": request["target_ticket_id"]
     });
 
     match call_mcp_tool("remove_ticket_relationship", Some(args)).await {

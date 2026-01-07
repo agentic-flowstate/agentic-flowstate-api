@@ -1,11 +1,11 @@
-mod db;
 mod handlers;
 mod models;
 mod utils;
 mod mcp_wrapper;
+mod agents;
 
 use axum::{
-    routing::{get, post, patch, delete},
+    routing::{get, post},
     Router,
 };
 use std::sync::Arc;
@@ -29,9 +29,9 @@ async fn main() -> anyhow::Result<()> {
     mcp_wrapper::init_mcp_handler().await?;
     tracing::info!("MCP handler initialized");
 
-    // Initialize DynamoDB connection pool
-    let db_pool = Arc::new(db::DynamoDbPool::new().await?);
-    tracing::info!("DynamoDB connection pool initialized");
+    // Initialize SQLite database pool
+    let db_pool = Arc::new(ticketing_system::init_db().await?);
+    tracing::info!("SQLite database pool initialized");
 
     // Build the application
     let app = Router::new()
@@ -52,14 +52,27 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/epics/:epic_id/slices/:slice_id/tickets",
             get(handlers::list_slice_tickets)
             .post(handlers::create_ticket))
-        .route("/api/tickets/:ticket_id",
-            get(handlers::get_ticket)
-            .patch(handlers::update_ticket)
-            .delete(handlers::delete_ticket))
-        .route("/api/tickets/:ticket_id/relationships",
-            post(handlers::add_ticket_relationship))
-        .route("/api/tickets/:ticket_id/relationships/:related_ticket_id",
-            delete(handlers::remove_ticket_relationship))
+        // Nested ticket routes (with epic_id/slice_id/ticket_id)
+        .route("/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id",
+            get(handlers::get_ticket_nested)
+            .patch(handlers::update_ticket_nested)
+            .delete(handlers::delete_ticket_nested))
+        .route("/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/relationships",
+            post(handlers::add_relationship_nested)
+            .delete(handlers::remove_relationship_nested))
+
+        // Agent run routes
+        .route("/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/agent-runs",
+            get(handlers::list_agent_runs)
+            .post(handlers::run_agent))
+        .route("/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/agent-runs/stream",
+            post(handlers::stream_agent_run))
+        .route("/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/agent-runs/active",
+            get(handlers::get_active_agent_run))
+        .route("/api/agent-runs/:session_id",
+            get(handlers::get_agent_run))
+        .route("/api/agent-runs/:session_id/stream",
+            get(handlers::reconnect_agent_stream))
 
         // Health check
         .route("/health", get(|| async { "OK" }))
