@@ -174,4 +174,9 @@ pub enum StreamEvent {
         status: String,
         is_error: bool,
     },
+    /// Sent after all historical events have been replayed during reconnection
+    ReplayComplete {
+        total_events: usize,
+        agent_status: String,
+    },
 }

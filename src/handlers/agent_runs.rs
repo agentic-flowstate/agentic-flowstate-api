@@ -274,6 +274,7 @@ pub async fn stream_agent_run(
                 StreamEvent::Thinking { .. } => "thinking",
                 StreamEvent::Status { .. } => "status",
                 StreamEvent::Result { .. } => "result",
+                StreamEvent::ReplayComplete { .. } => "replay_complete",
             };
             tracing::debug!("[STREAM] Received event #{}: {}", event_index, event_type);
 
@@ -340,18 +341,27 @@ pub async fn reconnect_agent_stream(
         match run_result {
             Ok(Some(run)) => {
                 // Always replay stored events first (for both running and completed agents)
-                let mut has_events = false;
+                let mut event_count = 0usize;
                 if let Ok(events) = events_result {
                     for db_event in events {
-                        has_events = true;
+                        event_count += 1;
                         // The event_data is already serialized JSON, send it directly
                         yield Ok(Event::default().data(db_event.event_data));
                     }
                 }
 
+                // Send ReplayComplete event so frontend knows historical replay is done
+                let replay_complete = StreamEvent::ReplayComplete {
+                    total_events: event_count,
+                    agent_status: run.status.clone(),
+                };
+                if let Ok(json) = serde_json::to_string(&replay_complete) {
+                    yield Ok(Event::default().data(json));
+                }
+
                 if run.status == "running" {
-                    // Agent is still running - just send a simple status indicator (no message)
-                    // Frontend will show a loader and poll for updates
+                    // Agent is still running - send status indicator
+                    // Frontend will show a loader for new events
                     let event = StreamEvent::Status {
                         status: "running".to_string(),
                         message: None,
@@ -361,7 +371,7 @@ pub async fn reconnect_agent_stream(
                     }
                 } else {
                     // Agent finished
-                    if !has_events {
+                    if event_count == 0 {
                         // Fallback: send stored output as text event if no events were stored
                         if let Some(output) = &run.output_summary {
                             let event = StreamEvent::Text { content: output.clone() };

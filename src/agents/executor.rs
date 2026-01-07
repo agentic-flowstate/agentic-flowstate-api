@@ -238,6 +238,11 @@ impl AgentExecutor {
                                         tracing::warn!("Failed to send result event: {}", e);
                                     }
                                 }
+
+                                // Result message means we're done - break out of the loop
+                                // The cc-sdk stream may not close automatically after Result
+                                tracing::info!("Breaking out of stream loop after Result message");
+                                break;
                             }
                         }
                         Err(e) => {
