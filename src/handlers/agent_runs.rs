@@ -113,19 +113,27 @@ pub async fn stream_agent_run(
     State(db): State<Arc<SqlitePool>>,
     Json(req): Json<RunAgentRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    tracing::info!("=== STREAM_AGENT_RUN START ===");
+    tracing::info!("Ticket: {}/{}/{}", epic_id, slice_id, ticket_id);
+    tracing::info!("Agent type: {:?}", req.agent_type);
+
     let (tx, rx) = mpsc::channel::<StreamEvent>(100);
 
     // Get ticket details
+    tracing::info!("Fetching ticket details...");
     let ticket_result = ticketing_system::tickets::get_ticket(&db, &epic_id, &slice_id, &ticket_id).await;
+    tracing::info!("Ticket fetch result: {:?}", ticket_result.is_ok());
     let db_clone = db.clone();
 
     // Generate session_id upfront so we can store running state before execution
     let session_id = uuid::Uuid::new_v4().to_string();
     let started_at = chrono::Utc::now().to_rfc3339();
+    tracing::info!("Generated session_id: {}", session_id);
 
     // Store agent run with "running" status BEFORE execution starts
     // This allows frontend to detect running agents on page refresh
     if let Ok(Some(ref ticket)) = ticket_result {
+        tracing::info!("Creating initial 'running' record in DB...");
         let create_req = ticketing_system::CreateAgentRunRequest {
             session_id: session_id.clone(),
             epic_id: epic_id.clone(),
@@ -134,18 +142,22 @@ pub async fn stream_agent_run(
             agent_type: req.agent_type.as_str().to_string(),
             input_message: ticket.intent.clone(),
         };
-        if let Err(e) = ticketing_system::agent_runs::create_agent_run(&db, create_req).await {
-            tracing::error!("Failed to store running agent state: {}", e);
+        match ticketing_system::agent_runs::create_agent_run(&db, create_req).await {
+            Ok(_) => tracing::info!("Successfully created 'running' record"),
+            Err(e) => tracing::error!("Failed to store running agent state: {}", e),
         }
     }
 
     let session_id_clone = session_id.clone();
-    let agent_type_clone = req.agent_type.clone();
+    let _agent_type_clone = req.agent_type.clone();
 
     // Spawn the agent execution in background
+    tracing::info!("Spawning background task for agent execution...");
     tokio::spawn(async move {
+        tracing::info!("[SPAWN] Background task started for session: {}", session_id_clone);
         match ticket_result {
             Ok(Some(ticket)) => {
+                tracing::info!("[SPAWN] Ticket found: {}", ticket.title);
                 let context = TicketContext {
                     epic_id: epic_id.clone(),
                     slice_id: slice_id.clone(),
@@ -158,6 +170,7 @@ pub async fn stream_agent_run(
                 let executor = AgentExecutor::new(working_dir);
 
                 // Send status update with session_id
+                tracing::info!("[SPAWN] Sending 'running' status to frontend...");
                 let _ = tx.send(StreamEvent::Status {
                     status: "running".to_string(),
                     message: Some(format!("Agent started (session: {})", session_id_clone)),
@@ -165,6 +178,7 @@ pub async fn stream_agent_run(
 
                 // Get previous output for chaining
                 let previous_output = if let Some(prev_session_id) = &req.previous_session_id {
+                    tracing::info!("[SPAWN] Fetching previous session output: {}", prev_session_id);
                     ticketing_system::agent_runs::get_agent_run(&db_clone, prev_session_id)
                         .await
                         .ok()
@@ -174,19 +188,32 @@ pub async fn stream_agent_run(
                     None
                 };
 
+                tracing::info!("[SPAWN] Starting executor.execute()...");
                 let agent_type_for_error = req.agent_type.clone();
                 match executor.execute(req.agent_type, context, previous_output, Some(tx.clone())).await {
                     Ok(mut agent_run) => {
+                        tracing::info!("[SPAWN] executor.execute() returned OK");
                         // Use our pre-generated session_id for consistency
                         agent_run.session_id = session_id_clone.clone();
+                        tracing::info!("[SPAWN] Agent completed with status: {:?}", agent_run.status);
+                        tracing::info!("[SPAWN] Output summary length: {:?}", agent_run.output_summary.as_ref().map(|s| s.len()));
+
                         // Store the completed run (updates the running record)
-                        let _ = store_agent_run(&db_clone, &agent_run).await;
+                        tracing::info!("[SPAWN] Calling store_agent_run to update status...");
+                        match store_agent_run(&db_clone, &agent_run).await {
+                            Ok(_) => tracing::info!("[SPAWN] Successfully stored agent run with status: {}", agent_run.status.as_str()),
+                            Err(e) => tracing::error!("[SPAWN] Failed to store completed agent run: {}", e),
+                        }
+
+                        tracing::info!("[SPAWN] Sending final status to frontend...");
                         let _ = tx.send(StreamEvent::Status {
                             status: agent_run.status.as_str().to_string(),
                             message: Some("Agent completed".to_string()),
                         }).await;
+                        tracing::info!("[SPAWN] Agent run complete, exiting spawn");
                     }
                     Err(e) => {
+                        tracing::error!("[SPAWN] executor.execute() returned ERROR: {}", e);
                         // Update the running record to failed status
                         let failed_run = ticketing_system::AgentRun {
                             session_id: session_id_clone.clone(),
@@ -200,7 +227,11 @@ pub async fn stream_agent_run(
                             input_message: String::new(),
                             output_summary: Some(format!("Agent failed: {}", e)),
                         };
-                        let _ = ticketing_system::agent_runs::update_agent_run(&db_clone, &failed_run).await;
+                        tracing::info!("[SPAWN] Storing failed status...");
+                        match ticketing_system::agent_runs::update_agent_run(&db_clone, &failed_run).await {
+                            Ok(_) => tracing::info!("[SPAWN] Successfully stored failed status"),
+                            Err(e) => tracing::error!("[SPAWN] Failed to store failed agent run: {}", e),
+                        }
                         let _ = tx.send(StreamEvent::Status {
                             status: "failed".to_string(),
                             message: Some(format!("Agent failed: {}", e)),
@@ -209,33 +240,68 @@ pub async fn stream_agent_run(
                 }
             }
             Ok(None) => {
+                tracing::error!("[SPAWN] Ticket not found!");
                 let _ = tx.send(StreamEvent::Status {
                     status: "failed".to_string(),
                     message: Some("Ticket not found".to_string()),
                 }).await;
             }
             Err(e) => {
+                tracing::error!("[SPAWN] Database error fetching ticket: {}", e);
                 let _ = tx.send(StreamEvent::Status {
                     status: "failed".to_string(),
                     message: Some(format!("Database error: {}", e)),
                 }).await;
             }
         }
+        tracing::info!("[SPAWN] Background task exiting");
     });
 
     // Convert channel to SSE stream with JSON serialization
+    // Also store events to database for replay on reconnect
+    tracing::info!("Setting up SSE stream for session: {}", session_id);
+    let db_for_stream = db.clone();
+    let session_id_for_stream = session_id.clone();
     let stream = stream! {
+        tracing::info!("[STREAM] SSE stream started");
         let mut rx = ReceiverStream::new(rx);
+        let mut event_index = 0i32;
         while let Some(event) = futures::StreamExt::next(&mut rx).await {
+            let event_type = match &event {
+                StreamEvent::Text { .. } => "text",
+                StreamEvent::ToolUse { .. } => "tool_use",
+                StreamEvent::ToolResult { .. } => "tool_result",
+                StreamEvent::Thinking { .. } => "thinking",
+                StreamEvent::Status { .. } => "status",
+                StreamEvent::Result { .. } => "result",
+            };
+            tracing::debug!("[STREAM] Received event #{}: {}", event_index, event_type);
+
             match serde_json::to_string(&event) {
-                Ok(json) => yield Ok(Event::default().data(json)),
+                Ok(json) => {
+                    // Store event to database for replay
+                    if let Err(e) = ticketing_system::agent_runs::store_event(
+                        &db_for_stream,
+                        &session_id_for_stream,
+                        event_index,
+                        event_type,
+                        &json,
+                    ).await {
+                        tracing::warn!("[STREAM] Failed to store event #{}: {}", event_index, e);
+                    }
+                    event_index += 1;
+
+                    yield Ok(Event::default().data(json));
+                }
                 Err(e) => {
-                    tracing::error!("Failed to serialize event: {}", e);
+                    tracing::error!("[STREAM] Failed to serialize event: {}", e);
                 }
             }
         }
+        tracing::info!("[STREAM] SSE stream ended after {} events", event_index);
     };
 
+    tracing::info!("=== STREAM_AGENT_RUN returning SSE ===");
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -260,8 +326,9 @@ pub async fn get_active_agent_run(
 /// GET /api/agent-runs/:session_id/stream
 ///
 /// Reconnect endpoint for agent runs.
-/// - If agent completed/failed: replays stored events as SSE
-/// - If agent still running: returns status indicating it's running (output not available)
+/// - Replays all stored events from the database
+/// - Works for both running and completed agents
+/// - For running agents, sends existing events then a status indicator
 pub async fn reconnect_agent_stream(
     Path(session_id): Path<String>,
     State(db): State<Arc<SqlitePool>>,
@@ -272,28 +339,35 @@ pub async fn reconnect_agent_stream(
     let stream = stream! {
         match run_result {
             Ok(Some(run)) => {
+                // Always replay stored events first (for both running and completed agents)
+                let mut has_events = false;
+                if let Ok(events) = events_result {
+                    for db_event in events {
+                        has_events = true;
+                        // The event_data is already serialized JSON, send it directly
+                        yield Ok(Event::default().data(db_event.event_data));
+                    }
+                }
+
                 if run.status == "running" {
-                    // Agent is still running - we can't reconnect to live stream
-                    // Just send status indicating it's running
+                    // Agent is still running - just send a simple status indicator (no message)
+                    // Frontend will show a loader and poll for updates
                     let event = StreamEvent::Status {
                         status: "running".to_string(),
-                        message: Some("Agent is still running. Output will be available when complete.".to_string()),
+                        message: None,
                     };
                     if let Ok(json) = serde_json::to_string(&event) {
                         yield Ok(Event::default().data(json));
                     }
                 } else {
-                    // Agent finished - replay stored events if available
-                    if let Ok(events) = events_result {
-                        for db_event in events {
-                            // The event_data is already serialized JSON, send it directly
-                            yield Ok(Event::default().data(db_event.event_data));
-                        }
-                    } else if let Some(output) = &run.output_summary {
-                        // Fallback: send stored output as text event
-                        let event = StreamEvent::Text { content: output.clone() };
-                        if let Ok(json) = serde_json::to_string(&event) {
-                            yield Ok(Event::default().data(json));
+                    // Agent finished
+                    if !has_events {
+                        // Fallback: send stored output as text event if no events were stored
+                        if let Some(output) = &run.output_summary {
+                            let event = StreamEvent::Text { content: output.clone() };
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                yield Ok(Event::default().data(json));
+                            }
                         }
                     }
 
