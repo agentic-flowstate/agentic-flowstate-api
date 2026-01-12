@@ -4,9 +4,17 @@
     "opus": "claude-opus-4-5-20251101"
   },
   "agents": {
-    "research": {
+    "vendor-research": {
       "model": "sonnet",
-      "prompt_file": "research.txt",
+      "prompt_file": "vendor-research.txt",
+      "tools": [
+        "WebFetch",
+        "WebSearch"
+      ]
+    },
+    "technical-research": {
+      "model": "sonnet",
+      "prompt_file": "technical-research.txt",
       "tools": [
         "Read",
         "Glob",
@@ -14,6 +22,14 @@
         "WebFetch",
         "WebSearch",
         "Task"
+      ]
+    },
+    "competitive-research": {
+      "model": "sonnet",
+      "prompt_file": "competitive-research.txt",
+      "tools": [
+        "WebFetch",
+        "WebSearch"
       ]
     },
     "planning": {
@@ -53,6 +69,30 @@
         "Grep",
         "Bash",
         "Task"
+      ]
+    },
+    "email": {
+      "model": "sonnet",
+      "prompt_file": "email.txt",
+      "tools": []
+    },
+    "workspace-manager": {
+      "model": "sonnet",
+      "prompt_file": "workspace-manager.txt",
+      "tools": [
+        "Read",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "mcp__agentic-mcp__list_epics",
+        "mcp__agentic-mcp__list_slices",
+        "mcp__agentic-mcp__list_tickets",
+        "mcp__agentic-mcp__get_epic",
+        "mcp__agentic-mcp__get_slice",
+        "mcp__agentic-mcp__get_ticket",
+        "mcp__agentic-mcp__create_slice",
+        "mcp__agentic-mcp__create_ticket",
+        "mcp__agentic-mcp__add_ticket_relationship"
       ]
     }
   }

@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{StatusCode, HeaderMap},
     Json,
     response::{IntoResponse, Response},
 };
@@ -15,6 +15,13 @@ use crate::{
     mcp_wrapper::call_mcp_tool,
 };
 
+fn get_organization(headers: &HeaderMap) -> String {
+    headers.get("X-Organization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("telemetryops")
+        .to_string()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListEpicsQuery {
     pub organization: Option<String>,
@@ -22,14 +29,16 @@ pub struct ListEpicsQuery {
 
 pub async fn list_epics(
     State(_pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Query(query): Query<ListEpicsQuery>,
 ) -> Response {
-    // Build args with optional organization filter
-    let args = if let Some(org) = query.organization {
-        Some(json!({ "organization": org }))
-    } else {
-        None
-    };
+    // Use query param if provided, otherwise check header, otherwise list ALL
+    let org = query.organization.or_else(|| {
+        headers.get("X-Organization")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    });
+    let args = org.map(|o| json!({ "organization": o }));
 
     match call_mcp_tool("list_epics", args).await {
         Ok(result) => {
@@ -47,9 +56,11 @@ pub async fn list_epics(
 
 pub async fn get_epic(
     State(_pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path(epic_id): Path<String>,
 ) -> Response {
-    let args = json!({ "epic_id": epic_id });
+    let organization = get_organization(&headers);
+    let args = json!({ "organization": organization, "epic_id": epic_id });
 
     match call_mcp_tool("get_epic", Some(args)).await {
         Ok(result) => {
@@ -101,9 +112,11 @@ pub async fn create_epic(
 
 pub async fn delete_epic(
     State(_pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path(epic_id): Path<String>,
 ) -> Response {
-    let args = json!({ "epic_id": epic_id });
+    let organization = get_organization(&headers);
+    let args = json!({ "organization": organization, "epic_id": epic_id });
 
     match call_mcp_tool("delete_epic", Some(args)).await {
         Ok(result) => {

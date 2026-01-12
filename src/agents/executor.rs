@@ -1,12 +1,13 @@
-use cc_sdk::{query, ClaudeCodeOptions, Message, ContentBlock};
+use cc_sdk::{ClaudeCodeOptions, ClaudeSDKClient, Message, ContentBlock, ToolsConfig};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use anyhow::{Result, Context};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::{AgentType, AgentRun, AgentRunStatus, TicketContext, StreamEvent};
+use super::{AgentType, AgentRun, AgentRunStatus, TicketContext, StreamEvent, EmailOutput, HookConfig};
 use super::prompts::load_prompt;
+use super::hooks::configure_tool_result_hook;
 
 /// Executes agents using the Claude Code CLI via cc-sdk.
 pub struct AgentExecutor {
@@ -22,12 +23,18 @@ impl AgentExecutor {
     ///
     /// Returns the completed AgentRun with session_id and output summary.
     /// If event_tx is provided, structured events are sent for real-time UI updates.
+    /// If hook_config is provided, tool results are stored directly to the database.
+    /// `selected_context` is used by the email agent to inject outputs from multiple selected agent runs.
+    /// `sender_info` is used by the email agent to populate the signature with user contact details.
     pub async fn execute(
         &self,
         agent_type: AgentType,
         ticket_context: TicketContext,
         previous_output: Option<String>,
+        selected_context: Option<String>,
+        sender_info: Option<String>,
         event_tx: Option<mpsc::Sender<StreamEvent>>,
+        hook_config: Option<HookConfig>,
     ) -> Result<AgentRun> {
         let started_at = chrono::Utc::now().to_rfc3339();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -58,12 +65,26 @@ impl AgentExecutor {
             }
         }
 
+        // Add selected context for email agent (multi-source context injection)
+        if let Some(ctx) = &selected_context {
+            vars.insert("selected_context".to_string(), ctx.clone());
+        } else {
+            vars.insert("selected_context".to_string(), "(No previous agent outputs selected)".to_string());
+        }
+
+        // Add sender info for email agent signature
+        if let Some(info) = &sender_info {
+            vars.insert("sender_info".to_string(), info.clone());
+        } else {
+            vars.insert("sender_info".to_string(), "(No sender information available - please add your contact details)".to_string());
+        }
+
         // Load system prompt for this agent type
         let system_prompt = load_prompt(agent_type.as_str(), vars)
             .context("Failed to load agent prompt")?;
 
         // Build cc-sdk options using builder pattern
-        let allowed_tools: Vec<String> = agent_type
+        let tools_list: Vec<String> = agent_type
             .allowed_tools()
             .iter()
             .map(|s| s.to_string())
@@ -78,14 +99,16 @@ impl AgentExecutor {
         );
         tracing::info!("System prompt length: {} chars", system_prompt.len());
         tracing::info!("Working dir: {:?}", self.working_dir);
-        tracing::info!("Allowed tools: {:?}", allowed_tools);
+        tracing::info!("Tools config: {:?}", tools_list);
         tracing::info!("Max turns: {:?}", agent_type.max_turns());
 
         // Build options
+        // Use ToolsConfig to actually restrict which tools are available (not just auto-approval)
         let mut builder = ClaudeCodeOptions::builder()
             .system_prompt(&system_prompt)
             .model(agent_type.model())
-            .allowed_tools(allowed_tools)
+            .tools(ToolsConfig::list(tools_list.clone()))
+            .allowed_tools(tools_list) // Also auto-approve these tools
             .cwd(&self.working_dir);
 
         // Only set max_turns if configured (otherwise unlimited)
@@ -93,7 +116,12 @@ impl AgentExecutor {
             builder = builder.max_turns(turns);
         }
 
-        let options = builder.build();
+        let mut options = builder.build();
+
+        // Configure PostToolUse hook to capture tool results if we have both event_tx and hook_config
+        if let (Some(ref tx), Some(config)) = (&event_tx, hook_config) {
+            configure_tool_result_hook(&mut options, tx.clone(), config);
+        }
 
         // The initial prompt is the ticket intent
         let prompt = format!(
@@ -102,18 +130,24 @@ impl AgentExecutor {
             ticket_context.intent
         );
 
-        // Execute the query and collect output
+        // Execute using ClaudeSDKClient (required for hooks support)
         let mut output_parts = Vec::new();
         let mut status = AgentRunStatus::Running;
         let mut actual_session_id = session_id.clone();
 
-        tracing::info!("Calling cc-sdk query...");
+        tracing::info!("Creating ClaudeSDKClient with hooks support...");
         let query_start = std::time::Instant::now();
 
-        match query(prompt.as_str(), Some(options)).await {
-            Ok(stream) => {
-                tracing::info!("cc-sdk query returned stream in {:?}", query_start.elapsed());
-                let mut stream = Box::pin(stream);
+        // Create client with the options (hooks are automatically detected and enabled)
+        let mut client = ClaudeSDKClient::new(options);
+
+        // Connect with initial prompt
+        match client.connect(Some(prompt)).await {
+            Ok(_) => {
+                tracing::info!("Client connected in {:?}", query_start.elapsed());
+
+                // Receive messages from the client
+                let mut stream = client.receive_messages().await;
                 let mut message_count = 0u32;
 
                 while let Some(message_result) = stream.next().await {
@@ -164,29 +198,19 @@ impl AgentExecutor {
                                             }
                                         }
                                         ContentBlock::ToolResult(tool_result) => {
-                                            // Note: cc-sdk/CLI rarely emits this directly
-                                            // Tool results are usually handled internally by the CLI
-                                            tracing::info!("Tool result for: {} (content: {})",
-                                                tool_result.tool_use_id,
-                                                tool_result.content.is_some());
+                                            // ToolResult blocks from the stream are rare - most tool results
+                                            // come via the PostToolUse hook configured above.
+                                            // This handles edge cases like transcript replay or resume scenarios.
+                                            tracing::debug!(
+                                                "ToolResult block from stream: {} (hook handles most results)",
+                                                tool_result.tool_use_id
+                                            );
 
-                                            if let Some(ref tx) = event_tx {
-                                                let content = match &tool_result.content {
-                                                    Some(cc_sdk::ContentValue::Text(s)) => s.clone(),
-                                                    Some(cc_sdk::ContentValue::Structured(vals)) => {
-                                                        serde_json::to_string(vals).unwrap_or_default()
-                                                    }
-                                                    None => String::new(),
-                                                };
-
-                                                let event = StreamEvent::ToolResult {
-                                                    tool_use_id: tool_result.tool_use_id.clone(),
-                                                    content,
-                                                    is_error: tool_result.is_error.unwrap_or(false),
-                                                };
-                                                if let Err(e) = tx.send(event).await {
-                                                    tracing::warn!("Failed to send tool_result event: {}", e);
-                                                }
+                                            // Only send if we don't have a hook (no event_tx means no hook configured)
+                                            if event_tx.is_none() {
+                                                tracing::info!("Tool result for: {} (content: {})",
+                                                    tool_result.tool_use_id,
+                                                    tool_result.content.is_some());
                                             }
                                         }
                                         ContentBlock::Thinking(thinking) => {
@@ -258,9 +282,14 @@ impl AgentExecutor {
                     message_count,
                     query_start.elapsed()
                 );
+
+                // Disconnect the client
+                if let Err(e) = client.disconnect().await {
+                    tracing::warn!("Error disconnecting client: {}", e);
+                }
             }
             Err(e) => {
-                tracing::error!("Failed to start agent query after {:?}: {}", query_start.elapsed(), e);
+                tracing::error!("Failed to connect client after {:?}: {}", query_start.elapsed(), e);
                 status = AgentRunStatus::Failed;
             }
         }
@@ -300,58 +329,129 @@ impl AgentExecutor {
             actual_session_id
         );
 
+        // Parse email output if this is an email agent
+        let email_output = if agent_type == AgentType::Email {
+            output_summary.as_ref().and_then(|s| EmailOutput::parse(s))
+        } else {
+            None
+        };
+
         Ok(AgentRun {
             session_id: actual_session_id,
             ticket_id: ticket_context.ticket_id,
             epic_id: ticket_context.epic_id,
             slice_id: ticket_context.slice_id,
-            agent_type,
+            agent_type: agent_type.as_str().to_string(),
             status,
             started_at,
             completed_at: Some(completed_at),
             input_message: ticket_context.intent,
             output_summary,
+            email_output,
         })
     }
 
     /// Resume an existing session with a new message.
+    /// Returns streamed events via the event_tx channel if provided.
     pub async fn resume(
         &self,
         session_id: &str,
         message: &str,
-        message_tx: Option<mpsc::Sender<String>>,
+        event_tx: Option<mpsc::Sender<StreamEvent>>,
+        hook_config: Option<HookConfig>,
     ) -> Result<Vec<String>> {
-        let options = ClaudeCodeOptions::builder()
+        let mut options = ClaudeCodeOptions::builder()
             .resume(session_id.to_string())
             .cwd(&self.working_dir)
             .build();
 
+        // Configure PostToolUse hook to capture tool results if we have both event_tx and hook_config
+        if let (Some(ref tx), Some(config)) = (&event_tx, hook_config) {
+            configure_tool_result_hook(&mut options, tx.clone(), config);
+        }
+
         let mut output_parts = Vec::new();
 
-        match query(message, Some(options)).await {
-            Ok(stream) => {
-                let mut stream = Box::pin(stream);
+        tracing::info!("Resuming session {} with message: {}...", session_id, &message[..message.len().min(100)]);
+
+        // Use ClaudeSDKClient for hooks support
+        let mut client = ClaudeSDKClient::new(options);
+
+        match client.connect(Some(message.to_string())).await {
+            Ok(_) => {
+                let mut stream = client.receive_messages().await;
 
                 while let Some(message_result) = stream.next().await {
                     match message_result {
                         Ok(message) => {
                             if let Message::Assistant { message: assistant_msg } = &message {
                                 for block in &assistant_msg.content {
-                                    if let ContentBlock::Text(text_content) = block {
-                                        output_parts.push(text_content.text.clone());
+                                    match block {
+                                        ContentBlock::Text(text_content) => {
+                                            output_parts.push(text_content.text.clone());
 
-                                        if let Some(ref tx) = message_tx {
-                                            let _ = tx.send(text_content.text.clone()).await;
+                                            if let Some(ref tx) = event_tx {
+                                                let event = StreamEvent::Text { content: text_content.text.clone() };
+                                                let _ = tx.send(event).await;
+                                            }
+                                        }
+                                        ContentBlock::ToolUse(tool_use) => {
+                                            if let Some(ref tx) = event_tx {
+                                                let event = StreamEvent::ToolUse {
+                                                    id: tool_use.id.clone(),
+                                                    name: tool_use.name.clone(),
+                                                    input: tool_use.input.clone(),
+                                                };
+                                                let _ = tx.send(event).await;
+                                            }
+                                        }
+                                        ContentBlock::ToolResult(tool_result) => {
+                                            // ToolResult blocks from the stream are rare - most tool results
+                                            // come via the PostToolUse hook configured above.
+                                            tracing::debug!(
+                                                "ToolResult block from stream in resume: {} (hook handles most results)",
+                                                tool_result.tool_use_id
+                                            );
+                                        }
+                                        ContentBlock::Thinking(thinking) => {
+                                            if let Some(ref tx) = event_tx {
+                                                let event = StreamEvent::Thinking { content: thinking.thinking.clone() };
+                                                let _ = tx.send(event).await;
+                                            }
                                         }
                                     }
                                 }
                             }
+
+                            // Check for result message
+                            if let Message::Result { session_id: sess_id, is_error, subtype, .. } = &message {
+                                if let Some(ref tx) = event_tx {
+                                    let event = StreamEvent::Result {
+                                        session_id: sess_id.clone(),
+                                        status: subtype.clone(),
+                                        is_error: *is_error,
+                                    };
+                                    let _ = tx.send(event).await;
+                                }
+                                break;
+                            }
                         }
                         Err(e) => {
-                            tracing::error!("Error receiving message: {}", e);
+                            tracing::error!("Error receiving message in resume: {}", e);
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(StreamEvent::Status {
+                                    status: "failed".to_string(),
+                                    message: Some(format!("Error: {}", e)),
+                                }).await;
+                            }
                             break;
                         }
                     }
+                }
+
+                // Disconnect the client
+                if let Err(e) = client.disconnect().await {
+                    tracing::warn!("Error disconnecting client in resume: {}", e);
                 }
             }
             Err(e) => {

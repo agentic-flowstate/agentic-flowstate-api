@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, HeaderMap},
     Json,
     response::{IntoResponse, Response},
 };
@@ -14,11 +14,20 @@ use crate::{
     mcp_wrapper::call_mcp_tool,
 };
 
+fn get_organization(headers: &HeaderMap) -> String {
+    headers.get("X-Organization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("telemetryops")
+        .to_string()
+}
+
 pub async fn list_slices(
     State(_pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path(epic_id): Path<String>,
 ) -> Response {
-    let args = json!({ "epic_id": epic_id });
+    let organization = get_organization(&headers);
+    let args = json!({ "organization": organization, "epic_id": epic_id });
 
     match call_mcp_tool("list_slices", Some(args)).await {
         Ok(result) => {
@@ -36,9 +45,12 @@ pub async fn list_slices(
 
 pub async fn get_slice(
     State(_pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path((epic_id, slice_id)): Path<(String, String)>,
 ) -> Response {
+    let organization = get_organization(&headers);
     let args = json!({
+        "organization": organization,
         "epic_id": epic_id,
         "slice_id": slice_id
     });
@@ -66,11 +78,15 @@ pub async fn get_slice(
 
 pub async fn create_slice(
     State(_pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path(epic_id): Path<String>,
     Json(request): Json<CreateSliceRequest>,
 ) -> Response {
+    let organization = get_organization(&headers);
     let args = json!({
+        "organization": organization,
         "epic_id": epic_id,
+        "slice_id": request.slice_id,
         "title": request.title,
         "notes": request.notes,
     });
@@ -92,9 +108,12 @@ pub async fn create_slice(
 
 pub async fn delete_slice(
     State(_pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path((epic_id, slice_id)): Path<(String, String)>,
 ) -> Response {
+    let organization = get_organization(&headers);
     let args = json!({
+        "organization": organization,
         "epic_id": epic_id,
         "slice_id": slice_id
     });
