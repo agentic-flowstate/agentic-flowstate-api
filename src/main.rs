@@ -10,10 +10,12 @@ mod seed_templates;
 use axum::{
     routing::{delete, get, patch, post},
     Router,
+    extract::DefaultBodyLimit,
 };
 use std::sync::Arc;
 use tower_http::cors::{CorsLayer, Any, AllowOrigin};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tokio::signal;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,6 +38,45 @@ async fn main() -> anyhow::Result<()> {
     let db_pool = Arc::new(ticketing_system::init_db().await?);
     tracing::info!("SQLite database pool initialized");
 
+    // Mark any interrupted agent checkpoints from previous run
+    match ticketing_system::checkpoints::mark_all_running_as_interrupted(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!("Marked {} interrupted agent checkpoint(s) from previous run", count);
+        }
+        Ok(_) => {
+            tracing::debug!("No interrupted agent checkpoints to clean up");
+        }
+        Err(e) => {
+            tracing::error!("Failed to clean up interrupted checkpoints: {}", e);
+        }
+    }
+
+    // Mark any interrupted agent runs from previous run (killed by server restart)
+    match ticketing_system::agent_runs::mark_all_running_as_interrupted(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!("Marked {} interrupted agent run(s) as failed from previous run", count);
+        }
+        Ok(_) => {
+            tracing::debug!("No interrupted agent runs to clean up");
+        }
+        Err(e) => {
+            tracing::error!("Failed to clean up interrupted agent runs: {}", e);
+        }
+    }
+
+    // Reset any pipeline steps stuck in "running" state from previous run
+    match ticketing_system::pipelines::reset_interrupted_pipeline_steps(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!("Reset interrupted pipeline steps on {} ticket(s) from previous run", count);
+        }
+        Ok(_) => {
+            tracing::debug!("No interrupted pipeline steps to reset");
+        }
+        Err(e) => {
+            tracing::error!("Failed to reset interrupted pipeline steps: {}", e);
+        }
+    }
+
     // Seed default pipeline templates
     if let Err(e) = seed_templates::seed_default_templates(&db_pool).await {
         tracing::warn!("Failed to seed pipeline templates: {:?}", e);
@@ -55,6 +96,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Clone db_pool for shutdown handler before building router (which moves db_pool)
+    let shutdown_db = db_pool.clone();
+
     // Build the application
     let app = Router::new()
         // Epic routes
@@ -70,7 +114,9 @@ async fn main() -> anyhow::Result<()> {
             .delete(handlers::delete_slice))
 
         // Ticket routes
+        .route("/api/tickets", get(handlers::list_all_tickets))
         .route("/api/tickets/:ticket_id", get(handlers::get_ticket_by_id))
+        .route("/api/tickets/:ticket_id/guidance", patch(handlers::update_ticket_guidance))
         .route("/api/tickets/:ticket_id/history", get(handlers::get_ticket_history_by_id))
         .route("/api/epics/:epic_id/tickets", get(handlers::list_tickets))
         .route("/api/epics/:epic_id/slices/:slice_id/tickets",
@@ -196,11 +242,38 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/agent-run",
             get(handlers::get_step_agent_run))
 
+        // Data events SSE (live updates)
+        .route("/api/data/subscribe", get(handlers::subscribe_data))
+
+        // Meeting routes
+        .route("/api/meetings",
+            get(handlers::list_meetings)
+            .post(handlers::create_meeting))
+        .route("/api/meetings/signaling",
+            get(handlers::signaling_websocket))
+        .route("/api/meetings/:room_id",
+            get(handlers::get_meeting)
+            .patch(handlers::update_meeting)
+            .delete(handlers::delete_meeting))
+        .route("/api/meetings/:room_id/start",
+            post(handlers::start_meeting))
+        .route("/api/meetings/:room_id/end",
+            post(handlers::end_meeting))
+        .route("/api/meetings/:room_id/transcribe",
+            post(handlers::transcribe_meeting))
+        .route("/api/meetings/:room_id/audio",
+            post(handlers::upload_meeting_audio))
+        .route("/api/meetings/:room_id/finalize-transcript",
+            post(handlers::finalize_meeting_transcript))
+        .route("/api/meetings/:room_id/favorite",
+            post(handlers::toggle_meeting_favorite))
+
         // Health check
         .route("/health", get(|| async { "OK" }))
 
         // Add state and middleware
         .with_state(db_pool)
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)) // 2GB - never lose a session due to size limits
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::any())
@@ -214,7 +287,83 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Server running on http://{}", addr);
 
-    axum::serve(listener, app).await?;
+    // Run server with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_db))
+        .await?;
 
     Ok(())
+}
+
+/// Graceful shutdown signal handler
+/// Waits for SIGTERM or Ctrl+C, then marks running checkpoints as interrupted
+async fn shutdown_signal(db_pool: Arc<ticketing_system::SqlitePool>) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received Ctrl+C, initiating graceful shutdown...");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, initiating graceful shutdown...");
+        },
+    }
+
+    // Give running agents a brief moment to finish current tool calls
+    // (in practice, this won't wait for long-running tools, just allows
+    // any in-flight checkpointing to complete)
+    tracing::info!("Waiting 2 seconds for in-flight operations to complete...");
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    // Mark any still-running checkpoints as interrupted
+    match ticketing_system::checkpoints::mark_all_running_as_interrupted(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!("Marked {} agent checkpoint(s) as interrupted during shutdown", count);
+        }
+        Ok(_) => {
+            tracing::debug!("No running checkpoints to interrupt");
+        }
+        Err(e) => {
+            tracing::error!("Failed to mark checkpoints as interrupted: {}", e);
+        }
+    }
+
+    // Mark any running agent runs as failed
+    match ticketing_system::agent_runs::mark_all_running_as_interrupted(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!("Marked {} agent run(s) as failed during shutdown", count);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("Failed to mark agent runs as failed: {}", e);
+        }
+    }
+
+    // Reset any pipeline steps stuck in "running" state
+    match ticketing_system::pipelines::reset_interrupted_pipeline_steps(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!("Reset interrupted pipeline steps on {} ticket(s) during shutdown", count);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("Failed to reset pipeline steps: {}", e);
+        }
+    }
+
+    tracing::info!("Graceful shutdown complete");
 }
