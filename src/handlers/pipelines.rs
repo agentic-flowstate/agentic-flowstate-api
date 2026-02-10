@@ -682,6 +682,117 @@ pub async fn reject_step(
         .into_response()
 }
 
+/// POST /api/tickets/:ticket_id/pipeline/steps/:step_id/retry
+/// Retry a failed or skipped step: resets it to queued, un-skips downstream steps,
+/// cleans up old agent runs/events, and auto-starts the step.
+pub async fn retry_step(
+    State(pool): State<Arc<SqlitePool>>,
+    Path((ticket_id, step_id)): Path<(String, String)>,
+) -> Response {
+    let (mut ticket, step_idx) = match get_ticket_and_step(&pool, &ticket_id, &step_id).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let pipeline = ticket.pipeline.as_mut().unwrap();
+    let step = &pipeline.steps[step_idx];
+
+    // Validate state: can only retry failed or skipped steps
+    if step.status != PipelineStepStatus::Failed && step.status != PipelineStepStatus::Skipped {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("Cannot retry step in {:?} status, must be Failed or Skipped", step.status)
+            })),
+        )
+            .into_response();
+    }
+
+    let agent_type = step.agent_type.clone();
+
+    // Reset the step and un-skip downstream steps
+    if !pipelines::retry_step(pipeline, &step_id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "Failed to reset step" })),
+        )
+            .into_response();
+    }
+
+    // Save updated pipeline
+    if let Err(e) = tickets::update_ticket_pipeline(&pool, &ticket_id, Some(pipeline)).await {
+        error!("Failed to update pipeline after retry_step: {:?}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to update pipeline: {}", e) })),
+        )
+            .into_response();
+    }
+
+    // Clean up old agent runs and events for this step's agent type
+    match ticketing_system::agent_runs::delete_runs_for_ticket_agent(&pool, &ticket_id, &agent_type).await {
+        Ok(count) if count > 0 => {
+            info!("Cleaned up {} old agent run(s) for retry of {} on ticket {}", count, agent_type, ticket_id);
+        }
+        Err(e) => {
+            error!("Failed to clean up old agent runs for retry: {:?}", e);
+            // Non-fatal, continue with retry
+        }
+        _ => {}
+    }
+
+    info!("Retrying step {} on ticket {}", step_id, ticket_id);
+
+    // Auto-start the retried step via pipeline automation
+    let pool_clone = pool.clone();
+    let ticket_id_clone = ticket_id.clone();
+    let step_id_clone = step_id.clone();
+    let session_id = match pipeline_automation::start_step_execution(&pool_clone, &ticket_id_clone, &step_id_clone).await {
+        Ok(pipeline_automation::PipelineProgressResult::AgentSpawned { session_id, .. }) => {
+            Some(session_id)
+        }
+        Ok(pipeline_automation::PipelineProgressResult::AwaitingApproval { .. }) => {
+            None
+        }
+        Ok(other) => {
+            info!("Retry step result: {:?}", other);
+            None
+        }
+        Err(e) => {
+            error!("Failed to auto-start retried step: {:?}", e);
+            // Step is reset to queued, user can start it manually
+            None
+        }
+    };
+
+    // Re-read ticket to get the latest pipeline state after automation
+    let (step, pipeline_status) = match tickets::get_ticket_by_id(&pool, &ticket_id).await {
+        Ok(Some(t)) if t.pipeline.is_some() => {
+            let p = t.pipeline.unwrap();
+            let s = p.steps.get(step_idx).cloned();
+            (s, p.status)
+        }
+        _ => (None, None)
+    };
+    let step = step.unwrap_or_else(|| {
+        ticket.pipeline.as_ref().unwrap().steps[step_idx].clone()
+    });
+    let pipeline_status = pipeline_status.or_else(|| {
+        ticket.pipeline.as_ref().unwrap().status.clone()
+    });
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "step": step,
+            "pipeline_status": pipeline_status,
+            "session_id": session_id,
+            "retried": true
+        })),
+    )
+        .into_response()
+}
+
 // ============================================================================
 // Agent Run Details Handler
 // ============================================================================

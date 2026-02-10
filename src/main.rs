@@ -239,6 +239,8 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::approve_step))
         .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/reject",
             post(handlers::reject_step))
+        .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/retry",
+            post(handlers::retry_step))
         .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/agent-run",
             get(handlers::get_step_agent_run))
 
