@@ -11,7 +11,6 @@
 
 use anyhow::Result;
 use sqlx::SqlitePool;
-use std::path::PathBuf;
 use tracing::{error, info, warn};
 
 use ticketing_system::{
@@ -19,10 +18,125 @@ use ticketing_system::{
     pipelines, tickets,
 };
 
-use crate::agents::{AgentExecutor, AgentType, TicketContext};
+use crate::agents::{AgentExecutor, AgentType, TicketContext, resolve_working_dir};
 
 /// Maximum depth of chained auto-steps to prevent infinite loops
 const MAX_AUTO_CHAIN_DEPTH: u32 = 10;
+
+/// Result of advancing a pipeline after a step completes
+#[derive(Debug)]
+pub enum PipelineAdvanceResult {
+    /// Pipeline completed (all steps done)
+    PipelineDone { completed: bool },
+    /// Next auto step was spawned in background
+    NextAutoStepSpawned { step_id: String, session_id: String },
+    /// Next step is manual, marked as awaiting approval
+    NextStepAwaitingApproval { step_id: String },
+    /// No next step to process
+    NoNextStep,
+    /// Step or pipeline not found
+    NotFound { reason: String },
+}
+
+/// Advance a pipeline after a step completes or fails.
+///
+/// This is the single reusable function called by both the streaming handler
+/// and the background auto-step executor after an agent finishes.
+///
+/// It:
+/// 1. Re-reads the ticket pipeline from DB (fresh state)
+/// 2. If success: calls `pipelines::complete_step()`, saves to DB
+/// 3. If failure: calls `pipelines::fail_step()`, saves to DB, returns early
+/// 4. Checks `pipeline.is_complete()` → updates ticket status to "completed" if done
+/// 5. Finds next step → if auto, spawns background agent; if manual, marks awaiting approval
+pub async fn advance_pipeline_after_step(
+    pool: &SqlitePool,
+    ticket_id: &str,
+    step_id: &str,
+    success: bool,
+    outputs: Option<serde_json::Value>,
+) -> Result<PipelineAdvanceResult> {
+    // Re-read ticket to get fresh pipeline state
+    let ticket = match tickets::get_ticket_by_id(pool, ticket_id).await? {
+        Some(t) => t,
+        None => return Ok(PipelineAdvanceResult::NotFound { reason: format!("Ticket not found: {}", ticket_id) }),
+    };
+
+    let mut pipeline = match ticket.pipeline.clone() {
+        Some(p) => p,
+        None => return Ok(PipelineAdvanceResult::NotFound { reason: "Pipeline not found on ticket".to_string() }),
+    };
+
+    // Find the step
+    let step_idx = match pipeline.steps.iter().position(|s| s.step_id == step_id) {
+        Some(idx) => idx,
+        None => return Ok(PipelineAdvanceResult::NotFound { reason: format!("Step not found: {}", step_id) }),
+    };
+
+    if !success {
+        // Mark step as failed
+        pipelines::fail_step(&mut pipeline, step_id, outputs);
+        tickets::update_ticket_pipeline(pool, ticket_id, Some(&pipeline)).await?;
+        info!("Pipeline step {} failed for ticket {}", step_id, ticket_id);
+        return Ok(PipelineAdvanceResult::PipelineDone { completed: false });
+    }
+
+    // Mark step as completed
+    pipelines::complete_step(&mut pipeline, step_id, outputs);
+    tickets::update_ticket_pipeline(pool, ticket_id, Some(&pipeline)).await?;
+    info!("Pipeline step {} completed for ticket {}", step_id, ticket_id);
+
+    // Check if pipeline is complete
+    if pipeline.is_complete() {
+        if !pipeline.has_failed() {
+            info!("Pipeline completed successfully for ticket {}, updating status to 'completed'", ticket_id);
+            if let Err(e) = tickets::update_ticket_status(
+                pool,
+                &ticket.organization,
+                &ticket.epic_id,
+                &ticket.slice_id,
+                ticket_id,
+                "completed",
+            ).await {
+                error!("Failed to update ticket status to completed: {}", e);
+            }
+            return Ok(PipelineAdvanceResult::PipelineDone { completed: true });
+        }
+        return Ok(PipelineAdvanceResult::PipelineDone { completed: false });
+    }
+
+    // Find next step
+    let next_idx = step_idx + 1;
+    if next_idx >= pipeline.steps.len() {
+        return Ok(PipelineAdvanceResult::NoNextStep);
+    }
+
+    let next_step = &pipeline.steps[next_idx];
+    if next_step.status != PipelineStepStatus::Queued {
+        return Ok(PipelineAdvanceResult::NoNextStep);
+    }
+
+    let next_step_id = next_step.step_id.clone();
+
+    match next_step.execution_type {
+        ExecutionType::Auto => {
+            // Spawn agent for auto step (background, non-streaming)
+            match spawn_agent_for_step(pool, &ticket, next_idx, 0).await? {
+                PipelineProgressResult::AgentSpawned { step_id, session_id } => {
+                    Ok(PipelineAdvanceResult::NextAutoStepSpawned { step_id, session_id })
+                }
+                _ => Ok(PipelineAdvanceResult::NoNextStep),
+            }
+        }
+        ExecutionType::Manual => {
+            // Mark as awaiting approval
+            pipelines::await_approval(&mut pipeline, &next_step_id);
+            tickets::update_ticket_pipeline(pool, ticket_id, Some(&pipeline)).await?;
+            info!("Pipeline step {} marked as awaiting approval for ticket {}", next_step_id, ticket_id);
+            Ok(PipelineAdvanceResult::NextStepAwaitingApproval { step_id: next_step_id })
+        }
+    }
+}
 
 /// Result of processing pipeline progression
 #[derive(Debug)]
@@ -191,7 +305,7 @@ async fn spawn_agent_for_step(
         slice_id: ticket.slice_id.clone(),
         ticket_id: ticket.ticket_id.clone(),
         agent_type: agent_type_str.clone(),
-        input_message: ticket.intent.clone(),
+        input_message: ticket.description.clone().unwrap_or_default(),
     };
     ticketing_system::agent_runs::create_agent_run(pool, create_req).await?;
 
@@ -200,8 +314,9 @@ async fn spawn_agent_for_step(
     let ticket_id = ticket.ticket_id.clone();
     let epic_id = ticket.epic_id.clone();
     let slice_id = ticket.slice_id.clone();
+    let organization = ticket.organization.clone();
     let title = ticket.title.clone();
-    let intent = ticket.intent.clone();
+    let description = ticket.description.clone().unwrap_or_default();
     let step_id_clone = step_id.clone();
     let session_id_clone = session_id.clone();
 
@@ -211,8 +326,9 @@ async fn spawn_agent_for_step(
             &ticket_id,
             &epic_id,
             &slice_id,
+            &organization,
             &title,
-            &intent,
+            &description,
             &step_id_clone,
             &session_id_clone,
             agent_type,
@@ -238,6 +354,7 @@ async fn execute_agent_for_step(
     ticket_id: &str,
     epic_id: &str,
     slice_id: &str,
+    organization: &str,
     title: &str,
     intent: &str,
     initial_step_id: &str,
@@ -245,13 +362,39 @@ async fn execute_agent_for_step(
     initial_agent_type: AgentType,
     initial_depth: u32,
 ) -> Result<()> {
-    let working_dir = PathBuf::from("/Users/jarvisgpt/projects");
+    let mut working_dir = resolve_working_dir(pool, &initial_agent_type, organization).await?;
 
     // Track current step info for the loop
     let mut current_step_id = initial_step_id.to_string();
     let mut current_session_id = initial_session_id.to_string();
     let mut current_agent_type = initial_agent_type;
     let mut depth = initial_depth;
+
+    // Track previous step output for chaining between auto-steps
+    let mut previous_step_output: Option<String> = {
+        // Check if there's a completed step before the initial step
+        let ticket = tickets::get_ticket_by_id(pool, ticket_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Ticket not found: {}", ticket_id))?;
+        if let Some(pipeline) = &ticket.pipeline {
+            if let Some(current_idx) = pipeline.steps.iter().position(|s| s.step_id == initial_step_id) {
+                if current_idx > 0 {
+                    pipeline.steps[current_idx - 1]
+                        .outputs
+                        .as_ref()
+                        .and_then(|o| o.get("summary"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
 
     loop {
         // Safety check
@@ -274,8 +417,9 @@ async fn execute_agent_for_step(
         };
 
         // Execute agent (no streaming for automated runs)
+        // Pass previous step output for chaining (e.g., research output → synthesis agent)
         let result = executor
-            .execute(current_agent_type.clone(), context, None, None, None, None, None)
+            .execute(current_agent_type.clone(), context, previous_step_output.clone(), None, None, None)
             .await;
 
         // Get current pipeline state
@@ -304,6 +448,9 @@ async fn execute_agent_for_step(
                     output_summary: agent_run.output_summary.clone(),
                 };
                 ticketing_system::agent_runs::update_agent_run(pool, &db_run).await?;
+
+                // Capture output for next step in chain
+                previous_step_output = agent_run.output_summary.clone();
 
                 // Create outputs JSON from agent run
                 let outputs = agent_run.output_summary.map(|s| serde_json::json!({ "summary": s }));
@@ -385,7 +532,7 @@ async fn execute_agent_for_step(
 
                 match next_execution_type {
                     ExecutionType::Auto => {
-                        // Set up for next iteration
+                        // Set up for next iteration — re-resolve working_dir for new agent type
                         current_agent_type = match serde_json::from_str(&format!("\"{}\"", next_agent_type_str)) {
                             Ok(at) => at,
                             Err(e) => {
@@ -404,6 +551,9 @@ async fn execute_agent_for_step(
                                 break;
                             }
                         };
+
+                        // Re-resolve working dir for the new agent type
+                        working_dir = resolve_working_dir(pool, &current_agent_type, organization).await?;
 
                         // Generate new session ID and mark step as started
                         current_session_id = uuid::Uuid::new_v4().to_string();
@@ -597,40 +747,3 @@ pub async fn start_step_execution(
     }
 }
 
-/// Execute an approved manual step.
-/// Called after a manual step transitions from AwaitingApproval to Queued.
-/// This spawns the agent to execute the step.
-pub async fn execute_approved_step(
-    pool: &SqlitePool,
-    ticket_id: &str,
-    step_id: &str,
-) -> Result<PipelineProgressResult> {
-    let ticket = tickets::get_ticket_by_id(pool, ticket_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("Ticket not found: {}", ticket_id))?;
-
-    let pipeline = match &ticket.pipeline {
-        Some(p) => p,
-        None => return Ok(PipelineProgressResult::NoNextStep),
-    };
-
-    let step_idx = pipeline
-        .steps
-        .iter()
-        .position(|s| s.step_id == step_id)
-        .ok_or_else(|| anyhow::anyhow!("Step not found: {}", step_id))?;
-
-    let step = &pipeline.steps[step_idx];
-
-    // Only execute if the step is in Queued status (after approval)
-    if step.status != PipelineStepStatus::Queued {
-        info!(
-            "Step {} is not queued (status: {:?}), cannot execute",
-            step_id, step.status
-        );
-        return Ok(PipelineProgressResult::NoNextStep);
-    }
-
-    // Spawn agent for the step
-    spawn_agent_for_step(pool, &ticket, step_idx, 0).await
-}

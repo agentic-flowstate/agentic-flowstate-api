@@ -1,11 +1,11 @@
 mod handlers;
 mod models;
-mod utils;
 mod mcp_wrapper;
 mod agents;
 mod email_fetcher;
 pub mod pipeline_automation;
 mod seed_templates;
+mod auth_middleware;
 
 use axum::{
     routing::{delete, get, patch, post},
@@ -13,7 +13,9 @@ use axum::{
     extract::DefaultBodyLimit,
 };
 use std::sync::Arc;
-use tower_http::cors::{CorsLayer, Any, AllowOrigin};
+use tower_http::cors::{CorsLayer, AllowOrigin};
+use http::{header, Method};
+use tower_cookies::CookieManagerLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tokio::signal;
 
@@ -99,8 +101,36 @@ async fn main() -> anyhow::Result<()> {
     // Clone db_pool for shutdown handler before building router (which moves db_pool)
     let shutdown_db = db_pool.clone();
 
-    // Build the application
-    let app = Router::new()
+    // Session cleanup background task (every 6 hours)
+    {
+        let cleanup_pool = db_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(6 * 60 * 60));
+            loop {
+                interval.tick().await;
+                match ticketing_system::auth::cleanup_expired_sessions(&cleanup_pool).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Cleaned up {} expired session(s)", count);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("Session cleanup error: {:?}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    // Public routes (no auth required)
+    let public_routes = Router::new()
+        .route("/api/auth/register", post(handlers::auth::register))
+        .route("/api/auth/login", post(handlers::auth::login))
+        .route("/api/auth/logout", post(handlers::auth::logout))
+        .route("/api/auth/me", get(handlers::auth::me))
+        .route("/health", get(|| async { "OK" }));
+
+    // Protected routes (require valid session)
+    let protected_routes = Router::new()
         // Epic routes
         .route("/api/epics", get(handlers::list_epics).post(handlers::create_epic))
         .route("/api/epics/:epic_id", get(handlers::get_epic).delete(handlers::delete_epic))
@@ -196,6 +226,36 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/workspace-manager/resume",
             post(handlers::workspace_manager_resume))
 
+        // Life Planner routes
+        .route("/api/life-planner/chat",
+            post(handlers::life_planner_chat))
+        .route("/api/life-planner/resume",
+            post(handlers::life_planner_resume))
+
+        // Project Workload routes
+        .route("/api/project-workload",
+            get(handlers::list_project_workload))
+        .route("/api/project-workload/pull",
+            post(handlers::pull_project_ticket))
+        .route("/api/project-workload/toggle",
+            post(handlers::toggle_project_workload))
+        .route("/api/project-workload/:id",
+            delete(handlers::remove_project_workload))
+
+        // Daily Plan routes
+        .route("/api/daily-plan",
+            get(handlers::get_daily_plan))
+        .route("/api/daily-plan/toggle",
+            post(handlers::toggle_daily_plan_item))
+        .route("/api/daily-plan/items",
+            get(handlers::list_daily_plan_items)
+            .post(handlers::create_daily_plan_item))
+        .route("/api/daily-plan/items/:item_id",
+            patch(handlers::update_daily_plan_item)
+            .delete(handlers::delete_daily_plan_item))
+        .route("/api/daily-plan/date-items",
+            post(handlers::create_daily_plan_date_item))
+
         // Conversation routes (for workspace manager persistence)
         .route("/api/conversations",
             get(handlers::list_conversations)
@@ -270,18 +330,40 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/meetings/:room_id/favorite",
             post(handlers::toggle_meeting_favorite))
 
-        // Health check
-        .route("/health", get(|| async { "OK" }))
+        .layer(axum::middleware::from_fn_with_state(db_pool.clone(), auth_middleware::require_auth));
 
-        // Add state and middleware
+    let app = public_routes
+        .merge(protected_routes)
         .with_state(db_pool)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)) // 2GB - never lose a session due to size limits
+        .layer(CookieManagerLayer::new())
         .layer(
             CorsLayer::new()
-                .allow_origin(AllowOrigin::any())
-                .allow_methods(Any)
-                .allow_headers(Any)
-                .expose_headers(Any),
+                .allow_origin(AllowOrigin::list([
+                    "http://localhost:3000".parse().unwrap(),
+                    "http://100.119.87.128:3000".parse().unwrap(),
+                    "https://jarviss-mac-mini-1.tail3da916.ts.net".parse().unwrap(),
+                ]))
+                .allow_credentials(true)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::PATCH,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    header::ACCEPT,
+                    header::AUTHORIZATION,
+                    header::COOKIE,
+                    header::HeaderName::from_static("x-organization"),
+                ])
+                .expose_headers([
+                    header::SET_COOKIE,
+                    header::CONTENT_TYPE,
+                ]),
         );
 
     // Start the server - bind to 0.0.0.0 to allow access from other devices (mobile via Tailscale)

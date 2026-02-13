@@ -1,8 +1,8 @@
 pub mod types;
 pub mod prompts;
 pub mod executor;
-pub mod hooks;
+pub mod working_dir;
 
 pub use types::*;
 pub use executor::*;
-pub use hooks::HookConfig;
+pub use working_dir::resolve_working_dir;

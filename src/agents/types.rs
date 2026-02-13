@@ -11,6 +11,10 @@ pub struct AgentConfig {
     #[allow(dead_code)] // Present in JSON config but prompts loaded by agent type name
     pub prompt_file: String,
     pub tools: Vec<String>,
+    /// Optional working directory template. Supports `{{ORG_REPO:type}}` for org-scoped repo resolution.
+    /// If not set, defaults to the base projects directory.
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 /// Root config structure from agents.json
@@ -43,28 +47,51 @@ impl AgentsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentType {
-    VendorResearch,
-    TechnicalResearch,
-    CompetitiveResearch,
     Planning,
     Execution,
     Evaluation,
     Email,
     WorkspaceManager,
+    MeetingNotes,
+    TicketAssistant,
+    /// EXA-powered deep research agent - uses EXA API for web search/content + Anthropic for analysis
+    ExaResearch,
+    /// Critically evaluates and synthesizes research findings into structured, actionable output
+    ResearchSynthesis,
+    /// Plans follow-up tickets by checking existing system for duplicates and producing a mermaid graph
+    TicketPlanner,
+    /// Creates follow-up tickets from an approved ticket plan
+    TicketCreator,
+    /// Drafts policy documents, checklists, and training materials into the documentation repo
+    DocDrafter,
+    /// Personal life planner agent — daily planning, nutrition, training, project management
+    LifePlanner,
+    /// Selects the best next ticket to work on for a given organization
+    PullTicket,
 }
 
 impl AgentType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            AgentType::VendorResearch => "vendor-research",
-            AgentType::TechnicalResearch => "technical-research",
-            AgentType::CompetitiveResearch => "competitive-research",
             AgentType::Planning => "planning",
             AgentType::Execution => "execution",
             AgentType::Evaluation => "evaluation",
             AgentType::Email => "email",
             AgentType::WorkspaceManager => "workspace-manager",
+            AgentType::MeetingNotes => "meeting-notes",
+            AgentType::TicketAssistant => "ticket-assistant",
+            AgentType::ExaResearch => "exa-research",
+            AgentType::ResearchSynthesis => "research-synthesis",
+            AgentType::TicketPlanner => "ticket-planner",
+            AgentType::TicketCreator => "ticket-creator",
+            AgentType::DocDrafter => "doc-drafter",
+            AgentType::LifePlanner => "life-planner",
+            AgentType::PullTicket => "pull-ticket",
         }
+    }
+
+    pub fn working_dir_template(&self) -> Option<&str> {
+        self.config().working_dir.as_deref()
     }
 
     pub fn config(&self) -> &AgentConfig {
@@ -220,6 +247,14 @@ pub struct RunAgentRequest {
     /// For email agent: select multiple previous agent runs to include as context
     #[serde(default)]
     pub selected_session_ids: Vec<String>,
+    /// For ticket-assistant: custom user question to ask about the ticket
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_input_message: Option<String>,
+    /// Explicit pipeline step ID to bind this agent run to.
+    /// When set, the streaming handler manages the full step lifecycle
+    /// (transition through Running → Completed/Failed) and advances the pipeline.
+    #[serde(default)]
+    pub step_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

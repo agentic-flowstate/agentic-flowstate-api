@@ -15,12 +15,7 @@ use crate::{
     mcp_wrapper::call_mcp_tool,
 };
 
-fn get_organization(headers: &HeaderMap) -> String {
-    headers.get("X-Organization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("telemetryops")
-        .to_string()
-}
+use super::get_organization;
 
 #[derive(Debug, Deserialize)]
 pub struct ListEpicsQuery {
@@ -88,17 +83,24 @@ pub async fn create_epic(
     Json(request): Json<CreateEpicRequest>,
 ) -> Response {
     let args = json!({
-        "epic_id": request.epic_id,
-        "title": request.title,
         "organization": request.organization,
-        "notes": request.notes,
-        "assignees": request.assignees,
+        "epics": [{
+            "epic_id": request.epic_id,
+            "title": request.title,
+            "notes": request.notes,
+            "assignees": request.assignees,
+        }]
     });
 
-    match call_mcp_tool("create_epic", Some(args)).await {
+    match call_mcp_tool("create_epics", Some(args)).await {
         Ok(result) => {
-            info!("Created epic: {:?}", result);
-            (StatusCode::CREATED, Json(result)).into_response()
+            // Extract first epic from batch result for single-item response
+            let epic = result.get("epics")
+                .and_then(|e| e.get(0))
+                .cloned()
+                .unwrap_or(result);
+            info!("Created epic: {:?}", epic);
+            (StatusCode::CREATED, Json(epic)).into_response()
         }
         Err(e) => {
             error!("Failed to create epic: {:?}", e);

@@ -9,6 +9,10 @@ Your task is to create a detailed implementation plan for the ticket below.
 - Title: {{TICKET_TITLE}}
 - Intent: {{TICKET_INTENT}}
 
+{{#if PREVIOUS_OUTPUT}}
+{{PREVIOUS_OUTPUT}}
+{{/if}}
+
 ## Research Output (from previous agent)
 {{RESEARCH_OUTPUT}}
 

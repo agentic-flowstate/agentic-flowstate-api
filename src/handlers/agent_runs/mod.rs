@@ -1,3 +1,4 @@
+mod artifacts;
 mod context;
 mod conversions;
 mod handlers;

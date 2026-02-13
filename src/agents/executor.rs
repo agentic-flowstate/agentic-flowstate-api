@@ -1,13 +1,12 @@
-use cc_sdk::{ClaudeCodeOptions, ClaudeSDKClient, Message, ContentBlock, ToolsConfig};
+use cc_sdk::{query, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use anyhow::{Result, Context};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::{AgentType, AgentRun, AgentRunStatus, TicketContext, StreamEvent, EmailOutput, HookConfig};
+use super::{AgentType, AgentRun, AgentRunStatus, TicketContext, StreamEvent, EmailOutput};
 use super::prompts::load_prompt;
-use super::hooks::configure_tool_result_hook;
 
 /// Executes agents using the Claude Code CLI via cc-sdk.
 pub struct AgentExecutor {
@@ -34,7 +33,6 @@ impl AgentExecutor {
         selected_context: Option<String>,
         sender_info: Option<String>,
         event_tx: Option<mpsc::Sender<StreamEvent>>,
-        hook_config: Option<HookConfig>,
     ) -> Result<AgentRun> {
         let started_at = chrono::Utc::now().to_rfc3339();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -60,6 +58,18 @@ impl AgentExecutor {
                 }
                 AgentType::Evaluation => {
                     vars.insert("execution_output".to_string(), prev.clone());
+                }
+                AgentType::ResearchSynthesis => {
+                    vars.insert("research_output".to_string(), prev.clone());
+                }
+                AgentType::TicketPlanner => {
+                    vars.insert("synthesis_output".to_string(), prev.clone());
+                }
+                AgentType::TicketCreator => {
+                    vars.insert("planner_output".to_string(), prev.clone());
+                }
+                AgentType::DocDrafter => {
+                    vars.insert("research_output".to_string(), prev.clone());
                 }
                 _ => {}
             }
@@ -116,12 +126,7 @@ impl AgentExecutor {
             builder = builder.max_turns(turns);
         }
 
-        let mut options = builder.build();
-
-        // Configure PostToolUse hook to capture tool results if we have both event_tx and hook_config
-        if let (Some(ref tx), Some(config)) = (&event_tx, hook_config) {
-            configure_tool_result_hook(&mut options, tx.clone(), config);
-        }
+        let options = builder.build();
 
         // The initial prompt is the ticket intent
         let prompt = format!(
@@ -130,24 +135,19 @@ impl AgentExecutor {
             ticket_context.intent
         );
 
-        // Execute using ClaudeSDKClient (required for hooks support)
+        // Execute using query() - simple and reliable
         let mut output_parts = Vec::new();
         let mut status = AgentRunStatus::Running;
         let mut actual_session_id = session_id.clone();
 
-        tracing::info!("Creating ClaudeSDKClient with hooks support...");
+        tracing::info!("Calling cc-sdk query...");
         let query_start = std::time::Instant::now();
 
-        // Create client with the options (hooks are automatically detected and enabled)
-        let mut client = ClaudeSDKClient::new(options);
+        match query(prompt.as_str(), Some(options)).await {
+            Ok(stream) => {
+                tracing::info!("Query returned stream in {:?}", query_start.elapsed());
 
-        // Connect with initial prompt
-        match client.connect(Some(prompt)).await {
-            Ok(_) => {
-                tracing::info!("Client connected in {:?}", query_start.elapsed());
-
-                // Receive messages from the client
-                let mut stream = client.receive_messages().await;
+                let mut stream = Box::pin(stream);
                 let mut message_count = 0u32;
 
                 while let Some(message_result) = stream.next().await {
@@ -282,14 +282,9 @@ impl AgentExecutor {
                     message_count,
                     query_start.elapsed()
                 );
-
-                // Disconnect the client
-                if let Err(e) = client.disconnect().await {
-                    tracing::warn!("Error disconnecting client: {}", e);
-                }
             }
             Err(e) => {
-                tracing::error!("Failed to connect client after {:?}: {}", query_start.elapsed(), e);
+                tracing::error!("Query failed after {:?}: {}", query_start.elapsed(), e);
                 status = AgentRunStatus::Failed;
             }
         }
@@ -315,8 +310,8 @@ impl AgentExecutor {
         } else {
             // Truncate if too long
             let full_output = output_parts.join("\n\n");
-            if full_output.len() > 10000 {
-                Some(format!("{}...\n\n[Output truncated]", &full_output[..10000]))
+            if full_output.len() > 100000 {
+                Some(format!("{}...\n\n[Output truncated]", &full_output[..100000]))
             } else {
                 Some(full_output)
             }
@@ -358,28 +353,19 @@ impl AgentExecutor {
         session_id: &str,
         message: &str,
         event_tx: Option<mpsc::Sender<StreamEvent>>,
-        hook_config: Option<HookConfig>,
     ) -> Result<Vec<String>> {
-        let mut options = ClaudeCodeOptions::builder()
+        let options = ClaudeCodeOptions::builder()
             .resume(session_id.to_string())
             .cwd(&self.working_dir)
             .build();
-
-        // Configure PostToolUse hook to capture tool results if we have both event_tx and hook_config
-        if let (Some(ref tx), Some(config)) = (&event_tx, hook_config) {
-            configure_tool_result_hook(&mut options, tx.clone(), config);
-        }
 
         let mut output_parts = Vec::new();
 
         tracing::info!("Resuming session {} with message: {}...", session_id, &message[..message.len().min(100)]);
 
-        // Use ClaudeSDKClient for hooks support
-        let mut client = ClaudeSDKClient::new(options);
-
-        match client.connect(Some(message.to_string())).await {
-            Ok(_) => {
-                let mut stream = client.receive_messages().await;
+        match query(message, Some(options)).await {
+            Ok(stream) => {
+                let mut stream = Box::pin(stream);
 
                 while let Some(message_result) = stream.next().await {
                     match message_result {
@@ -447,11 +433,6 @@ impl AgentExecutor {
                             break;
                         }
                     }
-                }
-
-                // Disconnect the client
-                if let Err(e) = client.disconnect().await {
-                    tracing::warn!("Error disconnecting client in resume: {}", e);
                 }
             }
             Err(e) => {

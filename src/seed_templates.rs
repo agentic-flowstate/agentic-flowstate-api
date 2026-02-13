@@ -43,23 +43,23 @@ pub async fn seed_default_templates(pool: &SqlitePool) -> anyhow::Result<()> {
 /// Get the default pipeline templates
 fn get_default_templates() -> Vec<CreatePipelineTemplateRequest> {
     vec![
-        // Standard dev workflow
+        // Standard dev workflow: research → plan → execute → evaluate
         CreatePipelineTemplateRequest {
             template_id: "standard-dev".to_string(),
             name: "Standard Development".to_string(),
             description: Some(
-                "Research, plan review, execute, and evaluate. Best for most feature work."
+                "Research, plan review, execute, and evaluate. For code implementation work."
                     .to_string(),
             ),
-            organization: None, // Global template
+            organization: None,
             epic_id: None,
             slice_id: None,
             steps: vec![
                 PipelineTemplateStep {
                     step_id: "research".to_string(),
-                    agent_type: "technical-research".to_string(),
+                    agent_type: "exa-research".to_string(),
                     execution_type: ExecutionType::Auto,
-                    name: Some("Research codebase".to_string()),
+                    name: Some("Research".to_string()),
                     default_inputs: None,
                 },
                 PipelineTemplateStep {
@@ -85,12 +85,86 @@ fn get_default_templates() -> Vec<CreatePipelineTemplateRequest> {
                 },
             ],
         },
-        // Research only
+        // Human task (no automation, manual completion)
+        CreatePipelineTemplateRequest {
+            template_id: "human-task".to_string(),
+            name: "Human Task".to_string(),
+            description: Some(
+                "Manual human task with no agent automation. Mark complete when done.".to_string(),
+            ),
+            organization: None,
+            epic_id: None,
+            slice_id: None,
+            steps: vec![
+                PipelineTemplateStep {
+                    step_id: "execute".to_string(),
+                    agent_type: "human".to_string(),
+                    execution_type: ExecutionType::Manual,
+                    name: Some("Complete task".to_string()),
+                    default_inputs: None,
+                },
+            ],
+        },
+        // Deep research with ticket creation
+        CreatePipelineTemplateRequest {
+            template_id: "exa-research".to_string(),
+            name: "Deep Research".to_string(),
+            description: Some(
+                "Web and codebase research and follow-up ticket creation.".to_string(),
+            ),
+            organization: None,
+            epic_id: None,
+            slice_id: None,
+            steps: vec![
+                PipelineTemplateStep {
+                    step_id: "exa-research".to_string(),
+                    agent_type: "exa-research".to_string(),
+                    execution_type: ExecutionType::Auto,
+                    name: Some("Research".to_string()),
+                    default_inputs: None,
+                },
+                PipelineTemplateStep {
+                    step_id: "plan-tickets".to_string(),
+                    agent_type: "ticket-planner".to_string(),
+                    execution_type: ExecutionType::Auto,
+                    name: Some("Plan follow-up tickets".to_string()),
+                    default_inputs: None,
+                },
+                PipelineTemplateStep {
+                    step_id: "create-tickets".to_string(),
+                    agent_type: "ticket-creator".to_string(),
+                    execution_type: ExecutionType::Manual,
+                    name: Some("Create follow-up tickets".to_string()),
+                    default_inputs: None,
+                },
+            ],
+        },
+        // Research only: single research step, no follow-up tickets
         CreatePipelineTemplateRequest {
             template_id: "research-only".to_string(),
             name: "Research Only".to_string(),
             description: Some(
-                "Deep dive research followed by findings review. For investigation tasks."
+                "Research a topic and produce findings. No follow-up ticket creation.".to_string(),
+            ),
+            organization: None,
+            epic_id: None,
+            slice_id: None,
+            steps: vec![
+                PipelineTemplateStep {
+                    step_id: "exa-research".to_string(),
+                    agent_type: "exa-research".to_string(),
+                    execution_type: ExecutionType::Auto,
+                    name: Some("Research".to_string()),
+                    default_inputs: None,
+                },
+            ],
+        },
+        // Document drafting: research → draft (drafter does its own structured extraction)
+        CreatePipelineTemplateRequest {
+            template_id: "doc-drafting".to_string(),
+            name: "Document Drafting".to_string(),
+            description: Some(
+                "Research a topic, then draft a policy/procedure/training document with evidence traceability."
                     .to_string(),
             ),
             organization: None,
@@ -99,119 +173,16 @@ fn get_default_templates() -> Vec<CreatePipelineTemplateRequest> {
             steps: vec![
                 PipelineTemplateStep {
                     step_id: "research".to_string(),
-                    agent_type: "technical-research".to_string(),
+                    agent_type: "exa-research".to_string(),
                     execution_type: ExecutionType::Auto,
-                    name: Some("Deep research".to_string()),
+                    name: Some("Research".to_string()),
                     default_inputs: None,
                 },
                 PipelineTemplateStep {
-                    step_id: "review".to_string(),
-                    agent_type: "planning".to_string(),
+                    step_id: "draft".to_string(),
+                    agent_type: "doc-drafter".to_string(),
                     execution_type: ExecutionType::Manual,
-                    name: Some("Review findings".to_string()),
-                    default_inputs: None,
-                },
-            ],
-        },
-        // Quick fix
-        CreatePipelineTemplateRequest {
-            template_id: "quick-fix".to_string(),
-            name: "Quick Fix".to_string(),
-            description: Some(
-                "Execute and verify. For simple bug fixes or small changes.".to_string(),
-            ),
-            organization: None,
-            epic_id: None,
-            slice_id: None,
-            steps: vec![
-                PipelineTemplateStep {
-                    step_id: "execute".to_string(),
-                    agent_type: "execution".to_string(),
-                    execution_type: ExecutionType::Auto,
-                    name: Some("Make fix".to_string()),
-                    default_inputs: None,
-                },
-                PipelineTemplateStep {
-                    step_id: "evaluate".to_string(),
-                    agent_type: "evaluation".to_string(),
-                    execution_type: ExecutionType::Auto,
-                    name: Some("Verify fix".to_string()),
-                    default_inputs: None,
-                },
-            ],
-        },
-        // Full review (extra gates for risky changes)
-        CreatePipelineTemplateRequest {
-            template_id: "full-review".to_string(),
-            name: "Full Review".to_string(),
-            description: Some(
-                "Research, plan review, execute, human review. For risky or complex changes."
-                    .to_string(),
-            ),
-            organization: None,
-            epic_id: None,
-            slice_id: None,
-            steps: vec![
-                PipelineTemplateStep {
-                    step_id: "research".to_string(),
-                    agent_type: "technical-research".to_string(),
-                    execution_type: ExecutionType::Auto,
-                    name: Some("Understand impact".to_string()),
-                    default_inputs: None,
-                },
-                PipelineTemplateStep {
-                    step_id: "plan".to_string(),
-                    agent_type: "planning".to_string(),
-                    execution_type: ExecutionType::Manual,
-                    name: Some("Review plan".to_string()),
-                    default_inputs: None,
-                },
-                PipelineTemplateStep {
-                    step_id: "execute".to_string(),
-                    agent_type: "execution".to_string(),
-                    execution_type: ExecutionType::Auto,
-                    name: Some("Implement".to_string()),
-                    default_inputs: None,
-                },
-                PipelineTemplateStep {
-                    step_id: "evaluate".to_string(),
-                    agent_type: "evaluation".to_string(),
-                    execution_type: ExecutionType::Manual,
-                    name: Some("Human review of changes".to_string()),
-                    default_inputs: None,
-                },
-            ],
-        },
-        // Vendor evaluation
-        CreatePipelineTemplateRequest {
-            template_id: "vendor-eval".to_string(),
-            name: "Vendor Evaluation".to_string(),
-            description: Some(
-                "Research vendors, compare options, review recommendations.".to_string(),
-            ),
-            organization: None,
-            epic_id: None,
-            slice_id: None,
-            steps: vec![
-                PipelineTemplateStep {
-                    step_id: "vendor-research".to_string(),
-                    agent_type: "vendor-research".to_string(),
-                    execution_type: ExecutionType::Auto,
-                    name: Some("Research vendors".to_string()),
-                    default_inputs: None,
-                },
-                PipelineTemplateStep {
-                    step_id: "competitive".to_string(),
-                    agent_type: "competitive-research".to_string(),
-                    execution_type: ExecutionType::Auto,
-                    name: Some("Compare options".to_string()),
-                    default_inputs: None,
-                },
-                PipelineTemplateStep {
-                    step_id: "review".to_string(),
-                    agent_type: "planning".to_string(),
-                    execution_type: ExecutionType::Manual,
-                    name: Some("Review recommendations".to_string()),
+                    name: Some("Draft document".to_string()),
                     default_inputs: None,
                 },
             ],

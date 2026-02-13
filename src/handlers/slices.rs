@@ -14,12 +14,7 @@ use crate::{
     mcp_wrapper::call_mcp_tool,
 };
 
-fn get_organization(headers: &HeaderMap) -> String {
-    headers.get("X-Organization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("telemetryops")
-        .to_string()
-}
+use super::get_organization;
 
 pub async fn list_slices(
     State(_pool): State<Arc<SqlitePool>>,
@@ -85,16 +80,23 @@ pub async fn create_slice(
     let organization = get_organization(&headers);
     let args = json!({
         "organization": organization,
-        "epic_id": epic_id,
-        "slice_id": request.slice_id,
-        "title": request.title,
-        "notes": request.notes,
+        "slices": [{
+            "epic_id": epic_id,
+            "slice_id": request.slice_id,
+            "title": request.title,
+            "notes": request.notes,
+        }]
     });
 
-    match call_mcp_tool("create_slice", Some(args)).await {
+    match call_mcp_tool("create_slices", Some(args)).await {
         Ok(result) => {
-            info!("Created slice: {:?}", result);
-            (StatusCode::CREATED, Json(result)).into_response()
+            // Extract first slice from batch result for single-item response
+            let slice = result.get("slices")
+                .and_then(|s| s.get(0))
+                .cloned()
+                .unwrap_or(result);
+            info!("Created slice: {:?}", slice);
+            (StatusCode::CREATED, Json(slice)).into_response()
         }
         Err(e) => {
             error!("Failed to create slice: {:?}", e);

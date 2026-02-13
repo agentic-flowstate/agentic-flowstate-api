@@ -1,39 +1,57 @@
 {
   "models": {
-    "sonnet": "claude-sonnet-4-5-20250929",
-    "opus": "claude-opus-4-5-20251101"
+    "opus": "claude-opus-4-6"
   },
   "agents": {
-    "vendor-research": {
-      "model": "sonnet",
-      "prompt_file": "vendor-research.txt",
+    "exa-research": {
+      "model": "opus",
+      "prompt_file": "exa-research.txt",
       "tools": [
-        "WebFetch",
-        "WebSearch"
-      ]
-    },
-    "technical-research": {
-      "model": "sonnet",
-      "prompt_file": "technical-research.txt",
-      "tools": [
+        "mcp__agentic-mcp__exa_search",
+        "mcp__agentic-mcp__exa_get_contents",
         "Read",
         "Glob",
-        "Grep",
-        "WebFetch",
-        "WebSearch",
-        "Task"
+        "Grep"
       ]
     },
-    "competitive-research": {
-      "model": "sonnet",
-      "prompt_file": "competitive-research.txt",
+    "research-synthesis": {
+      "model": "opus",
+      "prompt_file": "research-synthesis.txt",
+      "tools": []
+    },
+    "ticket-planner": {
+      "model": "opus",
+      "max_turns": 15,
+      "prompt_file": "ticket-planner.txt",
       "tools": [
-        "WebFetch",
-        "WebSearch"
+        "mcp__agentic-mcp__list_epics",
+        "mcp__agentic-mcp__list_slices",
+        "mcp__agentic-mcp__list_tickets",
+        "mcp__agentic-mcp__get_epic",
+        "mcp__agentic-mcp__get_slice",
+        "mcp__agentic-mcp__get_ticket"
+      ]
+    },
+    "ticket-creator": {
+      "model": "opus",
+      "max_turns": 15,
+      "prompt_file": "ticket-creator.txt",
+      "tools": [
+        "mcp__agentic-mcp__list_epics",
+        "mcp__agentic-mcp__list_slices",
+        "mcp__agentic-mcp__list_tickets",
+        "mcp__agentic-mcp__get_epic",
+        "mcp__agentic-mcp__get_slice",
+        "mcp__agentic-mcp__get_ticket",
+        "mcp__agentic-mcp__create_epics",
+        "mcp__agentic-mcp__create_slices",
+        "mcp__agentic-mcp__create_slice_tickets",
+        "mcp__agentic-mcp__add_ticket_relationship",
+        "mcp__agentic-mcp__update_ticket"
       ]
     },
     "planning": {
-      "model": "sonnet",
+      "model": "opus",
       "prompt_file": "planning.txt",
       "tools": [
         "Read",
@@ -45,7 +63,7 @@
       ]
     },
     "execution": {
-      "model": "sonnet",
+      "model": "opus",
       "prompt_file": "execution.txt",
       "tools": [
         "Read",
@@ -61,7 +79,7 @@
       ]
     },
     "evaluation": {
-      "model": "sonnet",
+      "model": "opus",
       "prompt_file": "evaluation.txt",
       "tools": [
         "Read",
@@ -72,12 +90,12 @@
       ]
     },
     "email": {
-      "model": "sonnet",
+      "model": "opus",
       "prompt_file": "email.txt",
       "tools": []
     },
     "workspace-manager": {
-      "model": "sonnet",
+      "model": "opus",
       "prompt_file": "workspace-manager.txt",
       "tools": [
         "Read",
@@ -90,8 +108,80 @@
         "mcp__agentic-mcp__get_epic",
         "mcp__agentic-mcp__get_slice",
         "mcp__agentic-mcp__get_ticket",
-        "mcp__agentic-mcp__create_slice",
-        "mcp__agentic-mcp__create_ticket",
+        "mcp__agentic-mcp__create_epics",
+        "mcp__agentic-mcp__create_slices",
+        "mcp__agentic-mcp__create_slice_tickets",
+        "mcp__agentic-mcp__add_ticket_relationship"
+      ]
+    },
+    "meeting-notes": {
+      "model": "opus",
+      "prompt_file": "meeting-notes.txt",
+      "tools": []
+    },
+    "ticket-assistant": {
+      "model": "opus",
+      "prompt_file": "ticket-assistant.txt",
+      "tools": [
+        "Read",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch"
+      ]
+    },
+    "doc-drafter": {
+      "model": "opus",
+      "prompt_file": "doc-drafter.txt",
+      "working_dir": "{{ORG_REPO:documentation}}",
+      "tools": [
+        "Write",
+        "Read",
+        "Glob",
+        "Grep"
+      ]
+    },
+    "pull-ticket": {
+      "model": "opus",
+      "max_turns": 15,
+      "prompt_file": "pull-ticket.txt",
+      "tools": [
+        "mcp__agentic-mcp__list_epics",
+        "mcp__agentic-mcp__list_slices",
+        "mcp__agentic-mcp__list_tickets",
+        "mcp__agentic-mcp__list_tickets_by_pipeline",
+        "mcp__agentic-mcp__get_ticket",
+        "mcp__agentic-mcp__get_epic",
+        "mcp__agentic-mcp__get_slice"
+      ]
+    },
+    "life-planner": {
+      "model": "opus",
+      "prompt_file": "life-planner.txt",
+      "tools": [
+        "WebFetch",
+        "WebSearch",
+        "mcp__agentic-mcp__get_life_context",
+        "mcp__agentic-mcp__update_life_context",
+        "mcp__agentic-mcp__delete_life_context",
+        "mcp__agentic-mcp__get_daily_plan",
+        "mcp__agentic-mcp__toggle_daily_plan_item",
+        "mcp__agentic-mcp__create_daily_plan_item",
+        "mcp__agentic-mcp__create_daily_plan_date_item",
+        "mcp__agentic-mcp__update_daily_plan_item",
+        "mcp__agentic-mcp__delete_daily_plan_item",
+        "mcp__agentic-mcp__list_daily_plan_items",
+        "mcp__agentic-mcp__list_epics",
+        "mcp__agentic-mcp__list_slices",
+        "mcp__agentic-mcp__list_tickets",
+        "mcp__agentic-mcp__get_epic",
+        "mcp__agentic-mcp__get_slice",
+        "mcp__agentic-mcp__get_ticket",
+        "mcp__agentic-mcp__create_epics",
+        "mcp__agentic-mcp__create_slices",
+        "mcp__agentic-mcp__create_slice_tickets",
+        "mcp__agentic-mcp__update_ticket",
+        "mcp__agentic-mcp__update_ticket_status",
         "mcp__agentic-mcp__add_ticket_relationship"
       ]
     }

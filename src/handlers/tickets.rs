@@ -15,16 +15,32 @@ use crate::{
     mcp_wrapper::call_mcp_tool,
 };
 
-fn get_organization(headers: &HeaderMap) -> String {
-    headers.get("X-Organization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("telemetryops")
-        .to_string()
-}
+use super::get_organization;
 
 #[derive(Debug, Deserialize)]
 pub struct TicketQuery {
     pub slice_id: Option<String>,
+}
+
+// List all tickets for an organization
+pub async fn list_all_tickets(
+    State(pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
+) -> Response {
+    let organization = get_organization(&headers);
+
+    match ticketing_system::tickets::list_tickets_by_organization(&pool, &organization).await {
+        Ok(tickets) => {
+            (StatusCode::OK, Json(tickets)).into_response()
+        }
+        Err(e) => {
+            error!("Failed to list all tickets: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to list tickets: {}", e) }))
+            ).into_response()
+        }
+    }
 }
 
 // List tickets for an epic or a specific slice
@@ -115,22 +131,29 @@ pub async fn create_ticket(
     Json(request): Json<CreateTicketRequest>,
 ) -> Response {
     let organization = get_organization(&headers);
+    let ref_handle = format!("api-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
     let args = json!({
         "organization": organization,
         "epic_id": epic_id,
         "slice_id": slice_id,
-        "title": request.title,
-        "intent": request.intent.unwrap_or_else(|| request.title.clone()),
-        "notes": request.notes,
-        "priority": request.priority,
-        "assignees": request.assignees,
-        "tags": request.tags,
+        "tickets": [{
+            "ref": ref_handle,
+            "title": request.title,
+            "ticket_type": "milestone",
+            "pipeline_template_id": "human-task",
+        }]
     });
 
-    match call_mcp_tool("create_ticket", Some(args)).await {
+    match call_mcp_tool("create_slice_tickets", Some(args)).await {
         Ok(result) => {
-            info!("Created ticket: {:?}", result);
-            (StatusCode::CREATED, Json(result)).into_response()
+            // Extract first ticket from batch result for single-item response
+            let ticket = result.get("tickets")
+                .and_then(|t| t.get(0))
+                .and_then(|t| t.get("ticket"))
+                .cloned()
+                .unwrap_or(result);
+            info!("Created ticket: {:?}", ticket);
+            (StatusCode::CREATED, Json(ticket)).into_response()
         }
         Err(e) => {
             error!("Failed to create ticket: {:?}", e);
@@ -329,6 +352,61 @@ pub async fn get_ticket_by_id(
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": format!("Failed to get ticket: {}", e) }))
+                ).into_response()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateGuidanceRequest {
+    pub guidance: Option<String>,
+}
+
+// Update ticket guidance by ID
+pub async fn update_ticket_guidance(
+    State(pool): State<Arc<SqlitePool>>,
+    Path(ticket_id): Path<String>,
+    Json(request): Json<UpdateGuidanceRequest>,
+) -> Response {
+    match ticketing_system::tickets::update_ticket_guidance(
+        &pool,
+        &ticket_id,
+        request.guidance.as_deref(),
+    ).await {
+        Ok(()) => {
+            // Fetch and return the updated ticket
+            match ticketing_system::tickets::get_ticket_by_id(&pool, &ticket_id).await {
+                Ok(Some(ticket)) => {
+                    info!("Updated ticket guidance for: {}", ticket_id);
+                    (StatusCode::OK, Json(ticket)).into_response()
+                }
+                Ok(None) => {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({ "error": "Ticket not found" }))
+                    ).into_response()
+                }
+                Err(e) => {
+                    error!("Failed to fetch updated ticket: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": format!("Failed to fetch ticket: {}", e) }))
+                    ).into_response()
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to update ticket guidance: {:?}", e);
+            if e.to_string().contains("not found") {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Ticket not found" }))
+                ).into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to update guidance: {}", e) }))
                 ).into_response()
             }
         }
