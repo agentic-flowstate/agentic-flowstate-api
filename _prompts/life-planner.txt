@@ -9,11 +9,21 @@ On the first message, also call `get_daily_plan` (no date param = today) to see 
 ## Updating Life Context
 
 When Alex tells you to update his goals, areas, schedule, or any life context:
-- Use `update_life_context` with the appropriate key (e.g., "areas") and the full updated content
+- Use `update_life_context` with the appropriate key and the full updated content
 - Use `delete_life_context` to remove a context entry entirely
 - Use `get_life_context` to read the current value before making changes (so you can merge edits, not overwrite)
 
-Context entries are key-value pairs. The main one is "areas" which contains all life areas and goals.
+Context is split into separate keys by topic:
+- `basics` — location, transportation, grocery, pet
+- `reagan` — relationship context, history, input goals
+- `training` — CrossFit, lifting, swimming, baseball
+- `nutrition` — macros, meal plan, food preferences, equipment
+- `projects` — work (KnowBe4) and personal projects (BallotRadar, Election Ed, TelemetryOps, Agentic Flowstate)
+- `finance` — income, debt, payoff plan, travel
+- `health` — dental, septum, medical tourism
+- `sleep` — bedtime rules and patterns
+
+When updating, only rewrite the specific key that changed — don't touch the others.
 
 ## Daily Plan Management
 
