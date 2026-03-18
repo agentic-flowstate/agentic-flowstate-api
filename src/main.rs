@@ -3,14 +3,14 @@ mod models;
 mod mcp_wrapper;
 mod agents;
 mod email_fetcher;
-pub mod pipeline_automation;
-mod seed_templates;
 mod auth_middleware;
+mod request_logger;
+pub mod system_log_helper;
 
 use axum::{
     routing::{delete, get, patch, post},
     Router,
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, FromRef},
 };
 use std::sync::Arc;
 use tower_http::cors::{CorsLayer, AllowOrigin};
@@ -18,6 +18,28 @@ use http::{header, Method};
 use tower_cookies::CookieManagerLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tokio::signal;
+
+use handlers::chat_client_manager::ChatClientManager;
+
+/// Shared application state.
+/// Implements `FromRef` so handlers can extract individual components.
+#[derive(Clone)]
+struct AppState {
+    db: Arc<sqlx::SqlitePool>,
+    chat_manager: Arc<ChatClientManager>,
+}
+
+impl FromRef<AppState> for Arc<sqlx::SqlitePool> {
+    fn from_ref(state: &AppState) -> Self {
+        state.db.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<ChatClientManager> {
+    fn from_ref(state: &AppState) -> Self {
+        state.chat_manager.clone()
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -66,39 +88,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Reset any pipeline steps stuck in "running" state from previous run
-    match ticketing_system::pipelines::reset_interrupted_pipeline_steps(&db_pool).await {
-        Ok(count) if count > 0 => {
-            tracing::warn!("Reset interrupted pipeline steps on {} ticket(s) from previous run", count);
-        }
-        Ok(_) => {
-            tracing::debug!("No interrupted pipeline steps to reset");
-        }
-        Err(e) => {
-            tracing::error!("Failed to reset interrupted pipeline steps: {}", e);
-        }
-    }
+    // Start email fetcher background task (queries email_accounts table each cycle)
+    tracing::info!("Starting email fetcher (hot-reload from database)");
+    email_fetcher::start_email_fetcher(db_pool.clone());
 
-    // Seed default pipeline templates
-    if let Err(e) = seed_templates::seed_default_templates(&db_pool).await {
-        tracing::warn!("Failed to seed pipeline templates: {:?}", e);
-    }
+    // Create chat client manager for persistent ClaudeSDKClient instances
+    let chat_manager = Arc::new(ChatClientManager::new());
+    tracing::info!("Chat client manager initialized");
 
-    // Start email fetcher background task
-    match email_fetcher::load_email_accounts() {
-        Ok(accounts) if !accounts.is_empty() => {
-            tracing::info!("Starting email fetcher for {} account(s)", accounts.len());
-            email_fetcher::start_email_fetcher(db_pool.clone(), accounts);
-        }
-        Ok(_) => {
-            tracing::info!("No email accounts configured, email fetcher disabled");
-        }
-        Err(e) => {
-            tracing::warn!("Failed to load email accounts: {:?}", e);
-        }
-    }
+    let app_state = AppState {
+        db: db_pool.clone(),
+        chat_manager,
+    };
 
-    // Clone db_pool for shutdown handler before building router (which moves db_pool)
+    // Clone db_pool for shutdown handler before building router (which moves app_state)
     let shutdown_db = db_pool.clone();
 
     // Session cleanup background task (every 6 hours)
@@ -121,16 +124,66 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // System log cleanup background task (every 24 hours, keep 30 days)
+    {
+        let cleanup_pool = db_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(24 * 60 * 60));
+            loop {
+                interval.tick().await;
+                let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
+                match ticketing_system::system_logs::delete_logs_before(&cleanup_pool, cutoff).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Cleaned up {} old system log(s)", count);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("System log cleanup error: {:?}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    // Client events cleanup background task (every 24 hours, keep 90 days)
+    {
+        let cleanup_pool = db_pool.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(24 * 60 * 60));
+            loop {
+                interval.tick().await;
+                let cutoff = chrono::Utc::now().timestamp() - 90 * 24 * 60 * 60;
+                match ticketing_system::client_events::delete_client_events_before(&cleanup_pool, cutoff).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("Cleaned up {} old client event(s)", count);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!("Client event cleanup error: {:?}", e);
+                    }
+                }
+            }
+        });
+    }
+
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/api/auth/register", post(handlers::auth::register))
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/logout", post(handlers::auth::logout))
         .route("/api/auth/me", get(handlers::auth::me))
-        .route("/health", get(|| async { "OK" }));
+        .route("/health", get(|| async {
+            axum::Json(serde_json::json!({
+                "status": "ok",
+                "build": "2026-03-17T-restart-test-2",
+                "uptime_note": "rebuilt via run_setup"
+            }))
+        }))
+        .route("/api/debug-log", post(handlers::debug_log::post_debug_log).get(handlers::debug_log::get_debug_log))
+;
 
-    // Protected routes (require valid session)
-    let protected_routes = Router::new()
+    // Org-scoped routes (require valid session + org membership)
+    let org_scoped_routes = Router::new()
         // Epic routes
         .route("/api/epics", get(handlers::list_epics).post(handlers::create_epic))
         .route("/api/epics/:epic_id", get(handlers::get_epic).delete(handlers::delete_epic))
@@ -152,7 +205,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/epics/:epic_id/slices/:slice_id/tickets",
             get(handlers::list_slice_tickets)
             .post(handlers::create_ticket))
-        // Nested ticket routes (with epic_id/slice_id/ticket_id)
         .route("/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id",
             get(handlers::get_ticket_nested)
             .patch(handlers::update_ticket_nested)
@@ -163,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/history",
             get(handlers::get_ticket_history))
 
-        // Agent run routes
+        // Agent run routes (org-scoped, nested under epics)
         .route("/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/agent-runs",
             get(handlers::list_agent_runs)
             .post(handlers::run_agent))
@@ -171,6 +223,40 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::stream_agent_run))
         .route("/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/agent-runs/active",
             get(handlers::get_active_agent_run))
+
+        // Workspace Manager routes
+        .route("/api/workspace-manager/chat",
+            post(handlers::workspace_manager_chat))
+
+        // Document routes (artifact-based)
+        .route("/api/tickets/:ticket_id/docs",
+            get(handlers::list_ticket_docs))
+        .route("/api/tickets/:ticket_id/docs/content",
+            get(handlers::serve_document_content))
+
+        // Library routes (artifacts & documents browsing)
+        .route("/api/library/artifacts",
+            get(handlers::list_library_artifacts))
+        .route("/api/library/artifacts/search",
+            get(handlers::search_library_artifacts))
+        .route("/api/library/artifacts/:artifact_id",
+            get(handlers::get_library_artifact))
+        .route("/api/library/documents",
+            get(handlers::list_library_documents))
+        .route("/api/library/documents/search",
+            get(handlers::search_library_documents))
+        .route("/api/library/documents/:document_id/download",
+            get(handlers::download_library_document))
+
+        // Data events SSE (live updates)
+        .route("/api/data/subscribe", get(handlers::subscribe_data))
+
+        .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_org_access))
+        .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_auth));
+
+    // User-scoped routes (require valid session only, no org membership check)
+    let user_scoped_routes = Router::new()
+        // Agent run routes (accessed by session_id, not org-scoped)
         .route("/api/agent-runs/:session_id",
             get(handlers::get_agent_run))
         .route("/api/agent-runs/:session_id/stream",
@@ -178,14 +264,31 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/agent-runs/:session_id/message",
             post(handlers::send_message_to_agent))
 
+        // Email account management routes
+        .route("/api/email-accounts",
+            get(handlers::list_email_accounts)
+            .post(handlers::create_email_account))
+        .route("/api/email-accounts/:email",
+            delete(handlers::delete_email_account))
+        .route("/api/email-accounts/:email/sync",
+            post(handlers::sync_email_account))
+
+        // Email SSE (live updates)
+        .route("/api/emails/subscribe", get(handlers::subscribe_emails))
+
         // Email routes
         .route("/api/emails", get(handlers::list_emails))
         .route("/api/emails/send", post(handlers::send_email))
         .route("/api/emails/stats", get(handlers::get_email_stats))
+        .route("/api/emails/search", get(handlers::search_emails))
+        .route("/api/emails/threads", get(handlers::list_threads))
+        .route("/api/emails/threads/:thread_id", get(handlers::get_thread))
+        .route("/api/emails/attachments/:attachment_id", get(handlers::download_attachment))
         .route("/api/emails/:id",
             get(handlers::get_email)
             .patch(handlers::update_email)
             .delete(handlers::delete_email))
+        .route("/api/emails/:id/attachments", get(handlers::list_attachments))
 
         // Draft routes
         .route("/api/drafts",
@@ -206,6 +309,8 @@ async fn main() -> anyhow::Result<()> {
             .post(handlers::link_thread_to_ticket))
         .route("/api/email-threads/:thread_id/tickets/:ticket_id",
             delete(handlers::unlink_thread_from_ticket))
+        .route("/api/tickets/:ticket_id/threads",
+            get(handlers::get_threads_for_ticket))
 
         // Transcript routes
         .route("/api/transcripts",
@@ -220,17 +325,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/transcripts/:session_id/stream",
             get(handlers::stream_session))
 
-        // Workspace Manager routes
-        .route("/api/workspace-manager/chat",
-            post(handlers::workspace_manager_chat))
-        .route("/api/workspace-manager/resume",
-            post(handlers::workspace_manager_resume))
+        // Home Planner routes
+        .route("/api/home-planner/chat",
+            post(handlers::home_planner_chat))
 
-        // Life Planner routes
-        .route("/api/life-planner/chat",
-            post(handlers::life_planner_chat))
-        .route("/api/life-planner/resume",
-            post(handlers::life_planner_resume))
+        // Full Access Chat routes
+        .route("/api/full-access/chat",
+            post(handlers::full_access_chat))
 
         // Project Workload routes
         .route("/api/project-workload",
@@ -245,6 +346,8 @@ async fn main() -> anyhow::Result<()> {
         // Daily Plan routes
         .route("/api/daily-plan",
             get(handlers::get_daily_plan))
+        .route("/api/daily-plan/subscribe",
+            get(handlers::subscribe_daily_plan))
         .route("/api/daily-plan/toggle",
             post(handlers::toggle_daily_plan_item))
         .route("/api/daily-plan/items",
@@ -256,7 +359,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/daily-plan/date-items",
             post(handlers::create_daily_plan_date_item))
 
-        // Conversation routes (for workspace manager persistence)
+        // Conversation routes (user-scoped, filtered by authenticated user_id)
         .route("/api/conversations",
             get(handlers::list_conversations)
             .post(handlers::create_conversation))
@@ -272,45 +375,30 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/conversations/:conv_id/messages/:message_id",
             patch(handlers::update_message))
 
-        // Pipeline template routes
-        .route("/api/pipeline-templates",
-            get(handlers::list_templates)
-            .post(handlers::create_template))
-        .route("/api/pipeline-templates/:template_id",
-            get(handlers::get_template)
-            .delete(handlers::delete_template))
-
-        // Ticket pipeline routes
-        .route("/api/tickets/:ticket_id/pipeline",
-            get(handlers::get_ticket_pipeline)
-            .post(handlers::set_ticket_pipeline)
-            .delete(handlers::delete_ticket_pipeline))
-        .route("/api/tickets/:ticket_id/pipeline/run",
-            post(handlers::run_pipeline))
-
-        // Pipeline step operations
-        .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/start",
-            post(handlers::start_step))
-        .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/complete",
-            post(handlers::complete_step))
-        .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/fail",
-            post(handlers::fail_step))
-        .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/approve",
-            post(handlers::approve_step))
-        .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/reject",
-            post(handlers::reject_step))
-        .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/retry",
-            post(handlers::retry_step))
-        .route("/api/tickets/:ticket_id/pipeline/steps/:step_id/agent-run",
-            get(handlers::get_step_agent_run))
-
-        // Data events SSE (live updates)
-        .route("/api/data/subscribe", get(handlers::subscribe_data))
+        // DM routes (user-scoped, 1:1 direct messages)
+        .route("/api/dms",
+            get(handlers::list_dms)
+            .post(handlers::create_dm))
+        .route("/api/dms/subscribe",
+            get(handlers::subscribe_dms))
+        .route("/api/dms/contacts",
+            get(handlers::list_contacts))
+        .route("/api/dms/:dm_id/messages",
+            get(handlers::get_dm_messages)
+            .post(handlers::send_dm_message))
+        .route("/api/dms/:dm_id/messages/json",
+            post(handlers::send_dm_message_json))
+        .route("/api/dms/:dm_id/attachments/:attachment_id",
+            get(handlers::download_dm_attachment))
+        .route("/api/dms/:dm_id/read",
+            post(handlers::mark_dm_read))
 
         // Meeting routes
         .route("/api/meetings",
             get(handlers::list_meetings)
             .post(handlers::create_meeting))
+        .route("/api/meetings/subscribe",
+            get(handlers::subscribe_meetings))
         .route("/api/meetings/signaling",
             get(handlers::signaling_websocket))
         .route("/api/meetings/:room_id",
@@ -327,15 +415,57 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::upload_meeting_audio))
         .route("/api/meetings/:room_id/finalize-transcript",
             post(handlers::finalize_meeting_transcript))
+        .route("/api/meetings/:room_id/join",
+            post(handlers::join_meeting_as_participant))
         .route("/api/meetings/:room_id/favorite",
             post(handlers::toggle_meeting_favorite))
 
-        .layer(axum::middleware::from_fn_with_state(db_pool.clone(), auth_middleware::require_auth));
+        // TTS route
+        .route("/api/tts", post(handlers::text_to_speech))
+
+        // Membership routes
+        .route("/api/memberships",
+            get(handlers::memberships::list_my_organizations)
+            .post(handlers::memberships::add_member))
+        .route("/api/memberships/:org",
+            get(handlers::memberships::list_members))
+        .route("/api/memberships/:org/:user_id",
+            delete(handlers::memberships::remove_member))
+
+        // Client telemetry ingestion
+        .route("/api/telemetry/events",
+            post(handlers::client_telemetry::ingest_events))
+
+        .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_auth));
+
+    // Admin routes (require valid session + admin role)
+    let admin_routes = Router::new()
+        .route("/api/admin/logs", get(handlers::admin_logs::list_logs))
+        .route("/api/admin/check", get(handlers::admin_logs::check_admin))
+        .route("/api/admin/reload", post(handlers::admin_reload::reload_services))
+        .route("/api/admin/reload/log", get(handlers::admin_reload::reload_log))
+        .route("/api/admin/client-events", get(handlers::client_telemetry::list_client_events))
+        .route("/api/meeting-agent/chat", post(handlers::meeting_agent_chat))
+        .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_admin))
+        .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_auth));
+
+    // Clone db_pool for request logger injection
+    let logger_pool = db_pool.clone();
 
     let app = public_routes
-        .merge(protected_routes)
-        .with_state(db_pool)
+        .merge(org_scoped_routes)
+        .merge(user_scoped_routes)
+        .merge(admin_routes)
+        .with_state(app_state)
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024)) // 2GB - never lose a session due to size limits
+        .layer(axum::middleware::from_fn(request_logger::request_logger))
+        .layer(axum::middleware::from_fn(move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+            let pool = logger_pool.clone();
+            async move {
+                req.extensions_mut().insert(pool);
+                next.run(req).await
+            }
+        }))
         .layer(CookieManagerLayer::new())
         .layer(
             CorsLayer::new()
@@ -370,6 +500,9 @@ async fn main() -> anyhow::Result<()> {
     let addr = "0.0.0.0:8001";
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Server running on http://{}", addr);
+
+    // Log server startup to system_logs so it appears on the admin page
+    system_log_helper::log_info(&db_pool, "api", "API server started on http://0.0.0.0:8001", None).await;
 
     // Run server with graceful shutdown
     axum::serve(listener, app)
@@ -438,16 +571,10 @@ async fn shutdown_signal(db_pool: Arc<ticketing_system::SqlitePool>) {
         }
     }
 
-    // Reset any pipeline steps stuck in "running" state
-    match ticketing_system::pipelines::reset_interrupted_pipeline_steps(&db_pool).await {
-        Ok(count) if count > 0 => {
-            tracing::warn!("Reset interrupted pipeline steps on {} ticket(s) during shutdown", count);
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::error!("Failed to reset pipeline steps: {}", e);
-        }
-    }
+    // Log shutdown to system_logs
+    let _ = ticketing_system::system_logs::insert_log(
+        &db_pool, "warn", "api", "API server shutting down", None, None, None,
+    ).await;
 
     tracing::info!("Graceful shutdown complete");
 }
