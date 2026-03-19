@@ -66,3 +66,24 @@ pub async fn unlink_thread_from_ticket(
 
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[derive(Debug, Serialize)]
+pub struct TicketThreadsResponse {
+    pub ticket_id: String,
+    pub threads: Vec<EmailThreadTicket>,
+}
+
+/// Get all threads linked to a ticket (GET /api/tickets/:ticket_id/threads)
+pub async fn get_threads_for_ticket(
+    State(pool): State<Arc<SqlitePool>>,
+    Path(ticket_id): Path<String>,
+) -> Result<Json<TicketThreadsResponse>, (StatusCode, String)> {
+    let threads = email_thread_tickets::get_threads_for_ticket(&pool, &ticket_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(TicketThreadsResponse {
+        ticket_id,
+        threads,
+    }))
+}

@@ -31,6 +31,8 @@ pub mod admin_logs;
 pub mod admin_reload;
 pub mod client_telemetry;
 pub mod debug_log;
+pub mod voice_transcribe;
+pub mod device_tokens;
 
 pub use epics::*;
 pub use slices::*;
@@ -57,6 +59,7 @@ pub use docs::*;
 pub use library::*;
 pub use tts::*;
 pub use dms::*;
+pub use voice_transcribe::*;
 
 use axum::http::HeaderMap;
 

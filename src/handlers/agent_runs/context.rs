@@ -52,10 +52,9 @@ pub async fn build_selected_context(db: &SqlitePool, session_ids: &[String]) -> 
     }
 }
 
-/// Build context from blocked_by tickets - returns file paths to research artifacts
-/// Agents can use Read tool to fetch the content they need
+/// Build context from blocked_by tickets — fetches artifact content directly from DB.
+/// Agents receive the full research content inline (no Read tool round-trip needed).
 pub async fn build_blocked_by_context(db: &SqlitePool, ticket_id: &str) -> Option<String> {
-    // Get the current ticket to find its blocked_by list
     let ticket = ticketing_system::tickets::get_ticket_by_id(db, ticket_id)
         .await
         .ok()
@@ -66,59 +65,21 @@ pub async fn build_blocked_by_context(db: &SqlitePool, ticket_id: &str) -> Optio
         return None;
     }
 
-    let mut artifact_entries = Vec::new();
+    let mut context_sections = Vec::new();
 
     for blocker_id in blocked_by {
-        // Get the blocker ticket
         if let Ok(Some(blocker_ticket)) = ticketing_system::tickets::get_ticket_by_id(db, blocker_id).await {
-            // Get ALL completed agent runs for this blocker
-            if let Ok(runs) = ticketing_system::agent_runs::list_runs_by_ticket(db, blocker_id).await {
-                let completed_runs: Vec<_> = runs.into_iter()
-                    .filter(|r| r.status == "completed")
-                    .collect();
-
-                for run in completed_runs {
-                    // Build the artifact path based on our naming convention
-                    // Look up the repo to get the local path
-                    // Try documentation repo first, fall back to research
-                    let repo = if let Ok(Some(r)) =
-                        ticketing_system::repositories::get_repository_by_org_and_type(
-                            db,
-                            &blocker_ticket.organization,
-                            "documentation",
-                        ).await
-                    {
-                        Some(r)
-                    } else if let Ok(Some(r)) =
-                        ticketing_system::repositories::get_repository_by_org_and_type(
-                            db,
-                            &blocker_ticket.organization,
-                            "research",
-                        ).await
-                    {
-                        Some(r)
-                    } else {
-                        None
-                    };
-
-                    let artifact_path = repo.and_then(|r| {
-                        r.local_path.map(|local_path| {
-                            // Determine subdirectory based on agent type
-                            let subdir = match run.agent_type.as_str() {
-                                "research" | "exa-research" | "research-synthesis"
-                                | "competitive-research" | "vendor-research" | "technical-research" => "docs/research",
-                                "planning" => "docs/planning",
-                                "evaluation" => "docs/evaluation",
-                                _ => "docs/agent-output",
-                            };
-                            format!("{}/{}/{}-{}.md", local_path, subdir, blocker_id, run.agent_type)
-                        })
-                    });
-
-                    if let Some(path) = artifact_path {
-                        artifact_entries.push(format!(
-                            "- {} ({}: \"{}\")",
-                            path, run.agent_type, blocker_ticket.title
+            // Fetch all artifacts for this blocker ticket
+            if let Ok(summaries) = ticketing_system::artifacts::list_by_ticket(db, blocker_id).await {
+                for summary in &summaries {
+                    // Fetch full content for each artifact
+                    if let Ok(Some(artifact)) = ticketing_system::artifacts::get_artifact(db, &summary.artifact_id).await {
+                        context_sections.push(format!(
+                            "## {} ({}: \"{}\")\n\n{}",
+                            artifact.title,
+                            artifact.artifact_type,
+                            blocker_ticket.title,
+                            artifact.content,
                         ));
                     }
                 }
@@ -126,16 +87,14 @@ pub async fn build_blocked_by_context(db: &SqlitePool, ticket_id: &str) -> Optio
         }
     }
 
-    if artifact_entries.is_empty() {
+    if context_sections.is_empty() {
         None
     } else {
         Some(format!(
-            "# Prior Research Available\n\n\
-            The following research artifacts were created by tickets this work depends on.\n\
-            Use the Read tool to fetch any that are relevant to your task:\n\n\
-            {}\n\n\
-            IMPORTANT: Only read these research docs. Do not explore other repository files.",
-            artifact_entries.join("\n")
+            "# Prior Research from Dependency Tickets\n\n\
+            The following research artifacts were created by tickets this work depends on.\n\n\
+            {}",
+            context_sections.join("\n\n---\n\n")
         ))
     }
 }

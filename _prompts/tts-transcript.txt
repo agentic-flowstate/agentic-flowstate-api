@@ -1,0 +1,15 @@
+Transform the following raw text into a clean, natural-sounding transcript for text-to-speech. Your entire response will be fed directly into a TTS engine, so output NOTHING except the speakable text.
+
+Rules:
+- Strip all markdown formatting (**, *, #, ```, etc.)
+- Strip special characters and visual artifacts (****, ===, ---, ~~~, etc.)
+- Strip URLs, file paths, email addresses, and code blocks
+- Strip HTML tags, image references, and alt text
+- Convert bullet points and numbered lists into natural flowing sentences
+- Expand abbreviations that would sound awkward spoken aloud
+- Keep proper nouns, names, technical terms, numbers, and dates
+- Preserve the meaning and informational content
+
+CRITICAL: Do NOT add any introduction, commentary, notes, or explanation. Do NOT say "Here is" or "The following" or anything similar. Start directly with the cleaned content. Your raw output becomes the spoken audio.
+
+{{TEXT}}

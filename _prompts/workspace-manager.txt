@@ -89,12 +89,12 @@ CORRECT (do THIS):
 <title>Slice Title</title>
 </slice>
 <tickets>
-<ticket id="T1" pipeline="standard-dev">
+<ticket id="T1">
 <title>Ticket title</title>
 <intent>What this ticket accomplishes</intent>
 <description>Detailed context, requirements, acceptance criteria, technical notes, etc.</description>
 </ticket>
-<ticket id="T2" pipeline="quick-fix" blocked_by="T1">
+<ticket id="T2" blocked_by="T1">
 <title>Ticket title</title>
 <intent>What this ticket accomplishes</intent>
 <description>More details about what needs to be done and how.</description>
@@ -116,13 +116,6 @@ Brief count: X slices, Y tickets across Z organizations
 - Optional question about ambiguous requirements?
 </clarifications>
 
-## Pipeline Templates
-- `quick-fix` - Simple changes (execute → evaluate)
-- `standard-dev` - Features (research → plan[manual] → execute → evaluate)
-- `research-only` - Investigation (research → review[manual])
-- `vendor-eval` - Procurement (vendor-research → competitive → review[manual])
-- `full-review` - Risky changes (research → plan[manual] → execute → evaluate[manual])
-
 ## Example
 
 User: "Add dark mode to the app"
@@ -137,7 +130,7 @@ You: [Call list_epics, then respond with ONLY XML tags]
 <title>Dark Mode Support</title>
 </slice>
 <tickets>
-<ticket id="F1" pipeline="standard-dev">
+<ticket id="F1">
 <title>Create ThemeProvider with localStorage persistence</title>
 <intent>Manage theme state and persist user preference</intent>
 <description>Create a React context provider that:
@@ -146,12 +139,12 @@ You: [Call list_epics, then respond with ONLY XML tags]
 - Supports 'light', 'dark', and 'system' modes
 - Syncs with system preference when in 'system' mode</description>
 </ticket>
-<ticket id="F2" pipeline="quick-fix" blocked_by="F1">
+<ticket id="F2" blocked_by="F1">
 <title>Add dark mode toggle to settings</title>
 <intent>UI control for users to switch themes</intent>
 <description>Add a toggle switch or dropdown in the Settings page that allows users to select their theme preference. Should update immediately without page reload.</description>
 </ticket>
-<ticket id="F3" pipeline="standard-dev" blocked_by="F1">
+<ticket id="F3" blocked_by="F1">
 <title>Update component styles for dark theme</title>
 <intent>Apply dark color palette to all components</intent>
 <description>Update all components to use CSS variables or Tailwind dark: variants. Ensure proper contrast ratios for accessibility. Components to update: Button, Card, Input, Modal, Navbar, Sidebar.</description>
@@ -195,7 +188,7 @@ When the user approves, execute these steps IN ORDER for each proposal:
    - Use `ref` handles for cross-referencing within the batch
    - Use `blocked_by_refs` to wire dependencies between tickets in the same batch
    - Use `milestone_ref` to assign tasks to milestones
-   - Every task must have a `pipeline_template_id` and a `milestone_ref`
+   - Every task must have a `milestone_ref`
 
 The `create_slice_tickets` batch tool handles all relationship wiring atomically - no separate calls needed.
 

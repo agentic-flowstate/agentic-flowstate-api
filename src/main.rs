@@ -6,6 +6,7 @@ mod email_fetcher;
 mod auth_middleware;
 mod request_logger;
 pub mod system_log_helper;
+pub mod apns;
 
 use axum::{
     routing::{delete, get, patch, post},
@@ -18,6 +19,7 @@ use http::{header, Method};
 use tower_cookies::CookieManagerLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tokio::signal;
+use tokio_util::sync::CancellationToken;
 
 use handlers::chat_client_manager::ChatClientManager;
 
@@ -27,6 +29,7 @@ use handlers::chat_client_manager::ChatClientManager;
 struct AppState {
     db: Arc<sqlx::SqlitePool>,
     chat_manager: Arc<ChatClientManager>,
+    apns: Option<Arc<apns::ApnsService>>,
 }
 
 impl FromRef<AppState> for Arc<sqlx::SqlitePool> {
@@ -88,17 +91,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Create shutdown token for coordinated cancellation of all background tasks.
+    // When cancelled, all tasks using a child token will break out of their loops.
+    let shutdown_token = CancellationToken::new();
+
     // Start email fetcher background task (queries email_accounts table each cycle)
     tracing::info!("Starting email fetcher (hot-reload from database)");
-    email_fetcher::start_email_fetcher(db_pool.clone());
+    email_fetcher::start_email_fetcher(db_pool.clone(), shutdown_token.child_token());
 
     // Create chat client manager for persistent ClaudeSDKClient instances
     let chat_manager = Arc::new(ChatClientManager::new());
     tracing::info!("Chat client manager initialized");
 
+    // Initialize APNs push notification service (optional — no-op if .p8 key missing)
+    let apns = apns::ApnsService::init();
+    if apns.is_some() {
+        tracing::info!("APNs push notification service initialized");
+    }
+
     let app_state = AppState {
         db: db_pool.clone(),
         chat_manager,
+        apns,
     };
 
     // Clone db_pool for shutdown handler before building router (which moves app_state)
@@ -107,10 +121,14 @@ async fn main() -> anyhow::Result<()> {
     // Session cleanup background task (every 6 hours)
     {
         let cleanup_pool = db_pool.clone();
+        let token = shutdown_token.child_token();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(6 * 60 * 60));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
                 match ticketing_system::auth::cleanup_expired_sessions(&cleanup_pool).await {
                     Ok(count) if count > 0 => {
                         tracing::info!("Cleaned up {} expired session(s)", count);
@@ -127,10 +145,14 @@ async fn main() -> anyhow::Result<()> {
     // System log cleanup background task (every 24 hours, keep 30 days)
     {
         let cleanup_pool = db_pool.clone();
+        let token = shutdown_token.child_token();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(24 * 60 * 60));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
                 let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
                 match ticketing_system::system_logs::delete_logs_before(&cleanup_pool, cutoff).await {
                     Ok(count) if count > 0 => {
@@ -148,10 +170,14 @@ async fn main() -> anyhow::Result<()> {
     // Client events cleanup background task (every 24 hours, keep 90 days)
     {
         let cleanup_pool = db_pool.clone();
+        let token = shutdown_token.child_token();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(24 * 60 * 60));
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
                 let cutoff = chrono::Utc::now().timestamp() - 90 * 24 * 60 * 60;
                 match ticketing_system::client_events::delete_client_events_before(&cleanup_pool, cutoff).await {
                     Ok(count) if count > 0 => {
@@ -166,19 +192,37 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Periodic cleanup of old conversation events (every hour, keep 1 hour after completion)
+    {
+        let cleanup_pool = db_pool.clone();
+        let token = shutdown_token.child_token();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+                match ticketing_system::conversations::cleanup_old_events(&cleanup_pool, 3600).await {
+                    Ok(deleted) if deleted > 0 => {
+                        tracing::info!("[CLEANUP] Deleted {} old conversation events", deleted);
+                    }
+                    Err(e) => {
+                        tracing::warn!("[CLEANUP] Failed to cleanup events: {}", e);
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/api/auth/register", post(handlers::auth::register))
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/logout", post(handlers::auth::logout))
         .route("/api/auth/me", get(handlers::auth::me))
-        .route("/health", get(|| async {
-            axum::Json(serde_json::json!({
-                "status": "ok",
-                "build": "2026-03-17T-restart-test-2",
-                "uptime_note": "rebuilt via run_setup"
-            }))
-        }))
+        .route("/health", get(|| async { "OK" }))
         .route("/api/debug-log", post(handlers::debug_log::post_debug_log).get(handlers::debug_log::get_debug_log))
 ;
 
@@ -369,6 +413,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_conversation)
             .patch(handlers::update_conversation)
             .delete(handlers::delete_conversation))
+        .route("/api/conversations/:id/checkpoint",
+            get(handlers::get_conversation_checkpoint))
+        .route("/api/conversations/:id/stream",
+            get(handlers::reconnect_conversation_stream))
         .route("/api/conversations/:id/messages",
             get(handlers::list_messages)
             .post(handlers::add_message))
@@ -420,6 +468,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/meetings/:room_id/favorite",
             post(handlers::toggle_meeting_favorite))
 
+        // Voice transcription (standalone Whisper)
+        .route("/api/transcribe", post(handlers::voice_transcribe))
+
         // TTS route
         .route("/api/tts", post(handlers::text_to_speech))
 
@@ -435,6 +486,11 @@ async fn main() -> anyhow::Result<()> {
         // Client telemetry ingestion
         .route("/api/telemetry/events",
             post(handlers::client_telemetry::ingest_events))
+
+        // Device token routes (APNs push notifications)
+        .route("/api/device-tokens",
+            post(handlers::device_tokens::register_device_token)
+            .delete(handlers::device_tokens::remove_device_token))
 
         .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_auth));
 
@@ -504,9 +560,23 @@ async fn main() -> anyhow::Result<()> {
     // Log server startup to system_logs so it appears on the admin page
     system_log_helper::log_info(&db_pool, "api", "API server started on http://0.0.0.0:8001", None).await;
 
+    // Spawn a force-exit watchdog. After shutdown_signal completes and cancels
+    // the token, this gives 5 seconds for connections to drain, then force-exits.
+    // Without this, axum waits indefinitely for SSE/WebSocket connections to close.
+    {
+        let exit_token = shutdown_token.child_token();
+        tokio::spawn(async move {
+            exit_token.cancelled().await;
+            tracing::info!("Shutdown watchdog: waiting 5s for connections to drain...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            tracing::info!("Shutdown watchdog: force exiting");
+            std::process::exit(0);
+        });
+    }
+
     // Run server with graceful shutdown
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_db))
+        .with_graceful_shutdown(shutdown_signal(shutdown_db, shutdown_token))
         .await?;
 
     Ok(())
@@ -514,7 +584,7 @@ async fn main() -> anyhow::Result<()> {
 
 /// Graceful shutdown signal handler
 /// Waits for SIGTERM or Ctrl+C, then marks running checkpoints as interrupted
-async fn shutdown_signal(db_pool: Arc<ticketing_system::SqlitePool>) {
+async fn shutdown_signal(db_pool: Arc<ticketing_system::SqlitePool>, shutdown_token: CancellationToken) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -544,6 +614,9 @@ async fn shutdown_signal(db_pool: Arc<ticketing_system::SqlitePool>) {
     // Give running agents a brief moment to finish current tool calls
     // (in practice, this won't wait for long-running tools, just allows
     // any in-flight checkpointing to complete)
+    // Cancel all background tasks (email fetcher, cleanup loops, etc.)
+    shutdown_token.cancel();
+
     tracing::info!("Waiting 2 seconds for in-flight operations to complete...");
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 

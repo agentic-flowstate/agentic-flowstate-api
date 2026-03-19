@@ -1,0 +1,88 @@
+use axum::{extract::{Extension, State}, Json};
+use std::sync::Arc;
+use std::path::PathBuf;
+use std::collections::HashMap;
+use sqlx::SqlitePool;
+use serde::Deserialize;
+
+use crate::agents::AgentType;
+use crate::auth_middleware::AuthenticatedUser;
+use super::chat_stream::{self, ChatConfig, SseStream};
+use super::chat_client_manager::ChatClientManager;
+
+#[derive(Debug, Deserialize)]
+pub struct HomePlannerRequest {
+    pub message: String,
+    pub conversation_id: Option<String>,
+}
+
+/// Build config (no data in system prompt) and load home context separately
+async fn load_home_context(db: &SqlitePool, user_id: &str) -> Option<String> {
+    match ticketing_system::home_context::list_contexts(db, user_id).await {
+        Ok(contexts) if !contexts.is_empty() => {
+            let parts: Vec<String> = contexts
+                .iter()
+                .map(|ctx| format!("### {}\n{}", ctx.key, ctx.content))
+                .collect();
+            Some(parts.join("\n\n"))
+        }
+        _ => None,
+    }
+}
+
+/// POST /api/home-planner/chat
+pub async fn home_planner_chat(
+    State(db): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(req): Json<HomePlannerRequest>,
+) -> SseStream {
+    tracing::info!("=== HOME_PLANNER_CHAT START === user={}", user.user_id);
+
+    // Look up user's display name
+    let user_name = match ticketing_system::users::get_user(&db, &user.user_id).await {
+        Ok(Some(u)) => u.name,
+        _ => user.user_id.clone(),
+    };
+
+    let mut prompt_vars = HashMap::new();
+    prompt_vars.insert("USER_NAME".to_string(), user_name);
+    prompt_vars.insert("USER_ID".to_string(), user.user_id.clone());
+
+    let config = ChatConfig {
+        agent_type: AgentType::HomePlanner,
+        prompt_name: "home-planner",
+        working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
+        prompt_vars,
+    };
+
+    // For new conversations (no existing session), prepend home context to user message.
+    // For resumed conversations, context is already in the conversation history.
+    let message = if let Some(ref conv_id) = req.conversation_id {
+        let has_session = ticketing_system::conversations::get_conversation(&db, conv_id, false)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|c| c.session_id)
+            .is_some();
+
+        if has_session {
+            req.message
+        } else if let Some(ctx) = load_home_context(&db, &user.user_id).await {
+            format!("<home_context>\n{}\n</home_context>\n\n{}", ctx, req.message)
+        } else {
+            req.message
+        }
+    } else {
+        req.message
+    };
+
+    chat_stream::chat(
+        db,
+        manager,
+        message,
+        req.conversation_id,
+        config,
+        user.user_id,
+    )
+}

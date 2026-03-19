@@ -5,23 +5,25 @@ use axum::{
     Json,
 };
 use futures::stream::Stream;
+use futures::StreamExt;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::path::PathBuf;
 use tokio::sync::mpsc;
 use sqlx::SqlitePool;
 
 use crate::agents::{
-    AgentExecutor, AgentRun, AgentRunsResponse, StreamEvent,
+    AgentExecutor, AgentType, AgentRun, AgentRunsResponse, StreamEvent,
     RunAgentRequest, RunAgentResponse, SendMessageRequest,
     resolve_working_dir,
 };
-use crate::pipeline_automation;
+use crate::agents::executor::build_agent_options;
+use crate::agents::prompts::load_prompt;
+use crate::handlers::chat_client_manager::{ChatClientManager, ChatClient};
 use super::{
     artifacts::write_artifact,
     context::{build_ticket_context, gather_agent_context},
     conversions::{db_run_to_api_run, store_agent_run},
-    sse_helpers::{create_sse_stream, create_reconnect_stream, create_error_stream},
+    sse_helpers::{create_sse_stream, spawn_event_persister, create_reconnect_stream, create_error_stream},
 };
 
 /// POST /api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/agent-runs
@@ -59,7 +61,7 @@ pub async fn run_agent(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to resolve working dir: {}", e)))?;
     let executor = AgentExecutor::new(working_dir);
 
-    let agent_run = executor
+    let (agent_run, _sdk_client) = executor
         .execute(req.agent_type, context, combined_previous, selected_context, sender_info, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Agent execution failed: {}", e)))?;
@@ -68,16 +70,17 @@ pub async fn run_agent(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to store agent run: {}", e)))?;
 
-    // Write artifact to repository if agent completed successfully
+    // Write artifact to DB if agent completed successfully
     if agent_run.status == crate::agents::AgentRunStatus::Completed {
         if let Some(ref output) = agent_run.output_summary {
-            if let Some(artifact_path) = write_artifact(
+            if let Some(artifact_id) = write_artifact(
                 &db,
                 &ticket_id,
                 agent_run.agent_type.as_str(),
                 output,
+                Some(&agent_run.session_id),
             ).await {
-                tracing::info!("Artifact written to {}", artifact_path);
+                tracing::info!("Artifact created: {}", artifact_id);
             }
         }
     }
@@ -118,6 +121,7 @@ pub async fn get_agent_run(
 pub async fn stream_agent_run(
     Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
     State(db): State<Arc<SqlitePool>>,
+    State(client_manager): State<Arc<ChatClientManager>>,
     Json(req): Json<RunAgentRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     tracing::info!("=== STREAM_AGENT_RUN START ===");
@@ -135,9 +139,10 @@ pub async fn stream_agent_run(
     if let Ok(Some(ref ticket)) = ticket_result {
         let create_req = ticketing_system::CreateAgentRunRequest {
             session_id: session_id.clone(),
-            epic_id: epic_id.clone(),
-            slice_id: slice_id.clone(),
-            ticket_id: ticket_id.clone(),
+            organization: Some(ticket.organization.clone()),
+            epic_id: Some(epic_id.clone()),
+            slice_id: Some(slice_id.clone()),
+            ticket_id: Some(ticket_id.clone()),
             agent_type: req.agent_type.as_str().to_string(),
             input_message: ticket.description.clone().unwrap_or_default(),
         };
@@ -150,56 +155,9 @@ pub async fn stream_agent_run(
 
     // Spawn agent execution in background
     let custom_input_message = req.custom_input_message.clone();
-    let step_id = req.step_id.clone();
     tokio::spawn(async move {
         match ticket_result {
             Ok(Some(ticket)) => {
-                // If step_id is provided, transition the pipeline step to Running
-                if let Some(ref sid) = step_id {
-                    if let Ok(Some(t)) = ticketing_system::tickets::get_ticket_by_id(&db_clone, &ticket_id).await {
-                        if let Some(mut pipeline) = t.pipeline {
-                            if let Some(step) = pipeline.steps.iter().find(|s| s.step_id == *sid) {
-                                let step_status = step.status.clone();
-                                match step_status {
-                                    ticketing_system::models::PipelineStepStatus::AwaitingApproval => {
-                                        // Approve + start in one shot
-                                        ticketing_system::pipelines::approve_step(&mut pipeline, sid);
-                                        ticketing_system::pipelines::start_step(&mut pipeline, sid, &session_id_clone);
-                                        if let Err(e) = ticketing_system::tickets::update_ticket_pipeline(&db_clone, &ticket_id, Some(&pipeline)).await {
-                                            tracing::error!("Failed to transition step {} to running: {}", sid, e);
-                                        } else {
-                                            tracing::info!("Pipeline step {} transitioned AwaitingApproval → Running for ticket {}", sid, ticket_id);
-                                        }
-                                    }
-                                    ticketing_system::models::PipelineStepStatus::Queued => {
-                                        ticketing_system::pipelines::start_step(&mut pipeline, sid, &session_id_clone);
-                                        if let Err(e) = ticketing_system::tickets::update_ticket_pipeline(&db_clone, &ticket_id, Some(&pipeline)).await {
-                                            tracing::error!("Failed to transition step {} to running: {}", sid, e);
-                                        } else {
-                                            tracing::info!("Pipeline step {} transitioned Queued → Running for ticket {}", sid, ticket_id);
-                                        }
-                                    }
-                                    other => {
-                                        tracing::error!("Cannot start step {} in {:?} status", sid, other);
-                                        let _ = tx.send(StreamEvent::Status {
-                                            status: "failed".to_string(),
-                                            message: Some(format!("Step {} is in {:?} status, cannot start", sid, other)),
-                                        }).await;
-                                        return;
-                                    }
-                                }
-                            } else {
-                                tracing::error!("Step {} not found in pipeline for ticket {}", sid, ticket_id);
-                                let _ = tx.send(StreamEvent::Status {
-                                    status: "failed".to_string(),
-                                    message: Some(format!("Step {} not found in pipeline", sid)),
-                                }).await;
-                                return;
-                            }
-                        }
-                    }
-                }
-
                 // For ticket-assistant, use custom_input_message as the intent with ticket context
                 let intent = if req.agent_type == crate::agents::AgentType::TicketAssistant {
                     if let Some(ref question) = custom_input_message {
@@ -256,11 +214,31 @@ pub async fn stream_agent_run(
                 let agent_type_for_error = req.agent_type.clone();
 
                 match executor.execute(req.agent_type, context, combined_previous, selected_context, sender_info, Some(tx.clone())).await {
-                    Ok(mut agent_run) => {
+                    Ok((mut agent_run, sdk_client)) => {
                         agent_run.session_id = session_id_clone.clone();
 
+                        // Store the still-connected client in the manager so follow-up
+                        // messages can reuse it (same pattern as home-planner/workspace-manager)
+                        let client = ChatClient {
+                            sdk_client,
+                            session_id: Some(session_id_clone.clone()),
+                            last_used: std::time::Instant::now(),
+                        };
+                        client_manager.insert(session_id_clone.clone(), client).await;
+                        tracing::info!("Stored agent client in manager for session {}", session_id_clone);
+
+                        tracing::info!(
+                            "Storing agent run: session={}, status={:?}",
+                            agent_run.session_id, agent_run.status
+                        );
                         if let Err(e) = store_agent_run(&db_clone, &agent_run).await {
                             tracing::error!("Failed to store completed agent run: {}", e);
+                            crate::system_log_helper::log_event(
+                                &db_clone, "error", "agent",
+                                &format!("Failed to store agent run: {}", e),
+                                Some(&format!("session={}, status={:?}", agent_run.session_id, agent_run.status)),
+                                None, Some(&agent_run.session_id),
+                            ).await;
                         }
 
                         if let Err(e) = ticketing_system::ticket_history::log_agent_run_completed(
@@ -270,32 +248,17 @@ pub async fn stream_agent_run(
                             tracing::warn!("Failed to log agent run to ticket history: {}", e);
                         }
 
-                        // Pipeline step management: use explicit step_id if provided
-                        if let Some(ref sid) = step_id {
-                            let outputs = agent_run.output_summary.as_ref().map(|s| serde_json::json!({ "summary": s }));
-                            match pipeline_automation::advance_pipeline_after_step(
-                                &db_clone, &ticket_id, sid, true, outputs
-                            ).await {
-                                Ok(result) => {
-                                    tracing::info!("Pipeline advance result for ticket {}: {:?}", ticket_id, result);
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to advance pipeline for ticket {}: {}", ticket_id, e);
-                                }
-                            }
-                        }
-                        // When step_id is None: ad-hoc agent run, no pipeline changes
-
-                        // Write artifact to repository if agent completed successfully
+                        // Write artifact to DB if agent completed successfully
                         if agent_run.status == crate::agents::AgentRunStatus::Completed {
                             if let Some(ref output) = agent_run.output_summary {
-                                if let Some(artifact_path) = write_artifact(
+                                if let Some(artifact_id) = write_artifact(
                                     &db_clone,
                                     &ticket_id,
                                     agent_run.agent_type.as_str(),
                                     output,
+                                    Some(&session_id_clone),
                                 ).await {
-                                    tracing::info!("Artifact written to {}", artifact_path);
+                                    tracing::info!("Artifact created: {}", artifact_id);
                                 }
                             }
                         }
@@ -306,39 +269,33 @@ pub async fn stream_agent_run(
                         }).await;
                     }
                     Err(e) => {
+                        crate::system_log_helper::log_event(
+                            &db_clone, "error", "agent",
+                            &format!("Agent execution failed: {}", e),
+                            Some(&format!("ticket={}, agent_type={}", ticket_id, agent_type_for_error.as_str())),
+                            None, Some(&session_id_clone),
+                        ).await;
+
                         let failed_run = ticketing_system::AgentRun {
                             session_id: session_id_clone.clone(),
-                            ticket_id: ticket_id.clone(),
-                            epic_id: epic_id.clone(),
-                            slice_id: slice_id.clone(),
+                            organization: None,
+                            ticket_id: Some(ticket_id.clone()),
+                            epic_id: Some(epic_id.clone()),
+                            slice_id: Some(slice_id.clone()),
                             agent_type: agent_type_for_error.as_str().to_string(),
                             status: "failed".to_string(),
                             started_at,
                             completed_at: Some(chrono::Utc::now().to_rfc3339()),
                             input_message: String::new(),
                             output_summary: Some(format!("Agent failed: {}", e)),
+                            tool_call_count: 0,
+                            cc_session_id: None,
                         };
 
                         let _ = ticketing_system::agent_runs::update_agent_run(&db_clone, &failed_run).await;
                         let _ = ticketing_system::ticket_history::log_agent_run_completed(
                             &db_clone, &ticket_id, &session_id_clone, agent_type_for_error.as_str(), "failed",
                         ).await;
-
-                        // Pipeline step failure: use explicit step_id if provided
-                        if let Some(ref sid) = step_id {
-                            match pipeline_automation::advance_pipeline_after_step(
-                                &db_clone, &ticket_id, sid, false,
-                                Some(serde_json::json!({ "error": e.to_string() })),
-                            ).await {
-                                Ok(result) => {
-                                    tracing::info!("Pipeline failure result for ticket {}: {:?}", ticket_id, result);
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to update pipeline failure for ticket {}: {}", ticket_id, e);
-                                }
-                            }
-                        }
-                        // When step_id is None: ad-hoc agent run, no pipeline changes
 
                         let _ = tx.send(StreamEvent::Status {
                             status: "failed".to_string(),
@@ -362,7 +319,9 @@ pub async fn stream_agent_run(
         }
     });
 
-    let stream = create_sse_stream((*db).clone(), session_id, rx, 0);
+    // Events are stored by the persister even if the frontend disconnects
+    let sse_rx = spawn_event_persister((*db).clone(), session_id, rx, 0);
+    let stream = create_sse_stream(sse_rx);
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
@@ -402,73 +361,257 @@ pub async fn reconnect_agent_stream(
 }
 
 /// POST /api/agent-runs/:session_id/message
+///
+/// Sends a follow-up message to an agent by reusing the still-connected
+/// ClaudeSDKClient from the ChatClientManager (same pattern as home-planner).
 pub async fn send_message_to_agent(
     Path(session_id): Path<String>,
     State(db): State<Arc<SqlitePool>>,
+    State(client_manager): State<Arc<ChatClientManager>>,
     Json(req): Json<SendMessageRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    tracing::info!("=== SEND_MESSAGE_TO_AGENT START ===");
+    tracing::info!("=== SEND_MESSAGE_TO_AGENT START === session={}", session_id);
 
     let (tx, rx) = mpsc::channel::<StreamEvent>(100);
     let session_id_clone = session_id.clone();
     let db_clone = db.clone();
 
     tokio::spawn(async move {
-        match ticketing_system::agent_runs::get_agent_run(&db_clone, &session_id_clone).await {
-            Ok(Some(run)) => {
-                // Resolve working dir from the original agent run's context
-                let working_dir = if let Ok(Some(ticket)) = ticketing_system::tickets::get_ticket_by_id(&db_clone, &run.ticket_id).await {
-                    if let Ok(agent_type) = serde_json::from_str::<crate::agents::AgentType>(&format!("\"{}\"", run.agent_type)) {
-                        resolve_working_dir(&db_clone, &agent_type, &ticket.organization).await.unwrap_or_else(|_| PathBuf::from("/Users/jarvisgpt/projects"))
-                    } else {
-                        PathBuf::from("/Users/jarvisgpt/projects")
-                    }
-                } else {
-                    PathBuf::from("/Users/jarvisgpt/projects")
-                };
-                let executor = AgentExecutor::new(working_dir);
+        let db = db_clone;
+        // Get the cached client, or try to resume from DB if missing/disconnected
+        let from_cache = if let Some(existing) = client_manager.get(&session_id_clone).await {
+            let guard = existing.lock().await;
+            if guard.sdk_client.is_connected().await {
+                drop(guard);
+                tracing::info!("[AGENT-MSG] Reusing cached client for session {}", session_id_clone);
+                Some(existing)
+            } else {
+                drop(guard);
+                tracing::warn!("[AGENT-MSG] Cached client disconnected for session {}, will try resume", session_id_clone);
+                client_manager.remove(&session_id_clone).await;
+                None
+            }
+        } else {
+            None
+        };
 
-                let _ = tx.send(StreamEvent::Status {
-                    status: "running".to_string(),
-                    message: Some("Processing follow-up message...".to_string()),
-                }).await;
+        let client_arc = match from_cache {
+            Some(arc) => arc,
+            None => {
+                tracing::info!("[AGENT-MSG] No cached client for session {}, attempting resume from DB", session_id_clone);
 
-                match executor.resume(&session_id_clone, &req.message, Some(tx.clone())).await {
-                    Ok(_) => {
+                // Load the agent run from DB to get cc_session_id
+                let db_run = match ticketing_system::agent_runs::get_agent_run(&db, &session_id_clone).await {
+                    Ok(Some(run)) => run,
+                    Ok(None) => {
                         let _ = tx.send(StreamEvent::Status {
-                            status: "completed".to_string(),
-                            message: Some("Message processed successfully".to_string()),
+                            status: "failed".to_string(),
+                            message: Some("Agent run not found in database.".to_string()),
                         }).await;
+                        return;
                     }
                     Err(e) => {
                         let _ = tx.send(StreamEvent::Status {
                             status: "failed".to_string(),
-                            message: Some(format!("Failed to process message: {}", e)),
+                            message: Some(format!("Database error: {}", e)),
                         }).await;
+                        return;
+                    }
+                };
+
+                let cc_sid = match &db_run.cc_session_id {
+                    Some(sid) => sid.clone(),
+                    None => {
+                        let _ = tx.send(StreamEvent::Status {
+                            status: "failed".to_string(),
+                            message: Some("Agent session cannot be resumed (no SDK session ID stored). Please run the agent again.".to_string()),
+                        }).await;
+                        return;
+                    }
+                };
+
+                // Parse agent type from stored string
+                let agent_type: AgentType = match serde_json::from_value(serde_json::Value::String(db_run.agent_type.clone())) {
+                    Ok(at) => at,
+                    Err(_) => {
+                        let _ = tx.send(StreamEvent::Status {
+                            status: "failed".to_string(),
+                            message: Some(format!("Unknown agent type: {}", db_run.agent_type)),
+                        }).await;
+                        return;
+                    }
+                };
+
+                // Load ticket for system prompt context
+                let ticket_id = db_run.ticket_id.as_deref().unwrap_or("");
+                let epic_id = db_run.epic_id.as_deref().unwrap_or("");
+                let slice_id = db_run.slice_id.as_deref().unwrap_or("");
+
+                let ticket = match ticketing_system::tickets::get_ticket_by_id(&db, ticket_id).await {
+                    Ok(Some(t)) => t,
+                    _ => {
+                        let _ = tx.send(StreamEvent::Status {
+                            status: "failed".to_string(),
+                            message: Some("Failed to load ticket for session resume.".to_string()),
+                        }).await;
+                        return;
+                    }
+                };
+
+                // Build system prompt with ticket context
+                let mut vars = std::collections::HashMap::new();
+                vars.insert("epic_id".to_string(), epic_id.to_string());
+                vars.insert("slice_id".to_string(), slice_id.to_string());
+                vars.insert("ticket_id".to_string(), ticket_id.to_string());
+                vars.insert("ticket_title".to_string(), ticket.title.clone());
+                vars.insert("ticket_intent".to_string(), ticket.description.unwrap_or_default());
+
+                let system_prompt = match load_prompt(agent_type.as_str(), vars) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(StreamEvent::Status {
+                            status: "failed".to_string(),
+                            message: Some(format!("Failed to load prompt: {}", e)),
+                        }).await;
+                        return;
+                    }
+                };
+
+                // Resolve working directory
+                let working_dir = match resolve_working_dir(&db, &agent_type, &ticket.organization).await {
+                    Ok(wd) => wd,
+                    Err(e) => {
+                        let _ = tx.send(StreamEvent::Status {
+                            status: "failed".to_string(),
+                            message: Some(format!("Failed to resolve working dir: {}", e)),
+                        }).await;
+                        return;
+                    }
+                };
+
+                // Build and connect client with resume
+                let options = build_agent_options(&agent_type, &system_prompt, &working_dir, Some(&cc_sid));
+                let mut sdk_client = cc_sdk::ClaudeSDKClient::new(options);
+
+                if let Err(e) = sdk_client.connect(None).await {
+                    tracing::error!("[AGENT-MSG] Failed to resume client: {}", e);
+                    let _ = tx.send(StreamEvent::Status {
+                        status: "failed".to_string(),
+                        message: Some(format!("Failed to resume agent session: {}", e)),
+                    }).await;
+                    return;
+                }
+
+                tracing::info!("[AGENT-MSG] Successfully resumed client for session {} via cc_session_id {}", session_id_clone, cc_sid);
+
+                let client = ChatClient {
+                    sdk_client,
+                    session_id: Some(cc_sid),
+                    last_used: std::time::Instant::now(),
+                };
+                client_manager.insert(session_id_clone.clone(), client).await
+            }
+        };
+
+        let _ = tx.send(StreamEvent::Status {
+            status: "running".to_string(),
+            message: Some("Processing follow-up message...".to_string()),
+        }).await;
+
+        // Persist the user message so it replays on reconnect
+        let _ = tx.send(StreamEvent::UserMessage {
+            content: req.message.clone(),
+        }).await;
+
+        // Send message and stream response — exactly like chat_stream::chat()
+        let mut client = client_arc.lock().await;
+        client.last_used = std::time::Instant::now();
+
+        if let Err(e) = client.sdk_client.send_user_message(req.message).await {
+            tracing::error!("[AGENT-MSG] Failed to send message: {}", e);
+            let _ = tx.send(StreamEvent::Status {
+                status: "failed".to_string(),
+                message: Some(format!("Failed to send: {}", e)),
+            }).await;
+            return;
+        }
+
+        let mut response_stream = client.sdk_client.receive_messages().await;
+        let mut message_count = 0u32;
+
+        while let Some(msg_result) = response_stream.next().await {
+            message_count += 1;
+            match msg_result {
+                Ok(msg) => {
+                    if let cc_sdk::Message::Assistant { message: assistant_msg } = &msg {
+                        for block in &assistant_msg.content {
+                            match block {
+                                cc_sdk::ContentBlock::Text(text_content) => {
+                                    let _ = tx.send(StreamEvent::Text {
+                                        content: text_content.text.clone()
+                                    }).await;
+                                }
+                                cc_sdk::ContentBlock::ToolUse(tool_use) => {
+                                    let _ = tx.send(StreamEvent::ToolUse {
+                                        id: tool_use.id.clone(),
+                                        name: tool_use.name.clone(),
+                                        input: tool_use.input.clone(),
+                                    }).await;
+                                }
+                                cc_sdk::ContentBlock::ToolResult(tool_result) => {
+                                    let content = tool_result.content.as_ref()
+                                        .map(|c| serde_json::to_string(c).unwrap_or_default())
+                                        .unwrap_or_default();
+                                    let _ = tx.send(StreamEvent::ToolResult {
+                                        tool_use_id: tool_result.tool_use_id.clone(),
+                                        content,
+                                        is_error: tool_result.is_error.unwrap_or(false),
+                                    }).await;
+                                }
+                                cc_sdk::ContentBlock::Thinking(thinking) => {
+                                    let _ = tx.send(StreamEvent::Thinking {
+                                        content: thinking.thinking.clone()
+                                    }).await;
+                                }
+                            }
+                        }
+                    }
+
+                    if let cc_sdk::Message::Result { session_id: sess_id, is_error, subtype, .. } = &msg {
+                        let _ = tx.send(StreamEvent::Result {
+                            session_id: sess_id.clone(),
+                            status: subtype.clone(),
+                            is_error: *is_error,
+                        }).await;
+                        break;
                     }
                 }
-            }
-            Ok(None) => {
-                let _ = tx.send(StreamEvent::Status {
-                    status: "failed".to_string(),
-                    message: Some("Session not found".to_string()),
-                }).await;
-            }
-            Err(e) => {
-                let _ = tx.send(StreamEvent::Status {
-                    status: "failed".to_string(),
-                    message: Some(format!("Database error: {}", e)),
-                }).await;
+                Err(e) => {
+                    tracing::error!("[AGENT-MSG] Error receiving message #{}: {}", message_count, e);
+                    let _ = tx.send(StreamEvent::Status {
+                        status: "failed".to_string(),
+                        message: Some(format!("Error: {}", e)),
+                    }).await;
+                    break;
+                }
             }
         }
+
+        tracing::info!("[AGENT-MSG] Stream ended after {} messages", message_count);
+        let _ = tx.send(StreamEvent::Status {
+            status: "completed".to_string(),
+            message: None,
+        }).await;
     });
 
-    // Get current max event index
+    // Get current max event index so new events continue the sequence
     let initial_index = match ticketing_system::agent_runs::get_events(&db, &session_id).await {
         Ok(events) => events.len() as i32,
         Err(_) => 0,
     };
 
-    let stream = create_sse_stream((*db).clone(), session_id, rx, initial_index);
+    // Events are stored by the persister even if the frontend disconnects
+    let sse_rx = spawn_event_persister((*db).clone(), session_id, rx, initial_index);
+    let stream = create_sse_stream(sse_rx);
     Sse::new(stream).keep_alive(KeepAlive::default())
 }

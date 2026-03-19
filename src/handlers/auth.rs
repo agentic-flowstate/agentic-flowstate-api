@@ -65,6 +65,12 @@ pub async fn register(
 
     cookies.add(make_session_cookie(&session_id));
 
+    crate::system_log_helper::log_event(
+        &pool, "info", "auth",
+        &format!("New user registered: {}", user.user_id),
+        None, Some(&user.user_id), Some(&session_id),
+    ).await;
+
     Ok((StatusCode::CREATED, Json(json!({
         "user_id": user.user_id,
         "name": user.name,
@@ -78,6 +84,7 @@ pub async fn login(
     cookies: Cookies,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    tracing::info!("Login attempt for user: {}", req.user_id);
     let user = ticketing_system::auth::authenticate(&pool, &req.user_id, &req.password)
         .await
         .map_err(|e| {
@@ -86,6 +93,12 @@ pub async fn login(
         })?;
 
     let Some(user) = user else {
+        tracing::warn!("Login rejected (401) for user: {}", req.user_id);
+        crate::system_log_helper::log_event(
+            &pool, "warn", "auth",
+            &format!("Failed login attempt for user: {}", req.user_id),
+            None, Some(&req.user_id), None,
+        ).await;
         return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid user_id or password"}))));
     };
 
@@ -97,6 +110,12 @@ pub async fn login(
         })?;
 
     cookies.add(make_session_cookie(&session_id));
+
+    crate::system_log_helper::log_event(
+        &pool, "info", "auth",
+        &format!("User logged in: {}", user.user_id),
+        None, Some(&user.user_id), Some(&session_id),
+    ).await;
 
     Ok(Json(json!({
         "user_id": user.user_id,
@@ -139,9 +158,19 @@ pub async fn me(
         return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "Session expired or invalid"}))));
     };
 
+    let organizations = ticketing_system::memberships::list_user_organizations(&pool, &user.user_id)
+        .await
+        .unwrap_or_default();
+
+    let is_admin = ticketing_system::system_logs::is_admin(&pool, &user.user_id)
+        .await
+        .unwrap_or(false);
+
     Ok(Json(json!({
         "user_id": user.user_id,
         "name": user.name,
         "email": user.email,
+        "organizations": organizations,
+        "is_admin": is_admin,
     })))
 }

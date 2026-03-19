@@ -11,11 +11,12 @@ mcp-handlers = { path = "../agentic-flowstate-mcp/mcp-handlers" }
 ticketing-system = { path = "../agentic-flowstate-ticketing-system" }
 
 # Claude Agent SDK
-cc-sdk = "0.4"
+cc-sdk = "0.6"
 
 # Web framework
-axum = { version = "0.7", features = ["default", "ws"] }
+axum = { version = "0.7", features = ["default", "ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 tower-cookies = "0.10"
@@ -64,6 +65,8 @@ tokio-process = "0.2"
 reqwest = { version = "0.12", features = ["json", "multipart"] }
 base64 = "0.22"
 lazy_static = "1.4"
+# APNs push notifications (JWT signing)
+jsonwebtoken = "9"
 
 # IMAP for email fetching
 async-imap = "0.10"
@@ -74,6 +77,12 @@ async-std = { version = "1.13", features = ["attributes"] }
 # AWS SES for sending emails
 aws-config = "1.1"
 aws-sdk-sesv2 = "1.9"
+
+# HTML sanitization
+ammonia = "4"
+
+# MIME email construction (for reply/forward with proper headers)
+mail-builder = "0.3"
 
 [[bin]]
 name = "agentic_api"

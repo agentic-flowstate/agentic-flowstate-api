@@ -8,42 +8,60 @@ use async_stream::stream;
 
 use crate::agents::StreamEvent;
 
-/// Create an SSE stream from a channel receiver, storing events to database
-pub fn create_sse_stream(
+/// Spawn a background task that persists events to the database and forwards them
+/// to an SSE channel. Events are always stored even if the SSE consumer disconnects.
+///
+/// Returns the receiver that the SSE stream should read from.
+pub fn spawn_event_persister(
     db: SqlitePool,
     session_id: String,
-    rx: mpsc::Receiver<StreamEvent>,
+    mut agent_rx: mpsc::Receiver<StreamEvent>,
     initial_event_index: i32,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    stream! {
-        tracing::info!("[STREAM] SSE stream started for session: {}", session_id);
-        let mut rx = ReceiverStream::new(rx);
+) -> mpsc::Receiver<StreamEvent> {
+    let (sse_tx, sse_rx) = mpsc::channel::<StreamEvent>(100);
+
+    tokio::spawn(async move {
         let mut event_index = initial_event_index;
 
-        while let Some(event) = futures::StreamExt::next(&mut rx).await {
+        while let Some(event) = agent_rx.recv().await {
             let event_type = get_event_type(&event);
-            tracing::debug!("[STREAM] Received event #{}: {}", event_index, event_type);
 
-            match serde_json::to_string(&event) {
-                Ok(json) => {
-                    if let Err(e) = ticketing_system::agent_runs::store_event(
-                        &db,
-                        &session_id,
-                        event_index,
-                        event_type,
-                        &json,
-                    ).await {
-                        tracing::warn!("[STREAM] Failed to store event #{}: {}", event_index, e);
-                    }
-                    event_index += 1;
-                    yield Ok(Event::default().data(json));
+            if let Ok(json) = serde_json::to_string(&event) {
+                if let Err(e) = ticketing_system::agent_runs::store_event(
+                    &db,
+                    &session_id,
+                    event_index,
+                    event_type,
+                    &json,
+                ).await {
+                    tracing::warn!("[PERSIST] Failed to store event #{}: {}", event_index, e);
                 }
-                Err(e) => {
-                    tracing::error!("[STREAM] Failed to serialize event: {}", e);
-                }
+                event_index += 1;
+            }
+
+            // Forward to SSE stream — OK if frontend disconnected (send fails silently)
+            let _ = sse_tx.send(event).await;
+        }
+
+        tracing::info!("[PERSIST] Event persister ended after {} events for session {}", event_index, session_id);
+    });
+
+    sse_rx
+}
+
+/// Create an SSE stream that forwards events from a channel (no DB storage — that's
+/// handled by spawn_event_persister).
+pub fn create_sse_stream(
+    rx: mpsc::Receiver<StreamEvent>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    stream! {
+        let mut rx = ReceiverStream::new(rx);
+
+        while let Some(event) = futures::StreamExt::next(&mut rx).await {
+            if let Ok(json) = serde_json::to_string(&event) {
+                yield Ok(Event::default().data(json));
             }
         }
-        tracing::info!("[STREAM] SSE stream ended after {} events", event_index);
     }
 }
 
@@ -132,6 +150,7 @@ pub fn get_event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::Thinking { .. } => "thinking",
         StreamEvent::Status { .. } => "status",
         StreamEvent::Result { .. } => "result",
+        StreamEvent::UserMessage { .. } => "user_message",
         StreamEvent::ReplayComplete { .. } => "replay_complete",
     }
 }

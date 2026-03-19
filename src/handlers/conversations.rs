@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::sse::{Event, KeepAlive, Sse},
     Json,
@@ -10,13 +10,18 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use ticketing_system::{
-    conversations, AddMessageRequest, Conversation, ConversationMessage,
+    conversations, checkpoints, AddMessageRequest, Conversation, ConversationMessage,
     CreateConversationRequest, SqlitePool, UpdateConversationRequest,
 };
+use std::pin::Pin;
+
+
+use crate::auth_middleware::AuthenticatedUser;
 
 #[derive(Debug, Deserialize)]
 pub struct ListConversationsQuery {
     pub organization: Option<String>,
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -28,9 +33,10 @@ pub struct ConversationListResponse {
 /// List conversations (GET /api/conversations)
 pub async fn list_conversations(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListConversationsQuery>,
 ) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
-    let list = conversations::list_conversations(&pool, params.organization.as_deref())
+    let list = conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user.user_id), params.agent.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -58,8 +64,10 @@ pub async fn get_conversation(
 /// Create a conversation (POST /api/conversations)
 pub async fn create_conversation(
     State(pool): State<Arc<SqlitePool>>,
-    Json(req): Json<CreateConversationRequest>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(mut req): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, Json<Conversation>), (StatusCode, String)> {
+    req.user_id = user.user_id;
     let conv = conversations::create_conversation(&pool, req)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -70,10 +78,11 @@ pub async fn create_conversation(
 /// Update a conversation (PATCH /api/conversations/:id)
 pub async fn update_conversation(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
     Json(req): Json<UpdateConversationRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    conversations::update_conversation(&pool, &id, req)
+    conversations::update_conversation(&pool, &user.user_id, &id, req)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -83,9 +92,10 @@ pub async fn update_conversation(
 /// Delete a conversation (DELETE /api/conversations/:id)
 pub async fn delete_conversation(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    conversations::delete_conversation(&pool, &id)
+    conversations::delete_conversation(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -114,7 +124,6 @@ pub async fn add_message(
 #[derive(Debug, Deserialize)]
 pub struct UpdateMessageRequest {
     pub content: String,
-    pub tool_uses: Option<Vec<ticketing_system::ToolUse>>,
 }
 
 /// Update a message (PATCH /api/conversations/:id/messages/:message_id)
@@ -129,7 +138,7 @@ pub async fn update_message(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
 
-    conversations::update_message(&pool, &message_id, &req.content, req.tool_uses.as_deref())
+    conversations::update_message(&pool, &message_id, &req.content)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -154,6 +163,83 @@ pub async fn list_messages(
     Ok(Json(messages))
 }
 
+/// Get checkpoint status for a conversation (GET /api/conversations/:id/checkpoint)
+/// Returns whether an agent is actively processing this conversation.
+pub async fn get_conversation_checkpoint(
+    State(pool): State<Arc<SqlitePool>>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationCheckpointResponse>, (StatusCode, String)> {
+    let checkpoint = ticketing_system::checkpoints::get_checkpoint(&pool, &id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    match checkpoint {
+        Some(cp) => Ok(Json(ConversationCheckpointResponse {
+            status: cp.status,
+            tool_call_count: cp.tool_call_count,
+            updated_at: cp.updated_at,
+        })),
+        None => Ok(Json(ConversationCheckpointResponse {
+            status: "none".to_string(),
+            tool_call_count: 0,
+            updated_at: 0,
+        })),
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversationCheckpointResponse {
+    pub status: String,
+    pub tool_call_count: i32,
+    pub updated_at: i64,
+}
+
+/// Query parameters for the reconnect SSE endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ReconnectQuery {
+    /// If provided, only replay events after this index (cursor-based resume).
+    pub starting_after: Option<i32>,
+}
+
+/// GET /api/conversations/:id/stream?starting_after=N
+/// SSE reconnection endpoint: replays stored events (optionally from cursor), then tails live events while agent is running.
+pub async fn reconnect_conversation_stream(
+    Path(id): Path<String>,
+    Query(query): Query<ReconnectQuery>,
+    State(db): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+    // Verify the authenticated user owns this conversation
+    let conv = conversations::get_conversation(&db, &id, false).await;
+    match conv {
+        Ok(Some(c)) if c.user_id == user.user_id => {}
+        _ => {
+            // Not found or not owned — return an empty stream that closes immediately
+            let empty = futures::stream::empty();
+            return Sse::new(Box::pin(empty) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+                .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"));
+        }
+    }
+
+    let checkpoint_status = match checkpoints::get_checkpoint(&db, &id).await {
+        Ok(Some(cp)) => cp.status,
+        _ => "none".to_string(),
+    };
+
+    let events = if let Some(after) = query.starting_after {
+        conversations::get_events_after(&db, &id, after).await.unwrap_or_default()
+    } else {
+        conversations::get_events(&db, &id).await.unwrap_or_default()
+    };
+
+    let stream = super::chat_stream::create_conversation_reconnect_stream(
+        db, id, events, checkpoint_status,
+    );
+
+    Sse::new(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"))
+}
+
 /// SSE event types for conversation updates
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
@@ -170,15 +256,17 @@ pub enum ConversationStreamEvent {
 /// SSE endpoint for real-time conversation list updates
 pub async fn subscribe_conversations(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListConversationsQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let user_id = user.user_id.clone();
     let stream = async_stream::stream! {
         // Track the last update time we've seen
         let mut last_sync_hash: u64 = 0;
 
         loop {
-            // Get current conversations
-            match conversations::list_conversations(&pool, params.organization.as_deref()).await {
+            // Get current conversations for this user
+            match conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user_id), params.agent.as_deref()).await {
                 Ok(convs) => {
                     // Simple change detection: hash the updated_at timestamps
                     use std::hash::{Hash, Hasher};

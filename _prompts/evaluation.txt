@@ -9,11 +9,8 @@ Your task is to review and validate the implementation for the ticket below.
 - Title: {{TICKET_TITLE}}
 - Intent: {{TICKET_INTENT}}
 
-## Original Plan
-{{PLAN_OUTPUT}}
-
-## Execution Summary
-{{EXECUTION_OUTPUT}}
+## Prior Context
+Previous agent outputs (plan, execution summary, etc.) will be provided in the user message within XML tags.
 
 ## Your Capabilities
 - Read files to review the changes

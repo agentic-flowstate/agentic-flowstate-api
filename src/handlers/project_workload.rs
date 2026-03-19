@@ -11,13 +11,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cc_sdk::{query, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig};
-use futures::StreamExt;
-
 use ticketing_system::WorkloadItem;
 
-use crate::agents::types::AgentType;
+use crate::agents::AgentType;
 use crate::agents::prompts::load_prompt;
+use crate::agents::run_oneshot;
 
 /// GET /api/project-workload
 /// Returns all unchecked workload items
@@ -59,85 +57,122 @@ pub async fn pull_project_ticket(
             .join("\n")
     };
 
-    // Load prompt with variables
+    // Pre-fetch all organization data for injection into user message
+    let org_data = build_org_data_snapshot(&db, org)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Load system prompt (role + rules only, no data)
     let mut vars = HashMap::new();
     vars.insert("organization".to_string(), org.clone());
-    vars.insert("current_workload".to_string(), current_workload_str);
 
     let system_prompt = load_prompt("pull-ticket", vars)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load prompt: {}", e)))?;
 
-    let agent_type = AgentType::PullTicket;
-    let tools_list: Vec<String> = agent_type
-        .allowed_tools()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
     let working_dir = PathBuf::from("/Users/jarvisgpt/projects");
 
-    let mut builder = ClaudeCodeOptions::builder()
-        .system_prompt(&system_prompt)
-        .model(agent_type.model())
-        .tools(ToolsConfig::list(tools_list.clone()))
-        .allowed_tools(tools_list)
-        .cwd(&working_dir);
+    // User message: data at top, query at bottom (per Anthropic best practices)
+    let prompt = format!(
+        "<current_workload>\n{}\n</current_workload>\n\n<organization_tickets>\n{}\n</organization_tickets>\n\nSelect the best next ticket to work on for the {} organization.",
+        current_workload_str, org_data, org
+    );
 
-    if let Some(turns) = agent_type.max_turns() {
-        builder = builder.max_turns(turns);
+    // Create agent run record BEFORE execution
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let create_req = ticketing_system::CreateAgentRunRequest {
+        session_id: session_id.clone(),
+        organization: Some(org.clone()),
+        epic_id: None,
+        slice_id: None,
+        ticket_id: None,
+        agent_type: "pull-ticket".to_string(),
+        input_message: prompt.clone(),
+    };
+    if let Err(e) = ticketing_system::agent_runs::create_agent_run(&db, create_req).await {
+        tracing::error!("[PULL-TICKET] Failed to create agent run record: {}", e);
     }
 
-    let options = builder.build();
+    tracing::info!("[PULL-TICKET] Starting agent for org={} session={}", org, session_id);
 
-    let prompt = format!("Select the best next ticket to work on for the {} organization.", org);
+    let result = run_oneshot(
+        Some(AgentType::PullTicket),
+        &system_prompt,
+        &working_dir,
+        prompt,
+    ).await;
 
-    tracing::info!("[PULL-TICKET] Starting agent for org={}", org);
-
-    // Run agent and collect output
-    let mut output_parts = Vec::new();
-
-    match query(prompt.as_str(), Some(options)).await {
-        Ok(stream) => {
-            let mut stream = Box::pin(stream);
-
-            while let Some(message_result) = stream.next().await {
-                match message_result {
-                    Ok(message) => {
-                        if let Message::Assistant { message: assistant_msg } = &message {
-                            for block in &assistant_msg.content {
-                                if let ContentBlock::Text(text_content) = block {
-                                    output_parts.push(text_content.text.clone());
-                                }
-                            }
-                        }
-                        if let Message::Result { .. } = &message {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("[PULL-TICKET] Stream error: {}", e);
-                        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Agent error: {}", e)));
-                    }
-                }
-            }
-        }
+    let (result_text, tool_call_count) = match result {
+        Ok(r) => (r.text, r.tool_call_count),
         Err(e) => {
-            tracing::error!("[PULL-TICKET] Failed to start agent: {}", e);
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to start agent: {}", e)));
+            tracing::error!("[PULL-TICKET] Agent failed: {}", e);
+            // Update run as failed
+            let failed_run = ticketing_system::AgentRun {
+                session_id: session_id.clone(),
+                organization: Some(org.clone()),
+                epic_id: None,
+                slice_id: None,
+                ticket_id: None,
+                agent_type: "pull-ticket".to_string(),
+                status: "failed".to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                input_message: String::new(),
+                output_summary: Some(format!("Agent failed: {}", e)),
+                tool_call_count: 0,
+                cc_session_id: None,
+            };
+            let _ = ticketing_system::agent_runs::update_agent_run(&db, &failed_run).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
         }
-    }
+    };
 
-    let full_output = output_parts.join("");
-    tracing::info!("[PULL-TICKET] Agent output: {} chars", full_output.len());
+    tracing::info!("[PULL-TICKET] Agent output: {} chars, tool_calls: {}", result_text.len(), tool_call_count);
 
     // Parse <selected_ticket>T-XXXXXXXX</selected_ticket>
-    let ticket_id = parse_selected_ticket(&full_output)
+    let ticket_id = parse_selected_ticket(&result_text)
         .ok_or_else(|| {
             tracing::error!("[PULL-TICKET] No <selected_ticket> tag found in output");
+            // Store the run as failed with output for debugging
+            let failed_run = ticketing_system::AgentRun {
+                session_id: session_id.clone(),
+                organization: Some(org.clone()),
+                epic_id: None,
+                slice_id: None,
+                ticket_id: None,
+                agent_type: "pull-ticket".to_string(),
+                status: "failed".to_string(),
+                started_at: String::new(),
+                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                input_message: String::new(),
+                output_summary: Some(truncate_output(&result_text)),
+                tool_call_count,
+                cc_session_id: None,
+            };
+            let db_clone = db.clone();
+            tokio::spawn(async move {
+                let _ = ticketing_system::agent_runs::update_agent_run(&db_clone, &failed_run).await;
+            });
             (StatusCode::UNPROCESSABLE_ENTITY, "Agent did not select a ticket".to_string())
         })?;
 
     if ticket_id == "NONE" {
+        // Store as completed with NONE result
+        let completed_run = ticketing_system::AgentRun {
+            session_id: session_id.clone(),
+            organization: Some(org.clone()),
+            epic_id: None,
+            slice_id: None,
+            ticket_id: None,
+            agent_type: "pull-ticket".to_string(),
+            status: "completed".to_string(),
+            started_at: String::new(),
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            input_message: String::new(),
+            output_summary: Some(truncate_output(&result_text)),
+            tool_call_count,
+            cc_session_id: None,
+        };
+        let _ = ticketing_system::agent_runs::update_agent_run(&db, &completed_run).await;
         return Err((StatusCode::NOT_FOUND, "No suitable tickets found".to_string()));
     }
 
@@ -147,7 +182,30 @@ pub async fn pull_project_ticket(
     let ticket = ticketing_system::tickets::get_ticket_by_id(&db, &ticket_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Ticket {} not found", ticket_id)))?;
+        .ok_or_else(|| {
+            tracing::error!("[PULL-TICKET] Ticket {} not found — agent hallucinated", ticket_id);
+            // Store as failed with output for debugging
+            let failed_run = ticketing_system::AgentRun {
+                session_id: session_id.clone(),
+                organization: Some(org.clone()),
+                epic_id: None,
+                slice_id: None,
+                ticket_id: Some(ticket_id.clone()),
+                agent_type: "pull-ticket".to_string(),
+                status: "failed".to_string(),
+                started_at: String::new(),
+                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                input_message: String::new(),
+                output_summary: Some(format!("Hallucinated ticket ID: {}\n\n{}", ticket_id, truncate_output(&result_text))),
+                tool_call_count,
+                cc_session_id: None,
+            };
+            let db_clone = db.clone();
+            tokio::spawn(async move {
+                let _ = ticketing_system::agent_runs::update_agent_run(&db_clone, &failed_run).await;
+            });
+            (StatusCode::NOT_FOUND, format!("Ticket {} not found", ticket_id))
+        })?;
 
     // Add to workload
     let item = ticketing_system::project_workload::add_to_workload(
@@ -167,6 +225,24 @@ pub async fn pull_project_ticket(
             (StatusCode::INTERNAL_SERVER_ERROR, msg)
         }
     })?;
+
+    // Store completed run with selected ticket
+    let completed_run = ticketing_system::AgentRun {
+        session_id,
+        organization: Some(org.clone()),
+        epic_id: Some(ticket.epic_id.clone()),
+        slice_id: Some(ticket.slice_id.clone()),
+        ticket_id: Some(ticket.ticket_id.clone()),
+        agent_type: "pull-ticket".to_string(),
+        status: "completed".to_string(),
+        started_at: String::new(),
+        completed_at: Some(chrono::Utc::now().to_rfc3339()),
+        input_message: String::new(),
+        output_summary: Some(truncate_output(&result_text)),
+        tool_call_count,
+        cc_session_id: None,
+    };
+    let _ = ticketing_system::agent_runs::update_agent_run(&db, &completed_run).await;
 
     tracing::info!("[PULL-TICKET] Added to workload: {} — {}", item.ticket_id, item.ticket_title);
     Ok(Json(item))
@@ -220,5 +296,75 @@ fn parse_selected_ticket(text: &str) -> Option<String> {
         None
     } else {
         Some(ticket_id)
+    }
+}
+
+/// Build a text snapshot of all org data for injection into the prompt
+async fn build_org_data_snapshot(db: &SqlitePool, org: &str) -> Result<String, String> {
+    let epics = ticketing_system::epics::list_epics(db, Some(org))
+        .await
+        .map_err(|e| format!("Failed to list epics: {}", e))?;
+
+    // Get all tickets in one query
+    let all_tickets = ticketing_system::tickets::list_tickets_by_organization(db, org)
+        .await
+        .map_err(|e| format!("Failed to list tickets: {}", e))?;
+
+    let mut output = String::new();
+
+    for epic in &epics {
+        output.push_str(&format!("\n### Epic: {} — {}\n", epic.epic_id, epic.title));
+        if let Some(ref notes) = epic.notes {
+            output.push_str(&format!("Notes: {}\n", notes));
+        }
+
+        let slices = ticketing_system::slices::list_slices(db, org, &epic.epic_id)
+            .await
+            .map_err(|e| format!("Failed to list slices: {}", e))?;
+
+        for slice in &slices {
+            output.push_str(&format!("\n#### Slice: {} — {}\n", slice.slice_id, slice.title));
+
+            // Filter tickets for this slice
+            let slice_tickets: Vec<_> = all_tickets
+                .iter()
+                .filter(|t| t.epic_id == epic.epic_id && t.slice_id == slice.slice_id)
+                .collect();
+
+            for ticket in &slice_tickets {
+                output.push_str(&format!(
+                    "- {} | {} | status={} | type={:?}",
+                    ticket.ticket_id,
+                    ticket.title,
+                    ticket.status,
+                    ticket.ticket_type,
+                ));
+                if let Some(ref blocked_by) = ticket.blocked_by {
+                    if !blocked_by.is_empty() {
+                        output.push_str(&format!(" | blocked_by={}", blocked_by.join(",")));
+                    }
+                }
+                if let Some(ref blocks) = ticket.blocks {
+                    if !blocks.is_empty() {
+                        output.push_str(&format!(" | blocks={}", blocks.join(",")));
+                    }
+                }
+                if let Some(ref mid) = ticket.milestone_id {
+                    output.push_str(&format!(" | milestone={}", mid));
+                }
+                output.push('\n');
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Truncate output to a reasonable size for storage
+fn truncate_output(text: &str) -> String {
+    if text.len() > 50000 {
+        format!("{}...\n\n[Output truncated at 50000 chars]", &text[..50000])
+    } else {
+        text.to_string()
     }
 }

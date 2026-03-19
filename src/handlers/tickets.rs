@@ -140,7 +140,6 @@ pub async fn create_ticket(
             "ref": ref_handle,
             "title": request.title,
             "ticket_type": "milestone",
-            "pipeline_template_id": "human-task",
         }]
     });
 

@@ -15,6 +15,14 @@ pub struct AgentConfig {
     /// If not set, defaults to the base projects directory.
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Effort level for adaptive thinking: "low", "medium", "high", "max".
+    /// Defaults to "high" if not set.
+    #[serde(default = "default_effort")]
+    pub effort: String,
+}
+
+fn default_effort() -> String {
+    "high".to_string()
 }
 
 /// Root config structure from agents.json
@@ -64,10 +72,18 @@ pub enum AgentType {
     TicketCreator,
     /// Drafts policy documents, checklists, and training materials into the documentation repo
     DocDrafter,
-    /// Personal life planner agent — daily planning, nutrition, training, project management
-    LifePlanner,
+    /// Personal home planner agent — daily planning, nutrition, training, project management
+    HomePlanner,
     /// Selects the best next ticket to work on for a given organization
     PullTicket,
+    /// Local codebase + CLI research agent — explores files, runs commands, produces implementation plan
+    CodebaseResearch,
+    /// Manages documentation references on tickets - finds and attaches relevant docs
+    DocManager,
+    /// Post-meeting agent — processes transcript, takes action (create tickets, send emails, etc.)
+    MeetingAgent,
+    /// Full-access agent — every MCP tool + all built-in tools, uses CLAUDE.md as system prompt
+    FullAccess,
 }
 
 impl AgentType {
@@ -85,8 +101,12 @@ impl AgentType {
             AgentType::TicketPlanner => "ticket-planner",
             AgentType::TicketCreator => "ticket-creator",
             AgentType::DocDrafter => "doc-drafter",
-            AgentType::LifePlanner => "life-planner",
+            AgentType::HomePlanner => "home-planner",
             AgentType::PullTicket => "pull-ticket",
+            AgentType::CodebaseResearch => "codebase-research",
+            AgentType::DocManager => "doc-manager",
+            AgentType::MeetingAgent => "meeting-agent",
+            AgentType::FullAccess => "full-access",
         }
     }
 
@@ -112,6 +132,10 @@ impl AgentType {
 
     pub fn max_turns(&self) -> Option<i32> {
         self.config().max_turns
+    }
+
+    pub fn effort(&self) -> &str {
+        &self.config().effort
     }
 }
 
@@ -193,9 +217,14 @@ impl EmailOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRun {
     pub session_id: String,
-    pub ticket_id: String,
-    pub epic_id: String,
-    pub slice_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epic_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slice_id: Option<String>,
     /// Agent type as string to support legacy/unknown types in history
     pub agent_type: String,
     pub status: AgentRunStatus,
@@ -208,6 +237,10 @@ pub struct AgentRun {
     /// Structured email output (only for email agent type)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email_output: Option<EmailOutput>,
+    pub tool_call_count: i32,
+    /// Claude Code SDK session ID for resuming after API restart
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cc_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -250,11 +283,6 @@ pub struct RunAgentRequest {
     /// For ticket-assistant: custom user question to ask about the ticket
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_input_message: Option<String>,
-    /// Explicit pipeline step ID to bind this agent run to.
-    /// When set, the streaming handler manages the full step lifecycle
-    /// (transition through Running → Completed/Failed) and advances the pipeline.
-    #[serde(default)]
-    pub step_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,6 +330,8 @@ pub enum StreamEvent {
         status: String,
         is_error: bool,
     },
+    /// User follow-up message (stored so it can be replayed on reconnect)
+    UserMessage { content: String },
     /// Sent after all historical events have been replayed during reconnection
     ReplayComplete {
         total_events: usize,

@@ -9,12 +9,8 @@ Your task is to implement the changes described in the plan for the ticket below
 - Title: {{TICKET_TITLE}}
 - Intent: {{TICKET_INTENT}}
 
-{{#if PREVIOUS_OUTPUT}}
-{{PREVIOUS_OUTPUT}}
-{{/if}}
-
-## Implementation Plan (from planning agent)
-{{PLAN_OUTPUT}}
+## Prior Context
+Previous agent outputs (implementation plan, research, etc.) will be provided in the user message within XML tags.
 
 ## Your Capabilities
 - Read, write, and edit files

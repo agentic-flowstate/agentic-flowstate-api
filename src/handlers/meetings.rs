@@ -4,16 +4,22 @@ use axum::{
         Path, Query, State,
     },
     http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
-use futures::{SinkExt, StreamExt};
+use futures::{stream::Stream, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 
+use crate::auth_middleware::AuthenticatedUser;
 use ticketing_system::{CreateMeetingRequest, Meeting};
 
 // ============================================================================
@@ -52,10 +58,20 @@ pub enum SignalingMessage {
     UserJoined { room_id: String, user_id: String },
     #[serde(rename = "user_left")]
     UserLeft { room_id: String, user_id: String },
+    #[serde(rename = "screen_share_started")]
+    ScreenShareStarted { room_id: String, user_id: String },
+    #[serde(rename = "screen_share_stopped")]
+    ScreenShareStopped { room_id: String, user_id: String },
+    #[serde(rename = "transcription_started")]
+    TranscriptionStarted { room_id: String, user_id: String },
+    #[serde(rename = "transcription_stopped")]
+    TranscriptionStopped { room_id: String, user_id: String },
     #[serde(rename = "room_users")]
     RoomUsers {
         room_id: String,
         users: Vec<String>,
+        screen_sharers: Vec<String>,
+        transcribers: Vec<String>,
     },
     #[serde(rename = "error")]
     Error { message: String },
@@ -64,6 +80,8 @@ pub enum SignalingMessage {
 #[derive(Debug, Default)]
 pub struct Room {
     pub participants: Vec<String>,
+    pub screen_sharers: Vec<String>,
+    pub transcribers: Vec<String>,
 }
 
 pub struct SignalingState {
@@ -106,12 +124,56 @@ impl SignalingState {
         let mut rooms = self.rooms.write().await;
         if let Some(room) = rooms.get_mut(room_id) {
             room.participants.retain(|u| u != user_id);
+            room.screen_sharers.retain(|u| u != user_id);
+            room.transcribers.retain(|u| u != user_id);
             if room.participants.is_empty() {
                 rooms.remove(room_id);
                 let mut channels = self.channels.write().await;
                 channels.remove(room_id);
             }
         }
+    }
+
+    pub async fn add_screen_sharer(&self, room_id: &str, user_id: &str) {
+        let mut rooms = self.rooms.write().await;
+        if let Some(room) = rooms.get_mut(room_id) {
+            if !room.screen_sharers.contains(&user_id.to_string()) {
+                room.screen_sharers.push(user_id.to_string());
+            }
+        }
+    }
+
+    pub async fn remove_screen_sharer(&self, room_id: &str, user_id: &str) {
+        let mut rooms = self.rooms.write().await;
+        if let Some(room) = rooms.get_mut(room_id) {
+            room.screen_sharers.retain(|u| u != user_id);
+        }
+    }
+
+    pub async fn get_screen_sharers(&self, room_id: &str) -> Vec<String> {
+        let rooms = self.rooms.read().await;
+        rooms.get(room_id).map(|r| r.screen_sharers.clone()).unwrap_or_default()
+    }
+
+    pub async fn add_transcriber(&self, room_id: &str, user_id: &str) {
+        let mut rooms = self.rooms.write().await;
+        if let Some(room) = rooms.get_mut(room_id) {
+            if !room.transcribers.contains(&user_id.to_string()) {
+                room.transcribers.push(user_id.to_string());
+            }
+        }
+    }
+
+    pub async fn remove_transcriber(&self, room_id: &str, user_id: &str) {
+        let mut rooms = self.rooms.write().await;
+        if let Some(room) = rooms.get_mut(room_id) {
+            room.transcribers.retain(|u| u != user_id);
+        }
+    }
+
+    pub async fn get_transcribers(&self, room_id: &str) -> Vec<String> {
+        let rooms = self.rooms.read().await;
+        rooms.get(room_id).map(|r| r.transcribers.clone()).unwrap_or_default()
     }
 
     #[allow(dead_code)]
@@ -145,10 +207,11 @@ pub struct MeetingsResponse {
 /// GET /api/meetings
 pub async fn list_meetings(
     State(db): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(query): Query<ListMeetingsQuery>,
 ) -> Result<Json<MeetingsResponse>, (StatusCode, String)> {
     let active_only = query.active_only.unwrap_or(false);
-    let meetings = ticketing_system::meetings::list_meetings(&db, active_only)
+    let meetings = ticketing_system::meetings::list_meetings_for_user(&db, active_only, Some(&user.user_id))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -259,6 +322,73 @@ pub async fn toggle_meeting_favorite(
 }
 
 // ============================================================================
+// SSE: Real-time meeting updates
+// ============================================================================
+
+fn hash_meetings(meetings: &[Meeting]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for m in meetings {
+        m.room_id.hash(&mut hasher);
+        m.status.hash(&mut hasher);
+        m.updated_at.hash(&mut hasher);
+        m.processing_status.hash(&mut hasher);
+    }
+    meetings.len().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// POST /api/meetings/:room_id/join
+/// Record the authenticated user as a participant of this meeting
+pub async fn join_meeting_as_participant(
+    Path(room_id): Path<String>,
+    State(db): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    ticketing_system::meetings::add_participant(&db, &room_id, &user.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// GET /api/meetings/subscribe
+/// SSE endpoint for real-time meeting list updates (scoped to authenticated user)
+pub async fn subscribe_meetings(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let user_id = user.user_id.clone();
+    let stream = async_stream::stream! {
+        let mut last_hash: u64 = 0;
+
+        loop {
+            match ticketing_system::meetings::list_meetings_for_user(&pool, false, Some(&user_id)).await {
+                Ok(meetings) => {
+                    let hash = hash_meetings(&meetings);
+                    if hash != last_hash {
+                        last_hash = hash;
+                        if let Ok(json) = serde_json::to_string(&MeetingsResponse { meetings }) {
+                            yield Ok(Event::default().data(json));
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to list meetings for SSE: {}", e);
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+// ============================================================================
 // WebSocket Signaling Handler
 // ============================================================================
 
@@ -334,7 +464,11 @@ async fn handle_signaling(socket: WebSocket) {
                                     from_user != &user_clone && (to_user == &user_clone || to_user == "*")
                                 }
                                 SignalingMessage::UserJoined { user_id, .. } |
-                                SignalingMessage::UserLeft { user_id, .. } => {
+                                SignalingMessage::UserLeft { user_id, .. } |
+                                SignalingMessage::ScreenShareStarted { user_id, .. } |
+                                SignalingMessage::ScreenShareStopped { user_id, .. } |
+                                SignalingMessage::TranscriptionStarted { user_id, .. } |
+                                SignalingMessage::TranscriptionStopped { user_id, .. } => {
                                     user_id != &user_clone
                                 }
                                 _ => true,
@@ -349,10 +483,14 @@ async fn handle_signaling(socket: WebSocket) {
                     });
                 }
 
+                let screen_sharers = SIGNALING.get_screen_sharers(&room_id).await;
+                let transcribers = SIGNALING.get_transcribers(&room_id).await;
                 let _ = tx
                     .send(SignalingMessage::RoomUsers {
                         room_id: room_id.clone(),
                         users: users.clone(),
+                        screen_sharers,
+                        transcribers,
                     })
                     .await;
 
@@ -377,6 +515,30 @@ async fn handle_signaling(socket: WebSocket) {
             SignalingMessage::Offer { ref room_id, .. }
             | SignalingMessage::Answer { ref room_id, .. }
             | SignalingMessage::IceCandidate { ref room_id, .. } => {
+                let channel = SIGNALING.get_or_create_channel(room_id).await;
+                let _ = channel.send(signal);
+            }
+
+            SignalingMessage::ScreenShareStarted { ref room_id, ref user_id } => {
+                SIGNALING.add_screen_sharer(room_id, user_id).await;
+                let channel = SIGNALING.get_or_create_channel(room_id).await;
+                let _ = channel.send(signal);
+            }
+
+            SignalingMessage::ScreenShareStopped { ref room_id, ref user_id } => {
+                SIGNALING.remove_screen_sharer(room_id, user_id).await;
+                let channel = SIGNALING.get_or_create_channel(room_id).await;
+                let _ = channel.send(signal);
+            }
+
+            SignalingMessage::TranscriptionStarted { ref room_id, ref user_id } => {
+                SIGNALING.add_transcriber(room_id, user_id).await;
+                let channel = SIGNALING.get_or_create_channel(room_id).await;
+                let _ = channel.send(signal);
+            }
+
+            SignalingMessage::TranscriptionStopped { ref room_id, ref user_id } => {
+                SIGNALING.remove_transcriber(room_id, user_id).await;
                 let channel = SIGNALING.get_or_create_channel(room_id).await;
                 let _ = channel.send(signal);
             }

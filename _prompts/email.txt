@@ -9,11 +9,8 @@ Your task is to compose a professional email based on the ticket context and any
 - Title: {{TICKET_TITLE}}
 - Intent: {{TICKET_INTENT}}
 
-## Sender Information
-{{SENDER_INFO}}
-
-## Selected Context from Previous Agents
-{{SELECTED_CONTEXT}}
+## Context
+Sender information and selected agent outputs will be provided in the user message within XML tags.
 
 ## Instructions
 

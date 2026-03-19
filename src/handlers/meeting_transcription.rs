@@ -8,15 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use sqlx::SqlitePool;
 
-use cc_sdk::{query, ClaudeCodeOptions, Message as CcMessage, ContentBlock, ToolsConfig};
-use futures::StreamExt;
 use ticketing_system::{
     CreateTranscriptEntryRequest, CreateTranscriptSessionRequest, TranscribeAudioRequest,
     TranscriptionResponse,
 };
 
 use crate::agents::prompts::load_prompt;
-use crate::agents::AgentType;
+use crate::agents::{AgentType, run_oneshot};
 
 // ============================================================================
 // Transcription Handler (OpenAI Whisper)
@@ -304,6 +302,16 @@ pub async fn finalize_meeting_transcript(
         }
     }
 
+    if all_entries.is_empty() {
+        tracing::error!("All audio segments failed to transcribe for meeting {}", room_id);
+        // Cleanup audio files even on failure
+        let _ = std::fs::remove_dir_all(&audio_dir);
+        ticketing_system::meetings::update_processing_status(&db, &room_id, "failed")
+            .await
+            .ok();
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Transcription failed for all audio segments".to_string()));
+    }
+
     all_entries.sort_by_key(|(ts, _, _)| *ts);
 
     // Format the merged transcript
@@ -405,61 +413,25 @@ pub async fn finalize_meeting_transcript(
 async fn extract_meeting_notes(transcript: &str) -> Result<String, String> {
     tracing::info!("Starting meeting notes extraction, transcript length: {} chars", transcript.len());
 
-    let mut vars = HashMap::new();
-    vars.insert("transcript".to_string(), transcript.to_string());
-
-    let system_prompt = load_prompt("meeting-notes", vars)
+    let system_prompt = load_prompt("meeting-notes", HashMap::new())
         .map_err(|e| format!("Failed to load meeting-notes prompt: {}", e))?;
 
-    let agent_config = AgentType::MeetingNotes;
     let working_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    let options = ClaudeCodeOptions::builder()
-        .system_prompt(&system_prompt)
-        .model(agent_config.model())
-        .tools(ToolsConfig::none())
-        .max_turns(1)
-        .cwd(&working_dir)
-        .build();
+    // Transcript goes in user message, not system prompt (per Anthropic best practices)
+    let prompt = format!(
+        "<transcript>\n{}\n</transcript>\n\nExtract structured notes from the transcript above.",
+        transcript
+    );
 
-    let prompt = "Extract structured notes from the transcript provided in the system prompt.";
-    let mut output_parts = Vec::new();
+    let result = run_oneshot(
+        Some(AgentType::MeetingNotes),
+        &system_prompt,
+        &working_dir,
+        prompt,
+    ).await?;
 
-    match query(prompt, Some(options)).await {
-        Ok(stream) => {
-            let mut stream = Box::pin(stream);
-
-            while let Some(message_result) = stream.next().await {
-                match message_result {
-                    Ok(message) => {
-                        if let CcMessage::Assistant { message: assistant_msg } = &message {
-                            for block in &assistant_msg.content {
-                                if let ContentBlock::Text(text_content) = block {
-                                    output_parts.push(text_content.text.clone());
-                                }
-                            }
-                        }
-                        if let CcMessage::Result { .. } = &message {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Error receiving message from meeting-notes agent: {}", e);
-                        break;
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            return Err(format!("Failed to run meeting-notes agent: {}", e));
-        }
-    }
-
-    if output_parts.is_empty() {
-        return Err("No output from meeting-notes agent".to_string());
-    }
-
-    Ok(output_parts.join("\n\n"))
+    Ok(result.text)
 }
 
 /// Generate a meeting title from the extracted notes

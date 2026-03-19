@@ -7,8 +7,8 @@ You are a research synthesis agent. Your job is to critically evaluate raw resea
 - Title: {{TICKET_TITLE}}
 - Intent: {{TICKET_INTENT}}
 
-## Research Findings (from previous agent)
-{{RESEARCH_OUTPUT}}
+## Prior Context
+Research findings from the previous agent will be provided in the user message within XML tags.
 
 ## Your Process
 

@@ -5,6 +5,7 @@ use crate::agents::{AgentRun, AgentRunStatus};
 pub async fn store_agent_run(db: &SqlitePool, run: &AgentRun) -> anyhow::Result<()> {
     let db_run = ticketing_system::AgentRun {
         session_id: run.session_id.clone(),
+        organization: run.organization.clone(),
         epic_id: run.epic_id.clone(),
         slice_id: run.slice_id.clone(),
         ticket_id: run.ticket_id.clone(),
@@ -14,6 +15,8 @@ pub async fn store_agent_run(db: &SqlitePool, run: &AgentRun) -> anyhow::Result<
         completed_at: run.completed_at.clone(),
         input_message: run.input_message.clone(),
         output_summary: run.output_summary.clone(),
+        tool_call_count: run.tool_call_count,
+        cc_session_id: run.cc_session_id.clone(),
     };
 
     ticketing_system::agent_runs::update_agent_run(db, &db_run).await
@@ -29,6 +32,7 @@ pub fn db_run_to_api_run(db_run: ticketing_system::AgentRun) -> AgentRun {
 
     AgentRun {
         session_id: db_run.session_id,
+        organization: db_run.organization,
         ticket_id: db_run.ticket_id,
         epic_id: db_run.epic_id,
         slice_id: db_run.slice_id,
@@ -39,6 +43,8 @@ pub fn db_run_to_api_run(db_run: ticketing_system::AgentRun) -> AgentRun {
         input_message: db_run.input_message,
         output_summary: db_run.output_summary,
         email_output,
+        tool_call_count: db_run.tool_call_count,
+        cc_session_id: db_run.cc_session_id,
     }
 }
 
