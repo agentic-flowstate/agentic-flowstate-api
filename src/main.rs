@@ -506,6 +506,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/daily-plan/date-items",
             post(handlers::create_daily_plan_date_item))
 
+        // Token usage tracking
+        .route("/api/usage", get(handlers::usage::get_usage))
+
         // Conversation routes (user-scoped, filtered by authenticated user_id)
         .route("/api/conversations",
             get(handlers::list_conversations)

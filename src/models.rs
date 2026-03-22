@@ -25,4 +25,5 @@ pub struct CreateTicketRequest {
 pub struct UpdateTicketRequest {
     pub status: Option<String>,
     pub notes: Option<String>,
+    pub due_date: Option<String>,
 }

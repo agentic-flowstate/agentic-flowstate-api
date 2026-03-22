@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::agents::StreamEvent;
 use crate::agents::prompts::load_prompt;
-use ticketing_system::{conversations, checkpoints, AddMessageRequest, ContentBlockDesc, ConversationMessage, UpdateConversationRequest};
+use ticketing_system::{conversations, checkpoints, token_usage, AddMessageRequest, ContentBlockDesc, ConversationMessage, UpdateConversationRequest};
 use super::chat_stream::{get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData};
 use super::chat_client_manager::{ChatClientManager, ChatClient};
 
@@ -75,6 +75,20 @@ impl ConversationWorker {
     pub async fn run(mut self) {
         tracing::info!("[WORKER] Started for conversation {}", self.conversation_id);
 
+        // Initialize event_index from DB to ensure monotonically increasing indices
+        // across worker sessions (e.g., after idle timeout killed the previous worker).
+        // Without this, cursor-based SSE reconnection breaks: the app remembers
+        // lastEventIndex=50 from the old session, but new events start at 0.
+        match conversations::get_max_event_index(&self.db, &self.conversation_id).await {
+            Ok(max_idx) => {
+                self.event_index = max_idx + 1;
+                tracing::info!("[WORKER] Initialized event_index to {} for {}", self.event_index, self.conversation_id);
+            }
+            Err(e) => {
+                tracing::warn!("[WORKER] Failed to get max event index for {}: {}, starting at 0", self.conversation_id, e);
+            }
+        }
+
         loop {
             let msg = tokio::select! {
                 msg = self.message_rx.recv() => msg,
@@ -126,9 +140,11 @@ impl ConversationWorker {
     async fn process_message(&mut self, mut msg: WorkerMessage) {
         // RAII guard: fires completion signal when this function exits (normal or early return)
         let _completion = CompletionGuard(msg.completion_tx.take());
-        // Clear stale events from previous message and reset index
+        // Clear stale events from previous message but keep event_index monotonically
+        // increasing. Resetting to 0 here was causing the "one turn late" bug: the app's
+        // SSE cursor (e.g., lastEventIndex=50) would be higher than all new events (0,1,2...),
+        // so reconnection with starting_after=50 returned nothing.
         let _ = conversations::delete_events(&self.db, &self.conversation_id).await;
-        self.event_index = 0;
 
         // Emit running status
         self.emit_event(&StreamEvent::Status {
@@ -440,8 +456,27 @@ impl ConversationWorker {
                             }
 
                             // Check for result message
-                            if let Message::Result { session_id: sess_id, is_error, subtype, .. } = &sdk_msg {
+                            if let Message::Result { session_id: sess_id, is_error, subtype, usage, .. } = &sdk_msg {
                                 tracing::info!("[WORKER] Result: subtype={}, is_error={}", subtype, is_error);
+
+                                // Track token usage
+                                if let Some(usage_json) = usage {
+                                    let input_tok = usage_json.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                    let output_tok = usage_json.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                    if input_tok > 0 || output_tok > 0 {
+                                        let db_ref = self.db.clone();
+                                        let conv_id = self.conversation_id.clone();
+                                        let uid = msg.user_id.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = token_usage::insert_token_usage(
+                                                &db_ref, "conversation", &conv_id,
+                                                Some(&uid), None, input_tok, output_tok,
+                                            ).await {
+                                                tracing::warn!("[WORKER] Failed to record token usage: {}", e);
+                                            }
+                                        });
+                                    }
+                                }
 
                                 result_session_id = Some(sess_id.clone());
 

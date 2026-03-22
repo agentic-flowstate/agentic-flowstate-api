@@ -577,7 +577,25 @@ pub async fn send_message_to_agent(
                         }
                     }
 
-                    if let cc_sdk::Message::Result { session_id: sess_id, is_error, subtype, .. } = &msg {
+                    if let cc_sdk::Message::Result { session_id: sess_id, is_error, subtype, usage, .. } = &msg {
+                        // Track token usage for agent runs
+                        if let Some(usage_json) = usage {
+                            let input_tok = usage_json.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let output_tok = usage_json.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                            if input_tok > 0 || output_tok > 0 {
+                                let db_ref = db.clone();
+                                let sid = session_id_clone.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = ticketing_system::token_usage::insert_token_usage(
+                                        &db_ref, "agent_run", &sid,
+                                        None, None, input_tok, output_tok,
+                                    ).await {
+                                        tracing::warn!("[AGENT-MSG] Failed to record token usage: {}", e);
+                                    }
+                                });
+                            }
+                        }
+
                         let _ = tx.send(StreamEvent::Result {
                             session_id: sess_id.clone(),
                             status: subtype.clone(),
