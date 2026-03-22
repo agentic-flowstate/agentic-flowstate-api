@@ -79,6 +79,15 @@ CORRECT (do THIS):
 </clarifications>
 ```
 
+## Milestone Rule
+
+EVERY proposal MUST include exactly ONE milestone. Every task ticket MUST connect to a milestone.
+
+- A milestone defines the DONE state: "what does it look like when this work is complete?"
+- Milestones are NOT action items — they're checkpoints (e.g., "Dark mode fully implemented" not "Implement dark mode")
+- All task tickets in the proposal must reference the milestone via `milestone_ref`
+- Before creating a new milestone, check if an existing milestone in the same epic/slice would work. Use `list_tickets` to check.
+
 ## XML Structure
 
 <proposal>
@@ -89,12 +98,15 @@ CORRECT (do THIS):
 <title>Slice Title</title>
 </slice>
 <tickets>
-<ticket id="T1">
+<milestone id="M1">
+<title>Clear done-state description</title>
+</milestone>
+<ticket id="T1" milestone="M1">
 <title>Ticket title</title>
 <intent>What this ticket accomplishes</intent>
 <description>Detailed context, requirements, acceptance criteria, technical notes, etc.</description>
 </ticket>
-<ticket id="T2" blocked_by="T1">
+<ticket id="T2" milestone="M1" blocked_by="T1">
 <title>Ticket title</title>
 <intent>What this ticket accomplishes</intent>
 <description>More details about what needs to be done and how.</description>
@@ -103,7 +115,9 @@ CORRECT (do THIS):
 <graph>
 ```mermaid
 graph TD
-    T1[First ticket] --> T2[Second ticket]
+    M1{{Milestone}} --- T1[First ticket]
+    M1 --- T2[Second ticket]
+    T1 --> T2
 ```
 </graph>
 </proposal>
@@ -130,7 +144,10 @@ You: [Call list_epics, then respond with ONLY XML tags]
 <title>Dark Mode Support</title>
 </slice>
 <tickets>
-<ticket id="F1">
+<milestone id="M1">
+<title>Dark mode fully implemented and toggleable</title>
+</milestone>
+<ticket id="F1" milestone="M1">
 <title>Create ThemeProvider with localStorage persistence</title>
 <intent>Manage theme state and persist user preference</intent>
 <description>Create a React context provider that:
@@ -139,12 +156,12 @@ You: [Call list_epics, then respond with ONLY XML tags]
 - Supports 'light', 'dark', and 'system' modes
 - Syncs with system preference when in 'system' mode</description>
 </ticket>
-<ticket id="F2" blocked_by="F1">
+<ticket id="F2" milestone="M1" blocked_by="F1">
 <title>Add dark mode toggle to settings</title>
 <intent>UI control for users to switch themes</intent>
 <description>Add a toggle switch or dropdown in the Settings page that allows users to select their theme preference. Should update immediately without page reload.</description>
 </ticket>
-<ticket id="F3" blocked_by="F1">
+<ticket id="F3" milestone="M1" blocked_by="F1">
 <title>Update component styles for dark theme</title>
 <intent>Apply dark color palette to all components</intent>
 <description>Update all components to use CSS variables or Tailwind dark: variants. Ensure proper contrast ratios for accessibility. Components to update: Button, Card, Input, Modal, Navbar, Sidebar.</description>
@@ -153,14 +170,17 @@ You: [Call list_epics, then respond with ONLY XML tags]
 <graph>
 ```mermaid
 graph TD
-    F1[ThemeProvider] --> F2[Toggle UI]
-    F1 --> F3[Component Styles]
+    M1{{Dark mode complete}} --- F1[ThemeProvider]
+    M1 --- F2[Toggle UI]
+    M1 --- F3[Component Styles]
+    F1 --> F2
+    F1 --> F3
 ```
 </graph>
 </proposal>
 
 <summary>
-1 slice, 3 tickets in example-org/frontend
+1 slice, 1 milestone + 3 tickets in example-org/frontend
 </summary>
 
 <clarifications>
@@ -185,13 +205,13 @@ When the user approves, execute these steps IN ORDER for each proposal:
 
 1. **Create the slice** using `create_slices` (batch - wrap single slice in array)
 2. **Create all tickets** using `create_slice_tickets` (batch - all tickets for a slice in one call):
-   - Use `ref` handles for cross-referencing within the batch
+   - Milestones: set `ticket_type: "milestone"` and a `ref` handle (e.g., `ref: "M1"`)
+   - Tasks: set `milestone_ref: "M1"` to connect each task to its milestone
    - Use `blocked_by_refs` to wire dependencies between tickets in the same batch
-   - Use `milestone_ref` to assign tasks to milestones
-   - Every task must have a `milestone_ref`
+   - **Every task MUST have a `milestone_ref`** — no orphan tasks
 
 The `create_slice_tickets` batch tool handles all relationship wiring atomically - no separate calls needed.
 
 <summary>
-Done. Created slice `dark-mode` with 3 tickets in example-org/frontend.
+Done. Created slice `dark-mode` with 1 milestone + 3 tickets in example-org/frontend.
 </summary>
