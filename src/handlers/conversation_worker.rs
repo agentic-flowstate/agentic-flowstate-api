@@ -316,9 +316,12 @@ impl ConversationWorker {
         // Send message to SDK and get response stream.
         // The mutex is released after getting the stream so the cancel handler
         // can acquire it to call interrupt().
-        let mut response_stream = {
+        let (mut response_stream, resume_session_id) = {
             let mut client = client_arc.lock().await;
             client.last_used = Instant::now();
+
+            // Capture the session_id we're trying to resume from (if any)
+            let resume_sid = client.session_id.clone();
 
             if let Err(e) = client.sdk_client.send_user_message(enhanced_message).await {
                 tracing::error!("[WORKER] Failed to send message: {}", e);
@@ -329,7 +332,7 @@ impl ConversationWorker {
                 return;
             }
 
-            client.sdk_client.receive_messages().await
+            (client.sdk_client.receive_messages().await, resume_sid)
             // MutexGuard dropped here — allows cancel handler to call interrupt()
         };
         let mut accumulated_text = String::new();
@@ -478,6 +481,26 @@ impl ConversationWorker {
                                     }
                                 }
 
+                                // Detect silent --resume failure: if the Result session_id
+                                // differs from what we passed to --resume, the CLI silently
+                                // started a fresh session. DO NOT overwrite the original
+                                // session_id — it may still be resumable later.
+                                let resume_failed = if let Some(ref original_sid) = resume_session_id {
+                                    if sess_id != original_sid {
+                                        tracing::warn!(
+                                            "[WORKER] RESUME FAILURE DETECTED for {}: \
+                                            requested --resume {} but CLI returned session {}. \
+                                            Original session_id preserved — NOT overwriting.",
+                                            self.conversation_id, original_sid, sess_id
+                                        );
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+
                                 result_session_id = Some(sess_id.clone());
 
                                 self.emit_event(&StreamEvent::Result {
@@ -486,16 +509,22 @@ impl ConversationWorker {
                                     is_error: *is_error,
                                 }).await;
 
-                                let _ = conversations::update_conversation(
-                                    &self.db,
-                                    &msg.user_id,
-                                    &self.conversation_id,
-                                    UpdateConversationRequest {
-                                        title: None,
-                                        session_id: Some(sess_id.clone()),
-                                        organization: None,
-                                    },
-                                ).await;
+                                // Only update the conversation's session_id if resume
+                                // succeeded (or this is a fresh conversation with no prior
+                                // session). When resume fails, preserving the original
+                                // session_id allows future resume attempts.
+                                if !resume_failed {
+                                    let _ = conversations::update_conversation(
+                                        &self.db,
+                                        &msg.user_id,
+                                        &self.conversation_id,
+                                        UpdateConversationRequest {
+                                            title: None,
+                                            session_id: Some(sess_id.clone()),
+                                            organization: None,
+                                        },
+                                    ).await;
+                                }
 
                                 if let Err(e) = checkpoints::upsert_checkpoint(&self.db, &self.conversation_id, sess_id, tool_call_count).await {
                                     tracing::warn!("[WORKER] Failed to update checkpoint: {}", e);
@@ -534,6 +563,8 @@ impl ConversationWorker {
                         }
                         Some(Err(e)) => {
                             tracing::error!("[WORKER] Error receiving message #{}: {}", message_count, e);
+                            // Mark checkpoint as interrupted so it doesn't block restarts
+                            let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
                             self.emit_event(&StreamEvent::Status {
                                 status: "failed".to_string(),
                                 message: Some(format!("Error: {}", e)),
@@ -541,7 +572,17 @@ impl ConversationWorker {
                             break;
                         }
                         None => {
-                            tracing::warn!("[WORKER] Stream ended without Result for {}", self.conversation_id);
+                            tracing::error!(
+                                "[WORKER] INCOMPLETE SESSION: Stream ended without Result \
+                                for conversation {} (session: {:?}). The session file will \
+                                have no result entry — future --resume may fail silently. \
+                                Tool calls processed: {}",
+                                self.conversation_id,
+                                resume_session_id,
+                                tool_call_count
+                            );
+                            // Mark checkpoint as interrupted — stream ended unexpectedly
+                            let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
                             break;
                         }
                     }
@@ -551,6 +592,10 @@ impl ConversationWorker {
                         status: "heartbeat".to_string(),
                         message: None,
                     }).await;
+                    // Touch checkpoint updated_at so staleness detection knows we're alive.
+                    // Without this, a long-running agent (e.g., 10-minute tool call) would
+                    // look stale and get auto-cleaned by the restart watcher.
+                    let _ = checkpoints::touch_checkpoint(&self.db, &self.conversation_id).await;
                 }
             }
         }
