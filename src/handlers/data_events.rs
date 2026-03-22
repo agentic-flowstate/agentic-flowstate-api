@@ -1,6 +1,7 @@
 use axum::{
     extract::{Query, State},
     response::sse::{Event, KeepAlive, Sse},
+    Extension,
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 use ticketing_system::{epics, slices, tickets, Epic, Slice, SqlitePool, Ticket};
+
+use crate::auth_middleware::AuthenticatedUser;
 
 #[derive(Debug, Deserialize)]
 pub struct DataSubscribeQuery {
@@ -128,6 +131,41 @@ pub async fn subscribe_data(
 
             // Poll every 2 seconds
             tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    };
+
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+/// GET /api/my-tickets/subscribe
+/// SSE endpoint for real-time updates to tickets assigned to the authenticated user.
+/// Polls across all organizations — no org header needed.
+pub async fn subscribe_my_tickets(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let user_id = user.user_id;
+
+    let stream = async_stream::stream! {
+        let mut last_hash: u64 = 0;
+
+        loop {
+            if let Ok(my_tickets) = tickets::list_tickets_by_assignee(&pool, &user_id).await {
+                let hash = hash_tickets(&my_tickets);
+                if hash != last_hash {
+                    last_hash = hash;
+                    let event = DataEvent::Tickets { tickets: my_tickets };
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        yield Ok(Event::default().data(json));
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     };
 

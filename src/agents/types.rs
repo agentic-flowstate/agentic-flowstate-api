@@ -337,4 +337,12 @@ pub enum StreamEvent {
         total_events: usize,
         agent_status: String,
     },
+    /// Auto-generated conversation title (sent after first message)
+    TitleUpdate {
+        title: String,
+    },
+    /// Auto-detected organization for the conversation (sent after first message)
+    OrgUpdate {
+        organization: String,
+    },
 }

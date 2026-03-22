@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
-use super::chat_stream::{self, ChatConfig, SseStream};
+use super::chat_stream::{self, ChatConfig, ChatImageData, SseStream};
 use super::chat_client_manager::ChatClientManager;
 
 #[derive(Debug, Deserialize)]
@@ -17,6 +17,7 @@ pub struct WorkspaceManagerRequest {
     #[allow(dead_code)]
     pub organization: Option<String>,
     pub conversation_id: Option<String>,
+    pub images: Option<Vec<ChatImageData>>,
 }
 
 fn config() -> ChatConfig {
@@ -43,5 +44,6 @@ pub async fn workspace_manager_chat(
         req.conversation_id,
         config(),
         user.user_id,
+        req.images,
     )
 }

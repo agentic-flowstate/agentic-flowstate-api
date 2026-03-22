@@ -1,7 +1,7 @@
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::StatusCode,
-    response::sse::{Event, KeepAlive, Sse},
+    http::{header, StatusCode},
+    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
     Json,
 };
 use futures::stream::Stream;
@@ -17,6 +17,8 @@ use std::pin::Pin;
 
 
 use crate::auth_middleware::AuthenticatedUser;
+use super::chat_client_manager::ChatClientManager;
+use super::chat_stream::get_broadcast_sender;
 
 #[derive(Debug, Deserialize)]
 pub struct ListConversationsQuery {
@@ -51,12 +53,17 @@ pub async fn list_conversations(
 /// Get single conversation by ID (GET /api/conversations/:id)
 pub async fn get_conversation(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Conversation>, (StatusCode, String)> {
     let conv = conversations::get_conversation(&pool, &id, true)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+
+    if conv.user_id != user.user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
 
     Ok(Json(conv))
 }
@@ -89,6 +96,24 @@ pub async fn update_conversation(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Serialize)]
+pub struct ToggleConversationFavoriteResponse {
+    pub is_favorited: bool,
+}
+
+/// Toggle conversation favorite (POST /api/conversations/:id/favorite)
+pub async fn toggle_conversation_favorite(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ToggleConversationFavoriteResponse>, (StatusCode, String)> {
+    let is_favorited = conversations::toggle_favorite(&pool, &user.user_id, &id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ToggleConversationFavoriteResponse { is_favorited }))
+}
+
 /// Delete a conversation (DELETE /api/conversations/:id)
 pub async fn delete_conversation(
     State(pool): State<Arc<SqlitePool>>,
@@ -102,17 +127,63 @@ pub async fn delete_conversation(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Add a message to a conversation (POST /api/conversations/:id/messages)
-pub async fn add_message(
+/// Cancel a running conversation's agent (POST /api/conversations/:id/cancel)
+pub async fn cancel_conversation(
     State(pool): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
-    Json(req): Json<AddMessageRequest>,
-) -> Result<(StatusCode, Json<ConversationMessage>), (StatusCode, String)> {
-    // Verify conversation exists
-    let _ = conversations::get_conversation(&pool, &id, false)
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Verify conversation belongs to user
+    let conv = conversations::get_conversation(&pool, &id, false)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+    if conv.user_id != user.user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
+
+    // Try to interrupt the running agent
+    match manager.interrupt(&id).await {
+        Ok(true) => {
+            tracing::info!("[CANCEL] Interrupted agent for conversation {}", id);
+            // Broadcast cancelled status so SSE clients get notified
+            let event = crate::agents::StreamEvent::Status {
+                status: "cancelled".to_string(),
+                message: Some("Cancelled by user".to_string()),
+            };
+            if let Ok(json) = serde_json::to_string(&event) {
+                let broadcast_tx = get_broadcast_sender(&id).await;
+                let _ = broadcast_tx.send((-1, json));
+            }
+        }
+        Ok(false) => {
+            tracing::info!("[CANCEL] No active client for conversation {}, nothing to cancel", id);
+        }
+        Err(e) => {
+            tracing::warn!("[CANCEL] Interrupt failed for {}: {}", id, e);
+            // Don't fail the request — the agent might have already finished
+        }
+    }
+
+    Ok(StatusCode::OK)
+}
+
+/// Add a message to a conversation (POST /api/conversations/:id/messages)
+pub async fn add_message(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+    Json(req): Json<AddMessageRequest>,
+) -> Result<(StatusCode, Json<ConversationMessage>), (StatusCode, String)> {
+    // Verify conversation exists and belongs to user
+    let conv = conversations::get_conversation(&pool, &id, false)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+    if conv.user_id != user.user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
 
     let msg = conversations::add_message(&pool, &id, req)
         .await
@@ -129,14 +200,18 @@ pub struct UpdateMessageRequest {
 /// Update a message (PATCH /api/conversations/:id/messages/:message_id)
 pub async fn update_message(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path((conv_id, message_id)): Path<(String, String)>,
     Json(req): Json<UpdateMessageRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // Verify conversation exists
-    let _ = conversations::get_conversation(&pool, &conv_id, false)
+    // Verify conversation exists and belongs to user
+    let conv = conversations::get_conversation(&pool, &conv_id, false)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+    if conv.user_id != user.user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
 
     conversations::update_message(&pool, &message_id, &req.content)
         .await
@@ -148,13 +223,17 @@ pub async fn update_message(
 /// List messages for a conversation (GET /api/conversations/:id/messages)
 pub async fn list_messages(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<ConversationMessage>>, (StatusCode, String)> {
-    // Verify conversation exists
-    let _ = conversations::get_conversation(&pool, &id, false)
+    // Verify conversation exists and belongs to user
+    let conv = conversations::get_conversation(&pool, &id, false)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+    if conv.user_id != user.user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
 
     let messages = conversations::list_messages(&pool, &id)
         .await
@@ -167,8 +246,18 @@ pub async fn list_messages(
 /// Returns whether an agent is actively processing this conversation.
 pub async fn get_conversation_checkpoint(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationCheckpointResponse>, (StatusCode, String)> {
+    // Verify conversation belongs to user
+    let conv = conversations::get_conversation(&pool, &id, false)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+    if conv.user_id != user.user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
+
     let checkpoint = ticketing_system::checkpoints::get_checkpoint(&pool, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -305,4 +394,34 @@ pub async fn subscribe_conversations(
             .interval(Duration::from_secs(15))
             .text("ping")
     )
+}
+
+/// GET /api/chat-images/:conversation_id/:filename
+/// Serve an image attachment from the chat-images directory.
+pub async fn get_chat_image(
+    Path((conversation_id, filename)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".agentic-flowstate/chat-images")
+        .join(&conversation_id)
+        .join(&filename);
+
+    match tokio::fs::read(&path).await {
+        Ok(data) => {
+            let mime = if filename.ends_with(".png") {
+                "image/png"
+            } else if filename.ends_with(".gif") {
+                "image/gif"
+            } else if filename.ends_with(".webp") {
+                "image/webp"
+            } else if filename.ends_with(".heic") {
+                "image/heic"
+            } else {
+                "image/jpeg"
+            };
+            ([(header::CONTENT_TYPE, mime)], data).into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }

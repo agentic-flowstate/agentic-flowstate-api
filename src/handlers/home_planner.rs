@@ -7,13 +7,14 @@ use serde::Deserialize;
 
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
-use super::chat_stream::{self, ChatConfig, SseStream};
+use super::chat_stream::{self, ChatConfig, ChatImageData, SseStream};
 use super::chat_client_manager::ChatClientManager;
 
 #[derive(Debug, Deserialize)]
 pub struct HomePlannerRequest {
     pub message: String,
     pub conversation_id: Option<String>,
+    pub images: Option<Vec<ChatImageData>>,
 }
 
 /// Build config (no data in system prompt) and load home context separately
@@ -84,5 +85,6 @@ pub async fn home_planner_chat(
         req.conversation_id,
         config,
         user.user_id,
+        req.images,
     )
 }

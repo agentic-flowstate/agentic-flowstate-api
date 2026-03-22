@@ -43,4 +43,21 @@ impl ChatClientManager {
         let mut clients = self.clients.lock().await;
         clients.remove(conversation_id);
     }
+
+    /// Interrupt a running conversation's agent via cc-sdk interrupt().
+    /// Returns Ok(true) if interrupted, Ok(false) if no active client found.
+    pub async fn interrupt(&self, conversation_id: &str) -> Result<bool, String> {
+        let client_arc = {
+            let clients = self.clients.lock().await;
+            clients.get(conversation_id).cloned()
+        };
+        if let Some(client_arc) = client_arc {
+            let mut client = client_arc.lock().await;
+            client.sdk_client.interrupt().await
+                .map_err(|e| format!("Interrupt failed: {}", e))?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }

@@ -91,6 +91,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Clear any stale restart queue entries from before the restart
+    match ticketing_system::restart_queue::clear_all_pending(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::info!("Cleared {} stale pending restart(s) from previous run", count);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!("Failed to clear stale restart queue: {}", e);
+        }
+    }
+
     // Create shutdown token for coordinated cancellation of all background tasks.
     // When cancelled, all tasks using a child token will break out of their loops.
     let shutdown_token = CancellationToken::new();
@@ -216,6 +227,93 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Deferred restart watcher: polls every 10 seconds for queued restarts.
+    // When a restart is pending AND no active work remains, executes the restart.
+    {
+        let restart_pool = db_pool.clone();
+        let restart_shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = restart_shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+
+                // Check for pending restarts
+                let pending = match ticketing_system::restart_queue::get_pending_restart(&restart_pool).await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!("[RESTART_WATCHER] Failed to check restart queue: {}", e);
+                        continue;
+                    }
+                };
+
+                // Pending restart found — check if all active work is done
+                let active = match ticketing_system::restart_queue::count_active_work(&restart_pool).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!("[RESTART_WATCHER] Failed to count active work: {}", e);
+                        continue;
+                    }
+                };
+
+                if active.total > 0 {
+                    tracing::debug!(
+                        "[RESTART_WATCHER] Restart queued for '{}' but {} agent(s) + {} conversation(s) still active, waiting...",
+                        pending.service, active.agent_run_count, active.checkpoint_count
+                    );
+                    continue;
+                }
+
+                // All clear — execute the deferred restart
+                tracing::info!(
+                    "[RESTART_WATCHER] Executing deferred {} for service '{}' (requested by {:?})",
+                    pending.action, pending.service, pending.requested_by
+                );
+
+                // Mark as executed before we restart (in case restart kills us mid-write)
+                let _ = ticketing_system::restart_queue::mark_executed(&restart_pool, pending.id).await;
+
+                // Log to system_logs
+                system_log_helper::log_info(
+                    &restart_pool,
+                    "restart_watcher",
+                    &format!("Executing deferred {} for '{}'", pending.action, pending.service),
+                    None,
+                ).await;
+
+                if pending.action == "setup" {
+                    // For setup, we need to run the setup script which will rebuild and restart
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
+                    let setup_script = format!("{}/projects/agentic-flowstate-setup/setup.sh", home);
+                    match std::process::Command::new("bash")
+                        .arg(&setup_script)
+                        .current_dir(format!("{}/projects/agentic-flowstate-setup", home))
+                        .spawn()
+                    {
+                        Ok(_child) => {
+                            tracing::info!("[RESTART_WATCHER] Setup script spawned, it will restart the API server");
+                        }
+                        Err(e) => {
+                            tracing::error!("[RESTART_WATCHER] Failed to spawn setup script: {}", e);
+                        }
+                    }
+                } else {
+                    // For restart, SIGTERM ourselves — launchd KeepAlive will restart with new binary
+                    let pid = std::process::id();
+                    tracing::info!("[RESTART_WATCHER] Sending SIGTERM to self (PID {})", pid);
+                    let _ = std::process::Command::new("kill")
+                        .args(&["-TERM", &pid.to_string()])
+                        .output();
+                }
+
+                break;
+            }
+        });
+    }
+
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/api/auth/register", post(handlers::auth::register))
@@ -325,6 +423,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/emails/send", post(handlers::send_email))
         .route("/api/emails/stats", get(handlers::get_email_stats))
         .route("/api/emails/search", get(handlers::search_emails))
+        .route("/api/emails/archive", post(handlers::archive_emails))
+        .route("/api/emails/unarchive", post(handlers::unarchive_emails))
         .route("/api/emails/threads", get(handlers::list_threads))
         .route("/api/emails/threads/:thread_id", get(handlers::get_thread))
         .route("/api/emails/attachments/:attachment_id", get(handlers::download_attachment))
@@ -377,6 +477,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/full-access/chat",
             post(handlers::full_access_chat))
 
+        // My Tickets SSE (live updates across all orgs)
+        .route("/api/my-tickets/subscribe", get(handlers::subscribe_my_tickets))
+
         // Project Workload routes
         .route("/api/project-workload",
             get(handlers::list_project_workload))
@@ -413,6 +516,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_conversation)
             .patch(handlers::update_conversation)
             .delete(handlers::delete_conversation))
+        .route("/api/conversations/:id/favorite",
+            post(handlers::toggle_conversation_favorite))
+        .route("/api/conversations/:id/cancel",
+            post(handlers::cancel_conversation))
         .route("/api/conversations/:id/checkpoint",
             get(handlers::get_conversation_checkpoint))
         .route("/api/conversations/:id/stream",
@@ -422,6 +529,10 @@ async fn main() -> anyhow::Result<()> {
             .post(handlers::add_message))
         .route("/api/conversations/:conv_id/messages/:message_id",
             patch(handlers::update_message))
+
+        // Chat image serving route
+        .route("/api/chat-images/:conversation_id/:filename",
+            get(handlers::get_chat_image))
 
         // DM routes (user-scoped, 1:1 direct messages)
         .route("/api/dms",

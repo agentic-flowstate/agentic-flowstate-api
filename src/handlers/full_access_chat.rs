@@ -7,13 +7,14 @@ use serde::Deserialize;
 
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
-use super::chat_stream::{self, ChatConfig, SseStream};
+use super::chat_stream::{self, ChatConfig, ChatImageData, SseStream};
 use super::chat_client_manager::ChatClientManager;
 
 #[derive(Debug, Deserialize)]
 pub struct FullAccessChatRequest {
     pub message: String,
     pub conversation_id: Option<String>,
+    pub images: Option<Vec<ChatImageData>>,
 }
 
 /// POST /api/full-access/chat
@@ -46,5 +47,6 @@ pub async fn full_access_chat(
         req.conversation_id,
         config,
         user.user_id,
+        req.images,
     )
 }

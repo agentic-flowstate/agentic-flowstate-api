@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -23,6 +24,8 @@ struct ApnsPayload {
     aps: Aps,
     #[serde(skip_serializing_if = "Option::is_none")]
     conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,7 +105,11 @@ impl ApnsService {
         let is_sandbox = std::env::var("APNS_SANDBOX").unwrap_or_default() == "true";
         let base_url = if is_sandbox { APNS_SANDBOX } else { APNS_PRODUCTION }.to_string();
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .http2_prior_knowledge()
+            .build()
+            .expect("Failed to build HTTP/2 APNs client");
 
         tracing::info!("[APNS] Initialized (endpoint: {})", base_url);
 
@@ -156,8 +163,14 @@ impl ApnsService {
     }
 
     /// Send a push notification to a single device token.
-    pub async fn send(&self, device_token: &str, title: &str, body: &str, conversation_id: Option<&str>) -> Result<(), String> {
-        let token = self.get_token().await?;
+    pub async fn send(&self, device_token: &str, title: &str, body: &str, conversation_id: Option<&str>, agent_name: Option<&str>) -> Result<(), String> {
+        let token = match self.get_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("[APNS] JWT token generation failed: {}", e);
+                return Err(e);
+            }
+        };
 
         let payload = ApnsPayload {
             aps: Aps {
@@ -169,11 +182,13 @@ impl ApnsService {
                 thread_id: "agent-completion".to_string(),
             },
             conversation_id: conversation_id.map(|s| s.to_string()),
+            agent_name: agent_name.map(|s| s.to_string()),
         };
 
         let url = format!("{}/3/device/{}", self.base_url, device_token);
+        tracing::info!("[APNS] Sending to {} via {}", &device_token[..std::cmp::min(8, device_token.len())], self.base_url);
 
-        let response = self.client
+        let response = match self.client
             .post(&url)
             .header("authorization", format!("bearer {}", token))
             .header("apns-topic", BUNDLE_ID)
@@ -183,13 +198,19 @@ impl ApnsService {
             .header("apns-collapse-id", conversation_id.unwrap_or("agent-completion"))
             .json(&payload)
             .send()
-            .await
-            .map_err(|e| format!("APNs request failed: {}", e))?;
+            .await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("[APNS] HTTP request failed: {} | source: {:?} | is_connect: {} | is_timeout: {}",
+                        e, e.source(), e.is_connect(), e.is_timeout());
+                    return Err(format!("APNs request failed: {}", e));
+                }
+            };
 
         let status = response.status();
 
         if status.is_success() {
-            tracing::debug!("[APNS] Push sent to {}", &device_token[..std::cmp::min(8, device_token.len())]);
+            tracing::info!("[APNS] Push sent OK (HTTP {}) to {}", status.as_u16(), &device_token[..std::cmp::min(8, device_token.len())]);
             Ok(())
         } else {
             let error: ApnsErrorResponse = response.json().await.unwrap_or(ApnsErrorResponse { reason: None });
@@ -208,20 +229,27 @@ impl ApnsService {
         title: &str,
         body: &str,
         conversation_id: Option<&str>,
+        agent_name: Option<&str>,
     ) -> Result<(), String> {
-        let tokens = ticketing_system::device_tokens::get_tokens_for_user(db, user_id)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+        let tokens = match ticketing_system::device_tokens::get_tokens_for_user(db, user_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("[APNS] DB error fetching tokens for user {}: {}", user_id, e);
+                return Err(format!("DB error: {}", e));
+            }
+        };
+
+        tracing::info!("[APNS] Found {} device token(s) for user {}", tokens.len(), user_id);
 
         if tokens.is_empty() {
-            tracing::debug!("[APNS] No device tokens for user {}", user_id);
             return Ok(());
         }
 
         for token in &tokens {
-            match self.send(token, title, body, conversation_id).await {
+            match self.send(token, title, body, conversation_id, agent_name).await {
                 Ok(()) => {}
                 Err(reason) => {
+                    tracing::warn!("[APNS] Send failed for user {}: {}", user_id, reason);
                     // Remove invalid tokens
                     if reason == "BadDeviceToken" || reason == "Unregistered" || reason == "DeviceTokenNotForTopic" {
                         tracing::info!("[APNS] Removing invalid token for user {}", user_id);

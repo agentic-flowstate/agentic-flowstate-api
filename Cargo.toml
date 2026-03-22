@@ -62,7 +62,7 @@ tempfile = "3.8"
 tokio-process = "0.2"
 
 # HTTP client for OpenAI API
-reqwest = { version = "0.12", features = ["json", "multipart"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
 base64 = "0.22"
 lazy_static = "1.4"
 # APNs push notifications (JWT signing)

@@ -11,6 +11,8 @@ pub mod email_thread_tickets;
 pub mod ticket_history;
 pub mod chat_stream;
 pub mod chat_client_manager;
+pub mod conversation_worker;
+pub mod conversation_worker_manager;
 pub mod workspace_manager;
 pub mod conversations;
 pub mod data_events;
@@ -33,6 +35,7 @@ pub mod client_telemetry;
 pub mod debug_log;
 pub mod voice_transcribe;
 pub mod device_tokens;
+pub mod title_generator;
 
 pub use epics::*;
 pub use slices::*;

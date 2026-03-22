@@ -556,3 +556,46 @@ pub async fn download_attachment(
 
     Ok(response)
 }
+
+// ============================================================================
+// Archive / Unarchive endpoints
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ArchiveEmailsRequest {
+    pub email_ids: Vec<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArchiveEmailsResponse {
+    pub archived: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnarchiveEmailsResponse {
+    pub unarchived: u64,
+}
+
+/// Archive emails (POST /api/emails/archive)
+pub async fn archive_emails(
+    State(pool): State<Arc<SqlitePool>>,
+    Json(req): Json<ArchiveEmailsRequest>,
+) -> Result<Json<ArchiveEmailsResponse>, (StatusCode, String)> {
+    let count = emails::update_email_folders(&pool, &req.email_ids, "Archive")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ArchiveEmailsResponse { archived: count }))
+}
+
+/// Unarchive emails (POST /api/emails/unarchive)
+pub async fn unarchive_emails(
+    State(pool): State<Arc<SqlitePool>>,
+    Json(req): Json<ArchiveEmailsRequest>,
+) -> Result<Json<UnarchiveEmailsResponse>, (StatusCode, String)> {
+    let count = emails::update_email_folders(&pool, &req.email_ids, "INBOX")
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(UnarchiveEmailsResponse { unarchived: count }))
+}

@@ -152,5 +152,7 @@ pub fn get_event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::Result { .. } => "result",
         StreamEvent::UserMessage { .. } => "user_message",
         StreamEvent::ReplayComplete { .. } => "replay_complete",
+        StreamEvent::TitleUpdate { .. } => "title_update",
+        StreamEvent::OrgUpdate { .. } => "org_update",
     }
 }

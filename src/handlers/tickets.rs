@@ -22,23 +22,37 @@ pub struct TicketQuery {
     pub slice_id: Option<String>,
 }
 
-// List all tickets for an organization
+#[derive(Debug, Deserialize)]
+pub struct AllTicketsQuery {
+    pub assignee: Option<String>,
+}
+
+// List all tickets for an organization, optionally filtered by assignee
 pub async fn list_all_tickets(
     State(pool): State<Arc<SqlitePool>>,
     headers: HeaderMap,
+    Query(params): Query<AllTicketsQuery>,
 ) -> Response {
     let organization = get_organization(&headers);
 
-    match ticketing_system::tickets::list_tickets_by_organization(&pool, &organization).await {
-        Ok(tickets) => {
-            (StatusCode::OK, Json(tickets)).into_response()
+    if let Some(assignee) = params.assignee {
+        // Use MCP tool for assignee-filtered query
+        let args = json!({ "organization": organization, "assignee": assignee });
+        match call_mcp_tool("list_tickets", Some(args)).await {
+            Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+            Err(e) => {
+                error!("Failed to list tickets by assignee: {:?}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to list tickets" }))).into_response()
+            }
         }
-        Err(e) => {
-            error!("Failed to list all tickets: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to list tickets: {}", e) }))
-            ).into_response()
+    } else {
+        // No assignee filter — list all tickets for org directly
+        match ticketing_system::tickets::list_tickets_by_organization(&pool, &organization).await {
+            Ok(tickets) => (StatusCode::OK, Json(tickets)).into_response(),
+            Err(e) => {
+                error!("Failed to list all tickets: {:?}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to list tickets" }))).into_response()
+            }
         }
     }
 }
