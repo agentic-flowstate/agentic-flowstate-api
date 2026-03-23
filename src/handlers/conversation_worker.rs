@@ -883,26 +883,12 @@ impl ConversationWorker {
                                     router_text_parts.push(text_content.text.clone());
                                 }
                                 ContentBlock::ToolUse(tool_use) => {
+                                    // Log but don't emit — router is invisible to the user.
+                                    // Only RouterResult is emitted at the end.
                                     tracing::info!("[ROUTER] Tool use: {} ({})", tool_use.name, tool_use.id);
-                                    self.emit_event(&StreamEvent::RouterToolUse {
-                                        id: tool_use.id.clone(),
-                                        name: tool_use.name.clone(),
-                                        input: tool_use.input.clone(),
-                                    }).await;
                                 }
-                                ContentBlock::ToolResult(tool_result) => {
-                                    let content = match &tool_result.content {
-                                        Some(cc_sdk::ContentValue::Text(s)) => s.clone(),
-                                        Some(cc_sdk::ContentValue::Structured(vals)) => {
-                                            serde_json::to_string(vals).unwrap_or_default()
-                                        }
-                                        None => String::new(),
-                                    };
-                                    self.emit_event(&StreamEvent::RouterToolResult {
-                                        tool_use_id: tool_result.tool_use_id.clone(),
-                                        content,
-                                        is_error: tool_result.is_error.unwrap_or(false),
-                                    }).await;
+                                ContentBlock::ToolResult(_tool_result) => {
+                                    // Silent — router tool results are not shown to the user.
                                 }
                                 ContentBlock::Thinking(_) => {
                                     // Ignore thinking blocks from router

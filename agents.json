@@ -259,7 +259,7 @@
     "ticket-router": {
       "model": "opus",
       "effort": "low",
-      "max_turns": 3,
+      "max_turns": 5,
       "prompt_file": "ticket-router.txt",
       "tools": [
         "mcp__agentic-mcp__search_tickets",
