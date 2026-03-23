@@ -268,51 +268,48 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // All agents finished — execute the deferred restart
+                // All agents finished — write pending_restart.json flag file.
+                // The iOS app polls for this and shows the approval UI.
+                // We do NOT restart directly — the user must approve first.
                 tracing::info!(
-                    "[RESTART_WATCHER] Executing deferred {} for service '{}' (requested by {:?})",
+                    "[RESTART_WATCHER] Agents finished. Writing pending_restart.json for deferred {} of '{}' (requested by {:?})",
                     pending.action, pending.service, pending.requested_by
                 );
 
-                // Mark as executed before we restart (in case restart kills us mid-write)
+                // Mark as executed in the DB queue
                 let _ = ticketing_system::restart_queue::mark_executed(&restart_pool, pending.id).await;
 
                 // Log to system_logs
                 system_log_helper::log_info(
                     &restart_pool,
                     "restart_watcher",
-                    &format!("Executing deferred {} for '{}'", pending.action, pending.service),
+                    &format!("Agents finished — queuing {} for '{}' for user approval", pending.action, pending.service),
                     None,
                 ).await;
 
-                if pending.action == "setup" {
-                    // For setup, run the setup script which rebuilds and restarts
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
-                    let setup_script = format!("{}/projects/agentic-flowstate-setup/setup.sh", home);
-                    match std::process::Command::new("bash")
-                        .arg(&setup_script)
-                        .current_dir(format!("{}/projects/agentic-flowstate-setup", home))
-                        .spawn()
-                    {
-                        Ok(_child) => {
-                            tracing::info!("[RESTART_WATCHER] Setup script spawned, it will restart the API server");
-                        }
-                        Err(e) => {
-                            tracing::error!("[RESTART_WATCHER] Failed to spawn setup script: {}", e);
-                        }
-                    }
+                // Write the flag file for the iOS app to detect
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
+                let data_dir = format!("{}/.agentic-flowstate", home);
+                let _ = std::fs::create_dir_all(&data_dir);
+                let pending_path = format!("{}/pending_restart.json", data_dir);
+
+                let restart_type = if pending.action == "setup" { "setup" } else { "restart" };
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let flag = serde_json::json!({
+                    "type": restart_type,
+                    "service": pending.service,
+                    "requested_at": ts,
+                    "requested_by": pending.requested_by
+                });
+
+                if let Err(e) = std::fs::write(&pending_path, serde_json::to_string_pretty(&flag).unwrap_or_default()) {
+                    tracing::error!("[RESTART_WATCHER] Failed to write pending_restart.json: {}", e);
                 } else {
-                    // For restart, use launchctl kickstart -k for atomic restart
-                    let uid = std::process::Command::new("id")
-                        .arg("-u")
-                        .output()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                        .unwrap_or_else(|_| "501".to_string());
-                    let target = format!("gui/{}/com.agentic.api", uid);
-                    tracing::info!("[RESTART_WATCHER] Restarting via launchctl kickstart -k {}", target);
-                    let _ = std::process::Command::new("launchctl")
-                        .args(&["kickstart", "-k", &target])
-                        .output();
+                    tracing::info!("[RESTART_WATCHER] pending_restart.json written — waiting for user approval via iOS app");
                 }
 
                 break;
@@ -630,6 +627,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/ios-install/log", get(handlers::admin_reload::ios_install_log))
         .route("/api/admin/pending-restart", get(handlers::admin_reload::get_pending_restart)
             .delete(handlers::admin_reload::clear_pending_restart))
+        .route("/api/admin/restart", post(handlers::admin_reload::restart_api))
         .route("/api/admin/client-events", get(handlers::client_telemetry::list_client_events))
         .route("/api/meeting-agent/chat", post(handlers::meeting_agent_chat))
         .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_admin))

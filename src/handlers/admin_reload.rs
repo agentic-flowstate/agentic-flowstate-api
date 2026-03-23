@@ -294,3 +294,32 @@ pub async fn clear_pending_restart() -> Response {
     let _ = fs::remove_file(&pending_path);
     (StatusCode::OK, Json(json!({"cleared": true}))).into_response()
 }
+
+/// POST /api/admin/restart — trigger API server restart via launchctl kickstart -k.
+///
+/// Called by the iOS app AFTER the user approves a pending restart.
+/// Spawns the restart in a background thread with a small delay so the HTTP
+/// response can be sent before the process gets killed.
+pub async fn restart_api() -> Response {
+    // Clear the pending restart flag first
+    let home = dirs::home_dir().unwrap_or_default();
+    let pending_path = home.join(".agentic-flowstate/pending_restart.json");
+    let _ = fs::remove_file(&pending_path);
+
+    // Spawn restart in a background thread with a delay so we can return the response
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "501".to_string());
+        let target = format!("gui/{}/com.agentic.api", uid);
+        tracing::info!("Executing approved restart via launchctl kickstart -k {}", target);
+        let _ = std::process::Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
+            .output();
+    });
+
+    (StatusCode::OK, Json(json!({"status": "restarting"}))).into_response()
+}
