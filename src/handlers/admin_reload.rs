@@ -193,7 +193,7 @@ echo ""
 
 xcodebuild build \
     -project AgenticFlowstate.xcodeproj \
-    -scheme AgenticFlowstate_iOS \
+    -scheme AgenticFlowstate \
     -destination "platform=iOS,id=$DEVICE_ID" \
     -configuration Debug \
     -allowProvisioningUpdates \
@@ -244,4 +244,53 @@ pub async fn ios_install_log() -> Response {
         Ok(content) => (StatusCode::OK, Json(json!({"log": content}))).into_response(),
         Err(_) => (StatusCode::OK, Json(json!({"log": ""}))).into_response(),
     }
+}
+
+// ---- Pending Restart Flag ----
+
+/// GET /api/admin/pending-restart — check if there's a pending restart/setup request.
+///
+/// MCP handlers write `~/.agentic-flowstate/pending_restart.json` when a restart
+/// is needed. The iOS app polls this to detect when to show the restart UI.
+pub async fn get_pending_restart() -> Response {
+    let home = dirs::home_dir().unwrap_or_default();
+    let pending_path = home.join(".agentic-flowstate/pending_restart.json");
+    let ios_pending_path = home.join(".agentic-flowstate/pending_ios_install.json");
+
+    // Check for pending restart flag
+    if let Ok(content) = fs::read_to_string(&pending_path) {
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+            return (StatusCode::OK, Json(json!({
+                "pending": true,
+                "type": data.get("type").and_then(|v| v.as_str()).unwrap_or("restart"),
+                "requested_at": data.get("requested_at"),
+                "requested_by": data.get("requested_by"),
+                "service": data.get("service")
+            }))).into_response();
+        }
+    }
+
+    // Check for pending iOS install flag
+    if let Ok(content) = fs::read_to_string(&ios_pending_path) {
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+            return (StatusCode::OK, Json(json!({
+                "pending": true,
+                "type": "ios_install",
+                "requested_at": data.get("requested_at"),
+            }))).into_response();
+        }
+    }
+
+    (StatusCode::OK, Json(json!({
+        "pending": false
+    }))).into_response()
+}
+
+/// DELETE /api/admin/pending-restart — clear the pending restart flag.
+/// Called after the restart has been executed.
+pub async fn clear_pending_restart() -> Response {
+    let home = dirs::home_dir().unwrap_or_default();
+    let pending_path = home.join(".agentic-flowstate/pending_restart.json");
+    let _ = fs::remove_file(&pending_path);
+    (StatusCode::OK, Json(json!({"cleared": true}))).into_response()
 }

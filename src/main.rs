@@ -228,7 +228,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Deferred restart watcher: polls every 10 seconds for queued restarts.
-    // When a restart is pending AND no active work remains, executes the restart.
+    // When a restart is pending AND no active agent runs remain, executes the restart.
+    // Only agent runs block restarts — conversations (MCP tool calls) do NOT.
     {
         let restart_pool = db_pool.clone();
         let restart_shutdown = shutdown_token.clone();
@@ -250,7 +251,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                // Pending restart found — check if all active work is done
+                // Pending restart found — check if any agent runs are still active
                 let active = match ticketing_system::restart_queue::count_active_work(&restart_pool).await {
                     Ok(a) => a,
                     Err(e) => {
@@ -261,13 +262,13 @@ async fn main() -> anyhow::Result<()> {
 
                 if active.total > 0 {
                     tracing::debug!(
-                        "[RESTART_WATCHER] Restart queued for '{}' but {} agent(s) + {} conversation(s) still active, waiting...",
-                        pending.service, active.agent_run_count, active.checkpoint_count
+                        "[RESTART_WATCHER] Restart queued for '{}' but {} agent run(s) still active, waiting...",
+                        pending.service, active.agent_run_count
                     );
                     continue;
                 }
 
-                // All clear — execute the deferred restart
+                // All agents finished — execute the deferred restart
                 tracing::info!(
                     "[RESTART_WATCHER] Executing deferred {} for service '{}' (requested by {:?})",
                     pending.action, pending.service, pending.requested_by
@@ -285,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
                 ).await;
 
                 if pending.action == "setup" {
-                    // For setup, we need to run the setup script which will rebuild and restart
+                    // For setup, run the setup script which rebuilds and restarts
                     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
                     let setup_script = format!("{}/projects/agentic-flowstate-setup/setup.sh", home);
                     match std::process::Command::new("bash")
@@ -301,11 +302,16 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 } else {
-                    // For restart, SIGTERM ourselves — launchd KeepAlive will restart with new binary
-                    let pid = std::process::id();
-                    tracing::info!("[RESTART_WATCHER] Sending SIGTERM to self (PID {})", pid);
-                    let _ = std::process::Command::new("kill")
-                        .args(&["-TERM", &pid.to_string()])
+                    // For restart, use launchctl kickstart -k for atomic restart
+                    let uid = std::process::Command::new("id")
+                        .arg("-u")
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_else(|_| "501".to_string());
+                    let target = format!("gui/{}/com.agentic.api", uid);
+                    tracing::info!("[RESTART_WATCHER] Restarting via launchctl kickstart -k {}", target);
+                    let _ = std::process::Command::new("launchctl")
+                        .args(&["kickstart", "-k", &target])
                         .output();
                 }
 
@@ -314,6 +320,9 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Mark service as ready now that all initialization is complete
+    handlers::health::set_ready();
+
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/api/auth/register", post(handlers::auth::register))
@@ -321,6 +330,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/logout", post(handlers::auth::logout))
         .route("/api/auth/me", get(handlers::auth::me))
         .route("/health", get(|| async { "OK" }))
+        .route("/health/ready", get(handlers::health::ready))
         .route("/api/debug-log", post(handlers::debug_log::post_debug_log).get(handlers::debug_log::get_debug_log))
 ;
 
@@ -618,6 +628,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/reload/log", get(handlers::admin_reload::reload_log))
         .route("/api/admin/ios-install", post(handlers::admin_reload::ios_install))
         .route("/api/admin/ios-install/log", get(handlers::admin_reload::ios_install_log))
+        .route("/api/admin/pending-restart", get(handlers::admin_reload::get_pending_restart)
+            .delete(handlers::admin_reload::clear_pending_restart))
         .route("/api/admin/client-events", get(handlers::client_telemetry::list_client_events))
         .route("/api/meeting-agent/chat", post(handlers::meeting_agent_chat))
         .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_admin))
@@ -729,9 +741,9 @@ async fn shutdown_signal(db_pool: Arc<ticketing_system::SqlitePool>, shutdown_to
         },
     }
 
-    // Give running agents a brief moment to finish current tool calls
-    // (in practice, this won't wait for long-running tools, just allows
-    // any in-flight checkpointing to complete)
+    // Mark service as not ready immediately — health probes return 503
+    handlers::health::set_not_ready();
+
     // Cancel all background tasks (email fetcher, cleanup loops, etc.)
     shutdown_token.cancel();
 

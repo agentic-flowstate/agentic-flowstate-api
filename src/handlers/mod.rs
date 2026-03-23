@@ -31,6 +31,7 @@ pub mod tts;
 pub mod dms;
 pub mod admin_logs;
 pub mod admin_reload;
+pub mod health;
 pub mod client_telemetry;
 pub mod debug_log;
 pub mod voice_transcribe;
