@@ -47,6 +47,24 @@ impl Drop for CompletionGuard {
     }
 }
 
+/// Short conversational messages that should skip the ticket router entirely.
+/// These are acknowledgements, confirmations, and approval-flow signals that
+/// will never need ticket context.
+const ROUTER_SKIP_MESSAGES: &[&str] = &[
+    "approved", "rejected",                     // workspace-manager approval flow
+    "yes", "no", "ok", "okay", "sure", "yep", "nope", "nah",
+    "thanks", "thank you", "ty", "thx",
+    "lgtm", "sounds good", "looks good", "got it",
+    "cool", "nice", "great", "perfect", "awesome",
+    "hi", "hello", "hey",
+    "done", "noted",
+    "\u{1F44D}",  // 👍
+    "\u{1F44E}",  // 👎
+    "\u{2705}",   // ✅
+    "\u{274C}",   // ❌
+    "\u{1F64F}",  // 🙏
+];
+
 /// A long-lived tokio task that owns the SDK client for a single conversation
 /// and processes messages sequentially from a queue.
 pub struct ConversationWorker {
@@ -55,6 +73,11 @@ pub struct ConversationWorker {
     manager: Arc<ChatClientManager>,
     message_rx: mpsc::Receiver<WorkerMessage>,
     event_index: i32,
+    /// Cached ticket_id from the last successful router match. When set, follow-up
+    /// messages in the same conversation skip the router and reuse this context.
+    last_router_ticket_id: Option<String>,
+    /// Cached organization from the last successful router match.
+    last_router_organization: Option<String>,
 }
 
 impl ConversationWorker {
@@ -70,6 +93,8 @@ impl ConversationWorker {
             manager,
             message_rx,
             event_index: 0,
+            last_router_ticket_id: None,
+            last_router_organization: None,
         }
     }
 
@@ -641,9 +666,63 @@ impl ConversationWorker {
     /// Run the ticket-router agent as a pre-processing step.
     /// Returns the enriched message if the router matched a ticket,
     /// or the original message on skip/failure/timeout.
+    ///
+    /// Applies three early-exit conditions to bypass the router entirely
+    /// (no cc-sdk call, no latency penalty):
+    /// 1. Short conversational messages (acknowledgements, confirmations)
+    /// 2. Workspace-manager approval flow signals ("approved"/"rejected")
+    /// 3. Conversations with an established ticket context from a prior message
     async fn run_ticket_router(&mut self, user_message: &str, _config: &ChatConfig) -> String {
         let original = user_message.to_string();
+        let trimmed = user_message.trim();
+        let lowered = trimmed.to_lowercase();
 
+        // --- Skip condition 1 & 2: short conversational / approval messages ---
+        // Check if the trimmed, lowercased message matches a known skip pattern.
+        // This covers single-word confirmations, emoji reactions, and
+        // workspace-manager approval signals ("approved" / "rejected").
+        let is_skip_message = ROUTER_SKIP_MESSAGES.contains(&lowered.as_str());
+
+        // Also skip single-word messages (max 1 word, no spaces) that are very
+        // short — these are almost never ticket-related queries.
+        let is_single_short_word = !trimmed.is_empty()
+            && !trimmed.contains(' ')
+            && trimmed.len() <= 12
+            && trimmed.chars().all(|c| c.is_alphanumeric() || c.is_ascii_punctuation());
+
+        if is_skip_message || (is_single_short_word && trimmed.len() <= 4) {
+            tracing::info!(
+                "[ROUTER] Skipping router for short/conversational message: {:?}",
+                if trimmed.len() > 30 { &trimmed[..30] } else { trimmed }
+            );
+            self.emit_event(&StreamEvent::RouterResult {
+                enriched_message: original.clone(),
+                ticket_id: None,
+                organization: None,
+                skipped: true,
+            }).await;
+            return original;
+        }
+
+        // --- Skip condition 3: conversation already has established ticket context ---
+        // If a previous message in this conversation matched a ticket, reuse that
+        // context instead of running the router again. This avoids redundant searches
+        // on follow-up messages in the same conversation.
+        if let Some(ref cached_ticket_id) = self.last_router_ticket_id {
+            tracing::info!(
+                "[ROUTER] Skipping router — reusing cached ticket context: {}",
+                cached_ticket_id
+            );
+            self.emit_event(&StreamEvent::RouterResult {
+                enriched_message: original.clone(),
+                ticket_id: Some(cached_ticket_id.clone()),
+                organization: self.last_router_organization.clone(),
+                skipped: true,
+            }).await;
+            return original;
+        }
+
+        // --- No skip conditions met — run the full router ---
         // Emit status so the frontend knows the router is running
         self.emit_event(&StreamEvent::Status {
             status: "routing".to_string(),
@@ -837,6 +916,11 @@ impl ConversationWorker {
             }
             RouterParsed::Enriched { enriched_message, ticket_id, organization } => {
                 tracing::info!("[ROUTER] Matched ticket={:?}, org={:?}", ticket_id, organization);
+                // Cache the ticket context so follow-up messages skip the router
+                if ticket_id.is_some() {
+                    self.last_router_ticket_id = ticket_id.clone();
+                    self.last_router_organization = organization.clone();
+                }
                 self.emit_event(&StreamEvent::RouterResult {
                     enriched_message: enriched_message.clone(),
                     ticket_id: ticket_id.clone(),
