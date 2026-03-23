@@ -519,8 +519,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_conversation)
             .patch(handlers::update_conversation)
             .delete(handlers::delete_conversation))
-        .route("/api/conversations/:id/favorite",
-            post(handlers::toggle_conversation_favorite))
+        .route("/api/conversations/:id/wait",
+            post(handlers::wait_conversation))
+        .route("/api/conversations/:id/activate",
+            post(handlers::activate_conversation))
         .route("/api/conversations/:id/cancel",
             post(handlers::cancel_conversation))
         .route("/api/conversations/:id/checkpoint",

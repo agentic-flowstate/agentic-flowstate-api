@@ -24,6 +24,8 @@ use super::chat_stream::get_broadcast_sender;
 pub struct ListConversationsQuery {
     pub organization: Option<String>,
     pub agent: Option<String>,
+    /// Comma-separated status filter (e.g., "open,waiting"). Default: "open,waiting"
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -38,7 +40,7 @@ pub async fn list_conversations(
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListConversationsQuery>,
 ) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
-    let list = conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user.user_id), params.agent.as_deref())
+    let list = conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user.user_id), params.agent.as_deref(), params.status.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -96,26 +98,34 @@ pub async fn update_conversation(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Serialize)]
-pub struct ToggleConversationFavoriteResponse {
-    pub is_favorited: bool,
-}
-
-/// Toggle conversation favorite (POST /api/conversations/:id/favorite)
-pub async fn toggle_conversation_favorite(
+/// Set conversation to waiting (POST /api/conversations/:id/wait)
+pub async fn wait_conversation(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
-) -> Result<Json<ToggleConversationFavoriteResponse>, (StatusCode, String)> {
-    let is_favorited = conversations::toggle_favorite(&pool, &user.user_id, &id)
+) -> Result<StatusCode, (StatusCode, String)> {
+    conversations::wait_conversation(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(ToggleConversationFavoriteResponse { is_favorited }))
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Activate a conversation — move from waiting/archived back to open (POST /api/conversations/:id/activate)
+pub async fn activate_conversation(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    conversations::activate_conversation(&pool, &user.user_id, &id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Archive a conversation (DELETE /api/conversations/:id)
-/// Soft-deletes by setting archived_at timestamp. Conversation data is preserved.
+/// Sets status='archived' and archived_at timestamp. Conversation data is preserved.
 pub async fn delete_conversation(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -356,7 +366,7 @@ pub async fn subscribe_conversations(
 
         loop {
             // Get current conversations for this user
-            match conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user_id), params.agent.as_deref()).await {
+            match conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user_id), params.agent.as_deref(), params.status.as_deref()).await {
                 Ok(convs) => {
                     // Simple change detection: hash the updated_at timestamps
                     use std::hash::{Hash, Hasher};
