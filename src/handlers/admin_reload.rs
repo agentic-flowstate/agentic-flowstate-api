@@ -128,7 +128,9 @@ pub async fn ios_install() -> Response {
         path
     );
 
-    // Shell script that does xcodegen + xcodebuild + devicectl install
+    // Shell script that does xcodegen + xcodebuild + devicectl install.
+    // Uses a temp JSON file for device list (--json-output /dev/stdout produces
+    // trailing non-JSON output that breaks python's json.load).
     let script = format!(
         r#"
 set -e
@@ -139,11 +141,14 @@ xcodegen generate 2>&1
 echo ""
 
 echo "=== Step 2/3: Building for device ==="
-# Find connected device
-DEVICE_JSON=$(xcrun devicectl list devices --json-output /dev/stdout 2>/dev/null)
-DEVICE_ID=$(echo "$DEVICE_JSON" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
+# Find connected device — write JSON to temp file to avoid parsing issues
+TMPJSON=$(mktemp /tmp/devicectl_XXXXXX.json)
+xcrun devicectl list devices --json-output "$TMPJSON" 2>/dev/null || true
+
+DEVICE_ID=$(python3 -c "
+import json
+with open('$TMPJSON') as f:
+    data = json.load(f)
 devices = data.get('result', {{}}).get('devices', [])
 for d in devices:
     udid = d.get('hardwareProperties', {{}}).get('udid', '')
@@ -152,9 +157,10 @@ for d in devices:
         break
 " 2>/dev/null || echo "")
 
-CORE_ID=$(echo "$DEVICE_JSON" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
+CORE_ID=$(python3 -c "
+import json
+with open('$TMPJSON') as f:
+    data = json.load(f)
 devices = data.get('result', {{}}).get('devices', [])
 for d in devices:
     cid = d.get('identifier', '')
@@ -163,9 +169,10 @@ for d in devices:
         break
 " 2>/dev/null || echo "")
 
-DEVICE_NAME=$(echo "$DEVICE_JSON" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
+DEVICE_NAME=$(python3 -c "
+import json
+with open('$TMPJSON') as f:
+    data = json.load(f)
 devices = data.get('result', {{}}).get('devices', [])
 for d in devices:
     name = d.get('deviceProperties', {{}}).get('name', '')
@@ -174,8 +181,10 @@ for d in devices:
         break
 " 2>/dev/null || echo "Unknown")
 
+rm -f "$TMPJSON"
+
 if [ -z "$DEVICE_ID" ]; then
-    echo "ERROR: No connected iOS device found"
+    echo "No connected iOS device found. Connect your iPhone via USB and retry."
     exit 1
 fi
 
