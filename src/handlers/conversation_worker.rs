@@ -1088,6 +1088,11 @@ pub(crate) async fn create_client(
         );
     }
 
+    // Increase channel buffer size to handle bursts of simultaneous Agent task
+    // results without backpressure. Default is 100, which was insufficient when
+    // 4+ Agent tasks completed at the same millisecond (see incident A-EB7EE722).
+    builder = builder.cli_channel_buffer_size(500);
+
     // Enable adaptive thinking via --effort flag
     builder = builder.add_extra_arg("effort", Some(config.agent_type.effort().to_string()));
 
