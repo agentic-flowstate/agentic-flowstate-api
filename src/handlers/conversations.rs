@@ -114,13 +114,14 @@ pub async fn toggle_conversation_favorite(
     Ok(Json(ToggleConversationFavoriteResponse { is_favorited }))
 }
 
-/// Delete a conversation (DELETE /api/conversations/:id)
+/// Archive a conversation (DELETE /api/conversations/:id)
+/// Soft-deletes by setting archived_at timestamp. Conversation data is preserved.
 pub async fn delete_conversation(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    conversations::delete_conversation(&pool, &user.user_id, &id)
+    conversations::archive_conversation(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
