@@ -88,3 +88,151 @@ pub async fn reload_log() -> Response {
         Err(_) => (StatusCode::OK, Json(json!({"log": ""}))).into_response(),
     }
 }
+
+// ---- iOS Install (lightweight, no full rebuild) ----
+
+const IOS_INSTALL_LOG_PATH: &str = "/tmp/agentic-ios-install.log";
+const APP_DIR: &str = "/Users/jarvisgpt/projects/agentic-flowstate-app";
+
+/// POST /api/admin/ios-install — build and install the iOS app only (no MCP/API/frontend rebuild).
+/// Spawns xcodegen + xcodebuild + devicectl install as a detached process.
+/// Much faster than a full reload — typically 15-30 seconds.
+pub async fn ios_install() -> Response {
+    // Clear previous log
+    let _ = fs::write(IOS_INSTALL_LOG_PATH, "");
+
+    let log_file = match fs::File::create(IOS_INSTALL_LOG_PATH) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to create log file: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+    let stderr_file = match log_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to clone log file: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let path = std::env::var("PATH").unwrap_or_default();
+    let full_path = format!(
+        "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/usr/local/bin:{}",
+        path
+    );
+
+    // Shell script that does xcodegen + xcodebuild + devicectl install
+    let script = format!(
+        r#"
+set -e
+cd {app_dir}
+
+echo "=== Step 1/3: Generating Xcode project ==="
+xcodegen generate 2>&1
+echo ""
+
+echo "=== Step 2/3: Building for device ==="
+# Find connected device
+DEVICE_JSON=$(xcrun devicectl list devices --json-output /dev/stdout 2>/dev/null)
+DEVICE_ID=$(echo "$DEVICE_JSON" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+devices = data.get('result', {{}}).get('devices', [])
+for d in devices:
+    udid = d.get('hardwareProperties', {{}}).get('udid', '')
+    if udid:
+        print(udid)
+        break
+" 2>/dev/null || echo "")
+
+CORE_ID=$(echo "$DEVICE_JSON" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+devices = data.get('result', {{}}).get('devices', [])
+for d in devices:
+    cid = d.get('identifier', '')
+    if cid:
+        print(cid)
+        break
+" 2>/dev/null || echo "")
+
+DEVICE_NAME=$(echo "$DEVICE_JSON" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+devices = data.get('result', {{}}).get('devices', [])
+for d in devices:
+    name = d.get('deviceProperties', {{}}).get('name', '')
+    if name:
+        print(name)
+        break
+" 2>/dev/null || echo "Unknown")
+
+if [ -z "$DEVICE_ID" ]; then
+    echo "ERROR: No connected iOS device found"
+    exit 1
+fi
+
+echo "Found device: $DEVICE_NAME ($DEVICE_ID)"
+echo ""
+
+xcodebuild build \
+    -project AgenticFlowstate.xcodeproj \
+    -scheme AgenticFlowstate_iOS \
+    -destination "platform=iOS,id=$DEVICE_ID" \
+    -configuration Debug \
+    -allowProvisioningUpdates \
+    -allowProvisioningDeviceRegistration \
+    2>&1 | tail -20
+
+echo ""
+echo "=== Step 3/3: Installing to $DEVICE_NAME ==="
+APP_PATH="$HOME/Library/Developer/Xcode/DerivedData/AgenticFlowstate-efyacuebtfljofhcznnfkbraddlm/Build/Products/Debug-iphoneos/AgenticFlowstate.app"
+xcrun devicectl device install app --device "$CORE_ID" "$APP_PATH" 2>&1
+
+# Clear pending install flag
+rm -f "$HOME/.agentic-flowstate/pending_ios_install.json"
+
+echo ""
+echo "=== iOS install complete ==="
+"#,
+        app_dir = APP_DIR
+    );
+
+    match std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&script)
+        .env("PATH", &full_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(stderr_file))
+        .spawn()
+    {
+        Ok(_) => {
+            tracing::info!("iOS install spawned (lightweight, no full rebuild)");
+            (StatusCode::OK, Json(json!({"status": "ios_install_started"}))).into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to spawn iOS install: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to start iOS install: {}", e)})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// GET /api/admin/ios-install/log — read the current iOS install log output
+pub async fn ios_install_log() -> Response {
+    match fs::read_to_string(IOS_INSTALL_LOG_PATH) {
+        Ok(content) => (StatusCode::OK, Json(json!({"log": content}))).into_response(),
+        Err(_) => (StatusCode::OK, Json(json!({"log": ""}))).into_response(),
+    }
+}

@@ -616,6 +616,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/admin/check", get(handlers::admin_logs::check_admin))
         .route("/api/admin/reload", post(handlers::admin_reload::reload_services))
         .route("/api/admin/reload/log", get(handlers::admin_reload::reload_log))
+        .route("/api/admin/ios-install", post(handlers::admin_reload::ios_install))
+        .route("/api/admin/ios-install/log", get(handlers::admin_reload::ios_install_log))
         .route("/api/admin/client-events", get(handlers::client_telemetry::list_client_events))
         .route("/api/meeting-agent/chat", post(handlers::meeting_agent_chat))
         .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_admin))
