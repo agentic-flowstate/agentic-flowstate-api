@@ -384,6 +384,7 @@ impl ConversationWorker {
         let mut blocks_dirty = false;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         heartbeat.tick().await; // consume immediate first tick
+        let mut last_message_time = Instant::now();
 
         loop {
             tokio::select! {
@@ -391,6 +392,7 @@ impl ConversationWorker {
                     match msg_opt {
                         Some(Ok(sdk_msg)) => {
                             message_count += 1;
+                            last_message_time = Instant::now();
 
                             if let Message::Assistant { message: assistant_msg } = &sdk_msg {
                                 for block in &assistant_msg.content {
@@ -532,6 +534,17 @@ impl ConversationWorker {
                                             Original session_id preserved — NOT overwriting.",
                                             self.conversation_id, original_sid, sess_id
                                         );
+                                        // Emit a visible status event so the user/app knows
+                                        // context was degraded. The conversation history was
+                                        // injected into the system prompt as a safety net.
+                                        self.emit_event(&StreamEvent::Status {
+                                            status: "resume_failed".to_string(),
+                                            message: Some(
+                                                "Session was interrupted and could not be fully restored. \
+                                                The agent is continuing with conversation history context."
+                                                .to_string()
+                                            ),
+                                        }).await;
                                         true
                                     } else {
                                         false
@@ -622,6 +635,15 @@ impl ConversationWorker {
                             );
                             // Mark checkpoint as interrupted — stream ended unexpectedly
                             let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                            // Emit visible status so the user knows the agent stopped
+                            self.emit_event(&StreamEvent::Status {
+                                status: "failed".to_string(),
+                                message: Some(
+                                    "Agent session ended unexpectedly. Your conversation history \
+                                    is preserved — send another message to continue."
+                                    .to_string()
+                                ),
+                            }).await;
                             break;
                         }
                     }
@@ -635,6 +657,36 @@ impl ConversationWorker {
                     // Without this, a long-running agent (e.g., 10-minute tool call) would
                     // look stale and get auto-cleaned by the restart watcher.
                     let _ = checkpoints::touch_checkpoint(&self.db, &self.conversation_id).await;
+
+                    // Watchdog: check if the subprocess is still alive.
+                    // If the SDK client is disconnected (subprocess died), there's no point
+                    // waiting for more messages — the stream will never produce them.
+                    let subprocess_alive = if let Some(client_arc) = self.manager.get(&self.conversation_id).await {
+                        let guard = client_arc.lock().await;
+                        guard.sdk_client.is_connected().await
+                    } else {
+                        false
+                    };
+
+                    if !subprocess_alive {
+                        tracing::error!(
+                            "[WORKER] WATCHDOG: Subprocess is no longer connected for {} \
+                            (last message {}s ago, tool_calls: {}). Breaking out of stream loop.",
+                            self.conversation_id,
+                            last_message_time.elapsed().as_secs(),
+                            tool_call_count
+                        );
+                        let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                        self.emit_event(&StreamEvent::Status {
+                            status: "failed".to_string(),
+                            message: Some(
+                                "Agent subprocess stopped unexpectedly. Your conversation history \
+                                is preserved — send another message to continue."
+                                .to_string()
+                            ),
+                        }).await;
+                        break;
+                    }
                 }
             }
         }
@@ -1205,29 +1257,61 @@ fn parse_router_result(output: &str) -> RouterParsed {
 fn build_conversation_history(messages: &[ConversationMessage]) -> String {
     let mut history = String::from(
         "## Previous Conversation Context\n\n\
-         This is a resumed conversation. If you already have full context from the session, \
-         ignore this section. Otherwise, here is what was discussed:\n\n"
+         IMPORTANT: This conversation was resumed but the previous session could not be fully \
+         restored. You MUST use the context below to continue the conversation seamlessly. \
+         Do NOT ask the user to repeat themselves or clarify what they were asking about — \
+         the full conversation history is provided here. Pick up exactly where you left off.\n\n"
     );
 
-    // Take last 20 messages to keep prompt size reasonable
-    let recent = if messages.len() > 20 {
-        &messages[messages.len() - 20..]
+    // Take last 30 messages to keep prompt size reasonable
+    let recent = if messages.len() > 30 {
+        &messages[messages.len() - 30..]
     } else {
         messages
     };
 
     for msg in recent {
-        if msg.content.is_empty() {
+        let has_content = !msg.content.is_empty();
+        let has_tools = msg.tool_call_summaries.as_ref().map_or(false, |t| !t.is_empty());
+        if !has_content && !has_tools {
             continue;
         }
+
         let role = if msg.role == "user" { "User" } else { "Assistant" };
-        let content = if msg.role == "assistant" && msg.content.len() > 300 {
-            let truncated: String = msg.content.chars().take(300).collect();
-            format!("{}…", truncated)
+
+        // User messages: include in full (they're typically short)
+        // Assistant messages: allow up to 2000 chars (was 300 — way too aggressive)
+        let content = if msg.role == "assistant" && msg.content.len() > 2000 {
+            let truncated: String = msg.content.chars().take(2000).collect();
+            format!("{}… [truncated]", truncated)
         } else {
             msg.content.clone()
         };
-        history.push_str(&format!("**{}**: {}\n\n", role, content));
+
+        if !content.is_empty() {
+            history.push_str(&format!("**{}**: {}\n\n", role, content));
+        }
+
+        // Include tool call summaries for assistant messages — critical for context
+        // preservation. Without these, the agent has no idea what tools were used or
+        // what results came back.
+        if let Some(ref summaries) = msg.tool_call_summaries {
+            if !summaries.is_empty() {
+                history.push_str("**Tool calls made:**\n");
+                for tc in summaries {
+                    let status = if tc.is_error { " [ERROR]" } else { "" };
+                    let preview = tc.result_preview.as_deref().unwrap_or("");
+                    let preview_truncated = if preview.len() > 200 {
+                        let t: String = preview.chars().take(200).collect();
+                        format!("{}…", t)
+                    } else {
+                        preview.to_string()
+                    };
+                    history.push_str(&format!("- `{}`{}: {}\n", tc.tool_name, status, preview_truncated));
+                }
+                history.push('\n');
+            }
+        }
     }
 
     history
