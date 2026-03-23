@@ -73,8 +73,10 @@ pub struct ConversationWorker {
     manager: Arc<ChatClientManager>,
     message_rx: mpsc::Receiver<WorkerMessage>,
     event_index: i32,
-    /// Cached ticket_id from the last successful router match. When set, follow-up
-    /// messages in the same conversation skip the router and reuse this context.
+    /// Whether the router has already run for this conversation. After the first
+    /// message, all subsequent messages skip the router entirely.
+    has_routed: bool,
+    /// Cached ticket_id from the last successful router match.
     last_router_ticket_id: Option<String>,
     /// Cached organization from the last successful router match.
     last_router_organization: Option<String>,
@@ -93,6 +95,7 @@ impl ConversationWorker {
             manager,
             message_rx,
             event_index: 0,
+            has_routed: false,
             last_router_ticket_id: None,
             last_router_organization: None,
         }
@@ -674,51 +677,30 @@ impl ConversationWorker {
     /// 3. Conversations with an established ticket context from a prior message
     async fn run_ticket_router(&mut self, user_message: &str, _config: &ChatConfig) -> String {
         let original = user_message.to_string();
+
+        // --- Primary skip: only route the FIRST message in a conversation ---
+        // After the first message, skip entirely — no events emitted, no latency.
+        if self.has_routed {
+            tracing::debug!("[ROUTER] Skipping — already routed this conversation");
+            return original;
+        }
+
         let trimmed = user_message.trim();
         let lowered = trimmed.to_lowercase();
 
-        // --- Skip condition 1 & 2: short conversational / approval messages ---
-        // Check if the trimmed, lowercased message matches a known skip pattern.
-        // This covers single-word confirmations, emoji reactions, and
-        // workspace-manager approval signals ("approved" / "rejected").
+        // --- Skip condition: short conversational / approval messages ---
         let is_skip_message = ROUTER_SKIP_MESSAGES.contains(&lowered.as_str());
-
-        // Also skip single-word messages (max 1 word, no spaces) that are very
-        // short — these are almost never ticket-related queries.
         let is_single_short_word = !trimmed.is_empty()
             && !trimmed.contains(' ')
-            && trimmed.len() <= 12
+            && trimmed.len() <= 4
             && trimmed.chars().all(|c| c.is_alphanumeric() || c.is_ascii_punctuation());
 
-        if is_skip_message || (is_single_short_word && trimmed.len() <= 4) {
+        if is_skip_message || is_single_short_word {
             tracing::info!(
                 "[ROUTER] Skipping router for short/conversational message: {:?}",
                 if trimmed.len() > 30 { &trimmed[..30] } else { trimmed }
             );
-            self.emit_event(&StreamEvent::RouterResult {
-                enriched_message: original.clone(),
-                ticket_id: None,
-                organization: None,
-                skipped: true,
-            }).await;
-            return original;
-        }
-
-        // --- Skip condition 3: conversation already has established ticket context ---
-        // If a previous message in this conversation matched a ticket, reuse that
-        // context instead of running the router again. This avoids redundant searches
-        // on follow-up messages in the same conversation.
-        if let Some(ref cached_ticket_id) = self.last_router_ticket_id {
-            tracing::info!(
-                "[ROUTER] Skipping router — reusing cached ticket context: {}",
-                cached_ticket_id
-            );
-            self.emit_event(&StreamEvent::RouterResult {
-                enriched_message: original.clone(),
-                ticket_id: Some(cached_ticket_id.clone()),
-                organization: self.last_router_organization.clone(),
-                skipped: true,
-            }).await;
+            self.has_routed = true;
             return original;
         }
 
@@ -734,6 +716,9 @@ impl ConversationWorker {
             self.run_ticket_router_inner(user_message),
         ).await;
 
+        // Mark as routed regardless of outcome — never route twice
+        self.has_routed = true;
+
         match result {
             Ok(Ok(enriched)) => enriched,
             Ok(Err(e)) => {
@@ -742,12 +727,6 @@ impl ConversationWorker {
             }
             Err(_) => {
                 tracing::warn!("[ROUTER] Router timed out after {}s, using original message", ROUTER_TIMEOUT_SECS);
-                self.emit_event(&StreamEvent::RouterResult {
-                    enriched_message: original.clone(),
-                    ticket_id: None,
-                    organization: None,
-                    skipped: true,
-                }).await;
                 original
             }
         }
@@ -846,10 +825,10 @@ impl ConversationWorker {
                         for block in &assistant_msg.content {
                             match block {
                                 ContentBlock::Text(text_content) => {
+                                    // Collect text for parsing but don't emit RouterText —
+                                    // the output is XML (<router_result>) not human-readable.
+                                    // Router tool calls already show what it's doing.
                                     router_text_parts.push(text_content.text.clone());
-                                    self.emit_event(&StreamEvent::RouterText {
-                                        content: text_content.text.clone(),
-                                    }).await;
                                 }
                                 ContentBlock::ToolUse(tool_use) => {
                                     tracing::info!("[ROUTER] Tool use: {} ({})", tool_use.name, tool_use.id);
