@@ -84,6 +84,8 @@ pub enum AgentType {
     MeetingAgent,
     /// Full-access agent — every MCP tool + all built-in tools, uses CLAUDE.md as system prompt
     FullAccess,
+    /// Pre-processing router — matches user messages to tickets before the main agent runs
+    TicketRouter,
 }
 
 impl AgentType {
@@ -107,6 +109,7 @@ impl AgentType {
             AgentType::DocManager => "doc-manager",
             AgentType::MeetingAgent => "meeting-agent",
             AgentType::FullAccess => "full-access",
+            AgentType::TicketRouter => "ticket-router",
         }
     }
 

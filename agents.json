@@ -255,6 +255,22 @@
         "Task",
         "mcp__agentic-mcp__*"
       ]
+    },
+    "ticket-router": {
+      "model": "opus",
+      "effort": "low",
+      "max_turns": 1,
+      "prompt_file": "ticket-router.txt",
+      "tools": [
+        "mcp__agentic-mcp__search_tickets",
+        "mcp__agentic-mcp__list_tickets",
+        "mcp__agentic-mcp__get_ticket",
+        "mcp__agentic-mcp__list_organizations",
+        "mcp__agentic-mcp__list_epics",
+        "mcp__agentic-mcp__list_slices",
+        "mcp__agentic-mcp__create_slices",
+        "mcp__agentic-mcp__create_slice_tickets"
+      ]
     }
   }
 }
