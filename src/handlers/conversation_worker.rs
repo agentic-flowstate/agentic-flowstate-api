@@ -336,6 +336,23 @@ impl ConversationWorker {
         // On any failure, we fall back to the original enhanced_message.
         let final_message = self.run_ticket_router(&enhanced_message, &msg.config).await;
 
+        // If the router enriched the message (added ticket context), save it as a
+        // "forwarded" message in the conversation DB so it persists across fetchMessages calls.
+        // The iOS app maps role="forwarded" to isForwardedMessage=true.
+        if final_message != enhanced_message {
+            if let Err(e) = conversations::add_message(
+                &self.db,
+                &self.conversation_id,
+                AddMessageRequest {
+                    role: "forwarded".to_string(),
+                    content: final_message.clone(),
+                    attachments: None,
+                },
+            ).await {
+                tracing::warn!("[WORKER] Failed to save forwarded message: {}", e);
+            }
+        }
+
         // Get or create SDK client
         let client_arc = match self.get_or_create_client(&msg.config).await {
             Ok(arc) => arc,
@@ -764,12 +781,35 @@ impl ConversationWorker {
 
         tracing::info!("[ROUTER] === RUNNING FULL ROUTER === conv={}", self.conversation_id);
 
+        // Emit heartbeats on the SSE connection while the router is running.
+        // The router can take 10-30+ seconds — without heartbeats the iOS watchdog
+        // (45s no-byte timeout) could kill the connection.
+        let heartbeat_conv_id = self.conversation_id.clone();
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            interval.tick().await; // consume immediate first tick
+            loop {
+                interval.tick().await;
+                let tx = get_broadcast_sender(&heartbeat_conv_id).await;
+                let heartbeat = StreamEvent::Status {
+                    status: "heartbeat".to_string(),
+                    message: None,
+                };
+                if let Ok(json) = serde_json::to_string(&heartbeat) {
+                    let _ = tx.send((-1, json));
+                }
+            }
+        });
+
         let start = std::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(ROUTER_TIMEOUT_SECS),
             self.run_ticket_router_inner(user_message),
         ).await;
         let elapsed = start.elapsed();
+
+        // Stop heartbeats now that the router is done
+        heartbeat_handle.abort();
 
         // Mark as routed regardless of outcome — never route twice
         self.has_routed = true;
