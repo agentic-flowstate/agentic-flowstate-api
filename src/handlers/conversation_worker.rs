@@ -73,12 +73,12 @@ pub struct ConversationWorker {
     manager: Arc<ChatClientManager>,
     message_rx: mpsc::Receiver<WorkerMessage>,
     event_index: i32,
-    /// Whether the router has already run for this conversation. After the first
-    /// message, all subsequent messages skip the router entirely.
+    /// Cached from DB — whether the router has already run for this conversation.
+    /// Initialized from DB in `run()`, so it survives server restarts.
     has_routed: bool,
-    /// Cached ticket_id from the last successful router match.
+    /// Cached ticket_id from the last successful router match (from DB).
     last_router_ticket_id: Option<String>,
-    /// Cached organization from the last successful router match.
+    /// Cached organization from the last successful router match (from DB).
     last_router_organization: Option<String>,
 }
 
@@ -117,6 +117,22 @@ impl ConversationWorker {
             }
             Err(e) => {
                 tracing::warn!("[WORKER] Failed to get max event index for {}: {}, starting at 0", self.conversation_id, e);
+            }
+        }
+
+        // Initialize router state from DB — survives server restarts.
+        // If the conversation already has router metadata or previous messages,
+        // skip the router on all subsequent messages.
+        match conversations::has_router_run(&self.db, &self.conversation_id).await {
+            Ok(true) => {
+                self.has_routed = true;
+                tracing::info!("[WORKER] Router already ran for {} (loaded from DB)", self.conversation_id);
+            }
+            Ok(false) => {
+                tracing::info!("[WORKER] Router has NOT run for {} (new conversation)", self.conversation_id);
+            }
+            Err(e) => {
+                tracing::warn!("[WORKER] Failed to check router state for {}: {}, assuming not routed", self.conversation_id, e);
             }
         }
 
@@ -776,6 +792,10 @@ impl ConversationWorker {
                 self.conversation_id, if trimmed.len() > 30 { &trimmed[..30] } else { trimmed }
             );
             self.has_routed = true;
+            // Persist so this survives server restarts
+            let _ = conversations::set_router_result(
+                &self.db, &self.conversation_id, Some("__skipped__"), None,
+            ).await;
             return original;
         }
 
@@ -828,6 +848,10 @@ impl ConversationWorker {
                     "[ROUTER] === FAILED ({:.1}s) === conv={} error={}",
                     elapsed.as_secs_f64(), self.conversation_id, e
                 );
+                // Persist so router doesn't retry on next message or after restart
+                let _ = conversations::set_router_result(
+                    &self.db, &self.conversation_id, Some("__failed__"), None,
+                ).await;
                 original
             }
             Err(_) => {
@@ -835,6 +859,9 @@ impl ConversationWorker {
                     "[ROUTER] === TIMEOUT ({}s) === conv={}",
                     ROUTER_TIMEOUT_SECS, self.conversation_id
                 );
+                let _ = conversations::set_router_result(
+                    &self.db, &self.conversation_id, Some("__timeout__"), None,
+                ).await;
                 original
             }
         }
@@ -979,6 +1006,10 @@ impl ConversationWorker {
         match parsed {
             RouterParsed::Skipped => {
                 tracing::info!("[ROUTER] Skipped — no ticket match needed");
+                // Persist sentinel so has_router_run() returns true even for skipped
+                let _ = conversations::set_router_result(
+                    &self.db, &self.conversation_id, Some("__skipped__"), None,
+                ).await;
                 self.emit_event(&StreamEvent::RouterResult {
                     enriched_message: user_message.to_string(),
                     ticket_id: None,
@@ -989,10 +1020,16 @@ impl ConversationWorker {
             }
             RouterParsed::Enriched { enriched_message, ticket_id, organization } => {
                 tracing::info!("[ROUTER] Matched ticket={:?}, org={:?}", ticket_id, organization);
-                // Cache the ticket context so follow-up messages skip the router
-                if ticket_id.is_some() {
-                    self.last_router_ticket_id = ticket_id.clone();
-                    self.last_router_organization = organization.clone();
+                // Persist router result to DB — survives server restarts
+                self.last_router_ticket_id = ticket_id.clone();
+                self.last_router_organization = organization.clone();
+                if let Err(e) = conversations::set_router_result(
+                    &self.db,
+                    &self.conversation_id,
+                    ticket_id.as_deref(),
+                    organization.as_deref(),
+                ).await {
+                    tracing::warn!("[ROUTER] Failed to persist router result: {}", e);
                 }
                 self.emit_event(&StreamEvent::RouterResult {
                     enriched_message: enriched_message.clone(),
@@ -1004,6 +1041,10 @@ impl ConversationWorker {
             }
             RouterParsed::ParseFailed(reason) => {
                 tracing::warn!("[ROUTER] Parse failed: {}", reason);
+                // Persist sentinel so router doesn't re-run on next message
+                let _ = conversations::set_router_result(
+                    &self.db, &self.conversation_id, Some("__failed__"), None,
+                ).await;
                 // Fall back to original message
                 self.emit_event(&StreamEvent::RouterResult {
                     enriched_message: user_message.to_string(),
