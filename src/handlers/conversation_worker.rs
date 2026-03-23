@@ -9,11 +9,14 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::Serialize;
 
-use crate::agents::StreamEvent;
+use crate::agents::{AgentType, StreamEvent};
 use crate::agents::prompts::load_prompt;
 use ticketing_system::{conversations, checkpoints, token_usage, AddMessageRequest, ContentBlockDesc, ConversationMessage, UpdateConversationRequest};
 use super::chat_stream::{get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData};
 use super::chat_client_manager::{ChatClientManager, ChatClient};
+
+/// Timeout for the ticket-router pre-processing phase.
+const ROUTER_TIMEOUT_SECS: u64 = 60;
 
 /// How often to flush accumulated content to the database (ms).
 const DB_FLUSH_INTERVAL_MS: u64 = 500;
@@ -299,6 +302,12 @@ impl ConversationWorker {
             Err(e) => tracing::error!("[WORKER] Failed to create assistant message: {}", e),
         }
 
+        // === TICKET ROUTER PRE-PROCESSING ===
+        // Run a lightweight router agent to match the user's message to a ticket.
+        // The router is ephemeral (no session persistence) and has a strict timeout.
+        // On any failure, we fall back to the original enhanced_message.
+        let final_message = self.run_ticket_router(&enhanced_message, &msg.config).await;
+
         // Get or create SDK client
         let client_arc = match self.get_or_create_client(&msg.config).await {
             Ok(arc) => arc,
@@ -325,7 +334,7 @@ impl ConversationWorker {
             // Capture the session_id we're trying to resume from (if any)
             let resume_sid = client.session_id.clone();
 
-            if let Err(e) = client.sdk_client.send_user_message(enhanced_message).await {
+            if let Err(e) = client.sdk_client.send_user_message(final_message).await {
                 tracing::error!("[WORKER] Failed to send message: {}", e);
                 self.emit_event(&StreamEvent::Status {
                     status: "failed".to_string(),
@@ -629,6 +638,227 @@ impl ConversationWorker {
         }).await;
     }
 
+    /// Run the ticket-router agent as a pre-processing step.
+    /// Returns the enriched message if the router matched a ticket,
+    /// or the original message on skip/failure/timeout.
+    async fn run_ticket_router(&mut self, user_message: &str, _config: &ChatConfig) -> String {
+        let original = user_message.to_string();
+
+        // Emit status so the frontend knows the router is running
+        self.emit_event(&StreamEvent::Status {
+            status: "routing".to_string(),
+            message: Some("Matching to ticket...".to_string()),
+        }).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(ROUTER_TIMEOUT_SECS),
+            self.run_ticket_router_inner(user_message),
+        ).await;
+
+        match result {
+            Ok(Ok(enriched)) => enriched,
+            Ok(Err(e)) => {
+                tracing::warn!("[ROUTER] Router failed, using original message: {}", e);
+                original
+            }
+            Err(_) => {
+                tracing::warn!("[ROUTER] Router timed out after {}s, using original message", ROUTER_TIMEOUT_SECS);
+                self.emit_event(&StreamEvent::RouterResult {
+                    enriched_message: original.clone(),
+                    ticket_id: None,
+                    organization: None,
+                    skipped: true,
+                }).await;
+                original
+            }
+        }
+    }
+
+    /// Inner router logic, separated so the caller can wrap it in a timeout.
+    async fn run_ticket_router_inner(&mut self, user_message: &str) -> Result<String, String> {
+        let router_type = AgentType::TicketRouter;
+
+        // Build prompt variables
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("USER_MESSAGE".to_string(), user_message.to_string());
+
+        // Fetch organizations from DB for the prompt
+        let orgs = ticketing_system::organizations::list_organizations(&self.db)
+            .await
+            .unwrap_or_default();
+        let org_names: Vec<String> = orgs.iter().map(|o| o.name.clone()).collect();
+        vars.insert("ORGANIZATIONS".to_string(), org_names.join(", "));
+
+        // Load the router prompt with variable substitution
+        let system_prompt = load_prompt(router_type.as_str(), vars)
+            .map_err(|e| format!("Failed to load router prompt: {}", e))?;
+
+        // Build tools list
+        let tools_list: Vec<String> = router_type
+            .allowed_tools()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let has_mcp_tools = tools_list.iter().any(|t| t.starts_with("mcp__"));
+
+        // Build cc-sdk client options for the router
+        let mut builder = ClaudeCodeOptions::builder()
+            .system_prompt(&system_prompt)
+            .model(router_type.model())
+            .tools(ToolsConfig::list(tools_list.clone()))
+            .allowed_tools(tools_list)
+            .permission_mode(PermissionMode::BypassPermissions)
+            .cwd(std::path::Path::new("/tmp"));
+
+        // Register MCP server (router uses mcp__agentic-mcp__* tools)
+        if has_mcp_tools {
+            let mcp_binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../agentic-flowstate-mcp/target/release/agentic_mcp");
+            let mcp_binary = mcp_binary.canonicalize().unwrap_or(mcp_binary);
+            builder = builder.add_mcp_server(
+                "agentic-mcp",
+                McpServerConfig::Stdio {
+                    command: mcp_binary.to_string_lossy().to_string(),
+                    args: None,
+                    env: None,
+                },
+            );
+        }
+
+        // Set max turns (1 for router — single turn)
+        if let Some(turns) = router_type.max_turns() {
+            builder = builder.max_turns(turns);
+        }
+
+        // Set effort level (low for router)
+        builder = builder.add_extra_arg("effort", Some(router_type.effort().to_string()));
+
+        // No session resumption — router is ephemeral
+        let options = builder.build();
+        let mut sdk_client = ClaudeSDKClient::new(options);
+
+        // Connect with a 30s timeout
+        match tokio::time::timeout(Duration::from_secs(30), sdk_client.connect(None)).await {
+            Ok(Ok(())) => {
+                tracing::info!("[ROUTER] Client connected");
+            }
+            Ok(Err(e)) => {
+                return Err(format!("Router connect failed: {}", e));
+            }
+            Err(_) => {
+                return Err("Router connect timed out after 30s".to_string());
+            }
+        }
+
+        // Send the user's message (the prompt already has it embedded, so send a short trigger)
+        if let Err(e) = sdk_client.send_user_message("Route this message.".to_string()).await {
+            return Err(format!("Router send failed: {}", e));
+        }
+
+        // Stream the response, emitting Router* events
+        let mut response_stream = sdk_client.receive_messages().await;
+        let mut router_text_parts: Vec<String> = Vec::new();
+
+        loop {
+            match response_stream.next().await {
+                Some(Ok(sdk_msg)) => {
+                    if let Message::Assistant { message: assistant_msg } = &sdk_msg {
+                        for block in &assistant_msg.content {
+                            match block {
+                                ContentBlock::Text(text_content) => {
+                                    router_text_parts.push(text_content.text.clone());
+                                    self.emit_event(&StreamEvent::RouterText {
+                                        content: text_content.text.clone(),
+                                    }).await;
+                                }
+                                ContentBlock::ToolUse(tool_use) => {
+                                    tracing::info!("[ROUTER] Tool use: {} ({})", tool_use.name, tool_use.id);
+                                    self.emit_event(&StreamEvent::RouterToolUse {
+                                        id: tool_use.id.clone(),
+                                        name: tool_use.name.clone(),
+                                        input: tool_use.input.clone(),
+                                    }).await;
+                                }
+                                ContentBlock::ToolResult(tool_result) => {
+                                    let content = match &tool_result.content {
+                                        Some(cc_sdk::ContentValue::Text(s)) => s.clone(),
+                                        Some(cc_sdk::ContentValue::Structured(vals)) => {
+                                            serde_json::to_string(vals).unwrap_or_default()
+                                        }
+                                        None => String::new(),
+                                    };
+                                    self.emit_event(&StreamEvent::RouterToolResult {
+                                        tool_use_id: tool_result.tool_use_id.clone(),
+                                        content,
+                                        is_error: tool_result.is_error.unwrap_or(false),
+                                    }).await;
+                                }
+                                ContentBlock::Thinking(_) => {
+                                    // Ignore thinking blocks from router
+                                }
+                            }
+                        }
+                    }
+
+                    // Check for result message — router is done
+                    if let Message::Result { .. } = &sdk_msg {
+                        tracing::info!("[ROUTER] Completed");
+                        break;
+                    }
+                }
+                Some(Err(e)) => {
+                    return Err(format!("Router stream error: {}", e));
+                }
+                None => {
+                    tracing::warn!("[ROUTER] Stream ended without Result");
+                    break;
+                }
+            }
+        }
+
+        // Parse the router output
+        let full_output = router_text_parts.join("");
+        tracing::info!("[ROUTER] Full output ({} chars): {}", full_output.len(),
+            if full_output.len() > 200 { &full_output[..200] } else { &full_output });
+
+        let parsed = parse_router_result(&full_output);
+
+        match parsed {
+            RouterParsed::Skipped => {
+                tracing::info!("[ROUTER] Skipped — no ticket match needed");
+                self.emit_event(&StreamEvent::RouterResult {
+                    enriched_message: user_message.to_string(),
+                    ticket_id: None,
+                    organization: None,
+                    skipped: true,
+                }).await;
+                Ok(user_message.to_string())
+            }
+            RouterParsed::Enriched { enriched_message, ticket_id, organization } => {
+                tracing::info!("[ROUTER] Matched ticket={:?}, org={:?}", ticket_id, organization);
+                self.emit_event(&StreamEvent::RouterResult {
+                    enriched_message: enriched_message.clone(),
+                    ticket_id: ticket_id.clone(),
+                    organization: organization.clone(),
+                    skipped: false,
+                }).await;
+                Ok(enriched_message)
+            }
+            RouterParsed::ParseFailed(reason) => {
+                tracing::warn!("[ROUTER] Parse failed: {}", reason);
+                // Fall back to original message
+                self.emit_event(&StreamEvent::RouterResult {
+                    enriched_message: user_message.to_string(),
+                    ticket_id: None,
+                    organization: None,
+                    skipped: true,
+                }).await;
+                Ok(user_message.to_string())
+            }
+        }
+    }
+
     /// Emit a StreamEvent: store in DB and broadcast to all subscribers.
     async fn emit_event(&mut self, event: &StreamEvent) {
         let event_type = get_stream_event_type(event);
@@ -814,6 +1044,95 @@ fn get_stream_event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::RouterToolUse { .. } => "router_tool_use",
         StreamEvent::RouterToolResult { .. } => "router_tool_result",
         StreamEvent::RouterResult { .. } => "router_result",
+    }
+}
+
+/// Parsed result from the ticket-router's `<router_result>` XML output.
+enum RouterParsed {
+    /// Router decided no ticket is needed (skipped="true")
+    Skipped,
+    /// Router matched or created a ticket
+    Enriched {
+        enriched_message: String,
+        ticket_id: Option<String>,
+        organization: Option<String>,
+    },
+    /// Could not parse the router output
+    ParseFailed(String),
+}
+
+/// Parse the `<router_result>` XML block from the router agent's text output.
+///
+/// Expected formats:
+///   `<router_result skipped="true">...original message...</router_result>`
+///   `<router_result>...enriched message with --- metadata block ---...</router_result>`
+fn parse_router_result(output: &str) -> RouterParsed {
+    // Check for skipped result first
+    if let Some(start) = output.find("<router_result skipped=\"true\">") {
+        if let Some(end) = output.find("</router_result>") {
+            let inner = output[start + "<router_result skipped=\"true\">".len()..end].trim();
+            if !inner.is_empty() {
+                return RouterParsed::Skipped;
+            }
+        }
+        return RouterParsed::Skipped;
+    }
+
+    // Check for enriched result
+    let tag_start = match output.find("<router_result>") {
+        Some(idx) => idx,
+        None => return RouterParsed::ParseFailed("No <router_result> tag found in output".to_string()),
+    };
+
+    let tag_end = match output.find("</router_result>") {
+        Some(idx) => idx,
+        None => return RouterParsed::ParseFailed("No </router_result> closing tag found".to_string()),
+    };
+
+    let inner = output[tag_start + "<router_result>".len()..tag_end].trim().to_string();
+    if inner.is_empty() {
+        return RouterParsed::ParseFailed("Empty <router_result> block".to_string());
+    }
+
+    // Parse the metadata block between --- markers
+    let mut ticket_id: Option<String> = None;
+    let mut organization: Option<String> = None;
+
+    // Look for the --- delimited metadata section
+    let parts: Vec<&str> = inner.splitn(2, "\n---\n").collect();
+    if parts.len() == 2 {
+        // There's a metadata block after the first ---
+        let metadata_section = parts[1];
+        // The metadata block ends at the second ---
+        let metadata = if let Some(end_idx) = metadata_section.find("\n---") {
+            &metadata_section[..end_idx]
+        } else {
+            metadata_section
+        };
+
+        for line in metadata.lines() {
+            let line = line.trim();
+            // Parse "Ticket: T-XXXXXXXX | Organization: org-name | Status: open"
+            if line.starts_with("Ticket:") {
+                for part in line.split('|') {
+                    let part = part.trim();
+                    if let Some(tid) = part.strip_prefix("Ticket:") {
+                        let tid = tid.trim();
+                        if tid.starts_with("T-") {
+                            ticket_id = Some(tid.to_string());
+                        }
+                    } else if let Some(org) = part.strip_prefix("Organization:") {
+                        organization = Some(org.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    RouterParsed::Enriched {
+        enriched_message: inner,
+        ticket_id,
+        organization,
     }
 }
 
