@@ -729,11 +729,17 @@ impl ConversationWorker {
     /// 3. Conversations with an established ticket context from a prior message
     async fn run_ticket_router(&mut self, user_message: &str, _config: &ChatConfig) -> String {
         let original = user_message.to_string();
+        let msg_preview = if user_message.len() > 60 { &user_message[..60] } else { user_message };
+
+        tracing::info!(
+            "[ROUTER] === ENTER === conv={} has_routed={} msg={:?}",
+            self.conversation_id, self.has_routed, msg_preview
+        );
 
         // --- Primary skip: only route the FIRST message in a conversation ---
         // After the first message, skip entirely — no events emitted, no latency.
         if self.has_routed {
-            tracing::debug!("[ROUTER] Skipping — already routed this conversation");
+            tracing::info!("[ROUTER] === SKIP (already routed) === conv={}", self.conversation_id);
             return original;
         }
 
@@ -749,36 +755,46 @@ impl ConversationWorker {
 
         if is_skip_message || is_single_short_word {
             tracing::info!(
-                "[ROUTER] Skipping router for short/conversational message: {:?}",
-                if trimmed.len() > 30 { &trimmed[..30] } else { trimmed }
+                "[ROUTER] === SKIP (short/conversational) === conv={} msg={:?}",
+                self.conversation_id, if trimmed.len() > 30 { &trimmed[..30] } else { trimmed }
             );
             self.has_routed = true;
             return original;
         }
 
-        // --- No skip conditions met — run the full router ---
-        // Emit status so the frontend knows the router is running
-        self.emit_event(&StreamEvent::Status {
-            status: "routing".to_string(),
-            message: Some("Matching to ticket...".to_string()),
-        }).await;
+        tracing::info!("[ROUTER] === RUNNING FULL ROUTER === conv={}", self.conversation_id);
 
+        let start = std::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(ROUTER_TIMEOUT_SECS),
             self.run_ticket_router_inner(user_message),
         ).await;
+        let elapsed = start.elapsed();
 
         // Mark as routed regardless of outcome — never route twice
         self.has_routed = true;
 
         match result {
-            Ok(Ok(enriched)) => enriched,
+            Ok(Ok(ref enriched)) => {
+                let enriched_preview = if enriched.len() > 100 { &enriched[..100] } else { enriched };
+                tracing::info!(
+                    "[ROUTER] === DONE ({:.1}s) === conv={} result={:?}",
+                    elapsed.as_secs_f64(), self.conversation_id, enriched_preview
+                );
+                enriched.clone()
+            }
             Ok(Err(e)) => {
-                tracing::warn!("[ROUTER] Router failed, using original message: {}", e);
+                tracing::warn!(
+                    "[ROUTER] === FAILED ({:.1}s) === conv={} error={}",
+                    elapsed.as_secs_f64(), self.conversation_id, e
+                );
                 original
             }
             Err(_) => {
-                tracing::warn!("[ROUTER] Router timed out after {}s, using original message", ROUTER_TIMEOUT_SECS);
+                tracing::warn!(
+                    "[ROUTER] === TIMEOUT ({}s) === conv={}",
+                    ROUTER_TIMEOUT_SECS, self.conversation_id
+                );
                 original
             }
         }
@@ -866,9 +882,10 @@ impl ConversationWorker {
             return Err(format!("Router send failed: {}", e));
         }
 
-        // Stream the response, emitting Router* events
+        // Stream the response — router is silent (no SSE events), only logging
         let mut response_stream = sdk_client.receive_messages().await;
         let mut router_text_parts: Vec<String> = Vec::new();
+        let mut tool_call_count = 0u32;
 
         loop {
             match response_stream.next().await {
@@ -883,9 +900,8 @@ impl ConversationWorker {
                                     router_text_parts.push(text_content.text.clone());
                                 }
                                 ContentBlock::ToolUse(tool_use) => {
-                                    // Log but don't emit — router is invisible to the user.
-                                    // Only RouterResult is emitted at the end.
-                                    tracing::info!("[ROUTER] Tool use: {} ({})", tool_use.name, tool_use.id);
+                                    tool_call_count += 1;
+                                    tracing::info!("[ROUTER] Tool #{}: {} ({})", tool_call_count, tool_use.name, tool_use.id);
                                 }
                                 ContentBlock::ToolResult(_tool_result) => {
                                     // Silent — router tool results are not shown to the user.
@@ -899,7 +915,7 @@ impl ConversationWorker {
 
                     // Check for result message — router is done
                     if let Message::Result { .. } = &sdk_msg {
-                        tracing::info!("[ROUTER] Completed");
+                        tracing::info!("[ROUTER] Completed — {} tool calls, {} text parts", tool_call_count, router_text_parts.len());
                         break;
                     }
                 }
