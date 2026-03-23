@@ -154,5 +154,9 @@ pub fn get_event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::ReplayComplete { .. } => "replay_complete",
         StreamEvent::TitleUpdate { .. } => "title_update",
         StreamEvent::OrgUpdate { .. } => "org_update",
+        StreamEvent::RouterText { .. } => "router_text",
+        StreamEvent::RouterToolUse { .. } => "router_tool_use",
+        StreamEvent::RouterToolResult { .. } => "router_tool_result",
+        StreamEvent::RouterResult { .. } => "router_result",
     }
 }

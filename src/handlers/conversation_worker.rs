@@ -304,7 +304,9 @@ impl ConversationWorker {
             Ok(arc) => arc,
             Err(e) => {
                 tracing::error!("[WORKER] Failed to get client for {}: {}", self.conversation_id, e);
-                let _ = checkpoints::upsert_checkpoint(&self.db, &self.conversation_id, "failed", 0).await;
+                // Mark checkpoint as interrupted so the iOS app doesn't think the agent is still running.
+                // (upsert_checkpoint always writes status='running', so we use mark_interrupted instead.)
+                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
                 self.emit_event(&StreamEvent::Status {
                     status: "failed".to_string(),
                     message: Some(format!("Failed to start agent: {}", e)),
@@ -808,6 +810,10 @@ fn get_stream_event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::ReplayComplete { .. } => "replay_complete",
         StreamEvent::TitleUpdate { .. } => "title_update",
         StreamEvent::OrgUpdate { .. } => "org_update",
+        StreamEvent::RouterText { .. } => "router_text",
+        StreamEvent::RouterToolUse { .. } => "router_tool_use",
+        StreamEvent::RouterToolResult { .. } => "router_tool_result",
+        StreamEvent::RouterResult { .. } => "router_result",
     }
 }
 

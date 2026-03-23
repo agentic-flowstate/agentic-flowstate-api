@@ -731,8 +731,8 @@ async fn shutdown_signal(db_pool: Arc<ticketing_system::SqlitePool>, shutdown_to
     // Cancel all background tasks (email fetcher, cleanup loops, etc.)
     shutdown_token.cancel();
 
-    tracing::info!("Waiting 2 seconds for in-flight operations to complete...");
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    tracing::info!("Waiting 10 seconds for in-flight operations to complete...");
+    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
     // Mark any still-running checkpoints as interrupted
     match ticketing_system::checkpoints::mark_all_running_as_interrupted(&db_pool).await {
