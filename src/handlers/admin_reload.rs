@@ -252,14 +252,22 @@ pub async fn ios_install_log() -> Response {
 ///
 /// MCP handlers write `~/.agentic-flowstate/pending_restart.json` when a restart
 /// is needed. The iOS app polls this to detect when to show the restart UI.
+///
+/// Stale flags (older than 10 minutes) are auto-cleaned. This prevents ghost
+/// prompts when a restart already happened but the flag wasn't cleaned up.
 pub async fn get_pending_restart() -> Response {
     let home = dirs::home_dir().unwrap_or_default();
     let pending_path = home.join(".agentic-flowstate/pending_restart.json");
     let ios_pending_path = home.join(".agentic-flowstate/pending_ios_install.json");
+    let max_age = std::time::Duration::from_secs(600); // 10 minutes
 
     // Check for pending restart flag
     if let Ok(content) = fs::read_to_string(&pending_path) {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+        // Check file age — auto-clean stale flags
+        if is_stale_flag(&pending_path, max_age) {
+            tracing::info!("Auto-cleaning stale pending_restart.json (older than 10 min)");
+            let _ = fs::remove_file(&pending_path);
+        } else if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
             return (StatusCode::OK, Json(json!({
                 "pending": true,
                 "type": data.get("type").and_then(|v| v.as_str()).unwrap_or("restart"),
@@ -272,7 +280,10 @@ pub async fn get_pending_restart() -> Response {
 
     // Check for pending iOS install flag
     if let Ok(content) = fs::read_to_string(&ios_pending_path) {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+        if is_stale_flag(&ios_pending_path, max_age) {
+            tracing::info!("Auto-cleaning stale pending_ios_install.json (older than 10 min)");
+            let _ = fs::remove_file(&ios_pending_path);
+        } else if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
             return (StatusCode::OK, Json(json!({
                 "pending": true,
                 "type": "ios_install",
@@ -286,12 +297,24 @@ pub async fn get_pending_restart() -> Response {
     }))).into_response()
 }
 
-/// DELETE /api/admin/pending-restart — clear the pending restart flag.
-/// Called after the restart has been executed.
+/// Check if a flag file is older than `max_age` based on filesystem modification time.
+fn is_stale_flag(path: &std::path::Path, max_age: std::time::Duration) -> bool {
+    if let Ok(metadata) = fs::metadata(path) {
+        if let Ok(modified) = metadata.modified() {
+            if let Ok(elapsed) = modified.elapsed() {
+                return elapsed > max_age;
+            }
+        }
+    }
+    false
+}
+
+/// DELETE /api/admin/pending-restart — clear ALL pending flag files.
+/// Called after the restart/install has been executed.
 pub async fn clear_pending_restart() -> Response {
     let home = dirs::home_dir().unwrap_or_default();
-    let pending_path = home.join(".agentic-flowstate/pending_restart.json");
-    let _ = fs::remove_file(&pending_path);
+    let _ = fs::remove_file(home.join(".agentic-flowstate/pending_restart.json"));
+    let _ = fs::remove_file(home.join(".agentic-flowstate/pending_ios_install.json"));
     (StatusCode::OK, Json(json!({"cleared": true}))).into_response()
 }
 
