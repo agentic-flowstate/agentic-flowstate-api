@@ -369,6 +369,13 @@ impl ConversationWorker {
             }
         }
 
+        // Bridge the gap between router completion and main agent streaming.
+        // Without this, the UI shows no activity during client creation + connection.
+        self.emit_event(&StreamEvent::Status {
+            status: "running".to_string(),
+            message: Some("Preparing agent...".to_string()),
+        }).await;
+
         // Get or create SDK client
         let client_arc = match self.get_or_create_client(&msg.config).await {
             Ok(arc) => arc,
