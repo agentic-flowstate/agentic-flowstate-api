@@ -331,21 +331,6 @@ impl ConversationWorker {
             tracing::warn!("[WORKER] Failed to create checkpoint: {}", e);
         }
 
-        // Create initial assistant message placeholder
-        let mut assistant_message_id: Option<String> = None;
-        match conversations::add_message(
-            &self.db,
-            &self.conversation_id,
-            AddMessageRequest {
-                role: "assistant".to_string(),
-                content: String::new(),
-                attachments: None,
-            },
-        ).await {
-            Ok(m) => assistant_message_id = Some(m.id),
-            Err(e) => tracing::error!("[WORKER] Failed to create assistant message: {}", e),
-        }
-
         // === TICKET ROUTER PRE-PROCESSING ===
         // Run a lightweight router agent to match the user's message to a ticket.
         // The router is ephemeral (no session persistence) and has a strict timeout.
@@ -355,6 +340,8 @@ impl ConversationWorker {
         // If the router enriched the message (added ticket context), save it as a
         // "forwarded" message in the conversation DB so it persists across fetchMessages calls.
         // The iOS app maps role="forwarded" to isForwardedMessage=true.
+        // NOTE: This must be created BEFORE the assistant message stub so that
+        // message_index ordering is: user → forwarded → assistant.
         if final_message != enhanced_message {
             if let Err(e) = conversations::add_message(
                 &self.db,
@@ -367,6 +354,23 @@ impl ConversationWorker {
             ).await {
                 tracing::warn!("[WORKER] Failed to save forwarded message: {}", e);
             }
+        }
+
+        // Create assistant message placeholder AFTER the forwarded message so it gets
+        // a higher message_index. This ensures the chat displays in the correct order:
+        // user message → forwarded context → assistant response.
+        let mut assistant_message_id: Option<String> = None;
+        match conversations::add_message(
+            &self.db,
+            &self.conversation_id,
+            AddMessageRequest {
+                role: "assistant".to_string(),
+                content: String::new(),
+                attachments: None,
+            },
+        ).await {
+            Ok(m) => assistant_message_id = Some(m.id),
+            Err(e) => tracing::error!("[WORKER] Failed to create assistant message: {}", e),
         }
 
         // Bridge the gap between router completion and main agent streaming.
