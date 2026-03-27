@@ -10,7 +10,7 @@ use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
-use ticketing_system::{epics, slices, tickets, Epic, Slice, SqlitePool, Ticket};
+use ticketing_system::{epics, memberships, slices, tickets, Epic, Slice, SqlitePool, Ticket};
 
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -142,8 +142,8 @@ pub async fn subscribe_data(
 }
 
 /// GET /api/my-tickets/subscribe
-/// SSE endpoint for real-time updates to tickets assigned to the authenticated user.
-/// Polls across all organizations — no org header needed.
+/// SSE endpoint for real-time ticket updates across all organizations the user belongs to.
+/// Returns ALL tickets (not filtered by assignee) for the user's orgs.
 pub async fn subscribe_my_tickets(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -153,15 +153,25 @@ pub async fn subscribe_my_tickets(
     let stream = async_stream::stream! {
         let mut last_hash: u64 = 0;
 
+        // Look up user's orgs once (memberships rarely change during a session)
+        let orgs = memberships::list_user_organizations(&pool, &user_id)
+            .await
+            .unwrap_or_default();
+
         loop {
-            if let Ok(my_tickets) = tickets::list_tickets_by_assignee(&pool, &user_id).await {
-                let hash = hash_tickets(&my_tickets);
-                if hash != last_hash {
-                    last_hash = hash;
-                    let event = DataEvent::Tickets { tickets: my_tickets };
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        yield Ok(Event::default().data(json));
-                    }
+            let mut all_tickets = Vec::new();
+            for org in &orgs {
+                if let Ok(org_tickets) = tickets::list_tickets_by_organization(&pool, &org.organization).await {
+                    all_tickets.extend(org_tickets);
+                }
+            }
+
+            let hash = hash_tickets(&all_tickets);
+            if hash != last_hash {
+                last_hash = hash;
+                let event = DataEvent::Tickets { tickets: all_tickets };
+                if let Ok(json) = serde_json::to_string(&event) {
+                    yield Ok(Event::default().data(json));
                 }
             }
 
