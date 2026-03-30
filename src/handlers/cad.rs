@@ -58,11 +58,49 @@ pub struct CadFileEntry {
     pub filename: String,
     pub part_name: String,
     pub repo: String,
+    pub category: String,
     pub format: String,
     pub size_bytes: u64,
     pub last_modified: i64,
     pub usdz_available: bool,
     pub thumbnail_available: bool,
+}
+
+/// Derive a category from repo + filename for better grouping
+fn categorize_file(repo: &str, stem: &str) -> &'static str {
+    match repo {
+        "laminarforge-gev-cad" => "Turbogenerator",
+        "laminarforge-cad" => {
+            if stem.starts_with("microfluidic_chip") || stem.starts_with("monolithic_board") {
+                "Microfluidic Chips"
+            } else if stem.starts_with("syringe_pump") || stem.starts_with("syringe_motor")
+                || stem.starts_with("syringe_plunger") || stem.starts_with("syringe_clamp")
+            {
+                "Syringe Pump"
+            } else if stem.starts_with("heating_block") || stem.starts_with("optical_mount")
+                || stem.starts_with("lid") || stem.starts_with("enclosure")
+                || stem.starts_with("tube_holder") || stem.starts_with("tube_fit")
+            {
+                "LAMP Device"
+            } else if stem.starts_with("dispensing") || stem.starts_with("gantry")
+                || stem.starts_with("xy_carriage") || stem.starts_with("z_carriage")
+                || stem.starts_with("wash_station") || stem.starts_with("chip_adapter")
+            {
+                "Dispensing System"
+            } else if stem.starts_with("co2_incubator") {
+                "CO2 Incubator"
+            } else if stem.starts_with("still_air_box") || stem.starts_with("workstation") {
+                "Workstation"
+            } else if stem.starts_with("water_bath") {
+                "Water Bath"
+            } else if stem.starts_with("swab") || stem.starts_with("microlattice") {
+                "Sample Collection"
+            } else {
+                "LAMP Device"
+            }
+        }
+        _ => "Other",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,29 +151,24 @@ pub async fn list_cad_files(
             }
         }
 
-        for (filename, meta) in &entry_data {
-            let path = output_dir.join(filename);
-            let ext = path.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
+        // Build a set of stems that have .usdz files — only these are viewable
+        let usdz_stems: std::collections::HashSet<String> = all_filenames.iter()
+            .filter(|f| f.ends_with(".usdz"))
+            .map(|f| f.strip_suffix(".usdz").unwrap_or(f).to_string())
+            .collect();
 
-            // Only list primary CAD formats (not thumbnails or intermediate files)
-            if !matches!(ext.as_str(), "stp" | "step" | "stl" | "usdz") {
+        for stem in &usdz_stems {
+            let usdz_filename = format!("{}.usdz", stem);
+
+            // Prefer STEP metadata if available, else use USDZ file
+            let (display_filename, meta) = if let Some((_, m)) = entry_data.iter().find(|(f, _)| f == &format!("{}.stp", stem)) {
+                (format!("{}.stp", stem), m)
+            } else if let Some((_, m)) = entry_data.iter().find(|(f, _)| f == &usdz_filename) {
+                (usdz_filename.clone(), m)
+            } else {
                 continue;
-            }
+            };
 
-            let stem = path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-
-            // Skip .usdz files that have a matching .stp (they'll be listed under the .stp entry)
-            if ext == "usdz" && all_filenames.iter().any(|f| f == &format!("{}.stp", stem)) {
-                continue;
-            }
-
-            let usdz_available = ext == "usdz" || all_filenames.contains(&format!("{}.usdz", stem));
             let thumbnail_available = all_filenames.contains(&format!("{}.thumb.png", stem));
 
             let last_modified = meta.modified()
@@ -144,20 +177,27 @@ pub async fn list_cad_files(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
 
+            // Use USDZ file size for download estimation
+            let usdz_size = entry_data.iter()
+                .find(|(f, _)| f == &usdz_filename)
+                .map(|(_, m)| m.len())
+                .unwrap_or(meta.len());
+
             files.push(CadFileEntry {
-                filename: filename.clone(),
-                part_name: humanize_part_name(&stem),
+                filename: display_filename,
+                part_name: humanize_part_name(stem),
                 repo: repo_name.to_string(),
-                format: ext.clone(),
-                size_bytes: meta.len(),
+                category: categorize_file(repo_name, stem).to_string(),
+                format: "usdz".to_string(),
+                size_bytes: usdz_size,
                 last_modified,
-                usdz_available,
+                usdz_available: true,
                 thumbnail_available,
             });
         }
     }
 
-    files.sort_by(|a, b| a.repo.cmp(&b.repo).then(a.part_name.cmp(&b.part_name)));
+    files.sort_by(|a, b| a.category.cmp(&b.category).then(a.part_name.cmp(&b.part_name)));
 
     (StatusCode::OK, Json(json!({
         "files": files,
