@@ -329,20 +329,35 @@ pub async fn restart_api() -> Response {
     let pending_path = home.join(".agentic-flowstate/pending_restart.json");
     let _ = fs::remove_file(&pending_path);
 
-    // Spawn restart in a background thread with a delay so we can return the response
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let uid = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "501".to_string());
-        let target = format!("gui/{}/com.agentic.api", uid);
-        tracing::info!("Executing approved restart via launchctl kickstart -k {}", target);
-        let _ = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", &target])
-            .output();
-    });
+    // Spawn restart as a detached process so it survives this server dying.
+    // After cargo build replaces the binary, macOS 26's code signing monitor
+    // caches the old hash. "kickstart -k" fails with SIGKILL (Code Signature
+    // Invalid) / Launch Constraint Violation. bootout+bootstrap fully resets
+    // the cached code signing state.
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "501".to_string());
+    let plist_path = format!(
+        "{}/Library/LaunchAgents/com.agentic.api.plist",
+        std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string())
+    );
+    let script = format!(
+        "sleep 1; \
+         launchctl bootout gui/{uid}/com.agentic.api 2>/dev/null; \
+         i=0; while launchctl list com.agentic.api >/dev/null 2>&1 && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; \
+         launchctl bootstrap gui/{uid} '{plist}'",
+        uid = uid,
+        plist = plist_path,
+    );
+    tracing::info!("Executing approved restart via bootout+bootstrap (code-sign safe)");
+    let _ = std::process::Command::new("bash")
+        .args(["-c", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 
     (StatusCode::OK, Json(json!({"status": "restarting"}))).into_response()
 }
