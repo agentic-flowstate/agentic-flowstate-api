@@ -615,6 +615,14 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::device_tokens::register_device_token)
             .delete(handlers::device_tokens::remove_device_token))
 
+        // CAD file routes (LaminarForge 3D models)
+        .route("/api/cad/files",
+            get(handlers::cad::list_cad_files))
+        .route("/api/cad/files/:filename",
+            get(handlers::cad::download_cad_file))
+        .route("/api/cad/files/:filename/thumbnail",
+            get(handlers::cad::get_cad_thumbnail))
+
         .layer(axum::middleware::from_fn_with_state(app_state.db.clone(), auth_middleware::require_auth));
 
     // Admin routes (require valid session + admin role)
