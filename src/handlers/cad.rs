@@ -275,6 +275,7 @@ pub async fn download_cad_file(
             (header::CONTENT_TYPE, content_type.to_string()),
             (header::CONTENT_LENGTH, file_size.to_string()),
             (header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", filename)),
+            (header::CACHE_CONTROL, "no-store".to_string()),
         ],
         body,
     ).into_response()
