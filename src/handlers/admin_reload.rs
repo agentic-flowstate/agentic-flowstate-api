@@ -12,7 +12,7 @@ const RELOAD_LOG_PATH: &str = "/tmp/agentic-reload.log";
 pub async fn reload_services() -> Response {
     let setup_script = dirs::home_dir()
         .unwrap_or_default()
-        .join("projects/agentic-flowstate-setup/setup.sh");
+        .join("projects/agentic-flowstate/agentic-flowstate-setup/setup.sh");
 
     if !setup_script.exists() {
         return (
@@ -55,28 +55,38 @@ pub async fn reload_services() -> Response {
         path
     );
 
-    // Spawn detached — the script will rebuild and restart services (including this API server).
-    // Output goes to the log file so the app can read progress.
-    match std::process::Command::new("bash")
-        .arg("-l")
-        .arg(&setup_script)
-        .env("PATH", &full_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(stderr_file))
-        .spawn()
+    // Spawn in a NEW SESSION (setsid) so the script survives launchctl bootout
+    // killing our process group during step 7 (LaunchAgents restart).
+    // Without setsid, setup.sh is a child of the API server — when bootout
+    // kills our process group, setup.sh dies and services never restart.
     {
-        Ok(_) => {
-            tracing::info!("Setup script spawned for full reload");
-            (StatusCode::OK, Json(json!({"status": "reload_started"}))).into_response()
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-l")
+            .arg(&setup_script)
+            .env("PATH", &full_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(stderr_file));
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
         }
-        Err(e) => {
-            tracing::error!("Failed to spawn setup script: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to start reload: {}", e)})),
-            )
-                .into_response()
+        match cmd.spawn() {
+            Ok(_) => {
+                tracing::info!("Setup script spawned for full reload (detached via setsid)");
+                (StatusCode::OK, Json(json!({"status": "reload_started"}))).into_response()
+            }
+            Err(e) => {
+                tracing::error!("Failed to spawn setup script: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("Failed to start reload: {}", e)})),
+                )
+                    .into_response()
+            }
         }
     }
 }
@@ -92,7 +102,7 @@ pub async fn reload_log() -> Response {
 // ---- iOS Install (lightweight, no full rebuild) ----
 
 const IOS_INSTALL_LOG_PATH: &str = "/tmp/agentic-ios-install.log";
-const APP_DIR: &str = "/Users/jarvisgpt/projects/agentic-flowstate-app";
+const APP_DIR: &str = "/Users/jarvisgpt/projects/agentic-flowstate/agentic-flowstate-app";
 
 /// POST /api/admin/ios-install — build and install the iOS app only (no MCP/API/frontend rebuild).
 /// Spawns xcodegen + xcodebuild + devicectl install as a detached process.
@@ -329,35 +339,74 @@ pub async fn restart_api() -> Response {
     let pending_path = home.join(".agentic-flowstate/pending_restart.json");
     let _ = fs::remove_file(&pending_path);
 
-    // Spawn restart as a detached process so it survives this server dying.
-    // After cargo build replaces the binary, macOS 26's code signing monitor
-    // caches the old hash. "kickstart -k" fails with SIGKILL (Code Signature
-    // Invalid) / Launch Constraint Violation. bootout+bootstrap fully resets
-    // the cached code signing state.
+    // Spawn restart via a FULLY DETACHED process (setsid) so it survives
+    // launchctl bootout killing this server's process group.
+    //
+    // Previous bug: the bash script was a child of the API server. When
+    // bootout killed the API server, it also killed the entire process group,
+    // so the bootstrap command never ran — leaving the service permanently down.
+    //
+    // Fix: use setsid to create a new session + process group, then exec bash.
+    // The restart script logs to /tmp/agentic-restart-debug.log for diagnostics.
     let uid = std::process::Command::new("id")
         .arg("-u")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "501".to_string());
-    let plist_path = format!(
-        "{}/Library/LaunchAgents/com.agentic.api.plist",
+    let log = "/tmp/agentic-restart-debug.log";
+    let binary = format!(
+        "{}/projects/agentic-flowstate/agentic-flowstate-api/target/release/agentic_api",
         std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string())
     );
     let script = format!(
-        "sleep 1; \
-         launchctl bootout gui/{uid}/com.agentic.api 2>/dev/null; \
-         i=0; while launchctl list com.agentic.api >/dev/null 2>&1 && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done; \
-         launchctl bootstrap gui/{uid} '{plist}'",
+        r#"exec > '{log}' 2>&1
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_api: script started (pid=$$, pgid=$(ps -o pgid= -p $$))"
+sleep 1
+
+# Atomic binary replacement — creates a new inode so the kernel's
+# code signing cache treats it as a fresh binary.
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_api: atomic binary replacement + codesign"
+cp '{binary}' '{binary}.tmp'
+mv '{binary}.tmp' '{binary}'
+codesign -f -s - '{binary}' 2>&1
+xattr -d com.apple.provenance '{binary}' 2>/dev/null || true
+
+# kickstart -k kills and restarts without deregistering the service.
+# Safe after atomic replacement fixes the code signing cache.
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_api: kickstart -k gui/{uid}/com.agentic.api"
+launchctl kickstart -k gui/{uid}/com.agentic.api 2>&1
+rc=$?
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_api: kickstart returned $rc"
+
+sleep 2
+if launchctl list com.agentic.api >/dev/null 2>&1; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_api: SUCCESS — service is running"
+else
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_api: FAILED — service not found after kickstart"
+fi
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_api: script complete""#,
         uid = uid,
-        plist = plist_path,
+        binary = binary,
+        log = log,
     );
-    tracing::info!("Executing approved restart via bootout+bootstrap (code-sign safe)");
-    let _ = std::process::Command::new("bash")
-        .args(["-c", &script])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    tracing::info!("Executing approved restart via atomic-replace + kickstart (debug logging to {})", log);
+    // Use pre_exec(setsid) to create a new session so this script survives
+    // kickstart killing our process group.
+    {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("bash");
+        cmd.args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let _ = cmd.spawn();
+    }
 
     (StatusCode::OK, Json(json!({"status": "restarting"}))).into_response()
 }

@@ -13,6 +13,9 @@ ticketing-system = { path = "../agentic-flowstate-ticketing-system" }
 # Claude Agent SDK
 cc-sdk = "0.6"
 
+# Process detachment (setsid for restart scripts)
+libc = "0.2"
+
 # Web framework
 axum = { version = "0.7", features = ["default", "ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }

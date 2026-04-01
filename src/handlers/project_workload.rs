@@ -363,7 +363,8 @@ async fn build_org_data_snapshot(db: &SqlitePool, org: &str) -> Result<String, S
 /// Truncate output to a reasonable size for storage
 fn truncate_output(text: &str) -> String {
     if text.len() > 50000 {
-        format!("{}...\n\n[Output truncated at 50000 chars]", &text[..50000])
+        let end = (0..=50000).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        format!("{}...\n\n[Output truncated at {} bytes]", &text[..end], end)
     } else {
         text.to_string()
     }

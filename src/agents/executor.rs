@@ -333,7 +333,8 @@ impl AgentExecutor {
         } else {
             let full_output = output_parts.join("\n\n");
             if full_output.len() > 100000 {
-                Some(format!("{}...\n\n[Output truncated]", &full_output[..100000]))
+                let end = (0..=100000).rev().find(|&i| full_output.is_char_boundary(i)).unwrap_or(0);
+                Some(format!("{}...\n\n[Output truncated]", &full_output[..end]))
             } else {
                 Some(full_output)
             }

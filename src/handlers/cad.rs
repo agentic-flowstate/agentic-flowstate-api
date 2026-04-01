@@ -13,8 +13,8 @@ use tokio_util::io::ReaderStream;
 use tracing::error;
 
 const REPOS: &[(&str, &str)] = &[
-    ("laminarforge-cad", "/Users/jarvisgpt/projects/laminarforge-cad"),
-    ("laminarforge-gev-cad", "/Users/jarvisgpt/projects/laminarforge-gev-cad"),
+    ("laminarforge-cad", "/Users/jarvisgpt/projects/laminarforge/laminarforge-cad"),
+    ("laminarforge-gev-cad", "/Users/jarvisgpt/projects/gev-dynamics/gevdynamics-cad"),
 ];
 
 fn resolve_output_dir(repo: &str) -> Option<PathBuf> {

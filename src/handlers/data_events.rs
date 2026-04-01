@@ -157,14 +157,22 @@ pub async fn subscribe_my_tickets(
         let orgs = memberships::list_user_organizations(&pool, &user_id)
             .await
             .unwrap_or_default();
+        tracing::info!("[MY-TICKETS-SSE] user={} found {} orgs: {:?}", user_id, orgs.len(), orgs.iter().map(|o| &o.organization).collect::<Vec<_>>());
 
         loop {
             let mut all_tickets = Vec::new();
             for org in &orgs {
-                if let Ok(org_tickets) = tickets::list_tickets_by_organization(&pool, &org.organization).await {
-                    all_tickets.extend(org_tickets);
+                match tickets::list_tickets_by_organization(&pool, &org.organization).await {
+                    Ok(org_tickets) => {
+                        tracing::debug!("[MY-TICKETS-SSE] org={} returned {} tickets", org.organization, org_tickets.len());
+                        all_tickets.extend(org_tickets);
+                    }
+                    Err(e) => {
+                        tracing::error!("[MY-TICKETS-SSE] org={} FAILED: {:?}", org.organization, e);
+                    }
                 }
             }
+            tracing::info!("[MY-TICKETS-SSE] total tickets={}", all_tickets.len());
 
             let hash = hash_tickets(&all_tickets);
             if hash != last_hash {

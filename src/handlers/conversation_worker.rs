@@ -773,7 +773,14 @@ impl ConversationWorker {
     /// 3. Conversations with an established ticket context from a prior message
     async fn run_ticket_router(&mut self, user_message: &str, _config: &ChatConfig) -> String {
         let original = user_message.to_string();
-        let msg_preview = if user_message.len() > 60 { &user_message[..60] } else { user_message };
+
+        // Truncate preview at a safe UTF-8 char boundary (floor to nearest boundary at or before 60)
+        let msg_preview = if user_message.len() > 60 {
+            let end = (0..=60).rev().find(|&i| user_message.is_char_boundary(i)).unwrap_or(0);
+            &user_message[..end]
+        } else {
+            user_message
+        };
 
         tracing::info!(
             "[ROUTER] === ENTER === conv={} has_routed={} msg={:?}",
@@ -800,7 +807,7 @@ impl ConversationWorker {
         if is_skip_message || is_single_short_word {
             tracing::info!(
                 "[ROUTER] === SKIP (short/conversational) === conv={} msg={:?}",
-                self.conversation_id, if trimmed.len() > 30 { &trimmed[..30] } else { trimmed }
+                self.conversation_id, if trimmed.len() > 30 { &trimmed[..(0..=30).rev().find(|&i| trimmed.is_char_boundary(i)).unwrap_or(0)] } else { trimmed }
             );
             self.has_routed = true;
             // Persist so this survives server restarts
@@ -847,7 +854,7 @@ impl ConversationWorker {
 
         match result {
             Ok(Ok(ref enriched)) => {
-                let enriched_preview = if enriched.len() > 100 { &enriched[..100] } else { enriched };
+                let enriched_preview = if enriched.len() > 100 { &enriched[..(0..=100).rev().find(|&i| enriched.is_char_boundary(i)).unwrap_or(0)] } else { enriched };
                 tracing::info!(
                     "[ROUTER] === DONE ({:.1}s) === conv={} result={:?}",
                     elapsed.as_secs_f64(), self.conversation_id, enriched_preview
@@ -1010,7 +1017,7 @@ impl ConversationWorker {
         // Parse the router output
         let full_output = router_text_parts.join("");
         tracing::info!("[ROUTER] Full output ({} chars): {}", full_output.len(),
-            if full_output.len() > 200 { &full_output[..200] } else { &full_output });
+            if full_output.len() > 200 { &full_output[..(0..=200).rev().find(|&i| full_output.is_char_boundary(i)).unwrap_or(0)] } else { &full_output });
 
         let parsed = parse_router_result(&full_output);
 
