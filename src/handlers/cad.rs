@@ -14,7 +14,7 @@ use tracing::error;
 
 const REPOS: &[(&str, &str)] = &[
     ("laminarforge-cad", "/Users/jarvisgpt/projects/laminarforge/laminarforge-cad"),
-    ("laminarforge-gev-cad", "/Users/jarvisgpt/projects/gev-dynamics/gevdynamics-cad"),
+    ("gevdynamics-cad", "/Users/jarvisgpt/projects/gev-dynamics/gevdynamics-cad"),
 ];
 
 fn resolve_output_dir(repo: &str) -> Option<PathBuf> {
@@ -69,7 +69,7 @@ pub struct CadFileEntry {
 /// Derive a category from repo + filename for better grouping
 fn categorize_file(repo: &str, stem: &str) -> &'static str {
     match repo {
-        "laminarforge-gev-cad" => "Turbogenerator",
+        "gevdynamics-cad" => "Turbogenerator",
         "laminarforge-cad" => {
             if stem.starts_with("microfluidic_chip") || stem.starts_with("monolithic_board") {
                 "Microfluidic Chips"
