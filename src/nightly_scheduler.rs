@@ -1,8 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use chrono::{Local, NaiveTime};
-use ticketing_system::{nightly_runs, tickets, Ticket, SqlitePool};
+use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig, PermissionMode};
+use futures::StreamExt;
+use ticketing_system::{nightly_runs, tickets, NightlyRun, Ticket, SqlitePool};
 use tokio_util::sync::CancellationToken;
+
+use crate::agents::prompts::load_prompt;
 
 /// Ticket data grouped by organization, ready for orchestrator dispatch.
 #[derive(Debug)]
@@ -255,21 +259,314 @@ fn group_by_org(tickets: &[&Ticket]) -> Vec<OrgTicketGroup> {
         .collect()
 }
 
-/// Placeholder for orchestrator dispatch (T-A6C15CBB).
-/// Will be replaced with actual per-org Opus orchestrator calls.
+/// Orchestrator execution plan — batches of ticket IDs per org.
+#[derive(Debug)]
+pub struct OrgExecutionPlan {
+    pub organization: String,
+    pub batches: Vec<Vec<String>>,
+    pub tickets: Vec<SchedulerTicket>,
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator dispatch
+// ---------------------------------------------------------------------------
+
+/// Run per-org orchestrator agents in parallel. Each receives its org's ticket
+/// data and outputs a batched execution plan as structured JSON.
 async fn run_orchestrator_dispatch(
     db_pool: &SqlitePool,
-    run: &ticketing_system::NightlyRun,
+    run: &NightlyRun,
     org_groups: Vec<OrgTicketGroup>,
 ) -> anyhow::Result<()> {
     tracing::info!(
-        "[nightly] Orchestrator dispatch placeholder — {} org group(s), run_id={}",
+        "[nightly] Dispatching orchestrators for {} org(s), run_id={}",
         org_groups.len(),
         run.id
     );
 
-    // TODO(T-A6C15CBB): Replace with actual orchestrator + execution pipeline.
-    // For now, mark the run as completed so the scheduler doesn't re-trigger.
+    // Fire all org orchestrators in parallel
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for group in org_groups {
+        let pool = db_pool.clone();
+        let run_id = run.id;
+        join_set.spawn(async move {
+            run_org_orchestrator(&pool, run_id, group).await
+        });
+    }
+
+    // Collect results
+    let mut all_plans = Vec::new();
+
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(plan)) => {
+                tracing::info!(
+                    "[nightly] Orchestrator for '{}' produced {} batch(es)",
+                    plan.organization,
+                    plan.batches.len()
+                );
+                all_plans.push(plan);
+            }
+            Ok(Err(e)) => {
+                tracing::error!("[nightly] Orchestrator failed: {}", e);
+            }
+            Err(e) => {
+                tracing::error!("[nightly] Orchestrator task panicked: {}", e);
+            }
+        }
+    }
+
+    if all_plans.is_empty() {
+        tracing::warn!("[nightly] All orchestrators failed, marking run as failed");
+        nightly_runs::update_run_status(db_pool, run.id, "failed", 0, 0).await?;
+        return Ok(());
+    }
+
+    // Hand off to batch execution engine (T-E350DA66)
+    run_batch_execution(db_pool, run, all_plans).await?;
+
+    Ok(())
+}
+
+/// Run a single org's orchestrator: format ticket data, call Opus, parse JSON.
+async fn run_org_orchestrator(
+    db_pool: &SqlitePool,
+    run_id: i64,
+    group: OrgTicketGroup,
+) -> anyhow::Result<OrgExecutionPlan> {
+    let org = &group.organization;
+    tracing::info!(
+        "[nightly] Running orchestrator for '{}' with {} ticket(s)",
+        org,
+        group.tickets.len()
+    );
+
+    // Format ticket data for the prompt
+    let tickets_text = format_tickets_for_orchestrator(&group.tickets);
+
+    // Load prompt template
+    let mut vars = HashMap::new();
+    vars.insert("organization".to_string(), org.clone());
+    vars.insert("tickets".to_string(), tickets_text);
+
+    let system_prompt = load_prompt("nightly-orchestrator", vars)?;
+
+    // Call Opus via cc-sdk (no tools, single turn)
+    let options = ClaudeCodeOptions::builder()
+        .system_prompt(&system_prompt)
+        .model("claude-opus-4-6")
+        .tools(ToolsConfig::none())
+        .max_turns(1)
+        .permission_mode(PermissionMode::BypassPermissions)
+        .cwd(std::path::Path::new("/tmp"))
+        .build();
+
+    let mut sdk_client = ClaudeSDKClient::new(options);
+    sdk_client.connect(None).await
+        .map_err(|e| anyhow::anyhow!("Failed to connect orchestrator for {}: {}", org, e))?;
+
+    let user_msg = format!(
+        "Analyze these {} tickets and produce the batched execution plan.",
+        group.tickets.len()
+    );
+    sdk_client.send_user_message(user_msg).await
+        .map_err(|e| anyhow::anyhow!("Failed to send to orchestrator for {}: {}", org, e))?;
+
+    let mut response_stream = sdk_client.receive_messages().await;
+    let mut output_parts = Vec::new();
+
+    while let Some(msg_result) = response_stream.next().await {
+        match msg_result {
+            Ok(Message::Assistant { message: assistant_msg }) => {
+                for block in &assistant_msg.content {
+                    if let ContentBlock::Text(text) = block {
+                        output_parts.push(text.text.clone());
+                    }
+                }
+            }
+            Ok(Message::Result { .. }) => break,
+            Err(e) => {
+                tracing::error!("[nightly] Orchestrator stream error for {}: {}", org, e);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let raw_output = output_parts.join("");
+    tracing::debug!("[nightly] Orchestrator raw output for {}: {}", org, &raw_output[..raw_output.len().min(500)]);
+
+    // Parse JSON output
+    let batches = parse_orchestrator_output(&raw_output, &group.tickets)?;
+
+    // Update nightly_run_tickets with batch numbers
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        for ticket_id in batch {
+            if let Err(e) = nightly_runs::set_batch_number(
+                db_pool,
+                run_id,
+                ticket_id,
+                (batch_idx + 1) as i64,
+            )
+            .await
+            {
+                tracing::error!(
+                    "[nightly] Failed to set batch number for {}: {}",
+                    ticket_id, e
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        "[nightly] Orchestrator for '{}' complete: {} batch(es) with {} total ticket(s)",
+        org,
+        batches.len(),
+        batches.iter().map(|b| b.len()).sum::<usize>()
+    );
+
+    Ok(OrgExecutionPlan {
+        organization: org.clone(),
+        batches,
+        tickets: group.tickets,
+    })
+}
+
+/// Format ticket data as structured text for the orchestrator prompt.
+fn format_tickets_for_orchestrator(tickets: &[SchedulerTicket]) -> String {
+    let mut lines = Vec::new();
+
+    for t in tickets {
+        lines.push(format!("### {} — {}", t.ticket_id, t.title));
+        lines.push(format!("- Classification: {}", t.classification));
+        if let Some(ref repo) = t.repository {
+            lines.push(format!("- Repository: {}", repo));
+        } else {
+            lines.push("- Repository: none (research only)".to_string());
+        }
+        if !t.blocked_by.is_empty() {
+            lines.push(format!("- Blocked by: {}", t.blocked_by.join(", ")));
+        }
+        if let Some(ref desc) = t.description {
+            let short = if desc.len() > 200 { &desc[..200] } else { desc };
+            lines.push(format!("- Description: {}", short));
+        }
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
+}
+
+/// Parse orchestrator JSON output. Falls back to all-in-one-batch on failure.
+fn parse_orchestrator_output(
+    raw: &str,
+    tickets: &[SchedulerTicket],
+) -> anyhow::Result<Vec<Vec<String>>> {
+    // Try to extract JSON from the response (may be wrapped in markdown fences)
+    let json_str = extract_json(raw);
+
+    match serde_json::from_str::<serde_json::Value>(&json_str) {
+        Ok(val) => {
+            if let Some(batches_arr) = val.get("batches").and_then(|b| b.as_array()) {
+                let mut batches = Vec::new();
+                for batch in batches_arr {
+                    if let Some(ids) = batch.as_array() {
+                        let ticket_ids: Vec<String> = ids
+                            .iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect();
+                        if !ticket_ids.is_empty() {
+                            batches.push(ticket_ids);
+                        }
+                    }
+                }
+                if batches.is_empty() {
+                    tracing::warn!("[nightly] Orchestrator returned empty batches, falling back");
+                    Ok(fallback_single_batch(tickets))
+                } else {
+                    Ok(batches)
+                }
+            } else {
+                tracing::warn!("[nightly] Orchestrator JSON missing 'batches' key, falling back");
+                Ok(fallback_single_batch(tickets))
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "[nightly] Failed to parse orchestrator JSON ({}), falling back to single batch",
+                e
+            );
+            Ok(fallback_single_batch(tickets))
+        }
+    }
+}
+
+/// Extract JSON from a response that may include markdown fences or preamble.
+fn extract_json(raw: &str) -> String {
+    let trimmed = raw.trim();
+
+    // Try direct parse first
+    if trimmed.starts_with('{') {
+        return trimmed.to_string();
+    }
+
+    // Try extracting from ```json ... ``` fences
+    if let Some(start) = trimmed.find("```json") {
+        let after_fence = &trimmed[start + 7..];
+        if let Some(end) = after_fence.find("```") {
+            return after_fence[..end].trim().to_string();
+        }
+    }
+
+    // Try extracting from ``` ... ``` fences
+    if let Some(start) = trimmed.find("```") {
+        let after_fence = &trimmed[start + 3..];
+        if let Some(end) = after_fence.find("```") {
+            let inner = after_fence[..end].trim();
+            if inner.starts_with('{') {
+                return inner.to_string();
+            }
+        }
+    }
+
+    // Try finding first { to last }
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            if end > start {
+                return trimmed[start..=end].to_string();
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+/// Fallback: put all tickets in a single batch.
+fn fallback_single_batch(tickets: &[SchedulerTicket]) -> Vec<Vec<String>> {
+    vec![tickets.iter().map(|t| t.ticket_id.clone()).collect()]
+}
+
+// ---------------------------------------------------------------------------
+// Batch execution placeholder (T-E350DA66)
+// ---------------------------------------------------------------------------
+
+/// Placeholder for batch execution engine. Will be replaced by T-E350DA66.
+async fn run_batch_execution(
+    db_pool: &SqlitePool,
+    run: &NightlyRun,
+    plans: Vec<OrgExecutionPlan>,
+) -> anyhow::Result<()> {
+    let total_tickets: usize = plans.iter().map(|p| p.batches.iter().map(|b| b.len()).sum::<usize>()).sum();
+    tracing::info!(
+        "[nightly] Batch execution placeholder — {} plan(s), {} total ticket(s), run_id={}",
+        plans.len(),
+        total_tickets,
+        run.id
+    );
+
+    // TODO(T-E350DA66): Replace with actual batch execution engine.
+    // For now, mark the run as completed.
     nightly_runs::update_run_status(db_pool, run.id, "completed", 0, 0).await?;
 
     Ok(())
