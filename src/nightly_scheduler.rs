@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use chrono::{Local, NaiveTime};
-use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig, PermissionMode};
+use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig, PermissionMode, McpServerConfig};
 use futures::StreamExt;
 use ticketing_system::{nightly_runs, tickets, NightlyRun, Ticket, SqlitePool};
 use tokio_util::sync::CancellationToken;
@@ -548,26 +548,650 @@ fn fallback_single_batch(tickets: &[SchedulerTicket]) -> Vec<Vec<String>> {
 }
 
 // ---------------------------------------------------------------------------
-// Batch execution placeholder (T-E350DA66)
+// Batch execution engine
 // ---------------------------------------------------------------------------
 
-/// Placeholder for batch execution engine. Will be replaced by T-E350DA66.
+/// Global concurrency limiter: max 5 ticket pipelines running simultaneously.
+static PIPELINE_SEMAPHORE: once_cell::sync::Lazy<tokio::sync::Semaphore> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Semaphore::new(5));
+
+/// Execute all org plans: batches run sequentially, tickets within a batch
+/// run in parallel (up to the global semaphore limit).
 async fn run_batch_execution(
     db_pool: &SqlitePool,
     run: &NightlyRun,
     plans: Vec<OrgExecutionPlan>,
 ) -> anyhow::Result<()> {
-    let total_tickets: usize = plans.iter().map(|p| p.batches.iter().map(|b| b.len()).sum::<usize>()).sum();
+    let total_tickets: usize = plans
+        .iter()
+        .map(|p| p.batches.iter().map(|b| b.len()).sum::<usize>())
+        .sum();
     tracing::info!(
-        "[nightly] Batch execution placeholder — {} plan(s), {} total ticket(s), run_id={}",
+        "[nightly] Starting batch execution — {} plan(s), {} total ticket(s), run_id={}",
         plans.len(),
         total_tickets,
         run.id
     );
 
-    // TODO(T-E350DA66): Replace with actual batch execution engine.
-    // For now, mark the run as completed.
-    nightly_runs::update_run_status(db_pool, run.id, "completed", 0, 0).await?;
+    // Build a lookup map: ticket_id -> SchedulerTicket
+    let mut ticket_map: HashMap<String, SchedulerTicket> = HashMap::new();
+    for plan in &plans {
+        for t in &plan.tickets {
+            ticket_map.insert(t.ticket_id.clone(), t.clone());
+        }
+    }
+
+    // Merge all org plans into a unified batch sequence.
+    // Find the max batch count across all orgs, then for each batch level,
+    // merge all org batches at that level.
+    let max_batches = plans.iter().map(|p| p.batches.len()).max().unwrap_or(0);
+
+    let mut completed_count: i64 = 0;
+    let mut failed_count: i64 = 0;
+
+    for batch_idx in 0..max_batches {
+        // Collect all ticket IDs across all orgs at this batch level
+        let mut batch_ticket_ids: Vec<String> = Vec::new();
+        for plan in &plans {
+            if let Some(batch) = plan.batches.get(batch_idx) {
+                batch_ticket_ids.extend(batch.clone());
+            }
+        }
+
+        if batch_ticket_ids.is_empty() {
+            continue;
+        }
+
+        tracing::info!(
+            "[nightly] Executing batch {} with {} ticket(s)",
+            batch_idx + 1,
+            batch_ticket_ids.len()
+        );
+
+        // Run all tickets in this batch in parallel (up to semaphore limit)
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for ticket_id in batch_ticket_ids {
+            let pool = db_pool.clone();
+            let run_id = run.id;
+            let ticket = match ticket_map.get(&ticket_id) {
+                Some(t) => t.clone(),
+                None => {
+                    tracing::error!("[nightly] Ticket {} not found in lookup map", ticket_id);
+                    continue;
+                }
+            };
+
+            join_set.spawn(async move {
+                // Acquire semaphore permit
+                let _permit = PIPELINE_SEMAPHORE.acquire().await.unwrap();
+                run_ticket_pipeline(&pool, run_id, &ticket).await
+            });
+        }
+
+        // Wait for all tickets in this batch to complete
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Ok(true)) => completed_count += 1,
+                Ok(Ok(false)) => failed_count += 1,
+                Ok(Err(e)) => {
+                    tracing::error!("[nightly] Pipeline error: {}", e);
+                    failed_count += 1;
+                }
+                Err(e) => {
+                    tracing::error!("[nightly] Pipeline task panicked: {}", e);
+                    failed_count += 1;
+                }
+            }
+        }
+
+        tracing::info!(
+            "[nightly] Batch {} complete. Running totals: {} completed, {} failed",
+            batch_idx + 1,
+            completed_count,
+            failed_count
+        );
+    }
+
+    // Finalize the run
+    let status = if failed_count == 0 { "completed" } else { "completed_with_failures" };
+    nightly_runs::update_run_status(db_pool, run.id, status, completed_count, failed_count).await?;
+
+    tracing::info!(
+        "[nightly] Run {} finished: {} completed, {} failed",
+        run.id,
+        completed_count,
+        failed_count
+    );
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Per-ticket pipeline
+// ---------------------------------------------------------------------------
+
+/// Run the 3-agent pipeline for a single ticket.
+/// Returns Ok(true) on success, Ok(false) on failure.
+async fn run_ticket_pipeline(
+    db_pool: &SqlitePool,
+    run_id: i64,
+    ticket: &SchedulerTicket,
+) -> anyhow::Result<bool> {
+    tracing::info!(
+        "[nightly] Starting pipeline for {} — {}",
+        ticket.ticket_id,
+        ticket.title
+    );
+
+    // Re-check ticket status before starting (may have changed since orchestrator)
+    if let Some(current) = tickets::get_ticket_by_id(db_pool, &ticket.ticket_id).await? {
+        if current.status.as_str() != "open" {
+            tracing::info!(
+                "[nightly] Ticket {} is no longer open (status: {}), skipping",
+                ticket.ticket_id,
+                current.status
+            );
+            nightly_runs::update_run_ticket_status(
+                db_pool, run_id, &ticket.ticket_id, "skipped",
+                Some(&format!("Ticket status changed to {}", current.status)),
+            ).await?;
+            return Ok(true);
+        }
+    }
+
+    // Move ticket to in_progress
+    if let Err(e) = tickets::update_ticket_status(
+        db_pool, &ticket.organization, &ticket.epic_id,
+        &ticket.slice_id, &ticket.ticket_id, "in_progress",
+    ).await {
+        tracing::warn!("[nightly] Failed to set {} to in_progress: {}", ticket.ticket_id, e);
+    }
+
+    // Set up worktree if ticket has a repository
+    let (worktree_path, branch_name, repo_path) = if let Some(ref repo_name) = ticket.repository {
+        match setup_worktree(db_pool, &ticket.ticket_id, repo_name).await {
+            Ok((wt, br, rp)) => {
+                nightly_runs::mark_run_ticket_started(
+                    db_pool, run_id, &ticket.ticket_id,
+                    Some(&wt), Some(&br),
+                ).await?;
+                (Some(wt), Some(br), Some(rp))
+            }
+            Err(e) => {
+                tracing::error!(
+                    "[nightly] Failed to create worktree for {}: {}",
+                    ticket.ticket_id, e
+                );
+                nightly_runs::update_run_ticket_status(
+                    db_pool, run_id, &ticket.ticket_id, "failed",
+                    Some(&format!("Worktree creation failed: {}", e)),
+                ).await?;
+                nightly_runs::increment_failed(db_pool, run_id).await?;
+                return Ok(false);
+            }
+        }
+    } else {
+        nightly_runs::mark_run_ticket_started(
+            db_pool, run_id, &ticket.ticket_id, None, None,
+        ).await?;
+        (None, None, None)
+    };
+
+    let working_dir = worktree_path
+        .as_deref()
+        .map(std::path::Path::new)
+        .unwrap_or(std::path::Path::new("/Users/jarvisgpt/projects"));
+
+    // ---- Agent 1: Codebase Research ----
+    let codebase_output = match run_codebase_research(ticket, working_dir).await {
+        Ok(output) => {
+            tracing::info!(
+                "[nightly] Codebase research complete for {} ({} chars)",
+                ticket.ticket_id,
+                output.len()
+            );
+            Some(output)
+        }
+        Err(e) => {
+            tracing::error!(
+                "[nightly] Codebase research failed for {}: {}",
+                ticket.ticket_id, e
+            );
+            None
+        }
+    };
+
+    // ---- Agent 2: Exa Research ----
+    let exa_output = match run_exa_research(ticket, working_dir, codebase_output.as_deref()).await {
+        Ok(output) => {
+            tracing::info!(
+                "[nightly] Exa research complete for {} ({} chars)",
+                ticket.ticket_id,
+                output.len()
+            );
+            Some(output)
+        }
+        Err(e) => {
+            tracing::error!(
+                "[nightly] Exa research failed for {}: {}",
+                ticket.ticket_id, e
+            );
+            None
+        }
+    };
+
+    // ---- Agent 3: Full-Access Execution ----
+    let execution_result = run_full_access_execution(
+        ticket,
+        working_dir,
+        worktree_path.as_deref(),
+        branch_name.as_deref(),
+        codebase_output.as_deref(),
+        exa_output.as_deref(),
+    )
+    .await;
+
+    // Determine outcome
+    let success = match &execution_result {
+        Ok(_) => {
+            tracing::info!("[nightly] Execution complete for {}", ticket.ticket_id);
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                "[nightly] Execution failed for {}: {}",
+                ticket.ticket_id, e
+            );
+            false
+        }
+    };
+
+    // Cleanup worktree
+    if let (Some(ref wt_path), Some(ref rp)) = (&worktree_path, &repo_path) {
+        cleanup_worktree(rp, wt_path).await;
+    }
+
+    // Update nightly run ticket status
+    if success {
+        nightly_runs::update_run_ticket_status(
+            db_pool, run_id, &ticket.ticket_id, "completed", None,
+        ).await?;
+        nightly_runs::increment_completed(db_pool, run_id).await?;
+    } else {
+        let error_msg = execution_result.err().map(|e| e.to_string());
+        nightly_runs::update_run_ticket_status(
+            db_pool, run_id, &ticket.ticket_id, "failed",
+            error_msg.as_deref(),
+        ).await?;
+        nightly_runs::increment_failed(db_pool, run_id).await?;
+    }
+
+    Ok(success)
+}
+
+// ---------------------------------------------------------------------------
+// Worktree management
+// ---------------------------------------------------------------------------
+
+/// Create a git worktree for isolated pipeline execution.
+/// Returns (worktree_path, branch_name, repo_path).
+async fn setup_worktree(
+    db_pool: &SqlitePool,
+    ticket_id: &str,
+    repo_name: &str,
+) -> anyhow::Result<(String, String, String)> {
+    let repo = ticketing_system::repositories::get_repository(db_pool, repo_name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Repository '{}' not found in registry", repo_name))?;
+
+    let repo_path = repo
+        .local_path
+        .ok_or_else(|| anyhow::anyhow!("Repository '{}' has no local_path", repo_name))?;
+
+    let branch_name = format!("nightly/{}", ticket_id);
+    let worktree_path = format!("/tmp/nightly/{}", ticket_id);
+
+    // Clean up any stale worktree from a previous failed run
+    if std::path::Path::new(&worktree_path).exists() {
+        tracing::warn!("[nightly] Stale worktree found at {}, removing", worktree_path);
+        let _ = tokio::process::Command::new("git")
+            .args(["worktree", "remove", "--force", &worktree_path])
+            .current_dir(&repo_path)
+            .output()
+            .await;
+        // Also clean up the stale branch if it exists
+        let _ = tokio::process::Command::new("git")
+            .args(["branch", "-D", &branch_name])
+            .current_dir(&repo_path)
+            .output()
+            .await;
+    }
+
+    // Create the worktree
+    let output = tokio::process::Command::new("git")
+        .args(["worktree", "add", "-b", &branch_name, &worktree_path])
+        .current_dir(&repo_path)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git worktree add failed: {}", stderr);
+    }
+
+    tracing::info!(
+        "[nightly] Created worktree at {} on branch {}",
+        worktree_path,
+        branch_name
+    );
+
+    Ok((worktree_path, branch_name, repo_path))
+}
+
+/// Cleanup a worktree after pipeline execution.
+/// Checks for commits first — keeps the branch if there are changes.
+async fn cleanup_worktree(repo_path: &str, worktree_path: &str) {
+    // Check if there are any commits on the worktree branch beyond main
+    let has_commits = tokio::process::Command::new("git")
+        .args(["log", "main..HEAD", "--oneline"])
+        .current_dir(worktree_path)
+        .output()
+        .await
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+
+    if has_commits {
+        tracing::info!(
+            "[nightly] Worktree {} has commits, keeping branch for review",
+            worktree_path
+        );
+        // Remove the worktree directory but keep the branch
+        let _ = tokio::process::Command::new("git")
+            .args(["worktree", "remove", worktree_path])
+            .current_dir(repo_path)
+            .output()
+            .await;
+    } else {
+        tracing::info!(
+            "[nightly] Worktree {} has no commits, cleaning up",
+            worktree_path
+        );
+        // Remove worktree and delete the branch
+        let _ = tokio::process::Command::new("git")
+            .args(["worktree", "remove", "--force", worktree_path])
+            .current_dir(repo_path)
+            .output()
+            .await;
+        // Extract branch name from worktree path
+        if let Some(ticket_id) = worktree_path.split('/').last() {
+            let branch = format!("nightly/{}", ticket_id);
+            let _ = tokio::process::Command::new("git")
+                .args(["branch", "-D", &branch])
+                .current_dir(repo_path)
+                .output()
+                .await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent pipeline stages
+// ---------------------------------------------------------------------------
+
+/// MCP binary path for agents that need MCP tools.
+fn mcp_binary_path() -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../agentic-flowstate-mcp/target/release/agentic_mcp");
+    path.canonicalize().unwrap_or(path)
+}
+
+/// Agent 1: Codebase Research — explores the repo and produces structured findings.
+async fn run_codebase_research(
+    ticket: &SchedulerTicket,
+    working_dir: &std::path::Path,
+) -> anyhow::Result<String> {
+    let mut vars = HashMap::new();
+    vars.insert("ticket_id".to_string(), ticket.ticket_id.clone());
+    vars.insert("ticket_title".to_string(), ticket.title.clone());
+    vars.insert("organization".to_string(), ticket.organization.clone());
+    vars.insert("classification".to_string(), ticket.classification.clone());
+    if let Some(ref desc) = ticket.description {
+        vars.insert("ticket_description".to_string(), desc.clone());
+    }
+
+    let system_prompt = load_prompt("nightly-codebase-research", vars)?;
+
+    let tools: Vec<String> = vec![
+        "Bash".into(), "Read".into(), "Glob".into(), "Grep".into(),
+    ];
+
+    let options = ClaudeCodeOptions::builder()
+        .system_prompt(&system_prompt)
+        .model("claude-opus-4-6")
+        .tools(ToolsConfig::list(tools.clone()))
+        .allowed_tools(tools)
+        .permission_mode(PermissionMode::BypassPermissions)
+        .cwd(working_dir)
+        .add_extra_arg("effort", Some("high".to_string()))
+        .build();
+
+    run_agent_to_completion("codebase-research", &ticket.ticket_id, options).await
+}
+
+/// Agent 2: Exa Research — augments codebase findings with web research.
+async fn run_exa_research(
+    ticket: &SchedulerTicket,
+    working_dir: &std::path::Path,
+    codebase_output: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut vars = HashMap::new();
+    vars.insert("ticket_id".to_string(), ticket.ticket_id.clone());
+    vars.insert("ticket_title".to_string(), ticket.title.clone());
+    vars.insert("organization".to_string(), ticket.organization.clone());
+    vars.insert("classification".to_string(), ticket.classification.clone());
+    if let Some(ref desc) = ticket.description {
+        vars.insert("ticket_description".to_string(), desc.clone());
+    }
+    if let Some(codebase) = codebase_output {
+        vars.insert("codebase_research".to_string(), codebase.to_string());
+    }
+
+    let system_prompt = load_prompt("nightly-exa-research", vars)?;
+
+    let tools: Vec<String> = vec![
+        "mcp__agentic-mcp__exa_search".into(),
+        "mcp__agentic-mcp__exa_get_contents".into(),
+        "Read".into(),
+        "Glob".into(),
+        "Grep".into(),
+    ];
+
+    let mcp_binary = mcp_binary_path();
+    let options = ClaudeCodeOptions::builder()
+        .system_prompt(&system_prompt)
+        .model("claude-opus-4-6")
+        .tools(ToolsConfig::list(tools.clone()))
+        .allowed_tools(tools)
+        .permission_mode(PermissionMode::BypassPermissions)
+        .cwd(working_dir)
+        .add_mcp_server(
+            "agentic-mcp",
+            McpServerConfig::Stdio {
+                command: mcp_binary.to_string_lossy().to_string(),
+                args: None,
+                env: None,
+            },
+        )
+        .add_extra_arg("effort", Some("high".to_string()))
+        .build();
+
+    run_agent_to_completion("exa-research", &ticket.ticket_id, options).await
+}
+
+/// Agent 3: Full-Access Execution — does the work with all tools and CLAUDE.md context.
+async fn run_full_access_execution(
+    ticket: &SchedulerTicket,
+    working_dir: &std::path::Path,
+    worktree_path: Option<&str>,
+    branch_name: Option<&str>,
+    codebase_output: Option<&str>,
+    exa_output: Option<&str>,
+) -> anyhow::Result<String> {
+    // Load CLAUDE.md
+    let claude_md = std::fs::read_to_string("/Users/jarvisgpt/projects/CLAUDE.md")
+        .unwrap_or_else(|e| format!("(Failed to read CLAUDE.md: {})", e));
+
+    // Build nightly context injection
+    let mut context_vars = HashMap::new();
+    context_vars.insert("branch_name".to_string(),
+        branch_name.unwrap_or("(no branch)").to_string());
+    context_vars.insert("repo_name".to_string(),
+        ticket.repository.clone().unwrap_or_else(|| "(no repo)".to_string()));
+    context_vars.insert("worktree_path".to_string(),
+        worktree_path.unwrap_or("(no worktree)").to_string());
+    context_vars.insert("ticket_id".to_string(), ticket.ticket_id.clone());
+    context_vars.insert("ticket_title".to_string(), ticket.title.clone());
+    context_vars.insert("organization".to_string(), ticket.organization.clone());
+    context_vars.insert("epic_id".to_string(), ticket.epic_id.clone());
+    context_vars.insert("slice_id".to_string(), ticket.slice_id.clone());
+    context_vars.insert("classification".to_string(), ticket.classification.clone());
+    if let Some(ref desc) = ticket.description {
+        context_vars.insert("ticket_description".to_string(), desc.clone());
+    }
+    if let Some(codebase) = codebase_output {
+        context_vars.insert("codebase_research".to_string(), codebase.to_string());
+    }
+    if let Some(exa) = exa_output {
+        context_vars.insert("exa_research".to_string(), exa.to_string());
+    }
+    if ticket.classification == "manual" {
+        context_vars.insert("manual_ticket".to_string(), "true".to_string());
+    }
+
+    let nightly_context = load_prompt("nightly-context", context_vars)?;
+
+    // Build the full-access system prompt: CLAUDE.MD + nightly context
+    let mut full_access_vars = HashMap::new();
+    full_access_vars.insert("claude_md".to_string(), claude_md);
+    full_access_vars.insert("context".to_string(), nightly_context);
+
+    let system_prompt = load_prompt("full-access", full_access_vars)?;
+
+    // Full-access tools
+    let tools: Vec<String> = vec![
+        "Read".into(), "Write".into(), "Edit".into(), "Bash".into(),
+        "Glob".into(), "Grep".into(), "Task".into(),
+        "mcp__agentic-mcp__*".into(),
+    ];
+
+    let mcp_binary = mcp_binary_path();
+    let options = ClaudeCodeOptions::builder()
+        .system_prompt(&system_prompt)
+        .model("claude-opus-4-6")
+        .tools(ToolsConfig::list(tools.clone()))
+        .allowed_tools(tools)
+        .permission_mode(PermissionMode::BypassPermissions)
+        .cwd(working_dir)
+        .add_mcp_server(
+            "agentic-mcp",
+            McpServerConfig::Stdio {
+                command: mcp_binary.to_string_lossy().to_string(),
+                args: None,
+                env: None,
+            },
+        )
+        .add_extra_arg("effort", Some("max".to_string()))
+        .build();
+
+    let user_msg = format!(
+        "Execute ticket {} — {}.\n\nClassification: {}\n\nWork on this ticket now. Follow the research findings provided in your context.",
+        ticket.ticket_id,
+        ticket.title,
+        ticket.classification,
+    );
+
+    run_agent_to_completion_with_message("full-access", &ticket.ticket_id, options, &user_msg).await
+}
+
+/// Generic agent runner: connect, send default message, stream to completion, return text.
+async fn run_agent_to_completion(
+    agent_name: &str,
+    ticket_id: &str,
+    options: ClaudeCodeOptions,
+) -> anyhow::Result<String> {
+    let msg = format!("Analyze and research ticket {}. Follow your system prompt instructions.", ticket_id);
+    run_agent_to_completion_with_message(agent_name, ticket_id, options, &msg).await
+}
+
+/// Generic agent runner with custom user message.
+async fn run_agent_to_completion_with_message(
+    agent_name: &str,
+    ticket_id: &str,
+    options: ClaudeCodeOptions,
+    user_message: &str,
+) -> anyhow::Result<String> {
+    tracing::info!("[nightly] Starting {} agent for {}", agent_name, ticket_id);
+
+    let mut sdk_client = ClaudeSDKClient::new(options);
+    sdk_client.connect(None).await
+        .map_err(|e| anyhow::anyhow!("Failed to connect {} agent for {}: {}", agent_name, ticket_id, e))?;
+
+    sdk_client.send_user_message(user_message.to_string()).await
+        .map_err(|e| anyhow::anyhow!("Failed to send to {} agent for {}: {}", agent_name, ticket_id, e))?;
+
+    let mut response_stream = sdk_client.receive_messages().await;
+    let mut output_parts = Vec::new();
+    let mut tool_call_count = 0u32;
+
+    while let Some(msg_result) = response_stream.next().await {
+        match msg_result {
+            Ok(Message::Assistant { message: assistant_msg }) => {
+                for block in &assistant_msg.content {
+                    match block {
+                        ContentBlock::Text(text) => {
+                            output_parts.push(text.text.clone());
+                        }
+                        ContentBlock::ToolUse(tool_use) => {
+                            tool_call_count += 1;
+                            if tool_call_count <= 5 || tool_call_count % 10 == 0 {
+                                tracing::debug!(
+                                    "[nightly] {} for {}: tool #{} — {}",
+                                    agent_name, ticket_id, tool_call_count, tool_use.name
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Message::Result { is_error, .. }) => {
+                if is_error {
+                    tracing::error!("[nightly] {} agent returned error for {}", agent_name, ticket_id);
+                }
+                break;
+            }
+            Err(e) => {
+                tracing::error!("[nightly] {} stream error for {}: {}", agent_name, ticket_id, e);
+                return Err(anyhow::anyhow!("{} stream error: {}", agent_name, e));
+            }
+            _ => {}
+        }
+    }
+
+    let output = output_parts.join("");
+    tracing::info!(
+        "[nightly] {} agent for {} complete: {} chars, {} tool calls",
+        agent_name,
+        ticket_id,
+        output.len(),
+        tool_call_count
+    );
+
+    if output.is_empty() {
+        Err(anyhow::anyhow!("No output from {} agent for {}", agent_name, ticket_id))
+    } else {
+        Ok(output)
+    }
+}
+
