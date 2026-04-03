@@ -3,6 +3,7 @@ mod models;
 mod mcp_wrapper;
 mod agents;
 mod email_fetcher;
+mod nightly_scheduler;
 mod auth_middleware;
 mod request_logger;
 pub mod system_log_helper;
@@ -91,6 +92,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Mark any interrupted nightly runs from previous run
+    match ticketing_system::nightly_runs::mark_running_as_failed(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!("Marked {} interrupted nightly run(s) as failed from previous run", count);
+        }
+        Ok(_) => {
+            tracing::debug!("No interrupted nightly runs to clean up");
+        }
+        Err(e) => {
+            tracing::error!("Failed to clean up interrupted nightly runs: {}", e);
+        }
+    }
+
     // Clear any stale restart queue entries from before the restart
     match ticketing_system::restart_queue::clear_all_pending(&db_pool).await {
         Ok(count) if count > 0 => {
@@ -109,6 +123,10 @@ async fn main() -> anyhow::Result<()> {
     // Start email fetcher background task (queries email_accounts table each cycle)
     tracing::info!("Starting email fetcher (hot-reload from database)");
     email_fetcher::start_email_fetcher(db_pool.clone(), shutdown_token.child_token());
+
+    // Start nightly scheduler (12:01 AM trigger + startup catch-up)
+    tracing::info!("Starting nightly scheduler");
+    nightly_scheduler::start_nightly_scheduler(db_pool.clone(), shutdown_token.child_token());
 
     // Create chat client manager for persistent ClaudeSDKClient instances
     let chat_manager = Arc::new(ChatClientManager::new());
