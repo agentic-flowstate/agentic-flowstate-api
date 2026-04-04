@@ -3,7 +3,10 @@ use std::sync::Arc;
 use chrono::{Local, NaiveTime};
 use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig, PermissionMode, McpServerConfig};
 use futures::StreamExt;
-use ticketing_system::{nightly_runs, tickets, NightlyRun, Ticket, SqlitePool};
+use ticketing_system::{
+    nightly_runs, tickets, conversations,
+    NightlyRun, Ticket, CreateConversationRequest, AddMessageRequest, SqlitePool,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::prompts::load_prompt;
@@ -196,29 +199,6 @@ pub async fn run_nightly_cycle(db_pool: &SqlitePool) -> anyhow::Result<()> {
     // Create the nightly run record
     let run = nightly_runs::create_run(db_pool, &today, eligible.len() as i64).await?;
 
-    // Create run ticket records
-    for ticket in &eligible {
-        let classification = ticket
-            .classification
-            .as_deref()
-            .unwrap_or("automated");
-
-        if let Err(e) = nightly_runs::create_run_ticket(
-            db_pool,
-            run.id,
-            &ticket.ticket_id,
-            &ticket.organization,
-            classification,
-        )
-        .await
-        {
-            tracing::error!(
-                "[nightly] Failed to create run ticket for {}: {}",
-                ticket.ticket_id, e
-            );
-        }
-    }
-
     // Group by organization
     let org_groups = group_by_org(&eligible);
 
@@ -399,25 +379,6 @@ async fn run_org_orchestrator(
 
     // Parse JSON output
     let batches = parse_orchestrator_output(&raw_output, &group.tickets)?;
-
-    // Update nightly_run_tickets with batch numbers
-    for (batch_idx, batch) in batches.iter().enumerate() {
-        for ticket_id in batch {
-            if let Err(e) = nightly_runs::set_batch_number(
-                db_pool,
-                run_id,
-                ticket_id,
-                (batch_idx + 1) as i64,
-            )
-            .await
-            {
-                tracing::error!(
-                    "[nightly] Failed to set batch number for {}: {}",
-                    ticket_id, e
-                );
-            }
-        }
-    }
 
     tracing::info!(
         "[nightly] Orchestrator for '{}' complete: {} batch(es) with {} total ticket(s)",
@@ -672,6 +633,7 @@ async fn run_batch_execution(
 // ---------------------------------------------------------------------------
 
 /// Run the 3-agent pipeline for a single ticket.
+/// Creates a conversation visible in the chat tab with real agent output.
 /// Returns Ok(true) on success, Ok(false) on failure.
 async fn run_ticket_pipeline(
     db_pool: &SqlitePool,
@@ -684,6 +646,55 @@ async fn run_ticket_pipeline(
         ticket.title
     );
 
+    // Create conversation so pipeline is visible in chat tab
+    let conv = conversations::create_conversation(db_pool, CreateConversationRequest {
+        user_id: "alex".to_string(),
+        organization: ticket.organization.clone(),
+        title: ticket.title.clone(),
+        session_id: None,
+        agent: Some("nightly-scheduler".to_string()),
+    }).await?;
+
+    // Link conversation to ticket
+    conversations::set_router_result(
+        db_pool, &conv.id,
+        Some(&ticket.ticket_id),
+        Some(&ticket.organization),
+    ).await?;
+
+    // Add user message with ticket context
+    let user_content = format!(
+        "Nightly pipeline — {}\n\n**Ticket:** {}\n**Organization:** {}\n**Epic:** {} / **Slice:** {}\n**Classification:** {}\n**Repository:** {}\n\n{}",
+        ticket.title, ticket.ticket_id, ticket.organization,
+        ticket.epic_id, ticket.slice_id, ticket.classification,
+        ticket.repository.as_deref().unwrap_or("none"),
+        ticket.description.as_deref().unwrap_or("(no description)")
+    );
+    conversations::add_message(db_pool, &conv.id, AddMessageRequest {
+        role: "user".to_string(),
+        content: user_content,
+        attachments: None,
+    }).await?;
+
+    // Create assistant message placeholder — updated as each agent completes
+    let assistant_msg = conversations::add_message(db_pool, &conv.id, AddMessageRequest {
+        role: "assistant".to_string(),
+        content: "Starting nightly pipeline...".to_string(),
+        attachments: None,
+    }).await?;
+
+    let mut output_sections: Vec<String> = Vec::new();
+
+    // Helper closure to update the assistant message with accumulated output
+    let update_output = |db: &SqlitePool, msg_id: &str, sections: &[String]| {
+        let content = sections.join("\n\n---\n\n");
+        let db = db.clone();
+        let msg_id = msg_id.to_string();
+        async move {
+            let _ = conversations::update_message(&db, &msg_id, &content).await;
+        }
+    };
+
     // Re-check ticket status before starting (may have changed since orchestrator)
     if let Some(current) = tickets::get_ticket_by_id(db_pool, &ticket.ticket_id).await? {
         if current.status.as_str() != "open" {
@@ -692,10 +703,12 @@ async fn run_ticket_pipeline(
                 ticket.ticket_id,
                 current.status
             );
-            nightly_runs::update_run_ticket_status(
-                db_pool, run_id, &ticket.ticket_id, "skipped",
-                Some(&format!("Ticket status changed to {}", current.status)),
-            ).await?;
+            output_sections.push(format!(
+                "Skipped — ticket status changed to **{}** before pipeline started.",
+                current.status
+            ));
+            update_output(db_pool, &assistant_msg.id, &output_sections).await;
+            conversations::archive_conversation(db_pool, "alex", &conv.id).await?;
             return Ok(true);
         }
     }
@@ -711,30 +724,19 @@ async fn run_ticket_pipeline(
     // Set up worktree if ticket has a repository
     let (worktree_path, branch_name, repo_path) = if let Some(ref repo_name) = ticket.repository {
         match setup_worktree(db_pool, &ticket.ticket_id, repo_name).await {
-            Ok((wt, br, rp)) => {
-                nightly_runs::mark_run_ticket_started(
-                    db_pool, run_id, &ticket.ticket_id,
-                    Some(&wt), Some(&br),
-                ).await?;
-                (Some(wt), Some(br), Some(rp))
-            }
+            Ok((wt, br, rp)) => (Some(wt), Some(br), Some(rp)),
             Err(e) => {
                 tracing::error!(
                     "[nightly] Failed to create worktree for {}: {}",
                     ticket.ticket_id, e
                 );
-                nightly_runs::update_run_ticket_status(
-                    db_pool, run_id, &ticket.ticket_id, "failed",
-                    Some(&format!("Worktree creation failed: {}", e)),
-                ).await?;
+                output_sections.push(format!("## Pipeline Failed\n\nWorktree creation failed: {}", e));
+                update_output(db_pool, &assistant_msg.id, &output_sections).await;
                 nightly_runs::increment_failed(db_pool, run_id).await?;
                 return Ok(false);
             }
         }
     } else {
-        nightly_runs::mark_run_ticket_started(
-            db_pool, run_id, &ticket.ticket_id, None, None,
-        ).await?;
         (None, None, None)
     };
 
@@ -751,6 +753,8 @@ async fn run_ticket_pipeline(
                 ticket.ticket_id,
                 output.len()
             );
+            output_sections.push(format!("## Codebase Research\n\n{}", output));
+            update_output(db_pool, &assistant_msg.id, &output_sections).await;
             Some(output)
         }
         Err(e) => {
@@ -758,6 +762,8 @@ async fn run_ticket_pipeline(
                 "[nightly] Codebase research failed for {}: {}",
                 ticket.ticket_id, e
             );
+            output_sections.push(format!("## Codebase Research\n\nFailed: {}", e));
+            update_output(db_pool, &assistant_msg.id, &output_sections).await;
             None
         }
     };
@@ -770,6 +776,8 @@ async fn run_ticket_pipeline(
                 ticket.ticket_id,
                 output.len()
             );
+            output_sections.push(format!("## Web Research\n\n{}", output));
+            update_output(db_pool, &assistant_msg.id, &output_sections).await;
             Some(output)
         }
         Err(e) => {
@@ -777,6 +785,8 @@ async fn run_ticket_pipeline(
                 "[nightly] Exa research failed for {}: {}",
                 ticket.ticket_id, e
             );
+            output_sections.push(format!("## Web Research\n\nFailed: {}", e));
+            update_output(db_pool, &assistant_msg.id, &output_sections).await;
             None
         }
     };
@@ -792,10 +802,12 @@ async fn run_ticket_pipeline(
     )
     .await;
 
-    // Determine outcome
+    // Determine outcome and update conversation
     let success = match &execution_result {
-        Ok(_) => {
+        Ok(output) => {
             tracing::info!("[nightly] Execution complete for {}", ticket.ticket_id);
+            output_sections.push(format!("## Execution\n\n{}", output));
+            update_output(db_pool, &assistant_msg.id, &output_sections).await;
             true
         }
         Err(e) => {
@@ -803,6 +815,8 @@ async fn run_ticket_pipeline(
                 "[nightly] Execution failed for {}: {}",
                 ticket.ticket_id, e
             );
+            output_sections.push(format!("## Execution\n\nFailed: {}", e));
+            update_output(db_pool, &assistant_msg.id, &output_sections).await;
             false
         }
     };
@@ -812,18 +826,11 @@ async fn run_ticket_pipeline(
         cleanup_worktree(rp, wt_path).await;
     }
 
-    // Update nightly run ticket status
+    // Archive conversation on success, leave open on failure
     if success {
-        nightly_runs::update_run_ticket_status(
-            db_pool, run_id, &ticket.ticket_id, "completed", None,
-        ).await?;
+        conversations::archive_conversation(db_pool, "alex", &conv.id).await?;
         nightly_runs::increment_completed(db_pool, run_id).await?;
     } else {
-        let error_msg = execution_result.err().map(|e| e.to_string());
-        nightly_runs::update_run_ticket_status(
-            db_pool, run_id, &ticket.ticket_id, "failed",
-            error_msg.as_deref(),
-        ).await?;
         nightly_runs::increment_failed(db_pool, run_id).await?;
     }
 
