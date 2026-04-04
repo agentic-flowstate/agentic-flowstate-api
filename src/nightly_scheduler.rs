@@ -144,8 +144,8 @@ fn duration_until_next_trigger() -> std::time::Duration {
 /// 2. Query overdue + due-today open tickets
 /// 3. Filter out done/in_progress/blocked
 /// 4. Group by organization
-/// 5. Create nightly_run + nightly_run_tickets records
-/// 6. Hand off to orchestrator dispatch (ticket #4)
+/// 5. Create nightly_run record (for double-run prevention)
+/// 6. Hand off to orchestrator dispatch
 pub async fn run_nightly_cycle(db_pool: &SqlitePool) -> anyhow::Result<()> {
     let today = Local::now().format("%Y-%m-%d").to_string();
 
