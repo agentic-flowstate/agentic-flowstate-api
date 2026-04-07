@@ -39,6 +39,7 @@ pub mod device_tokens;
 pub mod title_generator;
 pub mod usage;
 pub mod cad;
+pub mod quick_commands;
 
 pub use epics::*;
 pub use slices::*;

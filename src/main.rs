@@ -124,9 +124,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Starting email fetcher (hot-reload from database)");
     email_fetcher::start_email_fetcher(db_pool.clone(), shutdown_token.child_token());
 
-    // Start nightly scheduler (12:01 AM trigger + startup catch-up)
-    tracing::info!("Starting nightly scheduler");
-    nightly_scheduler::start_nightly_scheduler(db_pool.clone(), shutdown_token.child_token());
+    // Nightly scheduler DISABLED — do not re-enable until conversation integration is validated.
+    // nightly_scheduler::start_nightly_scheduler(db_pool.clone(), shutdown_token.child_token());
+    tracing::info!("Nightly scheduler is DISABLED");
 
     // Create chat client manager for persistent ClaudeSDKClient instances
     let chat_manager = Arc::new(ChatClientManager::new());
@@ -530,6 +530,10 @@ async fn main() -> anyhow::Result<()> {
             .delete(handlers::delete_daily_plan_item))
         .route("/api/daily-plan/date-items",
             post(handlers::create_daily_plan_date_item))
+
+        // Quick commands (dynamic presets above keyboard)
+        .route("/api/quick-commands",
+            get(handlers::quick_commands::list_quick_commands))
 
         // Token usage tracking
         .route("/api/usage", get(handlers::usage::get_usage))
