@@ -26,6 +26,8 @@ pub struct ListConversationsQuery {
     pub agent: Option<String>,
     /// Comma-separated status filter (e.g., "open,waiting"). Default: "open,waiting"
     pub status: Option<String>,
+    pub limit: Option<i64>,
+    pub updated_since: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -40,7 +42,7 @@ pub async fn list_conversations(
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListConversationsQuery>,
 ) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
-    let list = conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user.user_id), params.agent.as_deref(), params.status.as_deref())
+    let list = conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user.user_id), params.agent.as_deref(), params.status.as_deref(), params.limit, params.updated_since.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -366,7 +368,7 @@ pub async fn subscribe_conversations(
 
         loop {
             // Get current conversations for this user
-            match conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user_id), params.agent.as_deref(), params.status.as_deref()).await {
+            match conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user_id), params.agent.as_deref(), params.status.as_deref(), None, None).await {
                 Ok(convs) => {
                     // Simple change detection: hash the updated_at timestamps
                     use std::hash::{Hash, Hasher};
