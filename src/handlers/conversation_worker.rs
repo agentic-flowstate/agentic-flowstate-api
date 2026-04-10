@@ -919,6 +919,7 @@ impl ConversationWorker {
             .model(router_type.model())
             .tools(ToolsConfig::list(tools_list.clone()))
             .allowed_tools(tools_list)
+            .disallowed_tools(crate::safety::disallowed_tools())
             .permission_mode(PermissionMode::BypassPermissions)
             .cwd(std::path::Path::new("/tmp"));
 
@@ -1149,20 +1150,17 @@ pub(crate) async fn create_client(
         .flatten()
         .and_then(|c| c.session_id);
 
-    // When resuming, inject conversation history as a safety net.
-    // If --resume works, this context is redundant (harmless).
-    // If --resume fails silently (session file expired/gone), Claude still has context.
-    let system_prompt = if saved_session_id.is_some() {
-        match conversations::list_messages(db, conv_id).await {
-            Ok(messages) if !messages.is_empty() => {
-                tracing::info!("[WORKER] Injecting {} messages as resume context for {}", messages.len(), conv_id);
-                let history = build_conversation_history(&messages);
-                format!("{}\n\n{}", system_prompt, history)
-            }
-            _ => system_prompt,
+    // Always inject conversation history as context when messages exist.
+    // For resumed sessions: safety net if --resume fails silently.
+    // For new sessions on existing conversations (e.g., nightly scheduler stubs):
+    // provides the only context the agent will have.
+    let system_prompt = match conversations::list_messages(db, conv_id).await {
+        Ok(messages) if !messages.is_empty() => {
+            tracing::info!("[WORKER] Injecting {} messages as resume context for {}", messages.len(), conv_id);
+            let history = build_conversation_history(&messages);
+            format!("{}\n\n{}", system_prompt, history)
         }
-    } else {
-        system_prompt
+        _ => system_prompt,
     };
 
     let mut builder = ClaudeCodeOptions::builder()
@@ -1170,6 +1168,7 @@ pub(crate) async fn create_client(
         .model(config.agent_type.model())
         .tools(ToolsConfig::list(tools_list.clone()))
         .allowed_tools(tools_list)
+        .disallowed_tools(crate::safety::disallowed_tools())
         .permission_mode(PermissionMode::BypassPermissions)
         .cwd(&config.working_dir);
 

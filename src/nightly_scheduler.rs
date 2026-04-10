@@ -978,6 +978,7 @@ async fn run_codebase_research(
         .model("claude-opus-4-6")
         .tools(ToolsConfig::list(tools.clone()))
         .allowed_tools(tools)
+        .disallowed_tools(crate::safety::disallowed_tools())
         .permission_mode(PermissionMode::BypassPermissions)
         .cwd(working_dir)
         .add_extra_arg("effort", Some("high".to_string()))
@@ -1020,6 +1021,7 @@ async fn run_exa_research(
         .model("claude-opus-4-6")
         .tools(ToolsConfig::list(tools.clone()))
         .allowed_tools(tools)
+        .disallowed_tools(crate::safety::disallowed_tools())
         .permission_mode(PermissionMode::BypassPermissions)
         .cwd(working_dir)
         .add_mcp_server(
@@ -1098,6 +1100,7 @@ async fn run_full_access_execution(
         .model("claude-opus-4-6")
         .tools(ToolsConfig::list(tools.clone()))
         .allowed_tools(tools)
+        .disallowed_tools(crate::safety::disallowed_tools())
         .permission_mode(PermissionMode::BypassPermissions)
         .cwd(working_dir)
         .add_mcp_server(

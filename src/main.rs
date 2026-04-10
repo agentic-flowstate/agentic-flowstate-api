@@ -8,6 +8,7 @@ mod auth_middleware;
 mod request_logger;
 pub mod system_log_helper;
 pub mod apns;
+pub mod safety;
 
 use axum::{
     routing::{delete, get, patch, post},

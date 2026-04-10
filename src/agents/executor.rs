@@ -28,6 +28,7 @@ pub fn build_agent_options(
         .model(agent_type.model())
         .tools(ToolsConfig::list(tools_list.clone()))
         .allowed_tools(tools_list)
+        .disallowed_tools(crate::safety::disallowed_tools())
         .permission_mode(PermissionMode::BypassPermissions)
         .cwd(working_dir);
 

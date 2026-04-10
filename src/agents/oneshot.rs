@@ -25,6 +25,7 @@ pub async fn run_oneshot(
 ) -> Result<OneshotResult, String> {
     let mut builder = ClaudeCodeOptions::builder()
         .system_prompt(system_prompt)
+        .disallowed_tools(crate::safety::disallowed_tools())
         .permission_mode(PermissionMode::BypassPermissions)
         .cwd(working_dir);
 
