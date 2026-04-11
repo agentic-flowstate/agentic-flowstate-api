@@ -348,6 +348,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(|| async { "OK" }))
         .route("/health/ready", get(handlers::health::ready))
         .route("/api/debug-log", post(handlers::debug_log::post_debug_log).get(handlers::debug_log::get_debug_log))
+        // Client telemetry ingestion (public — TelemetryService uses its own URLSession without auth cookies)
+        .route("/api/telemetry/events",
+            post(handlers::client_telemetry::ingest_events))
 ;
 
     // Org-scoped routes (require valid session + org membership)
@@ -631,10 +634,6 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::memberships::list_members))
         .route("/api/memberships/:org/:user_id",
             delete(handlers::memberships::remove_member))
-
-        // Client telemetry ingestion
-        .route("/api/telemetry/events",
-            post(handlers::client_telemetry::ingest_events))
 
         // Device token routes (APNs push notifications)
         .route("/api/device-tokens",
