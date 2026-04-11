@@ -331,6 +331,28 @@ pub async fn subscribe_unified_events(
                 }
             }
 
+            // ── RESTART PENDING (check flag file) ────────────────────
+            // Zero-cost addition to existing poll loop — just a file stat.
+            // Pushes restart notification to active clients immediately.
+            {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
+                let pending_path = format!("{}/.agentic-flowstate/pending_restart.json", home);
+                if let Ok(contents) = tokio::fs::read_to_string(&pending_path).await {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
+                        let restart_type = parsed.get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("restart");
+                        let payload = serde_json::json!({
+                            "pending": true,
+                            "type": restart_type,
+                        });
+                        if let Ok(json) = serde_json::to_string(&payload) {
+                            yield Ok(Event::default().event("restart_pending").data(json));
+                        }
+                    }
+                }
+            }
+
             // Single sleep for all topics — one radio wakeup per cycle
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
