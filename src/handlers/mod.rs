@@ -72,10 +72,12 @@ pub use unified_events::*;
 
 use axum::http::HeaderMap;
 
-/// Extract organization from X-Organization header, defaulting to "telemetryops"
+/// Extract organization from X-Organization header.
+/// Returns empty string if header is missing (org-scoped routes are protected by
+/// require_org_access middleware which rejects requests without the header).
 pub fn get_organization(headers: &HeaderMap) -> String {
     headers.get("X-Organization")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("telemetryops")
+        .unwrap_or("")
         .to_string()
 }

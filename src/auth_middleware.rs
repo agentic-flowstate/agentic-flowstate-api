@@ -120,12 +120,21 @@ pub async fn require_org_access(
         }
     };
 
-    let org = request
+    let org = match request
         .headers()
         .get("X-Organization")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("telemetryops")
-        .to_string();
+        .filter(|s| !s.is_empty())
+    {
+        Some(org) => org.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "X-Organization header is required"})),
+            )
+                .into_response();
+        }
+    };
 
     match ticketing_system::memberships::check_membership(&pool, &user.user_id, &org).await {
         Ok(true) => next.run(request).await,

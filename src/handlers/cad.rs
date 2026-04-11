@@ -1,6 +1,7 @@
+use std::sync::Arc;
 use axum::{
     body::Body,
-    extract::{Path, Query},
+    extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -12,14 +13,25 @@ use std::path::PathBuf;
 use tokio_util::io::ReaderStream;
 use tracing::error;
 
-const REPOS: &[(&str, &str)] = &[
-    ("laminarforge-cad", "/Users/jarvisgpt/projects/laminarforge/laminarforge-cad"),
-    ("gevdynamics-cad", "/Users/jarvisgpt/projects/gev-dynamics/gevdynamics-cad"),
-];
+/// Query the repo registry for CAD repos (names ending in "-cad" with a local_path set).
+/// Returns Vec<(name, local_path)>.
+async fn get_cad_repos(pool: &sqlx::SqlitePool) -> Vec<(String, String)> {
+    match ticketing_system::repositories::list_repositories(pool).await {
+        Ok(repos) => repos
+            .into_iter()
+            .filter(|r| r.name.ends_with("-cad") && r.local_path.is_some())
+            .map(|r| (r.name, r.local_path.unwrap()))
+            .collect(),
+        Err(e) => {
+            error!("Failed to query CAD repos from registry: {:?}", e);
+            Vec::new()
+        }
+    }
+}
 
-fn resolve_output_dir(repo: &str) -> Option<PathBuf> {
-    REPOS.iter()
-        .find(|(name, _)| *name == repo)
+fn resolve_output_dir_from(repos: &[(String, String)], repo: &str) -> Option<PathBuf> {
+    repos.iter()
+        .find(|(name, _)| name == repo)
         .map(|(_, path)| PathBuf::from(path).join("output"))
 }
 
@@ -110,19 +122,20 @@ pub struct ListCadFilesQuery {
 
 /// GET /api/cad/files — list available CAD files with metadata
 pub async fn list_cad_files(
+    State(pool): State<Arc<sqlx::SqlitePool>>,
     Query(query): Query<ListCadFilesQuery>,
 ) -> Response {
-    let repos_to_scan: Vec<(&str, &str)> = if let Some(ref repo_filter) = query.repo {
-        REPOS.iter()
+    let all_repos = get_cad_repos(&pool).await;
+    let repos_to_scan: Vec<&(String, String)> = if let Some(ref repo_filter) = query.repo {
+        all_repos.iter()
             .filter(|(name, _)| name == repo_filter)
-            .copied()
             .collect()
     } else {
-        REPOS.to_vec()
+        all_repos.iter().collect()
     };
 
     if repos_to_scan.is_empty() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Unknown repo" }))).into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Unknown repo or no CAD repos registered" }))).into_response();
     }
 
     let mut files: Vec<CadFileEntry> = Vec::new();
@@ -213,6 +226,7 @@ pub struct DownloadCadFileQuery {
 /// GET /api/cad/files/:filename — stream CAD file download
 /// Supports USDZ, STEP, STL formats. Pass ?repo= to disambiguate.
 pub async fn download_cad_file(
+    State(pool): State<Arc<sqlx::SqlitePool>>,
     Path(filename): Path<String>,
     Query(query): Query<DownloadCadFileQuery>,
 ) -> Response {
@@ -222,14 +236,15 @@ pub async fn download_cad_file(
     }
 
     // Find the file across repos (or in specific repo)
-    let repos_to_check: Vec<(&str, &str)> = if let Some(ref repo) = query.repo {
-        REPOS.iter().filter(|(name, _)| name == repo).copied().collect()
+    let all_repos = get_cad_repos(&pool).await;
+    let repos_to_check: Vec<&(String, String)> = if let Some(ref repo) = query.repo {
+        all_repos.iter().filter(|(name, _)| name == repo).collect()
     } else {
-        REPOS.to_vec()
+        all_repos.iter().collect()
     };
 
     let mut file_path: Option<PathBuf> = None;
-    for (_, repo_path) in &repos_to_check {
+    for (_, repo_path) in repos_to_check {
         let candidate = PathBuf::from(repo_path).join("output").join(&filename);
         if candidate.exists() && candidate.is_file() {
             file_path = Some(candidate);
@@ -283,6 +298,7 @@ pub async fn download_cad_file(
 
 /// GET /api/cad/files/:filename/thumbnail — serve cached thumbnail PNG
 pub async fn get_cad_thumbnail(
+    State(pool): State<Arc<sqlx::SqlitePool>>,
     Path(filename): Path<String>,
     Query(query): Query<DownloadCadFileQuery>,
 ) -> Response {
@@ -298,14 +314,15 @@ pub async fn get_cad_thumbnail(
         .unwrap_or(&filename);
     let thumb_filename = format!("{}.thumb.png", stem);
 
-    let repos_to_check: Vec<(&str, &str)> = if let Some(ref repo) = query.repo {
-        REPOS.iter().filter(|(name, _)| name == repo).copied().collect()
+    let all_repos = get_cad_repos(&pool).await;
+    let repos_to_check: Vec<&(String, String)> = if let Some(ref repo) = query.repo {
+        all_repos.iter().filter(|(name, _)| name == repo).collect()
     } else {
-        REPOS.to_vec()
+        all_repos.iter().collect()
     };
 
     let mut thumb_path: Option<PathBuf> = None;
-    for (_, repo_path) in &repos_to_check {
+    for (_, repo_path) in repos_to_check {
         let candidate = PathBuf::from(repo_path).join("output").join(&thumb_filename);
         if candidate.exists() {
             thumb_path = Some(candidate);
