@@ -40,6 +40,7 @@ pub mod title_generator;
 pub mod usage;
 pub mod cad;
 pub mod quick_commands;
+pub mod unified_events;
 
 pub use epics::*;
 pub use slices::*;
@@ -67,6 +68,7 @@ pub use library::*;
 pub use tts::*;
 pub use dms::*;
 pub use voice_transcribe::*;
+pub use unified_events::*;
 
 use axum::http::HeaderMap;
 

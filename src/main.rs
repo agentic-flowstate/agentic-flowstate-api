@@ -503,6 +503,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/full-access/chat",
             post(handlers::full_access_chat))
 
+        // Unified SSE (single multiplexed connection for all topics)
+        .route("/api/events/subscribe", get(handlers::subscribe_unified_events))
+
         // My Tickets SSE (live updates across all orgs)
         .route("/api/my-tickets/subscribe", get(handlers::subscribe_my_tickets))
 
