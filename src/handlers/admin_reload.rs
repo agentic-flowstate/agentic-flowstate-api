@@ -103,6 +103,9 @@ pub async fn reload_log() -> Response {
 
 const IOS_INSTALL_LOG_PATH: &str = "/tmp/agentic-ios-install.log";
 const APP_DIR: &str = "/Users/jarvisgpt/projects/agentic-flowstate/agentic-flowstate-app";
+const CODE_SIGN_IDENTITY: &str = "Apple Distribution: Alexander Lewis (M3C97KFGK9)";
+const PROVISIONING_PROFILE: &str = "Agentic Flowstate App Store";
+const APPLE_ID: &str = "atlewisftw@gmail.com";
 
 /// POST /api/admin/ios-install — build and install the iOS app only (no MCP/API/frontend rebuild).
 /// Spawns xcodegen + xcodebuild + devicectl install as a detached process.
@@ -138,90 +141,149 @@ pub async fn ios_install() -> Response {
         path
     );
 
-    // Shell script that does xcodegen + xcodebuild + devicectl install.
-    // Uses a temp JSON file for device list (--json-output /dev/stdout produces
-    // trailing non-JSON output that breaks python's json.load).
+    // Shell script: xcodegen + xcodebuild + devicectl install (USB)
+    // OR auto-fallback to TestFlight when device is unavailable (remote user).
+    //
+    // Device availability is checked via connectionProperties.transportType —
+    // paired-but-disconnected devices are skipped. DerivedData path is found
+    // dynamically (never hardcoded — the hash changes on xcodegen regeneration).
     let script = format!(
         r#"
 set -e
 cd {app_dir}
 
-echo "=== Step 1/3: Generating Xcode project ==="
+echo "=== Step 1: Generating Xcode project ==="
 xcodegen generate 2>&1
 echo ""
 
-echo "=== Step 2/3: Building for device ==="
-# Find connected device — write JSON to temp file to avoid parsing issues
+echo "=== Checking device connectivity ==="
 TMPJSON=$(mktemp /tmp/devicectl_XXXXXX.json)
 xcrun devicectl list devices --json-output "$TMPJSON" 2>/dev/null || true
 
-DEVICE_ID=$(python3 -c "
+# Find a device that is ACTUALLY CONNECTED (has connectionProperties.transportType).
+# Devices remain in the device list even when unavailable (paired but not USB-connected).
+# We MUST check transportType to avoid trying to build/install to an unreachable device.
+DEVICE_INFO=$(python3 -c "
 import json
 with open('$TMPJSON') as f:
     data = json.load(f)
 devices = data.get('result', {{}}).get('devices', [])
 for d in devices:
+    conn = d.get('connectionProperties', {{}})
+    transport = conn.get('transportType', '')
+    if not transport:
+        continue
     udid = d.get('hardwareProperties', {{}}).get('udid', '')
+    core_id = d.get('identifier', '')
+    name = d.get('deviceProperties', {{}}).get('name', 'Unknown')
     if udid:
-        print(udid)
+        print(udid + '|' + core_id + '|' + name + '|' + transport)
         break
 " 2>/dev/null || echo "")
-
-CORE_ID=$(python3 -c "
-import json
-with open('$TMPJSON') as f:
-    data = json.load(f)
-devices = data.get('result', {{}}).get('devices', [])
-for d in devices:
-    cid = d.get('identifier', '')
-    if cid:
-        print(cid)
-        break
-" 2>/dev/null || echo "")
-
-DEVICE_NAME=$(python3 -c "
-import json
-with open('$TMPJSON') as f:
-    data = json.load(f)
-devices = data.get('result', {{}}).get('devices', [])
-for d in devices:
-    name = d.get('deviceProperties', {{}}).get('name', '')
-    if name:
-        print(name)
-        break
-" 2>/dev/null || echo "Unknown")
 
 rm -f "$TMPJSON"
 
-if [ -z "$DEVICE_ID" ]; then
-    echo "No connected iOS device found. Connect your iPhone via USB and retry."
-    exit 1
+if [ -n "$DEVICE_INFO" ]; then
+    # ==========================================
+    # DIRECT USB INSTALL — device is connected
+    # ==========================================
+    DEVICE_ID=$(echo "$DEVICE_INFO" | cut -d'|' -f1)
+    CORE_ID=$(echo "$DEVICE_INFO" | cut -d'|' -f2)
+    DEVICE_NAME=$(echo "$DEVICE_INFO" | cut -d'|' -f3)
+    TRANSPORT=$(echo "$DEVICE_INFO" | cut -d'|' -f4)
+
+    echo "Found device: $DEVICE_NAME ($DEVICE_ID) via $TRANSPORT"
+    echo ""
+
+    echo "=== Step 2/3: Building for device ==="
+    xcodebuild build \
+        -project AgenticFlowstate.xcodeproj \
+        -scheme AgenticFlowstate \
+        -destination "platform=iOS,id=$DEVICE_ID" \
+        -configuration Debug \
+        -allowProvisioningUpdates \
+        -allowProvisioningDeviceRegistration \
+        2>&1 | tail -20
+
+    echo ""
+    echo "=== Step 3/3: Installing to $DEVICE_NAME ==="
+
+    # Dynamic app path — never hardcode the DerivedData hash (it changes on regen)
+    APP_PATH=$(find "$HOME/Library/Developer/Xcode/DerivedData" -name "AgenticFlowstate.app" -path "*/Debug-iphoneos/*" -maxdepth 4 2>/dev/null | head -1)
+    if [ -z "$APP_PATH" ]; then
+        echo "ERROR: Built .app not found in DerivedData"
+        exit 1
+    fi
+    echo "App: $APP_PATH"
+    xcrun devicectl device install app --device "$CORE_ID" "$APP_PATH" 2>&1
+
+    rm -f "$HOME/.agentic-flowstate/pending_ios_install.json"
+    echo ""
+    echo "=== iOS install complete ==="
+else
+    # ==========================================
+    # TESTFLIGHT DEPLOY — no connected device
+    # ==========================================
+    echo "No connected iOS device — deploying via TestFlight"
+    echo ""
+
+    echo "=== Step 2/5: Bumping build number ==="
+    CURRENT_BUILD=$(grep -m1 'CURRENT_PROJECT_VERSION:' project.yml | sed 's/.*CURRENT_PROJECT_VERSION: *//' | tr -d '[:space:]')
+    NEW_BUILD=$((CURRENT_BUILD + 1))
+    sed -i '' "s/CURRENT_PROJECT_VERSION: .*/CURRENT_PROJECT_VERSION: $NEW_BUILD/" project.yml
+    sed -i '' "s/CFBundleVersion: .*/CFBundleVersion: \"$NEW_BUILD\"/" project.yml
+    echo "Build: $CURRENT_BUILD -> $NEW_BUILD"
+    xcodegen generate 2>&1
+
+    git add project.yml 2>&1 || true
+    git commit -m "Bump build to $NEW_BUILD for TestFlight" 2>&1 || true
+    git push 2>&1 || true
+    echo ""
+
+    echo "=== Step 3/5: Archiving (Release) ==="
+    xcodebuild archive \
+        -project AgenticFlowstate.xcodeproj \
+        -scheme AgenticFlowstate \
+        -archivePath "build/AgenticFlowstate.xcarchive" \
+        -destination "generic/platform=iOS" \
+        -configuration Release \
+        CODE_SIGN_STYLE=Manual \
+        "CODE_SIGN_IDENTITY={sign_id}" \
+        "PROVISIONING_PROFILE_SPECIFIER={prov}" \
+        2>&1 | tail -30
+    echo ""
+
+    echo "=== Step 4/5: Exporting IPA ==="
+    xcodebuild -exportArchive \
+        -archivePath "build/AgenticFlowstate.xcarchive" \
+        -exportOptionsPlist "ExportOptions.plist" \
+        -exportPath "build/export" \
+        2>&1 | tail -10
+    echo ""
+
+    if [ ! -f "build/export/AgenticFlowstate.ipa" ]; then
+        echo "ERROR: IPA not found after export"
+        exit 1
+    fi
+
+    echo "=== Step 5/5: Uploading to TestFlight ==="
+    xcrun altool --upload-app \
+        -f "build/export/AgenticFlowstate.ipa" \
+        -t ios \
+        -u "{apple_id}" \
+        -p @keychain:AC_PASSWORD \
+        2>&1
+
+    rm -f "$HOME/.agentic-flowstate/pending_ios_install.json"
+    echo ""
+    echo "=== TestFlight upload complete ==="
+    echo "You will receive a TestFlight notification when build $NEW_BUILD is ready."
 fi
-
-echo "Found device: $DEVICE_NAME ($DEVICE_ID)"
-echo ""
-
-xcodebuild build \
-    -project AgenticFlowstate.xcodeproj \
-    -scheme AgenticFlowstate \
-    -destination "platform=iOS,id=$DEVICE_ID" \
-    -configuration Debug \
-    -allowProvisioningUpdates \
-    -allowProvisioningDeviceRegistration \
-    2>&1 | tail -20
-
-echo ""
-echo "=== Step 3/3: Installing to $DEVICE_NAME ==="
-APP_PATH="$HOME/Library/Developer/Xcode/DerivedData/AgenticFlowstate-efyacuebtfljofhcznnfkbraddlm/Build/Products/Debug-iphoneos/AgenticFlowstate.app"
-xcrun devicectl device install app --device "$CORE_ID" "$APP_PATH" 2>&1
-
-# Clear pending install flag
-rm -f "$HOME/.agentic-flowstate/pending_ios_install.json"
-
-echo ""
-echo "=== iOS install complete ==="
 "#,
-        app_dir = APP_DIR
+        app_dir = APP_DIR,
+        sign_id = CODE_SIGN_IDENTITY,
+        prov = PROVISIONING_PROFILE,
+        apple_id = APPLE_ID,
     );
 
     match std::process::Command::new("bash")
