@@ -14,6 +14,7 @@
 /// permanently deregistered.
 pub fn disallowed_tools() -> Vec<String> {
     vec![
+        // ── Service management ──────────────────────────────────────────
         // Prevent agents from stopping/unloading/removing agentic services.
         // The setup script uses `kickstart -k` which is safe and atomic;
         // bootout/unload/remove are destructive and deregister the service.
@@ -30,5 +31,25 @@ pub fn disallowed_tools() -> Vec<String> {
         "Bash(kill *)".into(),
         "Bash(pkill *)".into(),
         "Bash(killall *)".into(),
+        // ── Repository creation ─────────────────────────────────────────
+        // Repos MUST be created via `mcp__agentic-mcp__create_repo`, which
+        // handles GitHub creation, local cloning, infrastructure scaffolding,
+        // and repo registration in one atomic operation. Manual CLI repo
+        // creation bypasses registration and infrastructure setup.
+        //
+        // git — local repo creation
+        "Bash(git init)".into(),
+        "Bash(git init *)".into(),
+        // GitHub CLI (gh) — remote repo creation & forking
+        "Bash(gh repo create*)".into(),
+        "Bash(gh repo fork*)".into(),
+        // GitLab CLI (glab) — remote repo creation & forking
+        "Bash(glab repo create*)".into(),
+        "Bash(glab project create*)".into(),
+        "Bash(glab repo fork*)".into(),
+        // Hub (deprecated GitHub CLI) — remote repo creation & forking
+        "Bash(hub create*)".into(),
+        "Bash(hub fork*)".into(),
+        "Bash(hub init*)".into(),
     ]
 }
