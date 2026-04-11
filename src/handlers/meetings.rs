@@ -377,13 +377,14 @@ pub async fn subscribe_meetings(
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Was 2s — reduced to save battery/radio on mobile
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
     };
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()
-            .interval(Duration::from_secs(15))
+            .interval(Duration::from_secs(30))
             .text("ping"),
     )
 }

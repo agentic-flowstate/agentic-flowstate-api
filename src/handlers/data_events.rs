@@ -129,14 +129,14 @@ pub async fn subscribe_data(
                 }
             }
 
-            // Poll every 2 seconds
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Poll every 10 seconds (was 2s — reduced to save battery/radio on mobile)
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
     };
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()
-            .interval(Duration::from_secs(15))
+            .interval(Duration::from_secs(30))
             .text("ping"),
     )
 }
@@ -183,13 +183,14 @@ pub async fn subscribe_my_tickets(
                 }
             }
 
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            // Was 3s — reduced to save battery/radio on mobile
+            tokio::time::sleep(Duration::from_secs(15)).await;
         }
     };
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()
-            .interval(Duration::from_secs(15))
+            .interval(Duration::from_secs(30))
             .text("ping"),
     )
 }

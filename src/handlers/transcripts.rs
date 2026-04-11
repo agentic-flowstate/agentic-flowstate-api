@@ -143,9 +143,9 @@ pub async fn stream_session(
             }
         }
 
-        // Poll for new entries every 500ms
+        // Poll for new entries every 2 seconds (was 500ms — reduced for battery)
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
             // Check if session is still active
             match ticketing_system::transcripts::get_session(&db, &session_id).await {

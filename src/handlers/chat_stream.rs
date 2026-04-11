@@ -186,7 +186,7 @@ fn create_sse_stream_raw(rx: mpsc::Receiver<(i32, String)>) -> SseStream {
     Sse::new(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
         .keep_alive(
             KeepAlive::new()
-                .interval(Duration::from_secs(15))
+                .interval(Duration::from_secs(30))
                 .text("ping"),
         )
 }

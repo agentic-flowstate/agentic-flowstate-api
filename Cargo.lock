@@ -2616,6 +2616,7 @@ dependencies = [
  "chrono-tz",
  "dirs",
  "futures-util",
+ "libc",
  "md5",
  "once_cell",
  "regex",

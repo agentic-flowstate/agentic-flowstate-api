@@ -319,7 +319,7 @@ pub async fn reconnect_conversation_stream(
             // Not found or not owned — return an empty stream that closes immediately
             let empty = futures::stream::empty();
             return Sse::new(Box::pin(empty) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
-                .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"));
+                .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)).text("ping"));
         }
     }
 
@@ -339,7 +339,7 @@ pub async fn reconnect_conversation_stream(
     );
 
     Sse::new(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("ping"))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)).text("ping"))
 }
 
 /// SSE event types for conversation updates
@@ -397,14 +397,14 @@ pub async fn subscribe_conversations(
                 }
             }
 
-            // Poll every 2 seconds
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Poll every 10 seconds (was 2s — reduced to save battery/radio on mobile)
+            tokio::time::sleep(Duration::from_secs(10)).await;
         }
     };
 
     Sse::new(stream).keep_alive(
         KeepAlive::new()
-            .interval(Duration::from_secs(15))
+            .interval(Duration::from_secs(30))
             .text("ping")
     )
 }
