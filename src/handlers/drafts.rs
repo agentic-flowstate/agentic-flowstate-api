@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use ticketing_system::{drafts, email_thread_tickets, CreateDraftRequest, EmailDraft, LinkThreadTicketRequest, SqlitePool, UpdateDraftRequest};
+use ticketing_system::{drafts, email_accounts, email_thread_tickets, CreateDraftRequest, EmailDraft, LinkThreadTicketRequest, SqlitePool, UpdateDraftRequest};
 
 #[derive(Debug, Deserialize)]
 pub struct ListDraftsQuery {
@@ -138,12 +138,17 @@ pub async fn send_draft(
         return Err((StatusCode::BAD_REQUEST, "Draft has already been sent or discarded".to_string()));
     }
 
-    // Load AWS config
-    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .profile_name("ballotradar-shared")
-        .region(aws_config::Region::new("us-east-1"))
-        .load()
-        .await;
+    // Look up sender's email account for AWS credentials
+    let account = email_accounts::get_email_account(&pool, &draft.from_address)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Unknown sender email '{}': {}", draft.from_address, e)))?;
+
+    let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(account.aws_region.clone()));
+    if let Some(ref profile) = account.aws_profile {
+        config_loader = config_loader.profile_name(profile);
+    }
+    let config = config_loader.load().await;
 
     let ses_client = aws_sdk_sesv2::Client::new(&config);
 

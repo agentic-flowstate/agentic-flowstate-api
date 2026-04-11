@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use ticketing_system::{emails, Email, EmailAttachment, EmailThread, SqlitePool};
+use ticketing_system::{emails, email_accounts, Email, EmailAttachment, EmailThread, SqlitePool};
 
 /// Sanitize HTML email body to prevent XSS
 fn sanitize_email_html(html: &str) -> String {
@@ -237,12 +237,17 @@ pub async fn send_email(
     State(pool): State<Arc<SqlitePool>>,
     Json(req): Json<SendEmailRequest>,
 ) -> Result<Json<SendEmailResponse>, (StatusCode, String)> {
-    // Load AWS config with ballotradar-shared profile
-    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .profile_name("ballotradar-shared")
-        .region(aws_config::Region::new("us-east-1"))
-        .load()
-        .await;
+    // Look up sender's email account for AWS credentials
+    let account = email_accounts::get_email_account(&pool, &req.from)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Unknown sender email '{}': {}", req.from, e)))?;
+
+    let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(account.aws_region.clone()));
+    if let Some(ref profile) = account.aws_profile {
+        config_loader = config_loader.profile_name(profile);
+    }
+    let config = config_loader.load().await;
 
     let ses_client = aws_sdk_sesv2::Client::new(&config);
 
