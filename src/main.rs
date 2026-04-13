@@ -9,6 +9,7 @@ mod request_logger;
 pub mod system_log_helper;
 pub mod apns;
 pub mod safety;
+mod health_monitor;
 
 use axum::{
     routing::{delete, get, patch, post},
@@ -332,6 +333,25 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 break;
+            }
+        });
+    }
+
+    // Uptime health monitor background task (every 6 hours)
+    // Checks configured endpoints across all orgs, creates bug tickets on failure.
+    {
+        let monitor_pool = db_pool.clone();
+        let token = shutdown_token.child_token();
+        tokio::spawn(async move {
+            // Wait 30 seconds after startup before first check (let services settle)
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(6 * 60 * 60));
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+                health_monitor::run_checks(&monitor_pool).await;
             }
         });
     }
