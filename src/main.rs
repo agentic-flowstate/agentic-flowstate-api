@@ -532,15 +532,15 @@ async fn main() -> anyhow::Result<()> {
         // My Tickets SSE (live updates across all orgs)
         .route("/api/my-tickets/subscribe", get(handlers::subscribe_my_tickets))
 
-        // Project Workload routes
-        .route("/api/project-workload",
-            get(handlers::list_project_workload))
-        .route("/api/project-workload/pull",
-            post(handlers::pull_project_ticket))
-        .route("/api/project-workload/toggle",
-            post(handlers::toggle_project_workload))
-        .route("/api/project-workload/:id",
-            delete(handlers::remove_project_workload))
+        // Focus routes
+        .route("/api/focus",
+            get(handlers::list_focus))
+        .route("/api/focus/pull",
+            post(handlers::pull_focus_ticket))
+        .route("/api/focus/toggle",
+            post(handlers::toggle_focus))
+        .route("/api/focus/:id",
+            delete(handlers::remove_focus))
 
         // Daily Plan routes
         .route("/api/daily-plan",

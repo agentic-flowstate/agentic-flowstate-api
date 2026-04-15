@@ -1,4 +1,4 @@
-//! Project workload REST API handlers
+//! Focus REST API handlers
 
 use axum::{
     extract::{Path, State},
@@ -11,18 +11,18 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ticketing_system::WorkloadItem;
+use ticketing_system::FocusItem;
 
 use crate::agents::AgentType;
 use crate::agents::prompts::load_prompt;
 use crate::agents::run_oneshot;
 
-/// GET /api/project-workload
-/// Returns all unchecked workload items
-pub async fn list_project_workload(
+/// GET /api/focus
+/// Returns all unchecked focus items
+pub async fn list_focus(
     State(db): State<Arc<SqlitePool>>,
-) -> Result<Json<Vec<WorkloadItem>>, (StatusCode, String)> {
-    let items = ticketing_system::project_workload::list_workload(&db, false)
+) -> Result<Json<Vec<FocusItem>>, (StatusCode, String)> {
+    let items = ticketing_system::focus::list_focus(&db, false)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -34,20 +34,20 @@ pub struct PullRequest {
     pub organization: String,
 }
 
-/// POST /api/project-workload/pull
-/// Run pull-ticket agent, parse output, add to workload
-pub async fn pull_project_ticket(
+/// POST /api/focus/pull
+/// Run pull-ticket agent, parse output, add to focus
+pub async fn pull_focus_ticket(
     State(db): State<Arc<SqlitePool>>,
     Json(req): Json<PullRequest>,
-) -> Result<Json<WorkloadItem>, (StatusCode, String)> {
+) -> Result<Json<FocusItem>, (StatusCode, String)> {
     let org = &req.organization;
 
-    // Get current workload for this org
-    let current = ticketing_system::project_workload::list_workload_ticket_ids(&db, org)
+    // Get current focus for this org
+    let current = ticketing_system::focus::list_focus_ticket_ids(&db, org)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let current_workload_str = if current.is_empty() {
+    let current_focus_str = if current.is_empty() {
         "(none)".to_string()
     } else {
         current
@@ -73,8 +73,8 @@ pub async fn pull_project_ticket(
 
     // User message: data at top, query at bottom (per Anthropic best practices)
     let prompt = format!(
-        "<current_workload>\n{}\n</current_workload>\n\n<organization_tickets>\n{}\n</organization_tickets>\n\nSelect the best next ticket to work on for the {} organization.",
-        current_workload_str, org_data, org
+        "<current_focus>\n{}\n</current_focus>\n\n<organization_tickets>\n{}\n</organization_tickets>\n\nSelect the best next ticket to work on for the {} organization.",
+        current_focus_str, org_data, org
     );
 
     // Create agent run record BEFORE execution
@@ -207,8 +207,8 @@ pub async fn pull_project_ticket(
             (StatusCode::NOT_FOUND, format!("Ticket {} not found", ticket_id))
         })?;
 
-    // Add to workload
-    let item = ticketing_system::project_workload::add_to_workload(
+    // Add to focus
+    let item = ticketing_system::focus::add_to_focus(
         &db,
         org,
         &ticket.ticket_id,
@@ -220,7 +220,7 @@ pub async fn pull_project_ticket(
     .map_err(|e| {
         let msg = e.to_string();
         if msg.contains("UNIQUE") {
-            (StatusCode::CONFLICT, format!("Ticket {} is already in workload", ticket_id))
+            (StatusCode::CONFLICT, format!("Ticket {} is already in focus", ticket_id))
         } else {
             (StatusCode::INTERNAL_SERVER_ERROR, msg)
         }
@@ -244,24 +244,24 @@ pub async fn pull_project_ticket(
     };
     let _ = ticketing_system::agent_runs::update_agent_run(&db, &completed_run).await;
 
-    tracing::info!("[PULL-TICKET] Added to workload: {} — {}", item.ticket_id, item.ticket_title);
+    tracing::info!("[PULL-TICKET] Added to focus: {} — {}", item.ticket_id, item.ticket_title);
     Ok(Json(item))
 }
 
 #[derive(Deserialize)]
-pub struct ToggleWorkloadRequest {
+pub struct ToggleFocusRequest {
     pub id: String,
 }
 
-/// POST /api/project-workload/toggle
-pub async fn toggle_project_workload(
+/// POST /api/focus/toggle
+pub async fn toggle_focus(
     State(db): State<Arc<SqlitePool>>,
-    Json(req): Json<ToggleWorkloadRequest>,
+    Json(req): Json<ToggleFocusRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let checked = ticketing_system::project_workload::toggle_workload_item(&db, &req.id)
+    let checked = ticketing_system::focus::toggle_focus_item(&db, &req.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Workload item not found".to_string()))?;
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Focus item not found".to_string()))?;
 
     Ok(Json(serde_json::json!({
         "id": req.id,
@@ -269,19 +269,19 @@ pub async fn toggle_project_workload(
     })))
 }
 
-/// DELETE /api/project-workload/:id
-pub async fn remove_project_workload(
+/// DELETE /api/focus/:id
+pub async fn remove_focus(
     Path(id): Path<String>,
     State(db): State<Arc<SqlitePool>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let deleted = ticketing_system::project_workload::remove_workload_item(&db, &id)
+    let deleted = ticketing_system::focus::remove_focus_item(&db, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if deleted {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, "Workload item not found".to_string()))
+        Err((StatusCode::NOT_FOUND, "Focus item not found".to_string()))
     }
 }
 

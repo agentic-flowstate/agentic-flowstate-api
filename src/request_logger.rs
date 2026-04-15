@@ -36,7 +36,7 @@ fn detect_component(path: &str) -> &'static str {
         "chat"
     } else if path.starts_with("/api/meetings") || path.starts_with("/api/tts") {
         "meetings"
-    } else if path.starts_with("/api/daily-plan") || path.starts_with("/api/project-workload") || path.starts_with("/api/home-planner") {
+    } else if path.starts_with("/api/daily-plan") || path.starts_with("/api/focus") || path.starts_with("/api/home-planner") {
         "planner"
     } else if path.starts_with("/api/library") || path.starts_with("/api/tickets") && path.contains("/docs") {
         "library"
