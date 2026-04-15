@@ -1,11 +1,13 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ticketing_system::{emails, email_accounts, Email, EmailAttachment, EmailThread, SqlitePool};
+
+use crate::auth_middleware::AuthenticatedUser;
 
 /// Sanitize HTML email body to prevent XSS
 fn sanitize_email_html(html: &str) -> String {
@@ -47,6 +49,49 @@ fn sanitize_emails(emails: Vec<Email>) -> Vec<Email> {
     emails.into_iter().map(sanitize_email).collect()
 }
 
+// ============================================================================
+// Auth helpers — verify user has access to mailboxes before returning data
+// ============================================================================
+
+/// Get list of mailbox addresses the authenticated user can access
+async fn get_user_mailboxes(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> Result<Vec<String>, (StatusCode, String)> {
+    let accounts = email_accounts::list_email_accounts_for_user(pool, user_id, true)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(accounts.into_iter().map(|a| a.email).collect())
+}
+
+/// Verify user has access to a specific mailbox, return 403 if not
+async fn verify_mailbox_access(
+    pool: &SqlitePool,
+    user_id: &str,
+    mailbox: &str,
+) -> Result<(), (StatusCode, String)> {
+    let has_access = email_accounts::user_has_email_access(pool, mailbox, user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !has_access {
+        return Err((StatusCode::FORBIDDEN, format!("No access to mailbox: {}", mailbox)));
+    }
+    Ok(())
+}
+
+/// Fetch an email by ID and verify the user has access to its mailbox
+async fn get_email_with_access_check(
+    pool: &SqlitePool,
+    user_id: &str,
+    email_id: i64,
+) -> Result<Email, (StatusCode, String)> {
+    let email = emails::get_email_by_id(pool, email_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    verify_mailbox_access(pool, user_id, &email.mailbox).await?;
+    Ok(email)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListEmailsQuery {
     pub mailbox: Option<String>,
@@ -65,12 +110,15 @@ pub struct EmailListResponse {
 /// List emails (GET /api/emails)
 pub async fn list_emails(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListEmailsQuery>,
 ) -> Result<Json<EmailListResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(50);
     let offset = params.offset.unwrap_or(0);
 
     let (email_list, total, unread) = if let Some(mailbox) = &params.mailbox {
+        // Specific mailbox requested — verify access
+        verify_mailbox_access(&pool, &user.user_id, mailbox).await?;
         let folder = params.folder.as_deref();
         let list = emails::list_emails(&pool, mailbox, folder, limit, offset)
             .await
@@ -82,20 +130,18 @@ pub async fn list_emails(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         (list, total, unread)
-    } else if let Some(folder) = &params.folder {
-        // Filter by folder across all mailboxes
-        let list = emails::list_emails_by_folder(&pool, folder, limit, offset)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let total = list.len() as i64;
-        let unread = list.iter().filter(|e| !e.is_read).count() as i64;
-        (list, total, unread)
     } else {
-        // List all emails across all mailboxes
-        let list = emails::list_all_emails(&pool, limit, offset)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        // For unified inbox, count is the list length (simplified)
+        // No specific mailbox — filter to user's accessible mailboxes
+        let accessible = get_user_mailboxes(&pool, &user.user_id).await?;
+        let list = if let Some(folder) = &params.folder {
+            emails::list_emails_by_mailboxes(&pool, &accessible, folder, limit, offset)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        } else {
+            emails::list_all_emails_for_mailboxes(&pool, &accessible, limit, offset)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        };
         let total = list.len() as i64;
         let unread = list.iter().filter(|e| !e.is_read).count() as i64;
         (list, total, unread)
@@ -111,12 +157,10 @@ pub async fn list_emails(
 /// Get single email by ID (GET /api/emails/:id)
 pub async fn get_email(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<i64>,
 ) -> Result<Json<Email>, (StatusCode, String)> {
-    let email = emails::get_email_by_id(&pool, id)
-        .await
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
-
+    let email = get_email_with_access_check(&pool, &user.user_id, id).await?;
     Ok(Json(sanitize_email(email)))
 }
 
@@ -129,9 +173,13 @@ pub struct UpdateEmailRequest {
 /// Update email (PATCH /api/emails/:id)
 pub async fn update_email(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<i64>,
     Json(req): Json<UpdateEmailRequest>,
 ) -> Result<Json<Email>, (StatusCode, String)> {
+    // Verify access before allowing modification
+    get_email_with_access_check(&pool, &user.user_id, id).await?;
+
     if let Some(is_read) = req.is_read {
         emails::mark_email_read(&pool, id, is_read)
             .await
@@ -154,8 +202,12 @@ pub async fn update_email(
 /// Delete email (DELETE /api/emails/:id)
 pub async fn delete_email(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // Verify access before allowing deletion
+    get_email_with_access_check(&pool, &user.user_id, id).await?;
+
     emails::delete_email(&pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -178,16 +230,13 @@ pub struct MailboxStats {
 /// Get email stats (GET /api/emails/stats)
 pub async fn get_email_stats(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<EmailStatsResponse>, (StatusCode, String)> {
-    // Query distinct mailboxes from stored emails
-    let rows = sqlx::query_as::<_, (String,)>("SELECT DISTINCT mailbox FROM emails")
-        .fetch_all(pool.as_ref())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mailboxes: Vec<String> = rows.into_iter().map(|(m,)| m).collect();
+    // Only return stats for mailboxes the user has access to
+    let accessible = get_user_mailboxes(&pool, &user.user_id).await?;
 
     let mut stats = Vec::new();
-    for mailbox in mailboxes {
+    for mailbox in accessible {
         let total = emails::count_emails(&pool, &mailbox, None)
             .await
             .unwrap_or(0);
@@ -235,8 +284,12 @@ pub struct SendEmailResponse {
 /// headers so mail clients thread the conversation properly.
 pub async fn send_email(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<SendEmailRequest>,
 ) -> Result<Json<SendEmailResponse>, (StatusCode, String)> {
+    // Verify user has access to send from this email account
+    verify_mailbox_access(&pool, &user.user_id, &req.from).await?;
+
     // Look up sender's email account for AWS credentials
     let account = email_accounts::get_email_account(&pool, &req.from)
         .await
@@ -436,6 +489,7 @@ pub struct SearchEmailsQuery {
 /// Search emails via FTS5 (GET /api/emails/search)
 pub async fn search_emails(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<SearchEmailsQuery>,
 ) -> Result<Json<EmailListResponse>, (StatusCode, String)> {
     if params.q.trim().is_empty() {
@@ -451,16 +505,19 @@ pub async fn search_emails(
     let mailbox = params.mailbox.as_deref()
         .and_then(|m| if m == "all" { None } else { Some(m) });
 
-    let results = emails::search_emails(
-        &pool,
-        &params.q,
-        mailbox,
-        params.folder.as_deref(),
-        limit,
-        offset,
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let results = if let Some(mb) = mailbox {
+        // Specific mailbox — verify access
+        verify_mailbox_access(&pool, &user.user_id, mb).await?;
+        emails::search_emails(&pool, &params.q, Some(mb), params.folder.as_deref(), limit, offset)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        // All mailboxes — filter to accessible ones
+        let accessible = get_user_mailboxes(&pool, &user.user_id).await?;
+        emails::search_emails_for_mailboxes(&pool, &params.q, &accessible, params.folder.as_deref(), limit, offset)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
 
     let total = results.len() as i64;
     let unread = results.iter().filter(|e| !e.is_read).count() as i64;
@@ -491,6 +548,7 @@ pub struct ThreadListResponse {
 /// List email threads (GET /api/emails/threads)
 pub async fn list_threads(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListThreadsQuery>,
 ) -> Result<Json<ThreadListResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(50);
@@ -498,9 +556,17 @@ pub async fn list_threads(
     let mailbox = params.mailbox.as_deref()
         .and_then(|m| if m == "all" { None } else { Some(m) });
 
-    let threads = emails::list_threads(&pool, mailbox, limit, offset)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let threads = if let Some(mb) = mailbox {
+        verify_mailbox_access(&pool, &user.user_id, mb).await?;
+        emails::list_threads(&pool, Some(mb), limit, offset)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        let accessible = get_user_mailboxes(&pool, &user.user_id).await?;
+        emails::list_threads_for_mailboxes(&pool, &accessible, limit, offset)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
 
     Ok(Json(ThreadListResponse { threads }))
 }
@@ -508,13 +574,25 @@ pub async fn list_threads(
 /// Get all emails in a thread (GET /api/emails/threads/:thread_id)
 pub async fn get_thread(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(thread_id): Path<String>,
 ) -> Result<Json<Vec<Email>>, (StatusCode, String)> {
+    let accessible = get_user_mailboxes(&pool, &user.user_id).await?;
     let thread_emails = emails::get_thread_emails(&pool, &thread_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(sanitize_emails(thread_emails)))
+    // Filter to only emails from accessible mailboxes
+    let filtered: Vec<Email> = thread_emails
+        .into_iter()
+        .filter(|e| accessible.contains(&e.mailbox))
+        .collect();
+
+    if filtered.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "Thread not found or no access".to_string()));
+    }
+
+    Ok(Json(sanitize_emails(filtered)))
 }
 
 // ============================================================================
@@ -524,8 +602,12 @@ pub async fn get_thread(
 /// List attachments for an email (GET /api/emails/:id/attachments)
 pub async fn list_attachments(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(email_id): Path<i64>,
 ) -> Result<Json<Vec<EmailAttachment>>, (StatusCode, String)> {
+    // Verify access to the parent email
+    get_email_with_access_check(&pool, &user.user_id, email_id).await?;
+
     let attachments = emails::list_attachments(&pool, email_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -536,6 +618,7 @@ pub async fn list_attachments(
 /// Download an attachment (GET /api/emails/attachments/:attachment_id)
 pub async fn download_attachment(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(attachment_id): Path<i64>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     use axum::body::Body;
@@ -544,6 +627,9 @@ pub async fn download_attachment(
     let attachment = emails::get_attachment(&pool, attachment_id)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+
+    // Verify access to the parent email
+    get_email_with_access_check(&pool, &user.user_id, attachment.email_id).await?;
 
     let stored_path = attachment.stored_path
         .ok_or((StatusCode::NOT_FOUND, "Attachment file not stored".to_string()))?;
@@ -584,8 +670,14 @@ pub struct UnarchiveEmailsResponse {
 /// Archive emails (POST /api/emails/archive)
 pub async fn archive_emails(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<ArchiveEmailsRequest>,
 ) -> Result<Json<ArchiveEmailsResponse>, (StatusCode, String)> {
+    // Verify access to all emails before archiving
+    for &id in &req.email_ids {
+        get_email_with_access_check(&pool, &user.user_id, id).await?;
+    }
+
     let count = emails::update_email_folders(&pool, &req.email_ids, "Archive")
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -596,8 +688,14 @@ pub async fn archive_emails(
 /// Unarchive emails (POST /api/emails/unarchive)
 pub async fn unarchive_emails(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<ArchiveEmailsRequest>,
 ) -> Result<Json<UnarchiveEmailsResponse>, (StatusCode, String)> {
+    // Verify access to all emails before unarchiving
+    for &id in &req.email_ids {
+        get_email_with_access_check(&pool, &user.user_id, id).await?;
+    }
+
     let count = emails::update_email_folders(&pool, &req.email_ids, "INBOX")
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
