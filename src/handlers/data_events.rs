@@ -1,10 +1,11 @@
 use axum::{
-    extract::{Query, State},
+    extract::State,
+    http::HeaderMap,
     response::sse::{Event, KeepAlive, Sse},
     Extension,
 };
 use futures::stream::Stream;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
@@ -13,11 +14,6 @@ use std::time::Duration;
 use ticketing_system::{epics, memberships, slices, tickets, Epic, Slice, SqlitePool, Ticket};
 
 use crate::auth_middleware::AuthenticatedUser;
-
-#[derive(Debug, Deserialize)]
-pub struct DataSubscribeQuery {
-    pub organization: String,
-}
 
 /// SSE event types for data updates
 #[derive(Debug, Serialize)]
@@ -71,13 +67,21 @@ fn hash_tickets(tickets: &[Ticket]) -> u64 {
     hasher.finish()
 }
 
-/// GET /api/data/subscribe?organization=X
-/// SSE endpoint for real-time data updates (epics, slices, tickets)
+/// GET /api/data/subscribe
+/// SSE endpoint for real-time data updates (epics, slices, tickets).
+/// Organization is read from the X-Organization header (validated by
+/// require_org_access middleware), NOT from query parameters.
 pub async fn subscribe_data(
     State(pool): State<Arc<SqlitePool>>,
-    Query(params): Query<DataSubscribeQuery>,
+    headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let org = params.organization;
+    // Use org from validated X-Organization header (require_org_access middleware),
+    // NOT from query parameter which could bypass membership checks
+    let org = headers
+        .get("X-Organization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
 
     let stream = async_stream::stream! {
         let mut last_epics_hash: u64 = 0;

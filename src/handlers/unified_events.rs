@@ -101,6 +101,20 @@ pub async fn subscribe_unified_events(
             .await
             .unwrap_or_default();
 
+        // Validate org parameter against memberships — only allow org-scoped
+        // topics (data, conversations) for orgs the user is a member of
+        let validated_org: Option<String> = org.as_ref().and_then(|o| {
+            if user_orgs.iter().any(|m| m.organization == *o) {
+                Some(o.clone())
+            } else {
+                tracing::warn!(
+                    "[UNIFIED-SSE] user={} denied access to org={} (not a member)",
+                    user_id, o
+                );
+                None
+            }
+        });
+
         // Cache email accounts
         let mut user_mailboxes: Vec<String> = Vec::new();
         let mut email_refresh_counter: u32 = 0;
@@ -216,7 +230,7 @@ pub async fn subscribe_unified_events(
             // ── CONVERSATIONS ────────────────────────────────────────────
             if topics.contains("conversations") {
                 if let Ok(convs) = ticketing_system::conversations::list_conversations(
-                    &pool, org.as_deref(), Some(&user_id), None, None, None, None,
+                    &pool, validated_org.as_deref(), Some(&user_id), None, None, None, None,
                 ).await {
                     let hash = hash_conversation_list(&convs);
                     if hash != hash_conversations {
@@ -276,7 +290,7 @@ pub async fn subscribe_unified_events(
 
             // ── DATA (workspace: epics/slices/tickets for one org) ───────
             if topics.contains("data") {
-                if let Some(ref org_name) = org {
+                if let Some(ref org_name) = validated_org {
                     if let Ok(epic_list) = ticketing_system::epics::list_epics(&pool, Some(org_name)).await {
                         let eh = hash_epic_list(&epic_list);
                         if eh != hash_epics {
