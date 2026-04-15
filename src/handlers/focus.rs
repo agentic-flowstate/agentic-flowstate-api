@@ -1,7 +1,7 @@
 //! Focus REST API handlers
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     Json,
 };
@@ -16,13 +16,15 @@ use ticketing_system::FocusItem;
 use crate::agents::AgentType;
 use crate::agents::prompts::load_prompt;
 use crate::agents::run_oneshot;
+use crate::auth_middleware::AuthenticatedUser;
 
 /// GET /api/focus
-/// Returns all unchecked focus items
+/// Returns all unchecked focus items for the authenticated user
 pub async fn list_focus(
+    Extension(user): Extension<AuthenticatedUser>,
     State(db): State<Arc<SqlitePool>>,
 ) -> Result<Json<Vec<FocusItem>>, (StatusCode, String)> {
-    let items = ticketing_system::focus::list_focus(&db, false)
+    let items = ticketing_system::focus::list_focus(&db, &user.user_id, false)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -37,13 +39,14 @@ pub struct PullRequest {
 /// POST /api/focus/pull
 /// Run pull-ticket agent, parse output, add to focus
 pub async fn pull_focus_ticket(
+    Extension(user): Extension<AuthenticatedUser>,
     State(db): State<Arc<SqlitePool>>,
     Json(req): Json<PullRequest>,
 ) -> Result<Json<FocusItem>, (StatusCode, String)> {
     let org = &req.organization;
 
     // Get current focus for this org
-    let current = ticketing_system::focus::list_focus_ticket_ids(&db, org)
+    let current = ticketing_system::focus::list_focus_ticket_ids(&db, &user.user_id, org)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -210,6 +213,7 @@ pub async fn pull_focus_ticket(
     // Add to focus
     let item = ticketing_system::focus::add_to_focus(
         &db,
+        &user.user_id,
         org,
         &ticket.ticket_id,
         &ticket.title,
@@ -255,10 +259,11 @@ pub struct ToggleFocusRequest {
 
 /// POST /api/focus/toggle
 pub async fn toggle_focus(
+    Extension(user): Extension<AuthenticatedUser>,
     State(db): State<Arc<SqlitePool>>,
     Json(req): Json<ToggleFocusRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let checked = ticketing_system::focus::toggle_focus_item(&db, &req.id)
+    let checked = ticketing_system::focus::toggle_focus_item(&db, &user.user_id, &req.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Focus item not found".to_string()))?;
@@ -271,10 +276,11 @@ pub async fn toggle_focus(
 
 /// DELETE /api/focus/:id
 pub async fn remove_focus(
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
     State(db): State<Arc<SqlitePool>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let deleted = ticketing_system::focus::remove_focus_item(&db, &id)
+    let deleted = ticketing_system::focus::remove_focus_item(&db, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
