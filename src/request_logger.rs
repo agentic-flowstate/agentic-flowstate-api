@@ -32,7 +32,12 @@ fn detect_component(path: &str) -> &'static str {
         "agent"
     } else if path.starts_with("/api/email") || path.starts_with("/api/drafts") {
         "email"
-    } else if path.starts_with("/api/conversations") || path.starts_with("/api/dms") {
+    } else if path.starts_with("/api/conversations")
+        || path.starts_with("/api/dms")
+        || path.starts_with("/api/full-access/chat")
+        || path.starts_with("/api/workspace-manager/chat")
+        || path.starts_with("/api/scoped-workspace/chat")
+    {
         "chat"
     } else if path.starts_with("/api/meetings") || path.starts_with("/api/tts") {
         "meetings"

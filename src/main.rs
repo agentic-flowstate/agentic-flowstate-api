@@ -526,6 +526,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/full-access/chat",
             post(handlers::full_access_chat))
 
+        // Scoped Workspace Chat routes (restricted agent for external collaborators)
+        .route("/api/scoped-workspace/chat",
+            post(handlers::scoped_workspace_chat))
+
         // Unified SSE (single multiplexed connection for all topics)
         .route("/api/events/subscribe", get(handlers::subscribe_unified_events))
 

@@ -256,6 +256,42 @@
         "mcp__agentic-mcp__*"
       ]
     },
+    "scoped-workspace": {
+      "model": "opus",
+      "effort": "high",
+      "prompt_file": "scoped-workspace.txt",
+      "tools": [
+        "mcp__agentic-mcp__list_user_organizations",
+        "mcp__agentic-mcp__list_members",
+        "mcp__agentic-mcp__list_epics",
+        "mcp__agentic-mcp__list_slices",
+        "mcp__agentic-mcp__list_tickets",
+        "mcp__agentic-mcp__get_epic",
+        "mcp__agentic-mcp__get_slice",
+        "mcp__agentic-mcp__get_ticket",
+        "mcp__agentic-mcp__search_tickets",
+        "mcp__agentic-mcp__list_ticket_history",
+        "mcp__agentic-mcp__list_tickets_by_due_date",
+        "mcp__agentic-mcp__create_epics",
+        "mcp__agentic-mcp__create_slices",
+        "mcp__agentic-mcp__create_slice_tickets",
+        "mcp__agentic-mcp__update_ticket",
+        "mcp__agentic-mcp__update_ticket_status",
+        "mcp__agentic-mcp__add_ticket_relationship",
+        "mcp__agentic-mcp__remove_ticket_relationship",
+        "mcp__agentic-mcp__search_artifacts",
+        "mcp__agentic-mcp__list_artifacts",
+        "mcp__agentic-mcp__get_artifact",
+        "mcp__agentic-mcp__create_artifact",
+        "mcp__agentic-mcp__update_artifact",
+        "mcp__agentic-mcp__search_documents",
+        "mcp__agentic-mcp__list_documents",
+        "mcp__agentic-mcp__get_document",
+        "mcp__agentic-mcp__get_user",
+        "mcp__agentic-mcp__exa_search",
+        "mcp__agentic-mcp__exa_get_contents"
+      ]
+    },
     "ticket-router": {
       "model": "opus",
       "effort": "low",

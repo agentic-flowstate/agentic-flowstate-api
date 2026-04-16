@@ -84,6 +84,8 @@ pub enum AgentType {
     MeetingAgent,
     /// Full-access agent — every MCP tool + all built-in tools, uses CLAUDE.md as system prompt
     FullAccess,
+    /// Scoped workspace manager — restricted tool set for external users (no home/daily plan/focus/code)
+    ScopedWorkspace,
     /// Pre-processing router — matches user messages to tickets before the main agent runs
     TicketRouter,
 }
@@ -109,6 +111,7 @@ impl AgentType {
             AgentType::DocManager => "doc-manager",
             AgentType::MeetingAgent => "meeting-agent",
             AgentType::FullAccess => "full-access",
+            AgentType::ScopedWorkspace => "scoped-workspace",
             AgentType::TicketRouter => "ticket-router",
         }
     }
