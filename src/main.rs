@@ -365,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/logout", post(handlers::auth::logout))
         .route("/api/auth/me", get(handlers::auth::me))
+        .route("/api/auth/users/public", get(handlers::auth::list_public_users))
         .route("/health", get(|| async { "OK" }))
         .route("/health/ready", get(handlers::health::ready))
         .route("/api/debug-log", post(handlers::debug_log::post_debug_log).get(handlers::debug_log::get_debug_log))

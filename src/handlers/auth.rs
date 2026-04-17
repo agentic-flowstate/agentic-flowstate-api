@@ -137,6 +137,30 @@ pub async fn logout(
     StatusCode::NO_CONTENT
 }
 
+/// GET /api/auth/users/public
+///
+/// Returns a public list of every user in the system. Used by the iOS login
+/// screen to populate a dropdown so users pick their account instead of
+/// typing it. Intentionally unauthenticated — this is an internal tool on a
+/// Tailscale network, and user_id + display name are not sensitive.
+pub async fn list_public_users(
+    State(pool): State<Arc<SqlitePool>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let users = ticketing_system::users::list_users(&pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to list users for public dropdown: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to list users"})))
+        })?;
+
+    let payload: Vec<Value> = users
+        .into_iter()
+        .map(|u| json!({"user_id": u.user_id, "name": u.name}))
+        .collect();
+
+    Ok(Json(json!({"users": payload})))
+}
+
 /// GET /api/auth/me
 pub async fn me(
     State(pool): State<Arc<SqlitePool>>,
