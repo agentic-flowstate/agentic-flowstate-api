@@ -50,7 +50,7 @@ pub fn build_agent_options(
         builder = builder.max_turns(turns);
     }
 
-    // Enable adaptive thinking via --effort flag (Opus 4.6 recommended approach)
+    // Enable adaptive thinking via --effort flag (Opus 4.7 xhigh recommended)
     builder = builder.add_extra_arg("effort", Some(agent_type.effort().to_string()));
 
     if let Some(sid) = cc_session_id {

@@ -1,11 +1,11 @@
 {
   "models": {
-    "opus": "claude-opus-4-6"
+    "opus": "claude-opus-4-7"
   },
   "agents": {
     "exa-research": {
       "model": "opus",
-      "effort": "high",
+      "effort": "xhigh",
       "prompt_file": "exa-research.txt",
       "tools": [
         "mcp__agentic-mcp__exa_search",
@@ -22,13 +22,13 @@
     },
     "research-synthesis": {
       "model": "opus",
-      "effort": "high",
+      "effort": "xhigh",
       "prompt_file": "research-synthesis.txt",
       "tools": []
     },
     "ticket-planner": {
       "model": "opus",
-      "effort": "high",
+      "effort": "xhigh",
       "prompt_file": "ticket-planner.txt",
       "tools": [
         "mcp__agentic-mcp__list_epics",
@@ -41,7 +41,7 @@
     },
     "ticket-creator": {
       "model": "opus",
-      "effort": "medium",
+      "effort": "xhigh",
       "prompt_file": "ticket-creator.txt",
       "tools": [
         "mcp__agentic-mcp__list_epics",
@@ -59,7 +59,7 @@
     },
     "planning": {
       "model": "opus",
-      "effort": "high",
+      "effort": "xhigh",
       "prompt_file": "planning.txt",
       "tools": [
         "Read",
@@ -72,7 +72,7 @@
     },
     "execution": {
       "model": "opus",
-      "effort": "max",
+      "effort": "xhigh",
       "prompt_file": "execution.txt",
       "tools": [
         "Read",
@@ -87,7 +87,7 @@
     },
     "evaluation": {
       "model": "opus",
-      "effort": "high",
+      "effort": "xhigh",
       "prompt_file": "evaluation.txt",
       "tools": [
         "Read",
@@ -99,13 +99,13 @@
     },
     "email": {
       "model": "opus",
-      "effort": "medium",
+      "effort": "xhigh",
       "prompt_file": "email.txt",
       "tools": []
     },
     "workspace-manager": {
       "model": "opus",
-      "effort": "high",
+      "effort": "xhigh",
       "prompt_file": "workspace-manager.txt",
       "tools": [
         "Read",
@@ -127,13 +127,13 @@
     },
     "meeting-notes": {
       "model": "opus",
-      "effort": "medium",
+      "effort": "xhigh",
       "prompt_file": "meeting-notes.txt",
       "tools": []
     },
     "ticket-assistant": {
       "model": "opus",
-      "effort": "medium",
+      "effort": "xhigh",
       "prompt_file": "ticket-assistant.txt",
       "tools": [
         "Read",
@@ -145,19 +145,19 @@
     },
     "doc-drafter": {
       "model": "opus",
-      "effort": "medium",
+      "effort": "xhigh",
       "prompt_file": "doc-drafter.txt",
       "tools": []
     },
     "pull-ticket": {
       "model": "opus",
-      "effort": "low",
+      "effort": "xhigh",
       "prompt_file": "pull-ticket.txt",
       "tools": []
     },
     "codebase-research": {
       "model": "opus",
-      "effort": "high",
+      "effort": "xhigh",
       "prompt_file": "codebase-research.txt",
       "tools": [
         "Bash",
@@ -168,7 +168,7 @@
     },
     "home-planner": {
       "model": "opus",
-      "effort": "high",
+      "effort": "xhigh",
       "prompt_file": "home-planner.txt",
       "tools": [
         "mcp__agentic-mcp__get_home_context",
@@ -216,7 +216,7 @@
     },
     "doc-manager": {
       "model": "opus",
-      "effort": "medium",
+      "effort": "xhigh",
       "prompt_file": "doc-manager.txt",
       "tools": [
         "mcp__agentic-mcp__get_ticket",
@@ -228,7 +228,7 @@
     },
     "meeting-agent": {
       "model": "opus",
-      "effort": "max",
+      "effort": "xhigh",
       "prompt_file": "meeting-agent.txt",
       "tools": [
         "Read",
@@ -243,7 +243,7 @@
     },
     "full-access": {
       "model": "opus",
-      "effort": "max",
+      "effort": "xhigh",
       "prompt_file": "full-access.txt",
       "tools": [
         "Read",
@@ -258,7 +258,7 @@
     },
     "scoped-workspace": {
       "model": "opus",
-      "effort": "high",
+      "effort": "xhigh",
       "prompt_file": "scoped-workspace.txt",
       "tools": [
         "mcp__agentic-mcp__list_user_organizations",
@@ -294,7 +294,7 @@
     },
     "ticket-router": {
       "model": "opus",
-      "effort": "low",
+      "effort": "xhigh",
       "max_turns": 5,
       "prompt_file": "ticket-router.txt",
       "tools": [

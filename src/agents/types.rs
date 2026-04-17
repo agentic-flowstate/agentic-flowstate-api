@@ -15,14 +15,14 @@ pub struct AgentConfig {
     /// If not set, defaults to the base projects directory.
     #[serde(default)]
     pub working_dir: Option<String>,
-    /// Effort level for adaptive thinking: "low", "medium", "high", "max".
-    /// Defaults to "high" if not set.
+    /// Effort level for adaptive thinking: "low", "medium", "high", "xhigh", "max".
+    /// Defaults to "xhigh" if not set (Opus 4.7 recommended).
     #[serde(default = "default_effort")]
     pub effort: String,
 }
 
 fn default_effort() -> String {
-    "high".to_string()
+    "xhigh".to_string()
 }
 
 /// Root config structure from agents.json

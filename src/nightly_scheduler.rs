@@ -335,7 +335,7 @@ async fn run_org_orchestrator(
     // Call Opus via cc-sdk (no tools, single turn)
     let options = ClaudeCodeOptions::builder()
         .system_prompt(&system_prompt)
-        .model("claude-opus-4-6")
+        .model("claude-opus-4-7")
         .tools(ToolsConfig::none())
         .max_turns(1)
         .permission_mode(PermissionMode::BypassPermissions)
@@ -975,13 +975,13 @@ async fn run_codebase_research(
 
     let options = ClaudeCodeOptions::builder()
         .system_prompt(&system_prompt)
-        .model("claude-opus-4-6")
+        .model("claude-opus-4-7")
         .tools(ToolsConfig::list(tools.clone()))
         .allowed_tools(tools)
         .disallowed_tools(crate::safety::disallowed_tools())
         .permission_mode(PermissionMode::BypassPermissions)
         .cwd(working_dir)
-        .add_extra_arg("effort", Some("high".to_string()))
+        .add_extra_arg("effort", Some("xhigh".to_string()))
         .build();
 
     run_agent_to_completion("codebase-research", &ticket.ticket_id, options).await
@@ -1018,7 +1018,7 @@ async fn run_exa_research(
     let mcp_binary = mcp_binary_path();
     let options = ClaudeCodeOptions::builder()
         .system_prompt(&system_prompt)
-        .model("claude-opus-4-6")
+        .model("claude-opus-4-7")
         .tools(ToolsConfig::list(tools.clone()))
         .allowed_tools(tools)
         .disallowed_tools(crate::safety::disallowed_tools())
@@ -1032,7 +1032,7 @@ async fn run_exa_research(
                 env: None,
             },
         )
-        .add_extra_arg("effort", Some("high".to_string()))
+        .add_extra_arg("effort", Some("xhigh".to_string()))
         .build();
 
     run_agent_to_completion("exa-research", &ticket.ticket_id, options).await
@@ -1097,7 +1097,7 @@ async fn run_full_access_execution(
     let mcp_binary = mcp_binary_path();
     let options = ClaudeCodeOptions::builder()
         .system_prompt(&system_prompt)
-        .model("claude-opus-4-6")
+        .model("claude-opus-4-7")
         .tools(ToolsConfig::list(tools.clone()))
         .allowed_tools(tools)
         .disallowed_tools(crate::safety::disallowed_tools())
@@ -1111,7 +1111,7 @@ async fn run_full_access_execution(
                 env: None,
             },
         )
-        .add_extra_arg("effort", Some("max".to_string()))
+        .add_extra_arg("effort", Some("xhigh".to_string()))
         .build();
 
     let user_msg = format!(

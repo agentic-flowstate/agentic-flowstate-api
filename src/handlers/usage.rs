@@ -75,7 +75,7 @@ pub async fn get_usage(
     };
 
     let conversation = summary.conversation.map(|c| {
-        let context_limit: i64 = 1_000_000; // 1M tokens for Opus 4.6 / Sonnet 4.6
+        let context_limit: i64 = 1_000_000; // 1M tokens for Opus 4.7 / Sonnet 4.6
         let pct = if context_limit > 0 {
             (c.total_tokens as f64 / context_limit as f64) * 100.0
         } else {
