@@ -366,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/logout", post(handlers::auth::logout))
         .route("/api/auth/me", get(handlers::auth::me))
         .route("/api/auth/users/public", get(handlers::auth::list_public_users))
+        .route("/api/auth/setup-code/redeem", post(handlers::auth::redeem_setup_code))
         .route("/health", get(|| async { "OK" }))
         .route("/health/ready", get(handlers::health::ready))
         .route("/api/debug-log", post(handlers::debug_log::post_debug_log).get(handlers::debug_log::get_debug_log))
@@ -448,6 +449,9 @@ async fn main() -> anyhow::Result<()> {
 
     // User-scoped routes (require valid session only, no org membership check)
     let user_scoped_routes = Router::new()
+        // Password rotation — called after every Face ID sign-in so the
+        // server-side secret never stays stable.
+        .route("/api/auth/password/rotate", post(handlers::auth::rotate_password))
         // Agent run routes (accessed by session_id, not org-scoped)
         .route("/api/agent-runs/:session_id",
             get(handlers::get_agent_run))

@@ -1,7 +1,7 @@
 //! Authentication handlers - register, login, logout, session check
 
 use std::sync::Arc;
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
 use tower_cookies::{Cookie, Cookies};
 
@@ -159,6 +159,118 @@ pub async fn list_public_users(
         .collect();
 
     Ok(Json(json!({"users": payload})))
+}
+
+/// POST /api/auth/setup-code/redeem
+///
+/// Unauthenticated. Body: `{"code": "123456"}`. On success:
+///   - Writes a fresh random password hash to the user row
+///   - Creates a session (session cookie is set on the response)
+///   - Returns `{user_id, name, password}` — the plaintext password is for
+///     the iOS client to stash in the Keychain behind Face ID so the
+///     auto-rotate-on-every-login flow can proceed.
+pub async fn redeem_setup_code(
+    State(pool): State<Arc<SqlitePool>>,
+    cookies: Cookies,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let code = body
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "code is required"})),
+            )
+        })?;
+
+    let redeemed = ticketing_system::setup_codes::redeem_code(&pool, &code)
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            tracing::warn!("Setup code redemption failed: {}", msg);
+            if msg.contains("Invalid")
+                || msg.contains("expired")
+                || msg.contains("already been used")
+                || msg.contains("no longer exists")
+            {
+                (StatusCode::UNAUTHORIZED, Json(json!({"error": msg})))
+            } else {
+                tracing::error!("Setup code redemption error: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Redemption failed"})),
+                )
+            }
+        })?;
+
+    cookies.add(make_session_cookie(&redeemed.session_id));
+
+    crate::system_log_helper::log_event(
+        &pool,
+        "info",
+        "auth",
+        &format!("Setup code redeemed for user: {}", redeemed.user_id),
+        None,
+        Some(&redeemed.user_id),
+        Some(&redeemed.session_id),
+    )
+    .await;
+
+    Ok(Json(json!({
+        "user_id": redeemed.user_id,
+        "name": redeemed.name,
+        "password": redeemed.password,
+    })))
+}
+
+/// POST /api/auth/password/rotate
+///
+/// Authenticated. Body: `{"new_password": "..."}`. Rotates the current
+/// user's server-side password hash to the supplied plaintext. The iOS
+/// client calls this after every Face ID sign-in so the secret never
+/// stays stable long enough to matter if it ever leaked.
+pub async fn rotate_password(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<crate::auth_middleware::AuthenticatedUser>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let new_password = body
+        .get("new_password")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| s.len() >= 16)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "new_password must be at least 16 characters"})),
+            )
+        })?;
+
+    ticketing_system::auth::rotate_password(&pool, &user.user_id, &new_password)
+        .await
+        .map_err(|e| {
+            tracing::error!("Password rotation error: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Rotation failed"})),
+            )
+        })?;
+
+    crate::system_log_helper::log_event(
+        &pool,
+        "info",
+        "auth",
+        &format!("Password rotated for user: {}", user.user_id),
+        None,
+        Some(&user.user_id),
+        None,
+    )
+    .await;
+
+    Ok(Json(json!({"ok": true})))
 }
 
 /// GET /api/auth/me
