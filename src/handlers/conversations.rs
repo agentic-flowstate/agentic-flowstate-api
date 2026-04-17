@@ -233,11 +233,20 @@ pub async fn update_message(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Query params for `GET /api/conversations/:id/messages`. Clients that only
+/// render a recent window pass a small `limit` to avoid downloading the full
+/// conversation on cold start. Omitted `limit` = all messages.
+#[derive(Debug, Deserialize)]
+pub struct ListMessagesQuery {
+    pub limit: Option<i64>,
+}
+
 /// List messages for a conversation (GET /api/conversations/:id/messages)
 pub async fn list_messages(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
+    Query(params): Query<ListMessagesQuery>,
 ) -> Result<Json<Vec<ConversationMessage>>, (StatusCode, String)> {
     // Verify conversation exists and belongs to user
     let conv = conversations::get_conversation(&pool, &id, false)
@@ -248,7 +257,7 @@ pub async fn list_messages(
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
 
-    let messages = conversations::list_messages(&pool, &id)
+    let messages = conversations::list_messages(&pool, &id, params.limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

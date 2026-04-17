@@ -1154,7 +1154,7 @@ pub(crate) async fn create_client(
     // For resumed sessions: safety net if --resume fails silently.
     // For new sessions on existing conversations (e.g., nightly scheduler stubs):
     // provides the only context the agent will have.
-    let system_prompt = match conversations::list_messages(db, conv_id).await {
+    let system_prompt = match conversations::list_messages(db, conv_id, None).await {
         Ok(messages) if !messages.is_empty() => {
             tracing::info!("[WORKER] Injecting {} messages as resume context for {}", messages.len(), conv_id);
             let history = build_conversation_history(&messages);
