@@ -42,6 +42,7 @@ pub mod usage;
 pub mod cad;
 pub mod quick_commands;
 pub mod unified_events;
+pub mod spanish_flashcards;
 
 pub use epics::*;
 pub use slices::*;

@@ -567,6 +567,20 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/daily-plan/date-items",
             post(handlers::create_daily_plan_date_item))
 
+        // Spanish flashcards (personal language-learning feature)
+        .route("/api/spanish/sections",
+            get(handlers::spanish_flashcards::list_spanish_sections))
+        .route("/api/spanish/sections/:section_id/cards",
+            get(handlers::spanish_flashcards::list_spanish_cards))
+        .route("/api/spanish/sections/:section_id/generate",
+            post(handlers::spanish_flashcards::generate_spanish_cards))
+        .route("/api/spanish/cards",
+            post(handlers::spanish_flashcards::create_spanish_card))
+        .route("/api/spanish/cards/:card_id/review",
+            post(handlers::spanish_flashcards::review_spanish_card))
+        .route("/api/spanish/cards/:card_id",
+            delete(handlers::spanish_flashcards::delete_spanish_card))
+
         // Quick commands (dynamic presets above keyboard)
         .route("/api/quick-commands",
             get(handlers::quick_commands::list_quick_commands))
