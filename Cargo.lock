@@ -2612,9 +2612,11 @@ name = "mcp-handlers"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "cc-sdk",
  "chrono",
  "chrono-tz",
  "dirs",
+ "futures 0.3.31",
  "futures-util",
  "libc",
  "md5",

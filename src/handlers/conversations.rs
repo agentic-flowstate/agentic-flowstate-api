@@ -236,9 +236,15 @@ pub async fn update_message(
 /// Query params for `GET /api/conversations/:id/messages`. Clients that only
 /// render a recent window pass a small `limit` to avoid downloading the full
 /// conversation on cold start. Omitted `limit` = all messages.
+///
+/// `before` is a `message_index` cursor: when set, returns up to `limit`
+/// messages strictly older than that index (chronological). Used by the
+/// iOS app for pull-to-load-older pagination — pass the smallest known
+/// `message_index` to load the previous page of older history.
 #[derive(Debug, Deserialize)]
 pub struct ListMessagesQuery {
     pub limit: Option<i64>,
+    pub before: Option<i64>,
 }
 
 /// List messages for a conversation (GET /api/conversations/:id/messages)
@@ -257,7 +263,7 @@ pub async fn list_messages(
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
 
-    let messages = conversations::list_messages(&pool, &id, params.limit)
+    let messages = conversations::list_messages(&pool, &id, params.limit, params.before)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -266,6 +272,23 @@ pub async fn list_messages(
 
 /// Get checkpoint status for a conversation (GET /api/conversations/:id/checkpoint)
 /// Returns whether an agent is actively processing this conversation.
+///
+/// On top of the basic `status/tool_call_count/updated_at` used by the
+/// background-task path, this returns a richer snapshot for the iOS chat UI
+/// to hydrate optimistic state on conversation re-entry:
+///
+///   * `last_event_index` — latest SSE event id persisted. Client uses this
+///     as the `starting_after` cursor instead of whatever stale cursor it
+///     had cached locally.
+///   * `server_time` — wall-clock time on the server. Clients diff this
+///     against `updated_at` to decide whether to show a "catching up…" pill
+///     or discard the checkpoint as stale.
+///   * `recent_events` — every event since the most recent terminator
+///     (result / status=completed / cancelled / failed / timeout), minus
+///     heartbeats. Capped at 200. Feeds through the same parseEvent pipeline
+///     the SSE stream uses, so the UI can show the current tool card and
+///     partial text BEFORE the SSE handshake completes. See
+///     `conversations::get_active_run_events` for the selection logic.
 pub async fn get_conversation_checkpoint(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -284,16 +307,52 @@ pub async fn get_conversation_checkpoint(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let last_event_index = conversations::get_max_event_index(&pool, &id)
+        .await
+        .unwrap_or(-1);
+
+    let server_time = chrono::Utc::now().timestamp();
+
+    // Only bother shipping recent events when the agent is actually running
+    // (or just finished) — no point paying the query cost for idle chats
+    // where the client has all the history via /messages.
+    let include_active = matches!(
+        checkpoint.as_ref().map(|c| c.status.as_str()),
+        Some("running") | Some("pending")
+    );
+
+    let recent_events = if include_active {
+        conversations::get_active_run_events(&pool, &id, 200)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| RecentEvent {
+                event_index: e.event_index,
+                event_type: e.event_type,
+                event_data: e.event_data,
+                created_at: e.created_at,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     match checkpoint {
         Some(cp) => Ok(Json(ConversationCheckpointResponse {
             status: cp.status,
             tool_call_count: cp.tool_call_count,
             updated_at: cp.updated_at,
+            last_event_index,
+            server_time,
+            recent_events,
         })),
         None => Ok(Json(ConversationCheckpointResponse {
             status: "none".to_string(),
             tool_call_count: 0,
             updated_at: 0,
+            last_event_index,
+            server_time,
+            recent_events,
         })),
     }
 }
@@ -303,6 +362,24 @@ pub struct ConversationCheckpointResponse {
     pub status: String,
     pub tool_call_count: i32,
     pub updated_at: i64,
+    /// Max event_index persisted to conversation_events. -1 if none.
+    /// Clients use this as the `starting_after` cursor on SSE reconnect.
+    pub last_event_index: i32,
+    /// Server wall-clock time at response generation, for client staleness checks.
+    pub server_time: i64,
+    /// Snapshot of events in the currently-running turn, ordered by event_index.
+    /// Empty when the agent isn't running. Heartbeats are filtered.
+    pub recent_events: Vec<RecentEvent>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecentEvent {
+    pub event_index: i32,
+    pub event_type: String,
+    /// Raw JSON string (same shape the SSE `data:` field carries). Ship it
+    /// as-is so the client can reuse its SSE parser with zero divergence.
+    pub event_data: String,
+    pub created_at: i64,
 }
 
 /// Query parameters for the reconnect SSE endpoint.
