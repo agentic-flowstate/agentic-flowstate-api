@@ -1,14 +1,18 @@
-use axum::{extract::{Extension, State}, Json};
-use std::sync::Arc;
-use std::path::PathBuf;
-use std::collections::HashMap;
-use sqlx::SqlitePool;
+use axum::{
+    extract::{Extension, State},
+    response::Response,
+    Json,
+};
 use serde::Deserialize;
+use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use super::chat_client_manager::ChatClientManager;
+use super::chat_stream::{self, ChatConfig, ChatImageData};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
-use super::chat_stream::{self, ChatConfig, ChatImageData, SseStream};
-use super::chat_client_manager::ChatClientManager;
 
 #[derive(Debug, Deserialize)]
 pub struct HomePlannerRequest {
@@ -37,7 +41,7 @@ pub async fn home_planner_chat(
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<HomePlannerRequest>,
-) -> SseStream {
+) -> Response {
     tracing::info!("=== HOME_PLANNER_CHAT START === user={}", user.user_id);
 
     // Look up user's display name
@@ -70,7 +74,10 @@ pub async fn home_planner_chat(
         if has_session {
             req.message
         } else if let Some(ctx) = load_home_context(&db, &user.user_id).await {
-            format!("<home_context>\n{}\n</home_context>\n\n{}", ctx, req.message)
+            format!(
+                "<home_context>\n{}\n</home_context>\n\n{}",
+                ctx, req.message
+            )
         } else {
             req.message
         }

@@ -1,14 +1,18 @@
-use axum::{extract::{Extension, State}, Json};
-use std::sync::Arc;
-use std::path::PathBuf;
-use std::collections::HashMap;
-use sqlx::SqlitePool;
+use axum::{
+    extract::{Extension, State},
+    response::Response,
+    Json,
+};
 use serde::Deserialize;
+use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use super::chat_client_manager::ChatClientManager;
+use super::chat_stream::{self, ChatConfig, ChatImageData};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
-use super::chat_stream::{self, ChatConfig, ChatImageData, SseStream};
-use super::chat_client_manager::ChatClientManager;
 
 #[derive(Debug, Deserialize)]
 pub struct ScopedWorkspaceChatRequest {
@@ -28,11 +32,8 @@ pub async fn scoped_workspace_chat(
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<ScopedWorkspaceChatRequest>,
-) -> SseStream {
-    tracing::info!(
-        "=== SCOPED_WORKSPACE_CHAT START === user={}",
-        user.user_id
-    );
+) -> Response {
+    tracing::info!("=== SCOPED_WORKSPACE_CHAT START === user={}", user.user_id);
 
     let display_name = lookup_display_name(&db, &user.user_id).await;
 

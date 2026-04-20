@@ -1,7 +1,11 @@
 use async_stream::stream;
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use futures::stream::Stream;
 use once_cell::sync::Lazy;
+use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -21,6 +25,7 @@ use super::conversation_worker_manager::WORKER_MANAGER;
 use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
 use crate::agents::{AgentType, StreamEvent};
 use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
+use crate::rate_limiting::{self, RateLimitDecision, StreamPermit};
 
 /// Image data attached to a chat message (base64-encoded)
 #[derive(Debug, Clone, Deserialize)]
@@ -75,7 +80,23 @@ pub struct ChatConfig {
 ///
 /// Pushes the message to a ConversationWorker (one per conversation) which
 /// processes messages sequentially, eliminating the dual-consumer race.
-/// Returns an SSE stream that subscribes to the worker's broadcast.
+/// Returns either an SSE stream (on admission) or a 429 JSON response
+/// (when the per-(user, conversation) rate limiter denies the open).
+///
+/// Rate-limit admission (T-C410DD96): when a `conversation_id` is supplied
+/// the function consults the process-wide [`rate_limiting::StreamRateLimiter`]
+/// (installed in `main.rs`) before opening the stream. On
+/// [`RateLimitDecision::Deny`] we short-circuit with the contract 429
+/// response. On [`RateLimitDecision::Allow`] the permit is moved into the
+/// spawned broadcast-forwarder task and dropped when the loop exits —
+/// guaranteeing the slot releases on natural EOS, client disconnect,
+/// worker timeout, or a panic.
+///
+/// When the limiter is not installed (unit tests that never called
+/// `install_global`) the rate check is skipped and every open is admitted.
+/// When no `conversation_id` is supplied the rate check is skipped too:
+/// the underlying handler will emit a `status: failed` frame in that case
+/// and the stream closes immediately.
 pub fn chat(
     db: Arc<SqlitePool>,
     manager: Arc<ChatClientManager>,
@@ -84,7 +105,34 @@ pub fn chat(
     config: ChatConfig,
     user_id: String,
     images: Option<Vec<ChatImageData>>,
-) -> SseStream {
+) -> Response {
+    // ---- Rate-limit admission (T-C410DD96). ----
+    //
+    // We evaluate the limiter BEFORE spawning the worker or opening the
+    // mpsc channel. A denied request must cost the server only one
+    // DashMap lookup — not a worker spawn, not a broadcast subscription,
+    // not a new SSE connection accepted by axum. Skip the check when
+    // either:
+    //   * the limiter is uninstalled (unit tests), OR
+    //   * no conversation_id is supplied (the bucket key would be
+    //     meaningless; the handler below will emit `status: failed`
+    //     and exit cleanly anyway).
+    let permit: Option<StreamPermit> = if let (Some(conv_id), Some(limiter)) =
+        (conversation_id.as_ref(), rate_limiting::global())
+    {
+        match limiter.check(&user_id, conv_id) {
+            RateLimitDecision::Allow(permit) => Some(permit),
+            RateLimitDecision::Deny {
+                retry_after,
+                reason,
+            } => {
+                return rate_limited_response(retry_after, reason);
+            }
+        }
+    } else {
+        None
+    };
+
     let (tx, rx) = mpsc::channel::<(i32, String)>(100);
 
     // Capture the conversation_id early so the outer SSE wrapper (keepalive
@@ -97,6 +145,14 @@ pub fn chat(
         .unwrap_or_else(|| "unknown".to_string());
 
     tokio::spawn(async move {
+        // Take the permit by move so rustc drops it at the end of the
+        // spawned task — whether the task exits via the normal break,
+        // the completion signal, the idle timeout, or a panic. DO NOT
+        // drop earlier than that: dropping before the broadcast-forward
+        // loop exits would re-open the slot while the stream is still
+        // live and let the same bucket admit a second concurrent
+        // connection.
+        let _rate_limit_permit = permit;
         let conv_id = match conversation_id {
             Some(id) => id,
             None => {
@@ -185,7 +241,45 @@ pub fn chat(
         }
     });
 
-    create_sse_stream_raw(rx, wrapper_conv_id)
+    create_sse_stream_raw(rx, wrapper_conv_id).into_response()
+}
+
+/// Build the 429 response emitted when the per-(user, conversation) rate
+/// limiter denies admission for a chat open.
+///
+/// Mirrors the contract used by [`super::resume_stream::rate_limited_response`]:
+///
+///   * Status: 429
+///   * Header: `Retry-After: <seconds>` — rounded up, minimum 1.
+///   * Body:   `{"error":"rate_limited","reason":"...","retry_after_seconds":N}`
+///
+/// Kept local to this module (not pub-use'd from resume_stream) so that
+/// each SSE entry point can tweak its wire shape independently if the
+/// product ever needs to differentiate them. Today they are byte-for-byte
+/// identical.
+fn rate_limited_response(
+    retry_after: Duration,
+    reason: crate::rate_limiting::DenyReason,
+) -> Response {
+    let seconds = retry_after
+        .as_millis()
+        .div_ceil(1_000)
+        .try_into()
+        .unwrap_or(u64::MAX)
+        .max(1);
+
+    let body = json!({
+        "error": "rate_limited",
+        "reason": reason.as_wire_str(),
+        "retry_after_seconds": seconds,
+    });
+
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    if let Ok(val) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, val);
+    }
+    resp
 }
 
 /// Create SSE stream from raw (index, json) broadcast tuples.

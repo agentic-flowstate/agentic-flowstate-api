@@ -1,14 +1,18 @@
-use axum::{extract::{Extension, State}, Json};
-use std::sync::Arc;
-use std::path::PathBuf;
-use std::collections::HashMap;
-use sqlx::SqlitePool;
+use axum::{
+    extract::{Extension, State},
+    response::Response,
+    Json,
+};
 use serde::Deserialize;
+use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use super::chat_client_manager::ChatClientManager;
+use super::chat_stream::{self, ChatConfig, ChatImageData};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
-use super::chat_stream::{self, ChatConfig, ChatImageData, SseStream};
-use super::chat_client_manager::ChatClientManager;
 
 #[derive(Debug, Deserialize)]
 pub struct MeetingAgentRequest {
@@ -72,8 +76,12 @@ pub async fn meeting_agent_chat(
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<MeetingAgentRequest>,
-) -> SseStream {
-    tracing::info!("=== MEETING_AGENT_CHAT START === user={} room={}", user.user_id, req.room_id);
+) -> Response {
+    tracing::info!(
+        "=== MEETING_AGENT_CHAT START === user={} room={}",
+        user.user_id,
+        req.room_id
+    );
 
     let user_name = match ticketing_system::users::get_user(&db, &user.user_id).await {
         Ok(Some(u)) => u.name,

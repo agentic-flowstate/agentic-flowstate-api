@@ -68,6 +68,7 @@ use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_event_emitted, record_stream_opened,
     DisconnectReason,
 };
+use crate::rate_limiting::{DenyReason, RateLimitDecision, StreamPermit, StreamRateLimiter};
 use crate::retention::{self, prune as retention_prune, RetentionConfig};
 
 use super::chat_stream::get_broadcast_sender;
@@ -110,6 +111,7 @@ use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
 /// this behavior.
 pub async fn resume_conversation_stream(
     State(pool): State<Arc<SqlitePool>>,
+    State(rate_limiter): State<Arc<StreamRateLimiter>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
     Query(query): Query<ResumeQuery>,
@@ -167,6 +169,24 @@ pub async fn resume_conversation_stream(
         )
             .into_response();
     }
+
+    // ---- 2b. Per-(user, conversation) SSE rate limit (T-C410DD96). ----
+    //
+    // Runs BEFORE retention validation + checkpoint lookup so a client
+    // stuck in a reconnect loop can't amplify cheap 429 rejection into
+    // expensive DB reads. The permit is RAII — storing it in the
+    // `StreamCloseGuard` below means it drops exactly when the outer
+    // `Sse` response is dropped (natural EOS, idle timeout, client
+    // disconnect, or panic-unwind).
+    let permit = match rate_limiter.check(&user.user_id, &id) {
+        RateLimitDecision::Allow(permit) => permit,
+        RateLimitDecision::Deny {
+            retry_after,
+            reason,
+        } => {
+            return rate_limited_response(retry_after, reason);
+        }
+    };
 
     // ---- 3. Retention validation: compare cursor to earliest retained. ----
     //
@@ -239,7 +259,7 @@ pub async fn resume_conversation_stream(
     let inner = build_resume_stream(pool.clone(), id.clone(), cursor, checkpoint_status);
     let inner_boxed: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
         Box::pin(inner);
-    let guarded = StreamCloseGuard::new(id.clone(), inner_boxed);
+    let guarded = StreamCloseGuard::new(id.clone(), inner_boxed, Some(permit));
     let guarded_boxed: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
         Box::pin(guarded);
     let hardened = wrap_stream_with_keepalive(guarded_boxed, KeepaliveConfig::from_env(), id);
@@ -493,19 +513,30 @@ fn build_resume_stream(
 
 /// RAII drop guard that records `stream_closed_total` + duration when
 /// the outer `Sse` response terminates (natural completion or client
-/// disconnect).
+/// disconnect). Also holds the rate-limit [`StreamPermit`] — dropping
+/// the guard drops the permit, which decrements the concurrent-streams
+/// gauge in the limiter bucket. The `_permit` field is named with a
+/// leading underscore to signal it is drop-only (never read).
 struct StreamCloseGuard {
     conversation_id: String,
     opened_at: std::time::Instant,
     reason: DisconnectReason,
     inner: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>,
     closed: bool,
+    /// Rate-limit permit. `None` when rate limiting is disabled (the
+    /// limiter was never installed, e.g. in unit tests). `Some` during
+    /// normal operation. Drop order (struct-field top-to-bottom in
+    /// Rust) runs `inner` before `_permit`, which is fine — we want
+    /// the generator shut down before releasing the concurrent-streams
+    /// slot.
+    _permit: Option<StreamPermit>,
 }
 
 impl StreamCloseGuard {
     fn new(
         conversation_id: String,
         inner: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>,
+        permit: Option<StreamPermit>,
     ) -> Self {
         Self {
             conversation_id,
@@ -513,6 +544,7 @@ impl StreamCloseGuard {
             reason: DisconnectReason::ClientDisconnect,
             inner,
             closed: false,
+            _permit: permit,
         }
     }
 }
@@ -551,6 +583,42 @@ impl Drop for StreamCloseGuard {
 pub(crate) fn _retention_link() -> &'static str {
     let _cfg = retention::RetentionConfig::default();
     "linked"
+}
+
+/// Build the 429 Too Many Requests response used by both SSE
+/// endpoints when the per-(user, conversation) limiter denies an open.
+///
+/// Wire contract:
+///   * Status: `429 Too Many Requests`
+///   * Header: `Retry-After: <seconds>` (RFC 9110 §10.2.3 integer form)
+///   * Body:   `{"error":"rate_limited","reason":"...","retry_after_seconds":N}`
+///
+/// Exposed as `pub(crate)` so `chat_stream::chat` can share the exact
+/// same contract without duplicating wire logic.
+pub(crate) fn rate_limited_response(retry_after: Duration, reason: DenyReason) -> Response {
+    // Round up so "less than 1s left" still reports as 1. Clients
+    // comparing `retry-after` to a wall clock must never see 0 — that
+    // would encourage an instant retry.
+    let seconds = retry_after.as_secs().max(1);
+    let reason_str = match reason {
+        DenyReason::ConcurrentStreamLimit => "concurrent_stream_limit",
+        DenyReason::ReconnectRateLimit => "reconnect_rate_limit",
+    };
+    let body = json!({
+        "error": "rate_limited",
+        "reason": reason_str,
+        "retry_after_seconds": seconds,
+    });
+
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    // Retry-After MUST be a non-negative integer number of seconds per
+    // RFC 9110 §10.2.3. Parsing into HeaderValue via a formatted string
+    // cannot fail for ASCII digits, so `.unwrap()` is sound here.
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_str(&seconds.to_string()).unwrap(),
+    );
+    response
 }
 
 #[cfg(test)]

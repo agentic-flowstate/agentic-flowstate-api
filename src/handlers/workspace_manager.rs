@@ -1,14 +1,18 @@
-use axum::{extract::{Extension, State}, Json};
-use std::sync::Arc;
-use std::path::PathBuf;
-use std::collections::HashMap;
-use sqlx::SqlitePool;
+use axum::{
+    extract::{Extension, State},
+    response::Response,
+    Json,
+};
 use serde::Deserialize;
+use sqlx::SqlitePool;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use super::chat_client_manager::ChatClientManager;
+use super::chat_stream::{self, ChatConfig, ChatImageData};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
-use super::chat_stream::{self, ChatConfig, ChatImageData, SseStream};
-use super::chat_client_manager::ChatClientManager;
 
 #[derive(Debug, Deserialize)]
 pub struct WorkspaceManagerRequest {
@@ -35,7 +39,7 @@ pub async fn workspace_manager_chat(
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<WorkspaceManagerRequest>,
-) -> SseStream {
+) -> Response {
     tracing::info!("=== WORKSPACE_MANAGER_CHAT START ===");
     chat_stream::chat(
         db,

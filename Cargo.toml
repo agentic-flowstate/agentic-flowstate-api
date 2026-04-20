@@ -54,6 +54,11 @@ once_cell = "1.19"
 # Used by event_vocab::current_mode (T-257C060D) so the conversation
 # worker reads the current mode on every turn with no lock contention.
 arc-swap = "1"
+# Sharded concurrent hash map. Used by the per-(user, conversation)
+# stream rate limiter (T-C410DD96) so a single global bucket table is
+# accessed under sharded locks rather than one global Mutex — a stream
+# check never contends with an unrelated (user, conversation)'s check.
+dashmap = "5"
 
 # Streaming/async
 tokio-stream = "0.1"

@@ -8,6 +8,7 @@ mod mcp_wrapper;
 mod models;
 mod nightly_scheduler;
 mod observability;
+mod rate_limiting;
 mod request_logger;
 mod retention;
 pub mod safety;
@@ -41,6 +42,13 @@ struct AppState {
     /// at startup. Handlers must call `send_silent_push` and handle
     /// `ApnsSilentError::NotInitialized` when silent push is disabled.
     apns_silent: Arc<apns::ApnsClient>,
+    /// Per-(user, conversation) SSE rate limiter (T-C410DD96).
+    /// Holds every active [`rate_limiting::StreamPermit`] on its backing
+    /// DashMap. Enforces the hard concurrency cap and the reconnect-
+    /// per-window sliding cap for both [`handlers::resume_stream`] and
+    /// [`handlers::chat_stream`] opens. See [`rate_limiting`] for
+    /// algorithm details and the cleanup task.
+    rate_limiter: Arc<rate_limiting::StreamRateLimiter>,
 }
 
 impl FromRef<AppState> for Arc<sqlx::SqlitePool> {
@@ -58,6 +66,12 @@ impl FromRef<AppState> for Arc<ChatClientManager> {
 impl FromRef<AppState> for Arc<apns::ApnsClient> {
     fn from_ref(state: &AppState) -> Self {
         state.apns_silent.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<rate_limiting::StreamRateLimiter> {
+    fn from_ref(state: &AppState) -> Self {
+        state.rate_limiter.clone()
     }
 }
 
@@ -268,11 +282,34 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("[APNS_SILENT] fan-out registry already initialized: {}", e),
     }
 
+    // Build the per-(user, conversation) SSE rate limiter (T-C410DD96).
+    // Config is read from env with fail-loud parsing — an invalid
+    // RATE_LIMIT_* env var panics here so the operator sees the error
+    // immediately. Defaults: 1 concurrent stream, 10 reconnects / 60s.
+    let rate_limit_config = rate_limiting::StreamRateLimitConfig::from_env();
+    tracing::info!(
+        "[RATE_LIMIT] Stream limiter config: max_concurrent={}, max_reconnects_per_window={}, window={}s",
+        rate_limit_config.max_concurrent_streams,
+        rate_limit_config.max_reconnects_per_window,
+        rate_limit_config.window_duration.as_secs(),
+    );
+    let rate_limiter = Arc::new(rate_limiting::StreamRateLimiter::new(rate_limit_config));
+    // Global install so chat_stream::chat (which does not yet receive
+    // AppState via parameter) can resolve the limiter. Handlers that DO
+    // already have State<...> in scope still pull from AppState —
+    // the global just covers the chat-handler call path.
+    if rate_limiting::install_global(rate_limiter.clone()).is_err() {
+        tracing::warn!("[RATE_LIMIT] global limiter already installed — ignoring (likely a test)");
+    }
+    // Cleanup task: prune idle buckets every 5 minutes.
+    rate_limiting::spawn_cleanup_task(rate_limiter.clone(), shutdown_token.child_token());
+
     let app_state = AppState {
         db: db_pool.clone(),
         chat_manager,
         apns,
         apns_silent,
+        rate_limiter,
     };
 
     // Clone db_pool for shutdown handler before building router (which moves app_state)
