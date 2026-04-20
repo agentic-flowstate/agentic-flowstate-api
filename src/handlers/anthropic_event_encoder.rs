@@ -134,12 +134,6 @@ impl AnthropicEventEncoder {
         self.pending_client_id = client_id;
     }
 
-    /// True if the encoder is currently inside a logical assistant
-    /// message (has emitted `message_start` but not yet `message_stop`).
-    pub fn is_message_open(&self) -> bool {
-        self.message_open
-    }
-
     /// Return the `message_id` of the most-recently-opened Anthropic
     /// message (format `msg_<conv_short>_<n>`), or `None` if
     /// `message_start` has never been emitted for this encoder.
@@ -148,23 +142,11 @@ impl AnthropicEventEncoder {
     /// frame and is the one external consumers should tag as
     /// `last_message_id` on downstream signals (e.g. the silent-push
     /// fan-out in T-90C7FAC4). The value is stable across a
-    /// `message_start` / `message_stop` pair — it is NOT cleared by
-    /// [`Self::reset`] or on-result, so callers who observe a
+    /// `message_start` / `message_stop` pair so callers who observe a
     /// `message_stop` in the encoder output can read it immediately
     /// afterward.
     pub fn current_message_id(&self) -> Option<&str> {
         self.current_message_id.as_deref()
-    }
-
-    /// Close the current turn and zero counters so the next encoder
-    /// call starts a fresh Anthropic message. Caller must have already
-    /// drained the terminal events via [`Self::translate`] — `reset`
-    /// does NOT flush anything.
-    pub fn reset(&mut self) {
-        self.message_open = false;
-        self.next_block_index = 0;
-        self.open_kind = OpenBlock::None;
-        self.current_block_index = 0;
     }
 
     /// Encode a single internal `StreamEvent` into the sequence of
@@ -674,8 +656,9 @@ mod tests {
     /// T-A819D36B: the staged client_id is consumed by the FIRST
     /// `message_start` and does not leak onto subsequent ones. If the
     /// encoder is re-used for a second turn (same worker, same
-    /// encoder instance, reset between turns) without restaging, the
-    /// second turn's message_start must NOT echo the first turn's key.
+    /// encoder instance) without restaging — once `on_result` has
+    /// closed the first turn — the second turn's message_start must
+    /// NOT echo the first turn's key.
     #[test]
     fn pending_client_id_is_consumed_once() {
         let mut tx = AnthropicEventEncoder::new("conv-once");
@@ -692,8 +675,9 @@ mod tests {
         .iter()
         .flat_map(|e| tx.encode(e))
         .collect();
-        // Consume terminator to close the turn; then reset.
-        tx.reset();
+        // The `Result` event already closes the message via on_result;
+        // no explicit reset needed — a subsequent Text on the same
+        // encoder opens a fresh message_start.
 
         // Second turn — NO set_pending_client_id, so client_id must be absent.
         let turn2: Vec<_> = tx.encode(&StreamEvent::Text {

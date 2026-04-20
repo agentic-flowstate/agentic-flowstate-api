@@ -290,7 +290,14 @@ pub struct ApiError {
 }
 
 /// The valid Anthropic event-type strings, exposed as an array for tests
-/// that want to enumerate the vocabulary.
+/// that want to enumerate the vocabulary. Consumed by the regression
+/// guard in `conversation_worker::streaming_persistence_tests` (pinned
+/// `ALLOWED_EVENT_TYPES`) and by the event-type round-trip test in this
+/// module's own `tests` submodule. Both call sites are `#[cfg(test)]`,
+/// so the release build sees zero non-test usages — but the test-only
+/// contract is load-bearing, and deleting the constant would silently
+/// break the regression guard.
+#[allow(dead_code)]
 pub const ALL_EVENT_TYPES: &[&str] = &[
     "message_start",
     "content_block_start",

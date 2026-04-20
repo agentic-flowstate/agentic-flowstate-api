@@ -56,7 +56,7 @@ pub struct RegisterDeviceRequest {
     pub device_name: Option<String>,
     /// Optional client build version (e.g. "1.23.0 (45)"). Populated by the
     /// iOS app so the `clients_session_start_total` metric can segment
-    /// by release and observability can chart the rollout gate per build.
+    /// by release for adoption tracking and crash-rate dashboards.
     pub client_version: Option<String>,
 }
 

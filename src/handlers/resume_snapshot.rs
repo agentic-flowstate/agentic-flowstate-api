@@ -432,8 +432,8 @@ fn new_state_from_start(parsed: StoredBlockStart) -> ContentBlockState {
             // cc-sdk fires `content_block_start` with `input: {}` and
             // streams the payload via `input_json_delta`. We still seed
             // `accumulated_input_json` from any non-empty `input` we see
-            // on start — defensive against backfilled rows where the
-            // full input was materialized eagerly.
+            // on start — defensive against events that emit a non-empty
+            // input eagerly on start (some cc-sdk versions do this).
             let seed = if matches!(input, serde_json::Value::Object(ref m) if m.is_empty()) {
                 String::new()
             } else {

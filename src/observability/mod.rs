@@ -16,9 +16,9 @@
 //! # Design rules
 //!
 //! * No hardcoded label strings at call sites. Labels that are enum-like
-//!   (disconnect reasons, push results, vocab modes, platforms) MUST go
-//!   through a `Display`-bearing enum in [`streaming`] so the set of
-//!   values is centralized and inspectable.
+//!   (disconnect reasons, push results, platforms) MUST go through a
+//!   `Display`-bearing enum in [`streaming`] so the set of values is
+//!   centralized and inspectable.
 //! * Every `tracing::info!` emitted from this module MUST also update a
 //!   metric — and vice-versa — so dashboards and logs agree.
 

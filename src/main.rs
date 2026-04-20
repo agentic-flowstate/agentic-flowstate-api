@@ -31,11 +31,17 @@ use handlers::chat_client_manager::ChatClientManager;
 
 /// Shared application state.
 /// Implements `FromRef` so handlers can extract individual components.
+///
+/// NOTE: the legacy alert-style `apns::ApnsService` is deliberately NOT
+/// held here. Its `init()` call populates a process-wide `OnceCell`
+/// (`APNS_INSTANCE`) that all downstream callers access via
+/// `ApnsService::global()`, so a separate AppState field would just be
+/// a dead Arc clone. The silent-push sender below IS kept on AppState
+/// because handlers extract it via `FromRef`.
 #[derive(Clone)]
 struct AppState {
     db: Arc<sqlx::SqlitePool>,
     chat_manager: Arc<ChatClientManager>,
-    apns: Option<Arc<apns::ApnsService>>,
     /// Silent-push sender (apns-h2 based) used by the durable chat
     /// streaming pipeline. Always present in app state; internally holds
     /// an `OnceCell` that is only populated when APNS_SILENT_ENABLED=true
@@ -222,9 +228,12 @@ async fn main() -> anyhow::Result<()> {
     let chat_manager = Arc::new(ChatClientManager::new());
     tracing::info!("Chat client manager initialized");
 
-    // Initialize APNs push notification service (optional — no-op if .p8 key missing)
-    let apns = apns::ApnsService::init();
-    if apns.is_some() {
+    // Initialize the legacy alert-style APNs push service. Its `init()`
+    // populates the process-wide `APNS_INSTANCE` OnceCell; downstream
+    // callers access it via `ApnsService::global()`. We deliberately
+    // drop the returned handle here — keeping it on AppState was dead
+    // weight (the singleton owns its own Arc clone via OnceCell).
+    if apns::ApnsService::init().is_some() {
         tracing::info!("APNs push notification service initialized");
     }
 
@@ -294,7 +303,6 @@ async fn main() -> anyhow::Result<()> {
     let app_state = AppState {
         db: db_pool.clone(),
         chat_manager,
-        apns,
         apns_silent,
         rate_limiter,
     };

@@ -209,15 +209,15 @@
     },
     {
       "id": 10,
-      "title": "APNs silent push by result",
-      "description": "push_sent_total labeled by PushResult::Display (success/unregistered/bad_token/throttled/error) and apns_status (200/410/429/…). 410 is expected churn — it soft-deletes unregistered tokens. 429 is backpressure from APNs; the apns-collapse-id ensures the latest wake still lands.",
+      "title": "APNs silent push by result and status",
+      "description": "push_sent_total labeled by PushResult::Display (success/unregistered/bad_token/throttled/error) and apns_status (200/410/429/…). 410 is expected churn — it soft-deletes unregistered tokens. 429 is backpressure from APNs; the apns-collapse-id ensures the latest wake still lands. Split by both labels so operators can distinguish throttling (429) from unregistered (410) from 500-class errors without cross-referencing another panel.",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 16, "x": 0, "y": 30 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum by (result) (rate(push_sent_total[5m]))",
-          "legendFormat": "result={{result}}"
+          "expr": "sum by (result, apns_status) (rate(push_sent_total[5m]))",
+          "legendFormat": "{{result}}/{{apns_status}}"
         }
       ],
       "fieldConfig": {
@@ -256,7 +256,7 @@
     {
       "id": 12,
       "title": "Client session_start by platform",
-      "description": "clients_session_start_total labeled by platform + client_version. Emitted once per device registration.",
+      "description": "clients_session_start_total labeled by platform + client_version. Emitted on every POST /api/device-tokens/register — once per iOS cold launch or token refresh. On a single-device deployment this is effectively launch-count.",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 38 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
@@ -268,6 +268,105 @@
       ],
       "fieldConfig": {
         "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "id": 13,
+      "title": "Stream rate-limit denials",
+      "description": "stream_rate_limited_total labeled by DenyReason::as_wire_str (concurrent_stream_limit | reconnect_rate_limit). One increment per 429 Too Many Requests response from the per-(user, conversation) SSE rate limiter (T-C410DD96). A sustained non-zero rate on reconnect_rate_limit usually means a client is in a reconnect loop; a sustained rate on concurrent_stream_limit means a single client opened more than one live stream.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(stream_rate_limited_total[5m]))",
+          "legendFormat": "reason={{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "id": 14,
+      "title": "SSE keepalive frames sent",
+      "description": "stream_keepalive_sent_total — `ping` frames emitted by the SSE keepalive wrapper (T-CFFAF032). Expected cadence is ~1 frame every 15 seconds per active stream. A sustained rate near zero while stream_concurrent > 0 indicates the keepalive task stopped ticking — clients will idle-disconnect next.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(rate(stream_keepalive_sent_total[5m]))",
+          "legendFormat": "keepalive/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "id": 15,
+      "title": "Retention — rows deleted per sweep",
+      "description": "retention_rows_deleted_total — throughput of the nightly retention prune (T-65DA4D32). Rate gives deletions/s during sweep windows; near-zero between sweeps is expected. A flat zero over 24h means the scheduler stopped firing.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "rate(retention_rows_deleted_total[15m])",
+          "legendFormat": "rows/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ops" }
+      }
+    },
+    {
+      "id": 16,
+      "title": "Retention — prune duration p95 / conversations touched",
+      "description": "retention_prune_duration_ms p95 (ms) and retention_conversations_touched (count per sweep). p95 duration climbing past the sweep interval is the first sign of prune lag. conversations_touched spiking unexpectedly may indicate a retention-window misconfiguration.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(retention_prune_duration_ms_bucket[15m])))",
+          "legendFormat": "p95 duration (ms)"
+        },
+        {
+          "expr": "retention_conversations_touched",
+          "legendFormat": "conversations touched"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms" }
+      }
+    },
+    {
+      "id": 17,
+      "title": "Retention — earliest remaining event age",
+      "description": "retention_earliest_remaining_event_age_seconds — the age (seconds) of the oldest surviving conversation_event across the fleet. Load-bearing for the resume-token 410 Gone contract: if this climbs past the retention window, clients holding older cursors will cold-start when they should have resumed. Red threshold = retention_window + 1h buffer.",
+      "type": "stat",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "retention_earliest_remaining_event_age_seconds",
+          "legendFormat": "earliest age"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 7776000 },
+              { "color": "red", "value": 8078400 }
+            ]
+          }
+        }
       }
     }
   ]

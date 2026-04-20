@@ -16,8 +16,13 @@ pub struct CreateSliceRequest {
     pub notes: Option<String>,
 }
 
+/// Thin HTTP-boundary shape for `POST /api/tickets`. Intentionally
+/// narrower than `ticketing_system::models::CreateTicketRequest` — the
+/// handler validates this body and enriches it into the domain shape
+/// before persisting. Renamed from `CreateTicketRequest` to
+/// disambiguate from the domain type (A-45F91AB6 P1-7).
 #[derive(Debug, Deserialize)]
-pub struct CreateTicketRequest {
+pub struct CreateTicketHttpBody {
     pub title: String,
 }
 

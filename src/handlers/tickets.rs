@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::{
-    models::{CreateTicketRequest, UpdateTicketRequest},
+    models::{CreateTicketHttpBody, UpdateTicketRequest},
     mcp_wrapper::call_mcp_tool,
 };
 
@@ -142,7 +142,7 @@ pub async fn create_ticket(
     State(_pool): State<Arc<SqlitePool>>,
     headers: HeaderMap,
     Path((epic_id, slice_id)): Path<(String, String)>,
-    Json(request): Json<CreateTicketRequest>,
+    Json(request): Json<CreateTicketHttpBody>,
 ) -> Response {
     let organization = get_organization(&headers);
     let ref_handle = format!("api-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
