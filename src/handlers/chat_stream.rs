@@ -121,7 +121,14 @@ pub fn chat(
     let permit: Option<StreamPermit> = if let (Some(conv_id), Some(limiter)) =
         (conversation_id.as_ref(), rate_limiting::global())
     {
-        match limiter.check(&user_id, conv_id) {
+        // T-1BEAA41E: `StreamKind::Generate` so POST /chat does NOT
+        // contend with the client's durable GET /events reader on the
+        // same conversation. Before this split a legitimate client that
+        // was already tailing events via resume_stream.rs would have its
+        // next POST 429'd with `concurrent_stream_limit` — which is
+        // exactly the "stuck on Connecting..." bug that motivated the
+        // ticket.
+        match limiter.check(&user_id, conv_id, rate_limiting::StreamKind::Generate) {
             RateLimitDecision::Allow(permit) => Some(permit),
             RateLimitDecision::Deny {
                 retry_after,

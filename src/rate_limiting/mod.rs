@@ -22,8 +22,10 @@
 //!
 //! ## Metrics emitted
 //!
-//! * `stream_rate_limited_total{reason="concurrent_stream_limit" | "reconnect_rate_limit"}`
-//!   — counter, one increment per denial.
+//! * `stream_rate_limited_total{reason="concurrent_stream_limit" | "reconnect_rate_limit", kind="generate" | "resume"}`
+//!   — counter, one increment per denial. The `kind` label was added in
+//!   T-1BEAA41E when the bucket was split by [`StreamKind`] so the
+//!   POST /chat and GET /events paths no longer share a slot.
 //!
 //! No metric is emitted on admission — the existing `stream_opened_total`
 //! counter already covers that side of the funnel.
@@ -31,7 +33,8 @@
 pub mod stream_limiter;
 
 pub use stream_limiter::{
-    DenyReason, RateLimitDecision, StreamPermit, StreamRateLimitConfig, StreamRateLimiter,
+    DenyReason, RateLimitDecision, StreamKind, StreamPermit, StreamRateLimitConfig,
+    StreamRateLimiter,
 };
 
 use std::sync::Arc;

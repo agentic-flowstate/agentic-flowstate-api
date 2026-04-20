@@ -1,4 +1,4 @@
-//! Per-(user_id, conversation_id) SSE stream rate limiter (T-C410DD96).
+//! Per-(user_id, conversation_id, kind) SSE stream rate limiter (T-C410DD96).
 //!
 //! Two independent checks per admission:
 //!
@@ -15,6 +15,20 @@
 //! reconnect loop is told loudly ("too many reconnects, come back in N
 //! seconds") instead of getting a series of "slot full" 429s that hide
 //! the underlying bug.
+//!
+//! ## Bucket key dimensionality (T-1BEAA41E)
+//!
+//! The bucket key includes a [`StreamKind`] axis so that the POST /chat
+//! "generate" path and the GET /events "resume" path do not share a
+//! permit. The two paths CAN overlap in time on a legitimate client: the
+//! app holds an SSE reader open to observe events (resume) while also
+//! issuing a POST to send a new message (generate). Before this split,
+//! those two streams contended on the same `(user, conv)` bucket with
+//! `max_concurrent_streams: 1`, and whichever landed second got a 429
+//! because permit release via RAII drop races TCP close delivery.
+//! Splitting by kind lets each path have its own slot and makes the
+//! 429 surface only when the *same* kind of stream is already open
+//! (which is the actual race condition the limiter is there to police).
 //!
 //! ## Concurrency model
 //!
@@ -52,9 +66,41 @@ use dashmap::DashMap;
 
 use crate::observability::streaming::record_stream_rate_limited;
 
+/// Which SSE path is asking for admission.
+///
+/// The two paths operate on completely different resources server-side —
+/// POST /chat spawns a new agent turn; GET /events just re-emits
+/// already-persisted events from `events_buffer`. It is safe, and
+/// expected, for a client to have both open simultaneously. Admission
+/// accounting MUST NOT treat them as competing for the same slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamKind {
+    /// POST /chat path (starts a new generation turn).
+    Generate,
+    /// GET /api/v1/conversations/:id/events (replay/tail durable events).
+    Resume,
+}
+
+impl StreamKind {
+    /// Stable wire label used in logs and metrics.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StreamKind::Generate => "generate",
+            StreamKind::Resume => "resume",
+        }
+    }
+}
+
+impl fmt::Display for StreamKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Composite bucket key: the rate limiter tracks one bucket per
-/// `(user_id, conversation_id)` pair.
-pub type BucketKey = (String, String);
+/// `(user_id, conversation_id, stream_kind)` triple. See module-level
+/// docs for why the `kind` axis is part of the key.
+pub type BucketKey = (String, String, StreamKind);
 
 /// Per-bucket mutable state.
 #[derive(Debug)]
@@ -246,6 +292,7 @@ impl StreamRateLimiterInner {
                 target: "rate_limiting.stream",
                 user_id = %key.0,
                 conversation_id = %key.1,
+                kind = %key.2,
                 active_streams = entry.active_streams,
                 "permit released"
             );
@@ -340,8 +387,17 @@ impl StreamRateLimiter {
     /// lifetime. On failure, emits the matching rate-limit metric and
     /// returns [`RateLimitDecision::Deny`] with a precomputed
     /// `retry_after`.
-    pub fn check(&self, user_id: &str, conversation_id: &str) -> RateLimitDecision {
-        let key: BucketKey = (user_id.to_string(), conversation_id.to_string());
+    ///
+    /// The `kind` axis isolates POST /chat (generate) from GET /events
+    /// (resume) — they CAN overlap in time on a legitimate client and
+    /// must not contend for the same slot. See module-level docs.
+    pub fn check(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        kind: StreamKind,
+    ) -> RateLimitDecision {
+        let key: BucketKey = (user_id.to_string(), conversation_id.to_string(), kind);
         let now = self.inner.clock.now();
         let config = self.inner.config;
 
@@ -375,11 +431,17 @@ impl StreamRateLimiter {
 
             drop(entry); // release shard lock before metric emission
 
-            record_stream_rate_limited(user_id, conversation_id, DenyReason::ReconnectRateLimit);
+            record_stream_rate_limited(
+                user_id,
+                conversation_id,
+                kind,
+                DenyReason::ReconnectRateLimit,
+            );
             tracing::warn!(
                 target: "rate_limiting.stream",
                 user_id = %user_id,
                 conversation_id = %conversation_id,
+                kind = %kind,
                 reason = %DenyReason::ReconnectRateLimit,
                 retry_after_secs = retry_after.as_secs(),
                 "stream rate-limited: reconnect window full"
@@ -395,11 +457,17 @@ impl StreamRateLimiter {
         if entry.active_streams >= config.max_concurrent_streams {
             drop(entry);
 
-            record_stream_rate_limited(user_id, conversation_id, DenyReason::ConcurrentStreamLimit);
+            record_stream_rate_limited(
+                user_id,
+                conversation_id,
+                kind,
+                DenyReason::ConcurrentStreamLimit,
+            );
             tracing::warn!(
                 target: "rate_limiting.stream",
                 user_id = %user_id,
                 conversation_id = %conversation_id,
+                kind = %kind,
                 reason = %DenyReason::ConcurrentStreamLimit,
                 "stream rate-limited: concurrent cap reached"
             );
@@ -423,6 +491,7 @@ impl StreamRateLimiter {
             target: "rate_limiting.stream",
             user_id = %user_id,
             conversation_id = %conversation_id,
+            kind = %kind,
             "stream admitted"
         );
 
@@ -522,17 +591,25 @@ mod tests {
     #[test]
     fn first_stream_allowed() {
         let limiter = StreamRateLimiter::new(test_config());
-        let decision = limiter.check("alex", "conv-1");
+        let decision = limiter.check("alex", "conv-1", StreamKind::Generate);
         match decision {
             RateLimitDecision::Allow(permit) => {
                 assert_eq!(
                     permit.key().unwrap(),
-                    &("alex".to_string(), "conv-1".to_string())
+                    &(
+                        "alex".to_string(),
+                        "conv-1".to_string(),
+                        StreamKind::Generate
+                    )
                 );
                 let entry = limiter
                     .inner
                     .state
-                    .get(&("alex".to_string(), "conv-1".to_string()))
+                    .get(&(
+                        "alex".to_string(),
+                        "conv-1".to_string(),
+                        StreamKind::Generate,
+                    ))
                     .unwrap();
                 assert_eq!(entry.active_streams, 1);
                 assert_eq!(entry.reconnect_log.len(), 1);
@@ -546,11 +623,11 @@ mod tests {
     #[test]
     fn second_concurrent_stream_denied_with_short_retry() {
         let limiter = StreamRateLimiter::new(test_config());
-        let _permit = match limiter.check("alex", "conv-1") {
+        let _permit = match limiter.check("alex", "conv-1", StreamKind::Generate) {
             RateLimitDecision::Allow(p) => p,
             other => panic!("expected Allow, got {:?}", other),
         };
-        match limiter.check("alex", "conv-1") {
+        match limiter.check("alex", "conv-1", StreamKind::Generate) {
             RateLimitDecision::Deny {
                 retry_after,
                 reason,
@@ -571,13 +648,13 @@ mod tests {
     fn permit_drop_frees_slot() {
         let limiter = StreamRateLimiter::new(test_config());
         {
-            let _permit = match limiter.check("alex", "conv-1") {
+            let _permit = match limiter.check("alex", "conv-1", StreamKind::Generate) {
                 RateLimitDecision::Allow(p) => p,
                 other => panic!("expected Allow, got {:?}", other),
             };
             // permit dropped at end of scope
         }
-        match limiter.check("alex", "conv-1") {
+        match limiter.check("alex", "conv-1", StreamKind::Generate) {
             RateLimitDecision::Allow(_) => {}
             other => panic!("expected Allow after drop, got {:?}", other),
         }
@@ -594,7 +671,7 @@ mod tests {
         // Burn 10 admissions by admitting + dropping each permit so the
         // concurrent-stream check doesn't fire first.
         for _ in 0..10 {
-            match limiter.check("alex", "conv-1") {
+            match limiter.check("alex", "conv-1", StreamKind::Generate) {
                 RateLimitDecision::Allow(p) => drop(p),
                 other => panic!("expected Allow, got {:?}", other),
             }
@@ -602,7 +679,7 @@ mod tests {
         }
 
         // 11th inside the same window → denied with ReconnectRateLimit.
-        match limiter.check("alex", "conv-1") {
+        match limiter.check("alex", "conv-1", StreamKind::Generate) {
             RateLimitDecision::Deny {
                 reason,
                 retry_after,
@@ -624,7 +701,7 @@ mod tests {
         let limiter = StreamRateLimiter::with_mock_clock(test_config(), clock.clone());
 
         for _ in 0..10 {
-            match limiter.check("alex", "conv-1") {
+            match limiter.check("alex", "conv-1", StreamKind::Generate) {
                 RateLimitDecision::Allow(p) => drop(p),
                 other => panic!("expected Allow, got {:?}", other),
             }
@@ -632,7 +709,7 @@ mod tests {
 
         // 11th denied
         matches!(
-            limiter.check("alex", "conv-1"),
+            limiter.check("alex", "conv-1", StreamKind::Generate),
             RateLimitDecision::Deny {
                 reason: DenyReason::ReconnectRateLimit,
                 ..
@@ -641,7 +718,7 @@ mod tests {
 
         // Advance past the window. Pruning happens lazily on next check.
         advance(&clock, Duration::from_secs(61));
-        match limiter.check("alex", "conv-1") {
+        match limiter.check("alex", "conv-1", StreamKind::Generate) {
             RateLimitDecision::Allow(_) => {}
             other => panic!("expected Allow after window, got {:?}", other),
         }
@@ -652,14 +729,53 @@ mod tests {
     #[test]
     fn different_users_have_separate_buckets() {
         let limiter = StreamRateLimiter::new(test_config());
-        let _p_alex = match limiter.check("alex", "conv-shared") {
+        let _p_alex = match limiter.check("alex", "conv-shared", StreamKind::Generate) {
             RateLimitDecision::Allow(p) => p,
             other => panic!("expected Allow for alex, got {:?}", other),
         };
         // Bob's check must NOT be throttled by alex's active stream.
-        match limiter.check("bob", "conv-shared") {
+        match limiter.check("bob", "conv-shared", StreamKind::Generate) {
             RateLimitDecision::Allow(_) => {}
             other => panic!("expected Allow for bob, got {:?}", other),
+        }
+    }
+
+    /// 6b. (T-1BEAA41E) Generate and Resume on the SAME (user, conv)
+    ///     must have independent slots. This is the regression test for
+    ///     the 429 storm where the app held an SSE resume reader open
+    ///     while issuing a POST /chat — the two contended on one permit
+    ///     and the POST got a `concurrent_stream_limit` 429.
+    #[test]
+    fn generate_and_resume_have_separate_slots_per_conversation() {
+        let limiter = StreamRateLimiter::new(test_config());
+
+        // Hold a Resume permit open (simulating the durable SSE reader).
+        let _resume = match limiter.check("alex", "conv-1", StreamKind::Resume) {
+            RateLimitDecision::Allow(p) => p,
+            other => panic!("expected Allow for resume, got {:?}", other),
+        };
+
+        // A Generate request on the SAME conversation MUST still be
+        // admitted — different `kind` means different bucket.
+        match limiter.check("alex", "conv-1", StreamKind::Generate) {
+            RateLimitDecision::Allow(_) => {}
+            other => panic!(
+                "generate must not be blocked by an open resume stream, got {:?}",
+                other
+            ),
+        }
+
+        // But a second Resume on the same conversation WHILE one is open
+        // must still be denied (within-kind contention is legitimate).
+        match limiter.check("alex", "conv-1", StreamKind::Resume) {
+            RateLimitDecision::Deny {
+                reason: DenyReason::ConcurrentStreamLimit,
+                ..
+            } => {}
+            other => panic!(
+                "second resume on same conv should still be denied, got {:?}",
+                other
+            ),
         }
     }
 
@@ -672,11 +788,11 @@ mod tests {
 
         // Create two buckets; let both go idle (drop their permits).
         {
-            let _p1 = match limiter.check("alex", "conv-a") {
+            let _p1 = match limiter.check("alex", "conv-a", StreamKind::Generate) {
                 RateLimitDecision::Allow(p) => p,
                 other => panic!("{:?}", other),
             };
-            let _p2 = match limiter.check("bob", "conv-b") {
+            let _p2 = match limiter.check("bob", "conv-b", StreamKind::Generate) {
                 RateLimitDecision::Allow(p) => p,
                 other => panic!("{:?}", other),
             };
@@ -701,7 +817,7 @@ mod tests {
         let clock = mock_clock(Instant::now());
         let limiter = StreamRateLimiter::with_mock_clock(test_config(), clock.clone());
 
-        let _permit = match limiter.check("alex", "conv-a") {
+        let _permit = match limiter.check("alex", "conv-a", StreamKind::Generate) {
             RateLimitDecision::Allow(p) => p,
             other => panic!("{:?}", other),
         };
@@ -720,7 +836,7 @@ mod tests {
         let limiter = StreamRateLimiter::new(test_config());
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let _permit = match limiter.check("alex", "conv-panic") {
+            let _permit = match limiter.check("alex", "conv-panic", StreamKind::Generate) {
                 RateLimitDecision::Allow(p) => p,
                 other => panic!("expected Allow, got {:?}", other),
             };
@@ -731,13 +847,20 @@ mod tests {
         assert!(result.is_err(), "expected the inner closure to panic");
 
         // Slot MUST be released — next check succeeds.
-        match limiter.check("alex", "conv-panic") {
+        match limiter.check("alex", "conv-panic", StreamKind::Generate) {
             RateLimitDecision::Allow(_) => {}
             other => panic!(
                 "permit did not release on panic — follow-up check got {:?}",
                 other
             ),
         }
+    }
+
+    /// StreamKind wire labels must match the metric label contract.
+    #[test]
+    fn stream_kind_wire_strings_are_stable() {
+        assert_eq!(StreamKind::Generate.as_str(), "generate");
+        assert_eq!(StreamKind::Resume.as_str(), "resume");
     }
 
     /// Deny wire strings must match the contract exposed via the 429

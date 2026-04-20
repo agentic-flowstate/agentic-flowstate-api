@@ -43,11 +43,13 @@ pub const METRIC_STREAM_RESUME: &str = "stream_resume_total";
 pub const METRIC_STREAM_COLD_START: &str = "stream_cold_start_total";
 pub const METRIC_STREAM_RESUME_RATIO: &str = "stream_resume_ratio";
 pub const METRIC_STREAM_CURSOR_EXPIRED: &str = "stream_cursor_expired_410_total";
-/// Counter: SSE stream admissions rejected by the per-(user,conv) rate
-/// limiter (T-C410DD96). Labeled by `reason`:
-/// `concurrent_stream_limit` | `reconnect_rate_limit`. One increment per
-/// 429 Too Many Requests response. No per-user/conversation label: the
-/// bucket cardinality would explode the Prometheus registry.
+/// Counter: SSE stream admissions rejected by the per-(user,conv,kind)
+/// rate limiter (T-C410DD96 / T-1BEAA41E). Labeled by:
+///   * `reason` ∈ {`concurrent_stream_limit`, `reconnect_rate_limit`}
+///   * `kind` ∈ {`generate`, `resume`} — which SSE path was denied
+/// One increment per 429 Too Many Requests response. No per-user /
+/// per-conversation label: the bucket cardinality would explode the
+/// Prometheus registry.
 pub const METRIC_STREAM_RATE_LIMITED: &str = "stream_rate_limited_total";
 /// Counter: `ping` keepalive frames shipped downstream. Incremented by
 /// the SSE keepalive wrapper (T-CFFAF032). One increment per frame.
@@ -325,11 +327,12 @@ pub fn record_cursor_expired(conversation_id: &str, requested_cursor: i32, oldes
 }
 
 /// Observed a rate-limit denial on an SSE stream open. Emitted by the
-/// per-(user, conversation) [`crate::rate_limiting::StreamRateLimiter`]
+/// per-(user, conversation, kind) [`crate::rate_limiting::StreamRateLimiter`]
 /// when it returns a `Deny` decision. The `reason` label is sourced
 /// from the rate-limiter's `DenyReason::as_wire_str`, which is locked
 /// down by a unit test so dashboards do not silently break on a
-/// refactor.
+/// refactor. The `kind` label distinguishes POST /chat (generate) from
+/// GET /events (resume) denials — see T-1BEAA41E.
 ///
 /// `user_id` and `conversation_id` are intentionally logged (structured
 /// tracing) but NOT attached as metric labels — high-cardinality labels
@@ -338,16 +341,24 @@ pub fn record_cursor_expired(conversation_id: &str, requested_cursor: i32, oldes
 pub fn record_stream_rate_limited(
     user_id: &str,
     conversation_id: &str,
+    kind: crate::rate_limiting::StreamKind,
     reason: crate::rate_limiting::DenyReason,
 ) {
     let reason_label: Cow<'static, str> = reason.as_wire_str().into();
-    counter!(METRIC_STREAM_RATE_LIMITED, "reason" => reason_label).increment(1);
+    let kind_label: Cow<'static, str> = kind.as_str().into();
+    counter!(
+        METRIC_STREAM_RATE_LIMITED,
+        "reason" => reason_label,
+        "kind" => kind_label,
+    )
+    .increment(1);
 
     tracing::warn!(
         target: "observability.streaming",
         event = "stream.rate_limited",
         user_id = %user_id,
         conversation_id = %conversation_id,
+        kind = %kind,
         reason = %reason,
         "stream rate-limited"
     );

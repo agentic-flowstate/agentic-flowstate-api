@@ -179,7 +179,16 @@ pub async fn resume_conversation_stream(
     // `StreamCloseGuard` below means it drops exactly when the outer
     // `Sse` response is dropped (natural EOS, idle timeout, client
     // disconnect, or panic-unwind).
-    let permit = match rate_limiter.check(&user.user_id, &id) {
+    // T-1BEAA41E: `StreamKind::Resume` so this durable reader does NOT
+    // share a slot with POST /chat (generate). Before this split, an
+    // iPhone that held this resume stream open while the user tapped
+    // Send would hit a 429 on the POST and the chat would hang on
+    // "Connecting..." until the app was relaunched.
+    let permit = match rate_limiter.check(
+        &user.user_id,
+        &id,
+        crate::rate_limiting::StreamKind::Resume,
+    ) {
         RateLimitDecision::Allow(permit) => permit,
         RateLimitDecision::Deny {
             retry_after,
