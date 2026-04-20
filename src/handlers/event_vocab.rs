@@ -8,18 +8,35 @@
 //! | `dual` (default)   | yes                | yes                   |
 //! | `modern_only`      | no                 | yes                   |
 //!
-//! This is the single source of truth for the rollout. T-257C060D formalizes
-//! operational management on top of this enum.
+//! ## Runtime flippability (T-257C060D)
+//!
+//! The mode is held in an [`ArcSwap<EventVocabMode>`] so readers get a
+//! lock-free O(1) snapshot and writers atomically swap a new value in.
+//! This replaces the previous `OnceLock` so operators can flip the
+//! rollout stage without a redeploy.
+//!
+//! Three writers touch the swap:
+//!   1. [`init_global`] — once at startup from env var / DB bootstrap.
+//!   2. [`store`] — when an admin PUTs `/api/admin/feature-flags/event_vocab_mode`.
+//!   3. The 30-second refresher task (see `admin_feature_flags.rs`) —
+//!      polls the DB and re-swaps when the value differs. This keeps
+//!      multiple API instances in sync.
+//!
+//! Readers call [`current_mode`] — a single atomic load. The old
+//! `global()` accessor remains as a thin forwarder for compatibility,
+//! but the new name makes the swap semantics explicit.
 //!
 //! ## Failure mode
 //!
-//! Missing or invalid `EVENT_VOCAB_MODE` — the binary fails at startup via
-//! [`EventVocabMode::from_env`] returning `Err`. There is no silent fallback.
-//! Absent env var is treated as "operator didn't say → pick the safe
-//! default (`dual`)"; any other value is a loud error.
+//! Missing or empty `EVENT_VOCAB_MODE` → default (`dual`). Any other
+//! non-canonical value at startup → fail loud (startup aborts). PUT of
+//! a non-canonical value → 400. There is NO silent fallback for invalid
+//! input.
 
 use std::fmt;
 use std::sync::OnceLock;
+
+use arc_swap::ArcSwap;
 
 /// Modes for the dual-write rollout.
 ///
@@ -39,6 +56,9 @@ pub enum EventVocabMode {
 impl EventVocabMode {
     /// Name of the env var read at startup.
     pub const ENV_VAR: &'static str = "EVENT_VOCAB_MODE";
+
+    /// Feature-flag key stored in the `feature_flags` table.
+    pub const FLAG_KEY: &'static str = "event_vocab_mode";
 
     /// Default when `EVENT_VOCAB_MODE` is unset — dual-write is the safe
     /// default because it keeps every existing client working while v2 rolls
@@ -66,18 +86,30 @@ impl EventVocabMode {
         }
     }
 
-    /// Read from the process environment. Returns the default when the env
-    /// var is unset; returns `Err` on any non-empty value that isn't one of
-    /// the three canonical names.
-    pub fn from_env() -> Result<Self, EventVocabModeError> {
+    /// Read the startup env var override. Returns `Ok(None)` when the
+    /// variable is unset or whitespace-only — the caller can then fall
+    /// back to the DB row or the default. Returns `Err` on non-UTF-8 or
+    /// a non-canonical value so startup can fail loudly.
+    pub fn from_env_optional() -> Result<Option<Self>, EventVocabModeError> {
         match std::env::var(Self::ENV_VAR) {
-            Ok(v) if v.trim().is_empty() => Ok(Self::DEFAULT),
-            Ok(v) => Self::parse(&v),
-            Err(std::env::VarError::NotPresent) => Ok(Self::DEFAULT),
+            Ok(v) if v.trim().is_empty() => Ok(None),
+            Ok(v) => Self::parse(&v).map(Some),
+            Err(std::env::VarError::NotPresent) => Ok(None),
             Err(std::env::VarError::NotUnicode(_)) => {
                 Err(EventVocabModeError::NotUnicode)
             }
         }
+    }
+
+    /// Read from the process environment. Returns the default when the env
+    /// var is unset; returns `Err` on any non-empty value that isn't one of
+    /// the three canonical names.
+    ///
+    /// Kept for backwards compatibility with the original startup path
+    /// (spec A-D50FCA98). New callers should prefer `from_env_optional`
+    /// so the DB-seeded row can survive a restart with no env var.
+    pub fn from_env() -> Result<Self, EventVocabModeError> {
+        Ok(Self::from_env_optional()?.unwrap_or(Self::DEFAULT))
     }
 
     /// The canonical string form — matches what `parse` accepts.
@@ -106,27 +138,55 @@ pub enum EventVocabModeError {
     NotUnicode,
 }
 
-/// Process-wide event-vocabulary mode, initialized once from
-/// `EVENT_VOCAB_MODE` at startup. Read by the conversation worker on every
-/// emitted event.
+/// Process-wide event-vocabulary mode, swap-able at runtime. Held in an
+/// `ArcSwap<EventVocabMode>` so readers get a lock-free atomic load and
+/// writers atomically publish the new value.
 ///
-/// Populated by `main.rs` via [`init_global`] immediately after env parsing.
-/// Before init, [`global`] returns [`EventVocabMode::DEFAULT`] — no panics,
-/// no silent fallbacks beyond the documented default. Tests can skip init
-/// and rely on the default, or call `init_global` explicitly.
-static GLOBAL_MODE: OnceLock<EventVocabMode> = OnceLock::new();
+/// Initialized lazily on first access: if no one has called
+/// [`init_global`] yet, [`current_mode`] will create the cell with
+/// [`EventVocabMode::DEFAULT`]. Production always calls `init_global`
+/// from `main.rs` before any worker starts.
+static GLOBAL_MODE: OnceLock<ArcSwap<EventVocabMode>> = OnceLock::new();
 
-/// Set the global mode. Idempotent only in the sense that subsequent calls
-/// are ignored (OnceLock::set errors after the first). Intended to be
-/// called exactly once, from main.rs, after parsing env.
-pub fn init_global(mode: EventVocabMode) {
-    let _ = GLOBAL_MODE.set(mode);
+fn cell() -> &'static ArcSwap<EventVocabMode> {
+    GLOBAL_MODE.get_or_init(|| ArcSwap::from_pointee(EventVocabMode::DEFAULT))
 }
 
-/// Read the global mode. Returns [`EventVocabMode::DEFAULT`] if
-/// [`init_global`] hasn't been called yet.
+/// Set the global mode. Can be called more than once — subsequent calls
+/// atomically swap in the new value. Called from `main.rs` at startup
+/// (once) and from the admin PUT handler / refresher task (possibly
+/// many times).
+pub fn init_global(mode: EventVocabMode) {
+    cell().store(std::sync::Arc::new(mode));
+}
+
+/// Atomic swap primitive used by the admin PUT handler and the
+/// refresher. Alias for [`init_global`] — kept as a distinct name so
+/// call sites document intent ("I'm *storing* a new value", not
+/// "initializing").
+pub fn store(mode: EventVocabMode) {
+    init_global(mode);
+}
+
+/// Read the current mode. Returns an owned `EventVocabMode` — cheap,
+/// since the enum is `Copy`. Lock-free.
+pub fn current_mode() -> EventVocabMode {
+    *cell().load_full()
+}
+
+/// Process-wide mutex used by tests that mutate the global `ArcSwap`
+/// and/or `EVENT_VOCAB_MODE` env var. Exposed so sibling modules
+/// (`admin_feature_flags`) can serialize with each other — cargo runs
+/// tests in parallel by default, and both modules share the same
+/// process-wide global.
+#[cfg(test)]
+pub(crate) static TEST_STATE_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
+
+/// Legacy accessor name. Forwards to [`current_mode`]. Kept so the
+/// conversation worker and tests don't need simultaneous edits.
 pub fn global() -> EventVocabMode {
-    GLOBAL_MODE.get().copied().unwrap_or(EventVocabMode::DEFAULT)
+    current_mode()
 }
 
 #[cfg(test)]
@@ -198,12 +258,31 @@ mod tests {
         }
     }
 
-    /// `from_env` is exercised indirectly by the unit tests on `parse`;
-    /// we don't mutate process env here because Rust test runners may
-    /// execute tests in parallel. The startup-failure behavior is covered
-    /// by the error path `parse` returns.
     #[test]
     fn default_is_dual() {
         assert_eq!(EventVocabMode::DEFAULT, EventVocabMode::Dual);
+    }
+
+    /// Runtime swap: writing a new value via `store()` makes the next
+    /// `current_mode()` read return it. This is the whole point of the
+    /// ArcSwap — validate that the primitive actually publishes.
+    ///
+    /// Serializes with `admin_feature_flags` tests via `TEST_STATE_LOCK`
+    /// so concurrent writers from the other module don't race this one.
+    #[test]
+    fn runtime_store_publishes_new_value() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap();
+        // Start from a known baseline.
+        store(EventVocabMode::Dual);
+        assert_eq!(current_mode(), EventVocabMode::Dual);
+
+        store(EventVocabMode::ModernOnly);
+        assert_eq!(current_mode(), EventVocabMode::ModernOnly);
+
+        store(EventVocabMode::LegacyOnly);
+        assert_eq!(current_mode(), EventVocabMode::LegacyOnly);
+
+        // Reset for anyone reading after us.
+        store(EventVocabMode::Dual);
     }
 }

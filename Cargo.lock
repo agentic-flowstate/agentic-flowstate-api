@@ -26,6 +26,7 @@ dependencies = [
  "ammonia",
  "anyhow",
  "apns-h2",
+ "arc-swap",
  "async-imap",
  "async-native-tls",
  "async-std",
@@ -147,6 +148,15 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.17",
  "tokio",
+]
+
+[[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]

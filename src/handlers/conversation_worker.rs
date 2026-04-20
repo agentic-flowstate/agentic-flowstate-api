@@ -82,9 +82,13 @@ pub struct ConversationWorker {
     last_router_ticket_id: Option<String>,
     /// Cached organization from the last successful router match (from DB).
     last_router_organization: Option<String>,
-    /// Dual-write toggle for the Anthropic 8-event vocabulary — captured at
-    /// worker construction time from the process-wide setting so that
-    /// live reloads of the env var don't change behavior mid-turn.
+    /// Dual-write toggle for the Anthropic 8-event vocabulary. Refreshed
+    /// from the process-wide ArcSwap (T-257C060D) at the top of every
+    /// `process_message` call so that an admin PUT to
+    /// `/api/admin/feature-flags/event_vocab_mode` is honored on the
+    /// next turn without a redeploy. We snapshot the value for the
+    /// duration of a single turn so mid-turn flips don't leave a
+    /// message half-written under the old mode and half under the new.
     vocab_mode: EventVocabMode,
     /// Stateful translator from internal `StreamEvent` → Anthropic events.
     /// Maintains message / content-block lifecycle across emit_event calls.
@@ -238,6 +242,22 @@ impl ConversationWorker {
         // pushes on `message_stop` without plumbing user_id through
         // every call site (T-90C7FAC4).
         self.current_user_id = Some(msg.user_id.clone());
+        // Refresh the vocab-mode snapshot for this turn. The worker is
+        // long-lived (10-min idle timeout), so without this refresh an
+        // admin flip would only be picked up after the worker died and
+        // respawned. Readers on a single turn still see one consistent
+        // value because we snapshot once here and reuse until the
+        // turn completes (T-257C060D).
+        let new_vocab_mode = event_vocab::current_mode();
+        if new_vocab_mode != self.vocab_mode {
+            tracing::info!(
+                "[WORKER] vocab_mode refreshed for {}: {} -> {}",
+                self.conversation_id,
+                self.vocab_mode,
+                new_vocab_mode,
+            );
+            self.vocab_mode = new_vocab_mode;
+        }
         // Clear stale events from previous message but keep event_index monotonically
         // increasing. Resetting to 0 here was causing the "one turn late" bug: the app's
         // SSE cursor (e.g., lastEventIndex=50) would be higher than all new events (0,1,2...),
