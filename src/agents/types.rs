@@ -1,6 +1,6 @@
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use once_cell::sync::Lazy;
 
 /// Agent configuration loaded from agents.json
 #[derive(Debug, Clone, Deserialize)]
@@ -192,7 +192,9 @@ impl EmailOutput {
         // Extract subject
         let subject_start = email_content.find("<subject>")?;
         let subject_end = email_content.find("</subject>")?;
-        let subject = email_content[subject_start + 9..subject_end].trim().to_string();
+        let subject = email_content[subject_start + 9..subject_end]
+            .trim()
+            .to_string();
 
         // Extract body
         let body_start = email_content.find("<body>")?;
@@ -308,68 +310,8 @@ pub struct AgentRunsResponse {
     pub runs: Vec<AgentRun>,
 }
 
-/// Structured streaming event for agent execution
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum StreamEvent {
-    /// Text content from the assistant
-    Text { content: String },
-    /// Tool use request
-    ToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    /// Tool result
-    ToolResult {
-        tool_use_id: String,
-        content: String,
-        is_error: bool,
-    },
-    /// Thinking content (extended thinking)
-    Thinking { content: String },
-    /// Agent run status update
-    Status { status: String, message: Option<String> },
-    /// Final result
-    Result {
-        session_id: String,
-        status: String,
-        is_error: bool,
-    },
-    /// User follow-up message (stored so it can be replayed on reconnect)
-    UserMessage { content: String },
-    /// Sent after all historical events have been replayed during reconnection
-    ReplayComplete {
-        total_events: usize,
-        agent_status: String,
-    },
-    /// Auto-generated conversation title (sent after first message)
-    TitleUpdate {
-        title: String,
-    },
-    /// Auto-detected organization for the conversation (sent after first message)
-    OrgUpdate {
-        organization: String,
-    },
-    /// Text content from the router agent (reasoning, search output)
-    RouterText { content: String },
-    /// Tool use by the router agent
-    RouterToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    /// Tool result for the router agent
-    RouterToolResult {
-        tool_use_id: String,
-        content: String,
-        is_error: bool,
-    },
-    /// Final router decision: enriched message + ticket info
-    RouterResult {
-        enriched_message: String,
-        ticket_id: Option<String>,
-        organization: Option<String>,
-        skipped: bool,
-    },
-}
+// `StreamEvent` moved to `crate::agents::stream_event` (re-exported from
+// `crate::agents::StreamEvent`) so the backfill binary can mount just the
+// enum without pulling in this file's `AgentsConfig`/`once_cell::Lazy`
+// static initializer. The compatibility re-export in `agents/mod.rs`
+// keeps every existing `use crate::agents::StreamEvent` import working.
