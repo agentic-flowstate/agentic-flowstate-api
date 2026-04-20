@@ -1,24 +1,25 @@
+use async_stream::stream;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
-use std::convert::Infallible;
-use std::sync::Arc;
+use once_cell::sync::Lazy;
+use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, RwLock};
-use once_cell::sync::Lazy;
-use tokio_stream::wrappers::ReceiverStream;
-use async_stream::stream;
-use sqlx::SqlitePool;
 use ticketing_system::conversations;
+use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio_stream::wrappers::ReceiverStream;
 
 use serde::Deserialize;
 
-use crate::agents::{AgentType, StreamEvent};
 use super::chat_client_manager::ChatClientManager;
 use super::conversation_worker::WorkerMessage;
 use super::conversation_worker_manager::WORKER_MANAGER;
+use crate::agents::{AgentType, StreamEvent};
+use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
 
 /// Image data attached to a chat message (base64-encoded)
 #[derive(Debug, Clone, Deserialize)]
@@ -111,19 +112,21 @@ pub fn chat(
         let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Get or create worker, push message to its queue
-        let worker_tx = WORKER_MANAGER.get_or_create(
-            conv_id.clone(),
-            db,
-            manager,
-        ).await;
+        let worker_tx = WORKER_MANAGER
+            .get_or_create(conv_id.clone(), db, manager)
+            .await;
 
-        if worker_tx.send(WorkerMessage {
-            user_id,
-            message,
-            config,
-            images,
-            completion_tx: Some(completion_tx),
-        }).await.is_err() {
+        if worker_tx
+            .send(WorkerMessage {
+                user_id,
+                message,
+                config,
+                images,
+                completion_tx: Some(completion_tx),
+            })
+            .await
+            .is_err()
+        {
             tracing::error!("[CHAT] Worker channel closed for {}", conv_id);
             if let Ok(json) = serde_json::to_string(&StreamEvent::Status {
                 status: "failed".to_string(),
@@ -222,6 +225,7 @@ pub fn create_conversation_reconnect_stream(
                     continue;
                 }
             };
+            record_stream_event_emitted(&conversation_id, payload.len());
             yield Ok(Event::default()
                 .id(db_event.event_index.to_string())
                 .data(payload));
@@ -255,6 +259,7 @@ pub fn create_conversation_reconnect_stream(
                                     last_event_index = event_index;
                                     // Reset inactivity timeout on each received event
                                     timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(600));
+                                    record_stream_event_emitted(&conversation_id, event_data.len());
                                     yield Ok(Event::default()
                                         .id(event_index.to_string())
                                         .data(event_data));
@@ -276,6 +281,7 @@ pub fn create_conversation_reconnect_stream(
                                                 continue;
                                             }
                                         };
+                                        record_stream_event_emitted(&conversation_id, payload.len());
                                         yield Ok(Event::default()
                                             .id(ev.event_index.to_string())
                                             .data(payload));
@@ -297,6 +303,7 @@ pub fn create_conversation_reconnect_stream(
                                                 continue;
                                             }
                                         };
+                                        record_stream_event_emitted(&conversation_id, payload.len());
                                         yield Ok(Event::default()
                                             .id(ev.event_index.to_string())
                                             .data(payload));
@@ -309,6 +316,8 @@ pub fn create_conversation_reconnect_stream(
                                 if let Ok(json) = serde_json::to_string(&done) {
                                     yield Ok(Event::default().data(json));
                                 }
+                                // Yielded close reason: worker finished cleanly.
+                                let _ = DisconnectReason::Normal;
                                 break;
                             }
                         }
@@ -322,6 +331,8 @@ pub fn create_conversation_reconnect_stream(
                         if let Ok(json) = serde_json::to_string(&timeout_event) {
                             yield Ok(Event::default().data(json));
                         }
+                        // Yielded close reason: idle timeout.
+                        let _ = DisconnectReason::ServerIdleTimeout;
                         break;
                     }
                 }

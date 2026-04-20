@@ -1,24 +1,29 @@
 use axum::{
     extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
-    response::{sse::{Event, KeepAlive, Sse}, IntoResponse},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     Json,
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use ticketing_system::{
-    conversations, checkpoints, AddMessageRequest, Conversation, ConversationMessage,
+    checkpoints, conversations, AddMessageRequest, Conversation, ConversationMessage,
     CreateConversationRequest, SqlitePool, UpdateConversationRequest,
 };
-use std::pin::Pin;
 
-
-use crate::auth_middleware::AuthenticatedUser;
 use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::get_broadcast_sender;
+use crate::auth_middleware::AuthenticatedUser;
+use crate::observability::streaming::{
+    record_cursor_expired, record_stream_closed, record_stream_opened, DisconnectReason,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ListConversationsQuery {
@@ -42,9 +47,17 @@ pub async fn list_conversations(
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListConversationsQuery>,
 ) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
-    let list = conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user.user_id), params.agent.as_deref(), params.status.as_deref(), params.limit, params.updated_since.as_deref())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let list = conversations::list_conversations(
+        &pool,
+        params.organization.as_deref(),
+        Some(&user.user_id),
+        params.agent.as_deref(),
+        params.status.as_deref(),
+        params.limit,
+        params.updated_since.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let total = list.len() as i64;
 
@@ -171,7 +184,10 @@ pub async fn cancel_conversation(
             }
         }
         Ok(false) => {
-            tracing::info!("[CANCEL] No active client for conversation {}, nothing to cancel", id);
+            tracing::info!(
+                "[CANCEL] No active client for conversation {}, nothing to cancel",
+                id
+            );
         }
         Err(e) => {
             tracing::warn!("[CANCEL] Interrupt failed for {}: {}", id, e);
@@ -421,8 +437,14 @@ pub async fn reconnect_conversation_stream(
         _ => {
             // Not found or not owned — return an empty stream that closes immediately
             let empty = futures::stream::empty();
-            return Sse::new(Box::pin(empty) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
-                .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)).text("ping"));
+            return Sse::new(
+                Box::pin(empty) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>
+            )
+            .keep_alive(
+                KeepAlive::new()
+                    .interval(Duration::from_secs(30))
+                    .text("ping"),
+            );
         }
     }
 
@@ -431,18 +453,144 @@ pub async fn reconnect_conversation_stream(
         _ => "none".to_string(),
     };
 
+    // Resume vs cold-start: a reconnect with `starting_after=N` is the
+    // resume arm of the stream-open metric; a reconnect without it is a
+    // cold start (the client is re-subscribing from the top).
+    let resume = query.starting_after.is_some();
+
     let events = if let Some(after) = query.starting_after {
-        conversations::get_events_after(&db, &id, after).await.unwrap_or_default()
+        conversations::get_events_after(&db, &id, after)
+            .await
+            .unwrap_or_default()
     } else {
-        conversations::get_events(&db, &id).await.unwrap_or_default()
+        conversations::get_events(&db, &id)
+            .await
+            .unwrap_or_default()
     };
 
-    let stream = super::chat_stream::create_conversation_reconnect_stream(
-        db, id, events, checkpoint_status,
+    // Cursor-expired 410 detection: the client passed `starting_after=N`
+    // but either (a) the allocator has already moved past N and no event
+    // at index N+1 is retained in the log (first returned event has an
+    // index well above N+1), or (b) the client's cursor is negative.
+    // We fold this into the normal SSE response (no 410 frame on the
+    // wire — iOS re-syncs via full message fetch) and only emit the
+    // metric so operators can chart the rate. Feature retention work
+    // (T-future) will convert this into an actual HTTP 410.
+    let mut cursor_expired = false;
+    if let Some(after) = query.starting_after {
+        let oldest_retained = match conversations::get_events(&db, &id).await {
+            Ok(ref all) if !all.is_empty() => Some(all[0].event_index),
+            _ => None,
+        };
+        if let Some(oldest) = oldest_retained {
+            if after < 0 || oldest > after + 1 {
+                record_cursor_expired(&id, after, oldest);
+                cursor_expired = true;
+            }
+        } else if after < 0 {
+            // No events retained AND negative cursor — still expired.
+            record_cursor_expired(&id, after, 0);
+            cursor_expired = true;
+        }
+    }
+
+    // Record the stream-opened metric BEFORE we hand the body off so the
+    // gauge/counter reflect the connection immediately, not after the
+    // first event flushes. The matching close is emitted by the
+    // StreamCloseGuard wrapper below when the stream is dropped.
+    record_stream_opened(&id, &user.user_id, resume);
+
+    let inner = super::chat_stream::create_conversation_reconnect_stream(
+        db,
+        id.clone(),
+        events,
+        checkpoint_status,
     );
 
-    Sse::new(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)).text("ping"))
+    // Box-pin the inner stream so the drop-guard wrapper has a
+    // concrete `Unpin`-able handle. The underlying async_stream
+    // `AsyncStream` is not itself `Unpin`, so we must pin on the heap.
+    let inner_boxed: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        Box::pin(inner);
+
+    // Drop-guard adapter: wraps the inner stream, records close when the
+    // stream terminates (natural end-of-stream OR client disconnect —
+    // axum drops the stream on both paths). If the cursor was detected
+    // as expired above, pre-seed the close reason so the close metric
+    // fires with `reason="cursor_expired"` instead of the default
+    // `client_disconnect`.
+    let mut guarded = StreamCloseGuard::new(id, inner_boxed);
+    if cursor_expired {
+        guarded.reason = DisconnectReason::CursorExpired;
+    }
+
+    Sse::new(Box::pin(guarded) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(30))
+                .text("ping"),
+        )
+}
+
+/// RAII stream wrapper that records the matching `stream_closed_total`
+/// counter + `stream_duration_ms` histogram observation when the stream
+/// is dropped.
+///
+/// The close reason is inferred from whether the underlying stream ever
+/// ran to completion (`Normal`) or was dropped mid-flight
+/// (`ClientDisconnect`). More specific reasons — idle timeouts or
+/// cursor-expired rejections — are emitted at the call site and
+/// suppress the generic close recorded here via `set_reason`.
+struct StreamCloseGuard {
+    conversation_id: String,
+    opened_at: std::time::Instant,
+    reason: DisconnectReason,
+    inner: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>,
+    closed: bool,
+}
+
+impl StreamCloseGuard {
+    fn new(
+        conversation_id: String,
+        inner: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>,
+    ) -> Self {
+        Self {
+            conversation_id,
+            opened_at: std::time::Instant::now(),
+            reason: DisconnectReason::ClientDisconnect,
+            inner,
+            closed: false,
+        }
+    }
+}
+
+impl Stream for StreamCloseGuard {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(poll, std::task::Poll::Ready(None)) {
+            // Natural end-of-stream: server drained everything and the
+            // generator yielded Poll::Ready(None). Mark the close as
+            // normal so the drop handler emits `reason="normal"`.
+            self.reason = DisconnectReason::Normal;
+        }
+        poll
+    }
+}
+
+impl Drop for StreamCloseGuard {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let duration_ms = self.opened_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        record_stream_closed(&self.conversation_id, duration_ms, self.reason);
+    }
 }
 
 /// SSE event types for conversation updates
@@ -508,7 +656,7 @@ pub async fn subscribe_conversations(
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(30))
-            .text("ping")
+            .text("ping"),
     )
 }
 

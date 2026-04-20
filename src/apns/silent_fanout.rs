@@ -39,6 +39,7 @@ use std::sync::Arc;
 use sqlx::SqlitePool;
 
 use super::silent::{ApnsClient, ApnsSilentError};
+use crate::observability::streaming::{record_push_sent, PushResult};
 
 /// Trait abstraction over the APNs silent-push sender so the fan-out
 /// logic can be unit-tested against a fake. Implemented by
@@ -208,6 +209,8 @@ pub async fn fan_out_silent_push(
                     device_token = %short_token(&token.device_token),
                     "[SILENT_PUSH_FANOUT] delivered"
                 );
+                // T-56987678: count every accepted silent push.
+                record_push_sent(PushResult::Success, 200);
                 outcomes.push(PerDeviceOutcome::Delivered);
             }
             Err(ApnsSilentError::DeviceUnregistered(reason)) => {
@@ -247,6 +250,8 @@ pub async fn fan_out_silent_push(
                         );
                     }
                 }
+                // T-56987678: APNs 410 Gone maps to PushResult::Unregistered.
+                record_push_sent(PushResult::Unregistered, 410);
                 outcomes.push(PerDeviceOutcome::Unregistered);
             }
             Err(ApnsSilentError::NotInitialized) => {
@@ -259,6 +264,9 @@ pub async fn fan_out_silent_push(
                     device_token = %short_token(&token.device_token),
                     "[SILENT_PUSH_FANOUT] sender not initialized — APNS_SILENT_ENABLED=true but init_from_env was never called"
                 );
+                // T-56987678: not-initialized counts as an error bucket
+                // with apns_status=0 (never reached APNs).
+                record_push_sent(PushResult::Error, 0);
                 outcomes.push(PerDeviceOutcome::SkippedNotInitialized);
             }
             Err(ApnsSilentError::Transport(e)) => {
@@ -272,6 +280,8 @@ pub async fn fan_out_silent_push(
                     error = %e,
                     "[SILENT_PUSH_FANOUT] transport error"
                 );
+                // T-56987678: transport error — never reached APNs, status=0.
+                record_push_sent(PushResult::Error, 0);
                 outcomes.push(PerDeviceOutcome::Timeout);
             }
             Err(other) => {
@@ -285,6 +295,21 @@ pub async fn fan_out_silent_push(
                     error = %other,
                     "[SILENT_PUSH_FANOUT] rejected"
                 );
+                // T-56987678: other rejection — map the typed error
+                // variant to PushResult and emit with the real APNs
+                // status code where available.
+                let (result, status) = match &other {
+                    ApnsSilentError::Rejected { code, .. } => {
+                        let r = match *code {
+                            429 => PushResult::Throttled,
+                            400 | 403 | 405 | 413 => PushResult::BadToken,
+                            _ => PushResult::Error,
+                        };
+                        (r, *code)
+                    }
+                    _ => (PushResult::Error, 0),
+                };
+                record_push_sent(result, status);
                 outcomes.push(PerDeviceOutcome::Other(other.to_string()));
             }
         }
@@ -295,7 +320,11 @@ pub async fn fan_out_silent_push(
 
 /// Redact a device token for logs — keep first 8 chars only.
 fn short_token(tok: &str) -> String {
-    let end = tok.char_indices().nth(8).map(|(i, _)| i).unwrap_or(tok.len());
+    let end = tok
+        .char_indices()
+        .nth(8)
+        .map(|(i, _)| i)
+        .unwrap_or(tok.len());
     format!("{}…", &tok[..end])
 }
 
@@ -472,11 +501,17 @@ mod tests {
 
         assert_eq!(outcomes.len(), 3);
         assert_eq!(
-            outcomes.iter().filter(|o| **o == PerDeviceOutcome::Delivered).count(),
+            outcomes
+                .iter()
+                .filter(|o| **o == PerDeviceOutcome::Delivered)
+                .count(),
             2,
         );
         assert_eq!(
-            outcomes.iter().filter(|o| **o == PerDeviceOutcome::Unregistered).count(),
+            outcomes
+                .iter()
+                .filter(|o| **o == PerDeviceOutcome::Unregistered)
+                .count(),
             1,
         );
 
@@ -485,8 +520,14 @@ mod tests {
             .await
             .unwrap();
         let remaining: Vec<_> = active.iter().map(|d| d.device_token.clone()).collect();
-        assert!(remaining.contains(&"tok-a".to_string()), "tok-a should still be active");
-        assert!(remaining.contains(&"tok-c".to_string()), "tok-c should still be active");
+        assert!(
+            remaining.contains(&"tok-a".to_string()),
+            "tok-a should still be active"
+        );
+        assert!(
+            remaining.contains(&"tok-c".to_string()),
+            "tok-c should still be active"
+        );
         assert!(
             !remaining.contains(&"tok-b".to_string()),
             "tok-b should have been soft-deleted"
@@ -514,7 +555,11 @@ mod tests {
         assert!(outcomes
             .iter()
             .all(|o| *o == PerDeviceOutcome::SkippedDisabled));
-        assert_eq!(sender.calls().len(), 0, "sender must not be invoked when disabled");
+        assert_eq!(
+            sender.calls().len(),
+            0,
+            "sender must not be invoked when disabled"
+        );
     }
 
     #[tokio::test]

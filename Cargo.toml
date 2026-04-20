@@ -40,6 +40,12 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Metrics (T-56987678). The `metrics` facade is the prometheus-compatible
+# frontend; `metrics-exporter-prometheus` renders the registry to text for
+# the /metrics endpoint that Grafana scrapes.
+metrics = "0.22"
+metrics-exporter-prometheus = { version = "0.13", default-features = false }
+
 # Utils
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

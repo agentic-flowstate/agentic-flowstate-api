@@ -23,11 +23,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use ticketing_system::device_tokens::{
-    DeviceToken, list_active_for_user, soft_delete_device_token, upsert_device_token,
+    list_active_for_user, soft_delete_device_token, upsert_device_token, DeviceToken,
 };
 use ticketing_system::SqlitePool;
 
+use super::event_vocab::{self, EventVocabMode};
 use crate::auth_middleware::AuthenticatedUser;
+use crate::observability::streaming::{record_session_start, ClientPlatform, SessionVocab};
 
 // ---------------------------------------------------------------------------
 // POST /v1/devices
@@ -53,6 +55,10 @@ pub struct RegisterDeviceRequest {
     /// part of the minimum contract but useful for the `GET /v1/devices`
     /// debug listing.
     pub device_name: Option<String>,
+    /// Optional client build version (e.g. "1.23.0 (45)"). Populated by the
+    /// iOS app so the `clients_session_start_total` metric can segment
+    /// by release and observability can chart the rollout gate per build.
+    pub client_version: Option<String>,
 }
 
 /// Wire shape for a device-token row. Mirrors [`DeviceToken`] one-for-one so
@@ -127,6 +133,22 @@ pub async fn register_device(
         row.id,
         row.bundle_id
     );
+
+    // T-56987678: emit `clients_session_start_total` + `clients_modern_session_ratio`
+    // on every device registration. This is the only path iOS clients call at
+    // launch before streaming, so it's the canonical session-start signal for
+    // the rollout gate on `event_vocab_mode`.
+    //
+    // Vocab label is derived from the in-memory feature-flag: legacy-only and
+    // dual-write clients bucket as `legacy`; modern-only buckets as `modern`.
+    let platform = ClientPlatform::parse(&req.platform);
+    let vocab = match event_vocab::current_mode() {
+        EventVocabMode::ModernOnly => SessionVocab::Modern,
+        _ => SessionVocab::Legacy,
+    };
+    let version = req.client_version.as_deref().unwrap_or("unknown");
+    record_session_start(&user.user_id, platform, version, vocab);
+
     Ok((StatusCode::OK, Json(row.into())))
 }
 
@@ -235,4 +257,3 @@ fn internal(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
         Json(json!({ "error": msg })),
     )
 }
-

@@ -1,21 +1,30 @@
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+use cc_sdk::{
+    ClaudeCodeOptions, ClaudeSDKClient, ContentBlock, McpServerConfig, Message, PermissionMode,
+    ToolsConfig,
+};
+use futures::StreamExt;
+use serde::Serialize;
+use sqlx::SqlitePool;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::path::PathBuf;
 use tokio::sync::mpsc;
-use sqlx::SqlitePool;
-use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig, PermissionMode, McpServerConfig};
-use futures::StreamExt;
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
-use serde::Serialize;
 
-use crate::agents::{AgentType, StreamEvent};
-use crate::agents::prompts::load_prompt;
-use ticketing_system::{conversations, checkpoints, token_usage, AddMessageRequest, ContentBlockDesc, ConversationMessage, UpdateConversationRequest};
-use super::chat_stream::{get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData};
-use super::chat_client_manager::{ChatClientManager, ChatClient};
 use super::anthropic_translator::AnthropicTranslator;
+use super::chat_client_manager::{ChatClient, ChatClientManager};
+use super::chat_stream::{
+    get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData,
+};
 use super::event_vocab::{self, EventVocabMode};
+use crate::agents::prompts::load_prompt;
+use crate::agents::{AgentType, StreamEvent};
+use crate::observability::streaming::{record_gap_detected, record_stream_event_emitted};
+use ticketing_system::{
+    checkpoints, conversations, token_usage, AddMessageRequest, ContentBlockDesc,
+    ConversationMessage, UpdateConversationRequest,
+};
 
 /// Timeout for the ticket-router pre-processing phase.
 const ROUTER_TIMEOUT_SECS: u64 = 60;
@@ -53,18 +62,39 @@ impl Drop for CompletionGuard {
 /// These are acknowledgements, confirmations, and approval-flow signals that
 /// will never need ticket context.
 const ROUTER_SKIP_MESSAGES: &[&str] = &[
-    "approved", "rejected",                     // workspace-manager approval flow
-    "yes", "no", "ok", "okay", "sure", "yep", "nope", "nah",
-    "thanks", "thank you", "ty", "thx",
-    "lgtm", "sounds good", "looks good", "got it",
-    "cool", "nice", "great", "perfect", "awesome",
-    "hi", "hello", "hey",
-    "done", "noted",
-    "\u{1F44D}",  // 👍
-    "\u{1F44E}",  // 👎
-    "\u{2705}",   // ✅
-    "\u{274C}",   // ❌
-    "\u{1F64F}",  // 🙏
+    "approved",
+    "rejected", // workspace-manager approval flow
+    "yes",
+    "no",
+    "ok",
+    "okay",
+    "sure",
+    "yep",
+    "nope",
+    "nah",
+    "thanks",
+    "thank you",
+    "ty",
+    "thx",
+    "lgtm",
+    "sounds good",
+    "looks good",
+    "got it",
+    "cool",
+    "nice",
+    "great",
+    "perfect",
+    "awesome",
+    "hi",
+    "hello",
+    "hey",
+    "done",
+    "noted",
+    "\u{1F44D}", // 👍
+    "\u{1F44E}", // 👎
+    "\u{2705}",  // ✅
+    "\u{274C}",  // ❌
+    "\u{1F64F}", // 🙏
 ];
 
 /// A long-lived tokio task that owns the SDK client for a single conversation
@@ -164,10 +194,18 @@ impl ConversationWorker {
         match conversations::get_max_event_index(&self.db, &self.conversation_id).await {
             Ok(max_idx) => {
                 self.event_index = max_idx + 1;
-                tracing::info!("[WORKER] Initialized event_index to {} for {}", self.event_index, self.conversation_id);
+                tracing::info!(
+                    "[WORKER] Initialized event_index to {} for {}",
+                    self.event_index,
+                    self.conversation_id
+                );
             }
             Err(e) => {
-                tracing::warn!("[WORKER] Failed to get max event index for {}: {}, starting at 0", self.conversation_id, e);
+                tracing::warn!(
+                    "[WORKER] Failed to get max event index for {}: {}, starting at 0",
+                    self.conversation_id,
+                    e
+                );
             }
         }
 
@@ -177,13 +215,23 @@ impl ConversationWorker {
         match conversations::has_router_run(&self.db, &self.conversation_id).await {
             Ok(true) => {
                 self.has_routed = true;
-                tracing::info!("[WORKER] Router already ran for {} (loaded from DB)", self.conversation_id);
+                tracing::info!(
+                    "[WORKER] Router already ran for {} (loaded from DB)",
+                    self.conversation_id
+                );
             }
             Ok(false) => {
-                tracing::info!("[WORKER] Router has NOT run for {} (new conversation)", self.conversation_id);
+                tracing::info!(
+                    "[WORKER] Router has NOT run for {} (new conversation)",
+                    self.conversation_id
+                );
             }
             Err(e) => {
-                tracing::warn!("[WORKER] Failed to check router state for {}: {}, assuming not routed", self.conversation_id, e);
+                tracing::warn!(
+                    "[WORKER] Failed to check router state for {}: {}, assuming not routed",
+                    self.conversation_id,
+                    e
+                );
             }
         }
 
@@ -217,7 +265,10 @@ impl ConversationWorker {
         if let Some(client_arc) = self.manager.get(&self.conversation_id).await {
             let client = client_arc.lock().await;
             if let Some(ref session_id) = client.session_id {
-                tracing::info!("[WORKER] Saving session_id {} before disconnect", session_id);
+                tracing::info!(
+                    "[WORKER] Saving session_id {} before disconnect",
+                    session_id
+                );
                 let _ = conversations::update_conversation(
                     &self.db,
                     "", // user_id not needed for session_id update (WHERE already has id)
@@ -227,7 +278,8 @@ impl ConversationWorker {
                         session_id: Some(session_id.clone()),
                         organization: None,
                     },
-                ).await;
+                )
+                .await;
             }
             drop(client);
         }
@@ -268,7 +320,8 @@ impl ConversationWorker {
         self.emit_event(&StreamEvent::Status {
             status: "running".to_string(),
             message: Some("running".to_string()),
-        }).await;
+        })
+        .await;
 
         // Process image attachments (save to disk, build metadata)
         let mut image_paths: Vec<String> = Vec::new();
@@ -306,7 +359,11 @@ impl ConversationWorker {
                     match STANDARD.decode(&image.data) {
                         Ok(bytes) => {
                             if let Err(e) = std::fs::write(&file_path, &bytes) {
-                                tracing::error!("[WORKER] Failed to write image {}: {}", filename, e);
+                                tracing::error!(
+                                    "[WORKER] Failed to write image {}: {}",
+                                    filename,
+                                    e
+                                );
                                 continue;
                             }
                             let path_str = file_path.to_string_lossy().to_string();
@@ -332,7 +389,8 @@ impl ConversationWorker {
 
         // Build enhanced message for SDK (with image paths for Claude to read)
         let enhanced_message = if !image_paths.is_empty() {
-            let paths_list = image_paths.iter()
+            let paths_list = image_paths
+                .iter()
                 .map(|p| format!("  - {}", p))
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -355,7 +413,8 @@ impl ConversationWorker {
                 content: msg.message.clone(),
                 attachments: attachments_json,
             },
-        ).await;
+        )
+        .await;
 
         // First message → generate title + detect org in background
         if let Ok(ref stored) = stored_msg {
@@ -373,11 +432,19 @@ impl ConversationWorker {
                     .unwrap_or_default();
                 tokio::spawn(async move {
                     if let Some(result) = super::title_generator::generate_title_and_org(
-                        title_db, title_user, title_conv.clone(), title_msg, current_org,
-                    ).await {
+                        title_db,
+                        title_user,
+                        title_conv.clone(),
+                        title_msg,
+                        current_org,
+                    )
+                    .await
+                    {
                         let broadcast_tx = get_broadcast_sender(&title_conv).await;
                         // Broadcast title update
-                        let title_event = StreamEvent::TitleUpdate { title: result.title };
+                        let title_event = StreamEvent::TitleUpdate {
+                            title: result.title,
+                        };
                         if let Ok(json) = serde_json::to_string(&title_event) {
                             let _ = broadcast_tx.send((-1, json));
                         }
@@ -398,7 +465,9 @@ impl ConversationWorker {
         }
 
         // Create checkpoint
-        if let Err(e) = checkpoints::upsert_checkpoint(&self.db, &self.conversation_id, "pending", 0).await {
+        if let Err(e) =
+            checkpoints::upsert_checkpoint(&self.db, &self.conversation_id, "pending", 0).await
+        {
             tracing::warn!("[WORKER] Failed to create checkpoint: {}", e);
         }
 
@@ -422,7 +491,9 @@ impl ConversationWorker {
                     content: final_message.clone(),
                     attachments: None,
                 },
-            ).await {
+            )
+            .await
+            {
                 tracing::warn!("[WORKER] Failed to save forwarded message: {}", e);
             }
         }
@@ -439,7 +510,9 @@ impl ConversationWorker {
                 content: String::new(),
                 attachments: None,
             },
-        ).await {
+        )
+        .await
+        {
             Ok(m) => assistant_message_id = Some(m.id),
             Err(e) => tracing::error!("[WORKER] Failed to create assistant message: {}", e),
         }
@@ -449,20 +522,26 @@ impl ConversationWorker {
         self.emit_event(&StreamEvent::Status {
             status: "running".to_string(),
             message: Some("Preparing agent...".to_string()),
-        }).await;
+        })
+        .await;
 
         // Get or create SDK client
         let client_arc = match self.get_or_create_client(&msg.config).await {
             Ok(arc) => arc,
             Err(e) => {
-                tracing::error!("[WORKER] Failed to get client for {}: {}", self.conversation_id, e);
+                tracing::error!(
+                    "[WORKER] Failed to get client for {}: {}",
+                    self.conversation_id,
+                    e
+                );
                 // Mark checkpoint as interrupted so the iOS app doesn't think the agent is still running.
                 // (upsert_checkpoint always writes status='running', so we use mark_interrupted instead.)
                 let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
                 self.emit_event(&StreamEvent::Status {
                     status: "failed".to_string(),
                     message: Some(format!("Failed to start agent: {}", e)),
-                }).await;
+                })
+                .await;
                 return;
             }
         };
@@ -482,7 +561,8 @@ impl ConversationWorker {
                 self.emit_event(&StreamEvent::Status {
                     status: "failed".to_string(),
                     message: Some(format!("Failed to send: {}", e)),
-                }).await;
+                })
+                .await;
                 return;
             }
 
@@ -820,7 +900,9 @@ impl ConversationWorker {
         // Store content block ordering
         if let Some(msg_id) = &assistant_message_id {
             if content_blocks.len() > 1 {
-                if let Err(e) = conversations::update_message_blocks(&self.db, msg_id, &content_blocks).await {
+                if let Err(e) =
+                    conversations::update_message_blocks(&self.db, msg_id, &content_blocks).await
+                {
                     tracing::error!("[WORKER] Failed to store content blocks: {}", e);
                 }
             }
@@ -830,7 +912,8 @@ impl ConversationWorker {
         self.emit_event(&StreamEvent::Status {
             status: "completed".to_string(),
             message: None,
-        }).await;
+        })
+        .await;
     }
 
     /// Run the ticket-router agent as a pre-processing step.
@@ -847,7 +930,10 @@ impl ConversationWorker {
 
         // Truncate preview at a safe UTF-8 char boundary (floor to nearest boundary at or before 60)
         let msg_preview = if user_message.len() > 60 {
-            let end = (0..=60).rev().find(|&i| user_message.is_char_boundary(i)).unwrap_or(0);
+            let end = (0..=60)
+                .rev()
+                .find(|&i| user_message.is_char_boundary(i))
+                .unwrap_or(0);
             &user_message[..end]
         } else {
             user_message
@@ -855,13 +941,18 @@ impl ConversationWorker {
 
         tracing::info!(
             "[ROUTER] === ENTER === conv={} has_routed={} msg={:?}",
-            self.conversation_id, self.has_routed, msg_preview
+            self.conversation_id,
+            self.has_routed,
+            msg_preview
         );
 
         // --- Primary skip: only route the FIRST message in a conversation ---
         // After the first message, skip entirely — no events emitted, no latency.
         if self.has_routed {
-            tracing::info!("[ROUTER] === SKIP (already routed) === conv={}", self.conversation_id);
+            tracing::info!(
+                "[ROUTER] === SKIP (already routed) === conv={}",
+                self.conversation_id
+            );
             return original;
         }
 
@@ -873,22 +964,39 @@ impl ConversationWorker {
         let is_single_short_word = !trimmed.is_empty()
             && !trimmed.contains(' ')
             && trimmed.len() <= 4
-            && trimmed.chars().all(|c| c.is_alphanumeric() || c.is_ascii_punctuation());
+            && trimmed
+                .chars()
+                .all(|c| c.is_alphanumeric() || c.is_ascii_punctuation());
 
         if is_skip_message || is_single_short_word {
             tracing::info!(
                 "[ROUTER] === SKIP (short/conversational) === conv={} msg={:?}",
-                self.conversation_id, if trimmed.len() > 30 { &trimmed[..(0..=30).rev().find(|&i| trimmed.is_char_boundary(i)).unwrap_or(0)] } else { trimmed }
+                self.conversation_id,
+                if trimmed.len() > 30 {
+                    &trimmed[..(0..=30)
+                        .rev()
+                        .find(|&i| trimmed.is_char_boundary(i))
+                        .unwrap_or(0)]
+                } else {
+                    trimmed
+                }
             );
             self.has_routed = true;
             // Persist so this survives server restarts
             let _ = conversations::set_router_result(
-                &self.db, &self.conversation_id, Some("__skipped__"), None,
-            ).await;
+                &self.db,
+                &self.conversation_id,
+                Some("__skipped__"),
+                None,
+            )
+            .await;
             return original;
         }
 
-        tracing::info!("[ROUTER] === RUNNING FULL ROUTER === conv={}", self.conversation_id);
+        tracing::info!(
+            "[ROUTER] === RUNNING FULL ROUTER === conv={}",
+            self.conversation_id
+        );
 
         // Emit heartbeats on the SSE connection while the router is running.
         // The router can take 10-30+ seconds — without heartbeats the iOS watchdog
@@ -914,7 +1022,8 @@ impl ConversationWorker {
         let result = tokio::time::timeout(
             Duration::from_secs(ROUTER_TIMEOUT_SECS),
             self.run_ticket_router_inner(user_message),
-        ).await;
+        )
+        .await;
         let elapsed = start.elapsed();
 
         // Stop heartbeats now that the router is done
@@ -925,32 +1034,52 @@ impl ConversationWorker {
 
         match result {
             Ok(Ok(ref enriched)) => {
-                let enriched_preview = if enriched.len() > 100 { &enriched[..(0..=100).rev().find(|&i| enriched.is_char_boundary(i)).unwrap_or(0)] } else { enriched };
+                let enriched_preview = if enriched.len() > 100 {
+                    &enriched[..(0..=100)
+                        .rev()
+                        .find(|&i| enriched.is_char_boundary(i))
+                        .unwrap_or(0)]
+                } else {
+                    enriched
+                };
                 tracing::info!(
                     "[ROUTER] === DONE ({:.1}s) === conv={} result={:?}",
-                    elapsed.as_secs_f64(), self.conversation_id, enriched_preview
+                    elapsed.as_secs_f64(),
+                    self.conversation_id,
+                    enriched_preview
                 );
                 enriched.clone()
             }
             Ok(Err(e)) => {
                 tracing::warn!(
                     "[ROUTER] === FAILED ({:.1}s) === conv={} error={}",
-                    elapsed.as_secs_f64(), self.conversation_id, e
+                    elapsed.as_secs_f64(),
+                    self.conversation_id,
+                    e
                 );
                 // Persist so router doesn't retry on next message or after restart
                 let _ = conversations::set_router_result(
-                    &self.db, &self.conversation_id, Some("__failed__"), None,
-                ).await;
+                    &self.db,
+                    &self.conversation_id,
+                    Some("__failed__"),
+                    None,
+                )
+                .await;
                 original
             }
             Err(_) => {
                 tracing::warn!(
                     "[ROUTER] === TIMEOUT ({}s) === conv={}",
-                    ROUTER_TIMEOUT_SECS, self.conversation_id
+                    ROUTER_TIMEOUT_SECS,
+                    self.conversation_id
                 );
                 let _ = conversations::set_router_result(
-                    &self.db, &self.conversation_id, Some("__timeout__"), None,
-                ).await;
+                    &self.db,
+                    &self.conversation_id,
+                    Some("__timeout__"),
+                    None,
+                )
+                .await;
                 original
             }
         }
@@ -1035,7 +1164,10 @@ impl ConversationWorker {
         }
 
         // Send the user's message (the prompt already has it embedded, so send a short trigger)
-        if let Err(e) = sdk_client.send_user_message("Route this message.".to_string()).await {
+        if let Err(e) = sdk_client
+            .send_user_message("Route this message.".to_string())
+            .await
+        {
             return Err(format!("Router send failed: {}", e));
         }
 
@@ -1047,7 +1179,10 @@ impl ConversationWorker {
         loop {
             match response_stream.next().await {
                 Some(Ok(sdk_msg)) => {
-                    if let Message::Assistant { message: assistant_msg } = &sdk_msg {
+                    if let Message::Assistant {
+                        message: assistant_msg,
+                    } = &sdk_msg
+                    {
                         for block in &assistant_msg.content {
                             match block {
                                 ContentBlock::Text(text_content) => {
@@ -1058,7 +1193,12 @@ impl ConversationWorker {
                                 }
                                 ContentBlock::ToolUse(tool_use) => {
                                     tool_call_count += 1;
-                                    tracing::info!("[ROUTER] Tool #{}: {} ({})", tool_call_count, tool_use.name, tool_use.id);
+                                    tracing::info!(
+                                        "[ROUTER] Tool #{}: {} ({})",
+                                        tool_call_count,
+                                        tool_use.name,
+                                        tool_use.id
+                                    );
                                 }
                                 ContentBlock::ToolResult(_tool_result) => {
                                     // Silent — router tool results are not shown to the user.
@@ -1072,7 +1212,11 @@ impl ConversationWorker {
 
                     // Check for result message — router is done
                     if let Message::Result { .. } = &sdk_msg {
-                        tracing::info!("[ROUTER] Completed — {} tool calls, {} text parts", tool_call_count, router_text_parts.len());
+                        tracing::info!(
+                            "[ROUTER] Completed — {} tool calls, {} text parts",
+                            tool_call_count,
+                            router_text_parts.len()
+                        );
                         break;
                     }
                 }
@@ -1088,8 +1232,18 @@ impl ConversationWorker {
 
         // Parse the router output
         let full_output = router_text_parts.join("");
-        tracing::info!("[ROUTER] Full output ({} chars): {}", full_output.len(),
-            if full_output.len() > 200 { &full_output[..(0..=200).rev().find(|&i| full_output.is_char_boundary(i)).unwrap_or(0)] } else { &full_output });
+        tracing::info!(
+            "[ROUTER] Full output ({} chars): {}",
+            full_output.len(),
+            if full_output.len() > 200 {
+                &full_output[..(0..=200)
+                    .rev()
+                    .find(|&i| full_output.is_char_boundary(i))
+                    .unwrap_or(0)]
+            } else {
+                &full_output
+            }
+        );
 
         let parsed = parse_router_result(&full_output);
 
@@ -1098,18 +1252,31 @@ impl ConversationWorker {
                 tracing::info!("[ROUTER] Skipped — no ticket match needed");
                 // Persist sentinel so has_router_run() returns true even for skipped
                 let _ = conversations::set_router_result(
-                    &self.db, &self.conversation_id, Some("__skipped__"), None,
-                ).await;
+                    &self.db,
+                    &self.conversation_id,
+                    Some("__skipped__"),
+                    None,
+                )
+                .await;
                 self.emit_event(&StreamEvent::RouterResult {
                     enriched_message: user_message.to_string(),
                     ticket_id: None,
                     organization: None,
                     skipped: true,
-                }).await;
+                })
+                .await;
                 Ok(user_message.to_string())
             }
-            RouterParsed::Enriched { enriched_message, ticket_id, organization } => {
-                tracing::info!("[ROUTER] Matched ticket={:?}, org={:?}", ticket_id, organization);
+            RouterParsed::Enriched {
+                enriched_message,
+                ticket_id,
+                organization,
+            } => {
+                tracing::info!(
+                    "[ROUTER] Matched ticket={:?}, org={:?}",
+                    ticket_id,
+                    organization
+                );
                 // Persist router result to DB — survives server restarts
                 self.last_router_ticket_id = ticket_id.clone();
                 self.last_router_organization = organization.clone();
@@ -1118,7 +1285,9 @@ impl ConversationWorker {
                     &self.conversation_id,
                     ticket_id.as_deref(),
                     organization.as_deref(),
-                ).await {
+                )
+                .await
+                {
                     tracing::warn!("[ROUTER] Failed to persist router result: {}", e);
                 }
                 self.emit_event(&StreamEvent::RouterResult {
@@ -1126,22 +1295,28 @@ impl ConversationWorker {
                     ticket_id: ticket_id.clone(),
                     organization: organization.clone(),
                     skipped: false,
-                }).await;
+                })
+                .await;
                 Ok(enriched_message)
             }
             RouterParsed::ParseFailed(reason) => {
                 tracing::warn!("[ROUTER] Parse failed: {}", reason);
                 // Persist sentinel so router doesn't re-run on next message
                 let _ = conversations::set_router_result(
-                    &self.db, &self.conversation_id, Some("__failed__"), None,
-                ).await;
+                    &self.db,
+                    &self.conversation_id,
+                    Some("__failed__"),
+                    None,
+                )
+                .await;
                 // Fall back to original message
                 self.emit_event(&StreamEvent::RouterResult {
                     enriched_message: user_message.to_string(),
                     ticket_id: None,
                     organization: None,
                     skipped: true,
-                }).await;
+                })
+                .await;
                 Ok(user_message.to_string())
             }
         }
@@ -1198,9 +1373,17 @@ impl ConversationWorker {
             .await
             {
                 Ok(allocated_index) => {
+                    // Gap detection: the allocator returns the actual
+                    // DB-assigned index. If it skipped ahead of the
+                    // worker's expected next index, another writer or a
+                    // rollback produced a gap. `record_gap_detected` is
+                    // a no-op when the indices match.
+                    record_gap_detected(&self.conversation_id, self.event_index, allocated_index);
+                    let bytes = legacy_json.len();
                     let broadcast_tx = get_broadcast_sender(&self.conversation_id).await;
                     let _ = broadcast_tx.send((allocated_index, legacy_json.clone()));
                     self.event_index = allocated_index + 1;
+                    record_stream_event_emitted(&self.conversation_id, bytes);
                 }
                 Err(e) => {
                     tracing::error!(
@@ -1244,22 +1427,37 @@ impl ConversationWorker {
                     &self.conversation_id,
                     ae_type,
                     ae_json.as_bytes(),
-                    None,         // mime defaults to application/json
-                    2,            // event_schema_version = 2 (Anthropic vocabulary)
+                    None, // mime defaults to application/json
+                    2,    // event_schema_version = 2 (Anthropic vocabulary)
                     Some(ae_type),
                 )
                 .await
                 {
                     Ok(allocated_index) => {
+                        // Gap detection mirrors the v1 path: if the
+                        // allocator jumps past what the worker expected
+                        // next we record the gap_size. In dual-write
+                        // mode the v1 branch already incremented the
+                        // counter for the legacy row at the SAME logical
+                        // emit, so we only record when the modern write
+                        // is the broadcast-visible one.
+                        if self.vocab_mode == EventVocabMode::ModernOnly {
+                            record_gap_detected(
+                                &self.conversation_id,
+                                self.event_index,
+                                allocated_index,
+                            );
+                        }
+                        let bytes = ae_json.len();
                         // In modern_only mode, broadcast v2 rows so SSE
                         // subscribers see the stream. In dual mode the v1
                         // broadcast above already fired, so we skip the
                         // duplicate to avoid double-rendering.
                         if self.vocab_mode == EventVocabMode::ModernOnly {
-                            let broadcast_tx =
-                                get_broadcast_sender(&self.conversation_id).await;
+                            let broadcast_tx = get_broadcast_sender(&self.conversation_id).await;
                             let _ = broadcast_tx.send((allocated_index, ae_json));
                             self.event_index = allocated_index + 1;
+                            record_stream_event_emitted(&self.conversation_id, bytes);
                         } else {
                             self.event_index = allocated_index + 1;
                         }
@@ -1348,7 +1546,10 @@ impl ConversationWorker {
                 return Ok(existing);
             }
             drop(guard);
-            tracing::info!("[WORKER] Client for {} disconnected, will recreate", self.conversation_id);
+            tracing::info!(
+                "[WORKER] Client for {} disconnected, will recreate",
+                self.conversation_id
+            );
             self.manager.remove(&self.conversation_id).await;
         }
 
@@ -1367,7 +1568,8 @@ pub(crate) async fn create_client(
     let system_prompt = load_prompt(config.prompt_name, config.prompt_vars.clone())
         .map_err(|e| format!("Failed to load prompt: {}", e))?;
 
-    let tools_list: Vec<String> = config.agent_type
+    let tools_list: Vec<String> = config
+        .agent_type
         .allowed_tools()
         .iter()
         .map(|s| s.to_string())
@@ -1394,7 +1596,11 @@ pub(crate) async fn create_client(
     // provides the only context the agent will have.
     let system_prompt = match conversations::list_messages(db, conv_id, None, None).await {
         Ok(messages) if !messages.is_empty() => {
-            tracing::info!("[WORKER] Injecting {} messages as resume context for {}", messages.len(), conv_id);
+            tracing::info!(
+                "[WORKER] Injecting {} messages as resume context for {}",
+                messages.len(),
+                conv_id
+            );
             let history = build_conversation_history(&messages);
             format!("{}\n\n{}", system_prompt, history)
         }
@@ -1435,16 +1641,26 @@ pub(crate) async fn create_client(
     builder = builder.add_extra_arg("effort", Some(config.agent_type.effort().to_string()));
 
     if let Some(ref sid) = saved_session_id {
-        tracing::info!("[WORKER] Resuming conversation {} from session {}", conv_id, sid);
+        tracing::info!(
+            "[WORKER] Resuming conversation {} from session {}",
+            conv_id,
+            sid
+        );
         builder = builder.resume(sid.clone());
     } else {
-        tracing::info!("[WORKER] Creating fresh client for conversation {}", conv_id);
+        tracing::info!(
+            "[WORKER] Creating fresh client for conversation {}",
+            conv_id
+        );
     }
 
     let options = builder.build();
     let mut sdk_client = ClaudeSDKClient::new(options);
 
-    tracing::info!("[WORKER] Connecting client for {} (30s timeout)...", conv_id);
+    tracing::info!(
+        "[WORKER] Connecting client for {} (30s timeout)...",
+        conv_id
+    );
     match tokio::time::timeout(Duration::from_secs(30), sdk_client.connect(None)).await {
         Ok(Ok(())) => {
             tracing::info!("[WORKER] Client connected for {}", conv_id);
@@ -1454,7 +1670,10 @@ pub(crate) async fn create_client(
             return Err(format!("Failed to connect: {}", e));
         }
         Err(_) => {
-            tracing::error!("[WORKER] Client connect timed out after 30s for {}", conv_id);
+            tracing::error!(
+                "[WORKER] Client connect timed out after 30s for {}",
+                conv_id
+            );
             drop(sdk_client);
             return Err("Connection timed out — the agent failed to start within 30 seconds. Please try again.".to_string());
         }
@@ -1470,17 +1689,9 @@ pub(crate) async fn create_client(
 }
 
 /// Flush accumulated text content to the database.
-async fn flush_to_db(
-    db: &SqlitePool,
-    assistant_message_id: Option<&str>,
-    accumulated_text: &str,
-) {
+async fn flush_to_db(db: &SqlitePool, assistant_message_id: Option<&str>, accumulated_text: &str) {
     if let Some(msg_id) = assistant_message_id {
-        if let Err(e) = conversations::update_message(
-            db,
-            msg_id,
-            accumulated_text,
-        ).await {
+        if let Err(e) = conversations::update_message(db, msg_id, accumulated_text).await {
             tracing::error!("[WORKER] Failed to flush message to DB: {}", e);
         }
     }
@@ -1539,15 +1750,21 @@ fn parse_router_result(output: &str) -> RouterParsed {
     // Check for enriched result
     let tag_start = match output.find("<router_result>") {
         Some(idx) => idx,
-        None => return RouterParsed::ParseFailed("No <router_result> tag found in output".to_string()),
+        None => {
+            return RouterParsed::ParseFailed("No <router_result> tag found in output".to_string())
+        }
     };
 
     let tag_end = match output.find("</router_result>") {
         Some(idx) => idx,
-        None => return RouterParsed::ParseFailed("No </router_result> closing tag found".to_string()),
+        None => {
+            return RouterParsed::ParseFailed("No </router_result> closing tag found".to_string())
+        }
     };
 
-    let inner = output[tag_start + "<router_result>".len()..tag_end].trim().to_string();
+    let inner = output[tag_start + "<router_result>".len()..tag_end]
+        .trim()
+        .to_string();
     if inner.is_empty() {
         return RouterParsed::ParseFailed("Empty <router_result> block".to_string());
     }
@@ -1603,7 +1820,7 @@ fn build_conversation_history(messages: &[ConversationMessage]) -> String {
          IMPORTANT: This conversation was resumed but the previous session could not be fully \
          restored. You MUST use the context below to continue the conversation seamlessly. \
          Do NOT ask the user to repeat themselves or clarify what they were asking about — \
-         the full conversation history is provided here. Pick up exactly where you left off.\n\n"
+         the full conversation history is provided here. Pick up exactly where you left off.\n\n",
     );
 
     // Take last 30 messages to keep prompt size reasonable
@@ -1615,12 +1832,19 @@ fn build_conversation_history(messages: &[ConversationMessage]) -> String {
 
     for msg in recent {
         let has_content = !msg.content.is_empty();
-        let has_tools = msg.tool_call_summaries.as_ref().map_or(false, |t| !t.is_empty());
+        let has_tools = msg
+            .tool_call_summaries
+            .as_ref()
+            .map_or(false, |t| !t.is_empty());
         if !has_content && !has_tools {
             continue;
         }
 
-        let role = if msg.role == "user" { "User" } else { "Assistant" };
+        let role = if msg.role == "user" {
+            "User"
+        } else {
+            "Assistant"
+        };
 
         // User messages: include in full (they're typically short)
         // Assistant messages: allow up to 2000 chars (was 300 — way too aggressive)
@@ -1650,7 +1874,10 @@ fn build_conversation_history(messages: &[ConversationMessage]) -> String {
                     } else {
                         preview.to_string()
                     };
-                    history.push_str(&format!("- `{}`{}: {}\n", tc.tool_name, status, preview_truncated));
+                    history.push_str(&format!(
+                        "- `{}`{}: {}\n",
+                        tc.tool_name, status, preview_truncated
+                    ));
                 }
                 history.push('\n');
             }
