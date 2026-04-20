@@ -14,6 +14,8 @@ use crate::agents::prompts::load_prompt;
 use ticketing_system::{conversations, checkpoints, token_usage, AddMessageRequest, ContentBlockDesc, ConversationMessage, UpdateConversationRequest};
 use super::chat_stream::{get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData};
 use super::chat_client_manager::{ChatClientManager, ChatClient};
+use super::anthropic_translator::AnthropicTranslator;
+use super::event_vocab::{self, EventVocabMode};
 
 /// Timeout for the ticket-router pre-processing phase.
 const ROUTER_TIMEOUT_SECS: u64 = 60;
@@ -80,6 +82,15 @@ pub struct ConversationWorker {
     last_router_ticket_id: Option<String>,
     /// Cached organization from the last successful router match (from DB).
     last_router_organization: Option<String>,
+    /// Dual-write toggle for the Anthropic 8-event vocabulary — captured at
+    /// worker construction time from the process-wide setting so that
+    /// live reloads of the env var don't change behavior mid-turn.
+    vocab_mode: EventVocabMode,
+    /// Stateful translator from internal `StreamEvent` → Anthropic events.
+    /// Maintains message / content-block lifecycle across emit_event calls.
+    /// One translator instance per worker — it survives the entire
+    /// conversation and is reset between turns by cc-sdk's `Result` event.
+    translator: AnthropicTranslator,
 }
 
 impl ConversationWorker {
@@ -89,6 +100,8 @@ impl ConversationWorker {
         manager: Arc<ChatClientManager>,
         message_rx: mpsc::Receiver<WorkerMessage>,
     ) -> Self {
+        let vocab_mode = event_vocab::global();
+        let translator = AnthropicTranslator::new(&conversation_id);
         Self {
             db,
             conversation_id,
@@ -98,6 +111,33 @@ impl ConversationWorker {
             has_routed: false,
             last_router_ticket_id: None,
             last_router_organization: None,
+            vocab_mode,
+            translator,
+        }
+    }
+
+    /// Test-only constructor that lets the caller pin the vocab mode
+    /// directly, bypassing the process-wide global.
+    #[cfg(test)]
+    pub fn new_with_vocab_mode(
+        db: Arc<SqlitePool>,
+        conversation_id: String,
+        manager: Arc<ChatClientManager>,
+        message_rx: mpsc::Receiver<WorkerMessage>,
+        vocab_mode: EventVocabMode,
+    ) -> Self {
+        let translator = AnthropicTranslator::new(&conversation_id);
+        Self {
+            db,
+            conversation_id,
+            manager,
+            message_rx,
+            event_index: 0,
+            has_routed: false,
+            last_router_ticket_id: None,
+            last_router_organization: None,
+            vocab_mode,
+            translator,
         }
     }
 
@@ -1083,31 +1123,108 @@ impl ConversationWorker {
     /// safe under concurrent writers for the same conversation_id. The
     /// worker no longer maintains a Rust-side counter; the index in the
     /// broadcast tuple is whatever the allocator returned.
+    ///
+    /// Dual-write behavior (T-49352BF5): depending on `self.vocab_mode`
+    /// this may write a v1 legacy row, a sequence of v2 Anthropic rows,
+    /// or both. The broadcast to SSE subscribers always reflects the v1
+    /// row's JSON — iOS currently consumes the legacy vocabulary. v2
+    /// rows are written to the DB for replay / backfill purposes but do
+    /// not replace the live broadcast until a future ticket flips the
+    /// broadcast wire format.
     async fn emit_event(&mut self, event: &StreamEvent) {
-        let event_type = get_stream_event_type(event);
+        let legacy_event_type = get_stream_event_type(event);
 
-        if let Ok(json) = serde_json::to_string(event) {
+        // ---- Legacy (v1) write ----
+        // Broadcast a single v1 row so SSE subscribers see one logical
+        // event per `StreamEvent`, matching today's behavior.
+        let legacy_json = match serde_json::to_string(event) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!(
+                    "[WORKER] Failed to serialize StreamEvent for {}: {}",
+                    self.conversation_id,
+                    e
+                );
+                return;
+            }
+        };
+
+        if self.vocab_mode.writes_legacy() {
             match conversations::insert_conversation_event(
                 &self.db,
                 &self.conversation_id,
-                event_type,
-                &json,
+                legacy_event_type,
+                &legacy_json,
                 1,    // event_schema_version = 1 (legacy vocabulary)
-                None, // anthropic_event_type — set when dual-write lands (T-49352BF5)
+                None, // anthropic_event_type unset for v1 rows
             )
             .await
             {
                 Ok(allocated_index) => {
                     let broadcast_tx = get_broadcast_sender(&self.conversation_id).await;
-                    let _ = broadcast_tx.send((allocated_index, json));
+                    let _ = broadcast_tx.send((allocated_index, legacy_json.clone()));
                     self.event_index = allocated_index + 1;
                 }
                 Err(e) => {
                     tracing::error!(
-                        "[WORKER] Failed to persist event for {}: {}",
+                        "[WORKER] Failed to persist v1 event for {}: {}",
                         self.conversation_id,
                         e
                     );
+                }
+            }
+        }
+
+        // ---- Modern (v2) write ----
+        // Translate the StreamEvent into a sequence of Anthropic events.
+        // An event may produce zero frames (router/metadata events), one
+        // frame (a text_delta), or many (tool_use: start + delta + stop).
+        if self.vocab_mode.writes_modern() {
+            let anthropic_events = self.translator.translate(event);
+            for ae in anthropic_events {
+                let ae_type = ae.event_type();
+                let ae_json = match serde_json::to_string(&ae) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        tracing::error!(
+                            "[WORKER] Failed to serialize AnthropicEvent for {}: {}",
+                            self.conversation_id,
+                            e
+                        );
+                        continue;
+                    }
+                };
+                match conversations::insert_conversation_event(
+                    &self.db,
+                    &self.conversation_id,
+                    ae_type,
+                    &ae_json,
+                    2,            // event_schema_version = 2 (Anthropic vocabulary)
+                    Some(ae_type),
+                )
+                .await
+                {
+                    Ok(allocated_index) => {
+                        // In modern_only mode, broadcast v2 rows so SSE
+                        // subscribers see the stream. In dual mode the v1
+                        // broadcast above already fired, so we skip the
+                        // duplicate to avoid double-rendering.
+                        if self.vocab_mode == EventVocabMode::ModernOnly {
+                            let broadcast_tx =
+                                get_broadcast_sender(&self.conversation_id).await;
+                            let _ = broadcast_tx.send((allocated_index, ae_json));
+                            self.event_index = allocated_index + 1;
+                        } else {
+                            self.event_index = allocated_index + 1;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "[WORKER] Failed to persist v2 event for {}: {}",
+                            self.conversation_id,
+                            e
+                        );
+                    }
                 }
             }
         }

@@ -12,6 +12,8 @@ pub mod ticket_history;
 pub mod chat_stream;
 pub mod chat_client_manager;
 pub mod conversation_worker;
+pub mod event_vocab;
+pub mod anthropic_translator;
 pub mod conversation_worker_manager;
 pub mod workspace_manager;
 pub mod conversations;

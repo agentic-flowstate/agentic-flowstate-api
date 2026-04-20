@@ -130,6 +130,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Load event-vocabulary mode (dual-write toggle) from EVENT_VOCAB_MODE.
+    // Missing / empty → default (dual). Any other invalid value fails startup
+    // loudly — there is no silent fallback. See handlers::event_vocab.
+    let vocab_mode = handlers::event_vocab::EventVocabMode::from_env().map_err(|e| {
+        tracing::error!("[EVENT_VOCAB] invalid EVENT_VOCAB_MODE: {}", e);
+        anyhow::anyhow!(e)
+    })?;
+    handlers::event_vocab::init_global(vocab_mode);
+    tracing::info!("[EVENT_VOCAB] mode = {}", vocab_mode);
+
     // Create shutdown token for coordinated cancellation of all background tasks.
     // When cancelled, all tasks using a child token will break out of their loops.
     let shutdown_token = CancellationToken::new();

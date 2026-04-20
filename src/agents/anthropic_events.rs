@@ -1,0 +1,556 @@
+//! Anthropic Messages API 8-event streaming vocabulary.
+//!
+//! This module defines the typed enum that represents the events emitted by
+//! Anthropic's streaming Messages API, along with the four `content_block_delta`
+//! sub-variants. Serde serialization is configured to produce byte-exact
+//! wire-format frames: flat objects with a `type` field as the discriminator,
+//! nested `delta` object for block deltas, snake_case field names throughout.
+//!
+//! The event names come from Anthropic's public docs:
+//! <https://docs.anthropic.com/en/api/messages-streaming>
+//!
+//! - `message_start` — first frame: carries the skeleton `Message` (id, role,
+//!   model, empty `content`).
+//! - `content_block_start` — a new content block opens at `index`. Body is a
+//!   `ContentBlock` stub (type=text/tool_use/thinking, empty fields).
+//! - `content_block_delta` — partial update to the block at `index`. Body is
+//!   a `delta` object, one of:
+//!   - `text_delta` — `{ type:"text_delta", text:"..." }`
+//!   - `input_json_delta` — `{ type:"input_json_delta", partial_json:"..." }`
+//!     (streamed JSON for tool_use `input`; concatenate across deltas).
+//!   - `thinking_delta` — `{ type:"thinking_delta", thinking:"..." }`
+//!   - `signature_delta` — `{ type:"signature_delta", signature:"..." }`
+//!     (thinking block integrity signature).
+//! - `content_block_stop` — block at `index` is finalized.
+//! - `message_delta` — top-level message fields changed (stop_reason,
+//!   stop_sequence, usage updates).
+//! - `message_stop` — message complete.
+//! - `ping` — keepalive, no semantic payload.
+//! - `error` — terminal error frame with an `error` object.
+//!
+//! The shape is deliberately identical to what the Anthropic SDK emits so any
+//! consumer that already parses Anthropic streams can read our persisted
+//! frames directly.
+
+use serde::{Deserialize, Serialize};
+
+/// The 8-event top-level streaming vocabulary.
+///
+/// Serialized as a flat object with `type` tag — e.g.
+/// `{"type":"message_start","message":{...}}` — matching Anthropic's
+/// wire format exactly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AnthropicEvent {
+    /// First frame of a message. Payload is a skeleton `Message` with empty
+    /// `content` array.
+    MessageStart {
+        message: MessageStub,
+    },
+    /// A new content block has opened at `index`.
+    ContentBlockStart {
+        index: u32,
+        content_block: ContentBlockStub,
+    },
+    /// Incremental update to the block at `index`.
+    ContentBlockDelta {
+        index: u32,
+        delta: ContentBlockDelta,
+    },
+    /// The block at `index` is finalized.
+    ContentBlockStop {
+        index: u32,
+    },
+    /// Top-level message fields changed (stop_reason, usage, ...).
+    MessageDelta {
+        delta: MessageDeltaBody,
+        /// Optional usage snapshot. Anthropic emits this on the terminal
+        /// `message_delta` right before `message_stop`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+    },
+    /// Message is complete.
+    MessageStop,
+    /// Transport keepalive.
+    Ping,
+    /// Terminal error. Body is the Anthropic `{type, message}` error shape.
+    Error {
+        error: ApiError,
+    },
+}
+
+impl AnthropicEvent {
+    /// The Anthropic event-type string used for the
+    /// `anthropic_event_type` column in `conversation_events`.
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            AnthropicEvent::MessageStart { .. } => "message_start",
+            AnthropicEvent::ContentBlockStart { .. } => "content_block_start",
+            AnthropicEvent::ContentBlockDelta { .. } => "content_block_delta",
+            AnthropicEvent::ContentBlockStop { .. } => "content_block_stop",
+            AnthropicEvent::MessageDelta { .. } => "message_delta",
+            AnthropicEvent::MessageStop => "message_stop",
+            AnthropicEvent::Ping => "ping",
+            AnthropicEvent::Error { .. } => "error",
+        }
+    }
+}
+
+/// Skeleton `Message` emitted inside `message_start`.
+///
+/// Anthropic sends the full Message header with an empty `content` array;
+/// the content is streamed via `content_block_*` frames. Fields that aren't
+/// known yet (`stop_reason`, `stop_sequence`) are null.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageStub {
+    pub id: String,
+    /// Always `"message"` for this frame.
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// Always `"assistant"` — server-to-client stream only carries assistant
+    /// messages.
+    pub role: String,
+    /// Model identifier (e.g., `"claude-opus-4-7"`). Optional because cc-sdk
+    /// doesn't always surface it; we pass `None` when unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Empty at message_start; populated via content_block_* frames.
+    pub content: Vec<ContentBlockStub>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+impl MessageStub {
+    /// Build a fresh `message_start` stub for an assistant message.
+    /// `model` can be `None` when cc-sdk doesn't surface the model id.
+    pub fn new_assistant(id: impl Into<String>, model: Option<String>) -> Self {
+        Self {
+            id: id.into(),
+            message_type: "message".to_string(),
+            role: "assistant".to_string(),
+            model,
+            content: Vec::new(),
+            stop_reason: None,
+            stop_sequence: None,
+            usage: None,
+        }
+    }
+}
+
+/// `content_block_start` body. Each variant is serialized with a flat
+/// `type` tag — e.g. `{"type":"text","text":""}`,
+/// `{"type":"tool_use","id":"...","name":"...","input":{}}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlockStub {
+    /// Text block — starts empty, filled by `text_delta` updates.
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    /// Tool-use block — `input` starts as empty object, filled by
+    /// `input_json_delta` updates (concatenate partial_json, then parse).
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
+    /// Thinking (extended-reasoning) block — starts empty, filled by
+    /// `thinking_delta` + `signature_delta` updates.
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        signature: String,
+    },
+    /// Tool-result block. In Anthropic's REST API this appears on USER
+    /// messages (the reply sent after a tool_use). cc-sdk surfaces the
+    /// result inline on the assistant stream as a separate Message with
+    /// `role: "user"` content. We emit it as a `content_block_start`
+    /// with the full result as initial content — no delta follow-ups.
+    ToolResult {
+        tool_use_id: String,
+        /// Inline text form of the result — cc-sdk flattens structured
+        /// results into a JSON string before we see them.
+        #[serde(default)]
+        content: String,
+        /// Mirrors Anthropic's `is_error` flag on tool_result blocks.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_error: bool,
+    },
+}
+
+/// The four `content_block_delta` sub-variants. Serialized as a flat object
+/// with `type` — e.g. `{"type":"text_delta","text":"..."}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlockDelta {
+    /// Incremental text content for a `text` block.
+    TextDelta { text: String },
+    /// Incremental JSON string for a `tool_use` block's `input`. Multiple
+    /// deltas concatenate into a single JSON string that the client parses
+    /// after the matching `content_block_stop`.
+    InputJsonDelta { partial_json: String },
+    /// Incremental thinking text for a `thinking` block.
+    ThinkingDelta { thinking: String },
+    /// Integrity signature for a `thinking` block — carries an opaque token
+    /// that the server can use to verify the block wasn't tampered with.
+    SignatureDelta { signature: String },
+}
+
+/// Body of the top-level `message_delta` frame. Fields match Anthropic's
+/// docs — any combination can be present. Only fields the server has
+/// learned about are serialized (others are skipped).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MessageDeltaBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<String>,
+}
+
+/// Token-usage snapshot. Anthropic surfaces this on `message_start` (initial
+/// rate-limit bookkeeping) and on the terminal `message_delta` (final counts).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+/// Body of an `error` frame. Anthropic uses
+/// `{"error":{"type":"overloaded_error","message":"..."}}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiError {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
+}
+
+/// The valid Anthropic event-type strings, exposed as an array for tests
+/// that want to enumerate the vocabulary.
+pub const ALL_EVENT_TYPES: &[&str] = &[
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+    "ping",
+    "error",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Byte-exact serialization: every variant round-trips through JSON and
+    /// the wire shape matches Anthropic's public Messages API documentation.
+    #[test]
+    fn message_start_wire_shape() {
+        let ev = AnthropicEvent::MessageStart {
+            message: MessageStub::new_assistant("msg_abc123", Some("claude-opus-4-7".to_string())),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_abc123",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-opus-4-7",
+                    "content": []
+                }
+            })
+        );
+        let round: AnthropicEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(round, ev);
+    }
+
+    #[test]
+    fn content_block_start_text_wire_shape() {
+        let ev = AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStub::Text {
+                text: String::new(),
+            },
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "text", "text": "" }
+            })
+        );
+    }
+
+    #[test]
+    fn content_block_start_tool_use_wire_shape() {
+        let ev = AnthropicEvent::ContentBlockStart {
+            index: 1,
+            content_block: ContentBlockStub::ToolUse {
+                id: "toolu_01".to_string(),
+                name: "get_weather".to_string(),
+                input: json!({}),
+            },
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "get_weather",
+                    "input": {}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn content_block_start_thinking_wire_shape() {
+        let ev = AnthropicEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStub::Thinking {
+                thinking: String::new(),
+                signature: String::new(),
+            },
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "thinking", "thinking": "" }
+            })
+        );
+    }
+
+    #[test]
+    fn content_block_delta_text_wire_shape() {
+        let ev = AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentBlockDelta::TextDelta {
+                text: "Hello".to_string(),
+            },
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "Hello" }
+            })
+        );
+        let round: AnthropicEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(round, ev);
+    }
+
+    #[test]
+    fn content_block_delta_input_json_wire_shape() {
+        let ev = AnthropicEvent::ContentBlockDelta {
+            index: 1,
+            delta: ContentBlockDelta::InputJsonDelta {
+                partial_json: "{\"location\":\"SF\"}".to_string(),
+            },
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{\"location\":\"SF\"}"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn content_block_delta_thinking_wire_shape() {
+        let ev = AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentBlockDelta::ThinkingDelta {
+                thinking: "Let me consider...".to_string(),
+            },
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "thinking_delta",
+                    "thinking": "Let me consider..."
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn content_block_delta_signature_wire_shape() {
+        let ev = AnthropicEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentBlockDelta::SignatureDelta {
+                signature: "sig_abc".to_string(),
+            },
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": "sig_abc"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn content_block_stop_wire_shape() {
+        let ev = AnthropicEvent::ContentBlockStop { index: 2 };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v, json!({ "type": "content_block_stop", "index": 2 }));
+    }
+
+    #[test]
+    fn message_delta_wire_shape() {
+        let ev = AnthropicEvent::MessageDelta {
+            delta: MessageDeltaBody {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+            },
+            usage: Some(Usage {
+                input_tokens: Some(10),
+                output_tokens: Some(42),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            }),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "input_tokens": 10, "output_tokens": 42 }
+            })
+        );
+    }
+
+    #[test]
+    fn message_stop_wire_shape() {
+        let ev = AnthropicEvent::MessageStop;
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v, json!({ "type": "message_stop" }));
+    }
+
+    #[test]
+    fn ping_wire_shape() {
+        let ev = AnthropicEvent::Ping;
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v, json!({ "type": "ping" }));
+    }
+
+    #[test]
+    fn error_wire_shape() {
+        let ev = AnthropicEvent::Error {
+            error: ApiError {
+                error_type: "overloaded_error".to_string(),
+                message: "Overloaded".to_string(),
+            },
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "error",
+                "error": { "type": "overloaded_error", "message": "Overloaded" }
+            })
+        );
+    }
+
+    #[test]
+    fn event_type_string_matches_tag() {
+        let cases: &[(AnthropicEvent, &str)] = &[
+            (
+                AnthropicEvent::MessageStart {
+                    message: MessageStub::new_assistant("x", None),
+                },
+                "message_start",
+            ),
+            (
+                AnthropicEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: ContentBlockStub::Text {
+                        text: String::new(),
+                    },
+                },
+                "content_block_start",
+            ),
+            (
+                AnthropicEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: ContentBlockDelta::TextDelta {
+                        text: String::new(),
+                    },
+                },
+                "content_block_delta",
+            ),
+            (
+                AnthropicEvent::ContentBlockStop { index: 0 },
+                "content_block_stop",
+            ),
+            (
+                AnthropicEvent::MessageDelta {
+                    delta: MessageDeltaBody::default(),
+                    usage: None,
+                },
+                "message_delta",
+            ),
+            (AnthropicEvent::MessageStop, "message_stop"),
+            (AnthropicEvent::Ping, "ping"),
+            (
+                AnthropicEvent::Error {
+                    error: ApiError {
+                        error_type: "x".into(),
+                        message: "y".into(),
+                    },
+                },
+                "error",
+            ),
+        ];
+
+        let all: std::collections::HashSet<&str> = ALL_EVENT_TYPES.iter().copied().collect();
+        for (ev, expected) in cases {
+            assert_eq!(ev.event_type(), *expected);
+            assert!(all.contains(expected), "{} not in ALL_EVENT_TYPES", expected);
+        }
+    }
+}

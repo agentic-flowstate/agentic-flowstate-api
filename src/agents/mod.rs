@@ -3,6 +3,7 @@ pub mod prompts;
 pub mod executor;
 pub mod oneshot;
 pub mod working_dir;
+pub mod anthropic_events;
 
 pub use types::*;
 pub use executor::*;
