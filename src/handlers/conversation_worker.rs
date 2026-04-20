@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use super::anthropic_translator::AnthropicTranslator;
+use super::anthropic_event_encoder::AnthropicEventEncoder;
 use super::chat_client_manager::{ChatClient, ChatClientManager};
 use super::chat_stream::{
     get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData,
@@ -46,7 +46,7 @@ pub struct WorkerMessage {
     pub completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Optional `Idempotency-Key` the client supplied on the HTTP POST
     /// that triggered this turn (T-A819D36B). Threaded from the handler
-    /// → [`WorkerMessage`] → [`AnthropicTranslator::set_pending_client_id`]
+    /// → [`WorkerMessage`] → [`AnthropicEventEncoder::set_pending_client_id`]
     /// so the `message_start` SSE frame echoes it back as
     /// `message.client_id`. iOS's `MessageEchoService.reconcileServerMessageStart`
     /// matches on this value to lock its optimistic-echo row.
@@ -119,11 +119,11 @@ pub struct ConversationWorker {
     last_router_ticket_id: Option<String>,
     /// Cached organization from the last successful router match (from DB).
     last_router_organization: Option<String>,
-    /// Stateful translator from internal `StreamEvent` → Anthropic events.
+    /// Stateful encoder from internal `StreamEvent` → Anthropic events.
     /// Maintains message / content-block lifecycle across emit_event calls.
-    /// One translator instance per worker — it survives the entire
+    /// One encoder instance per worker — it survives the entire
     /// conversation and is reset between turns by cc-sdk's `Result` event.
-    translator: AnthropicTranslator,
+    encoder: AnthropicEventEncoder,
     /// User id for the turn currently being processed. Populated at the
     /// top of `process_message` from the inbound `WorkerMessage.user_id`
     /// and consumed by `emit_event` to fan out silent pushes on
@@ -138,7 +138,7 @@ impl ConversationWorker {
         manager: Arc<ChatClientManager>,
         message_rx: mpsc::Receiver<WorkerMessage>,
     ) -> Self {
-        let translator = AnthropicTranslator::new(&conversation_id);
+        let encoder = AnthropicEventEncoder::new(&conversation_id);
         Self {
             db,
             conversation_id,
@@ -148,7 +148,7 @@ impl ConversationWorker {
             has_routed: false,
             last_router_ticket_id: None,
             last_router_organization: None,
-            translator,
+            encoder,
             current_user_id: None,
         }
     }
@@ -266,11 +266,11 @@ impl ConversationWorker {
         // every call site (T-90C7FAC4).
         self.current_user_id = Some(msg.user_id.clone());
         // Stage the inbound Idempotency-Key (T-A819D36B) onto the
-        // translator BEFORE any StreamEvent is translated. The translator
+        // encoder BEFORE any StreamEvent is encoded. The encoder
         // consumes it on the first `open_message_if_needed` call (i.e.,
         // the next `message_start` frame). When `None`, it stays `None`
         // end-to-end — no synthetic fallbacks.
-        self.translator
+        self.encoder
             .set_pending_client_id(msg.client_id.clone());
         // Clear stale events from previous message but keep event_index monotonically
         // increasing. Resetting to 0 here was causing the "one turn late" bug: the app's
@@ -1284,22 +1284,21 @@ impl ConversationWorker {
         }
     }
 
-    /// Emit a StreamEvent: translate to Anthropic events, persist, and broadcast.
+    /// Emit a StreamEvent: encode to Anthropic events, persist, and broadcast.
     ///
     /// Uses the server-side allocator (`insert_conversation_event`) so the
     /// event_index comes from the DB under a BEGIN IMMEDIATE transaction —
     /// safe under concurrent writers for the same conversation_id.
     ///
-    /// Single-path emission (T-49352BF5): the translator maps each internal
-    /// `StreamEvent` to zero or more Anthropic frames from the 8-event
-    /// vocabulary (`message_start` / `content_block_start` / `content_block_delta`
-    /// / `content_block_stop` / `message_delta` / `message_stop` / `ping` /
-    /// `error`). Router/metadata events produce zero frames; a text chunk
-    /// produces one; a tool_use turn produces several. Every produced frame
-    /// is persisted AND broadcast to live SSE subscribers — there is no
-    /// legacy vocabulary, no dual-write, no feature flag.
+    /// The encoder maps each internal `StreamEvent` to zero or more
+    /// Anthropic frames from the 8-event vocabulary (`message_start` /
+    /// `content_block_start` / `content_block_delta` / `content_block_stop`
+    /// / `message_delta` / `message_stop` / `ping` / `error`).
+    /// Router/metadata events produce zero frames; a text chunk produces
+    /// one; a tool_use turn produces several. Every produced frame is
+    /// persisted AND broadcast to live SSE subscribers.
     async fn emit_event(&mut self, event: &StreamEvent) {
-        // Translate the StreamEvent into a sequence of Anthropic events.
+        // Encode the StreamEvent into a sequence of Anthropic events.
         // An event may produce zero frames (router/metadata events), one
         // frame (a text_delta), or many (tool_use: start + delta + stop).
         //
@@ -1310,7 +1309,7 @@ impl ConversationWorker {
         // — spawned onto its own tokio task so it never blocks the SSE
         // stream or holds the worker's state.
         let mut message_stop_persisted = false;
-        let anthropic_events = self.translator.translate(event);
+        let anthropic_events = self.encoder.encode(event);
         for ae in anthropic_events {
             let ae_type = ae.event_type();
             let ae_json = match serde_json::to_string(&ae) {
@@ -1388,13 +1387,13 @@ impl ConversationWorker {
             if let Some(user_id) = self.current_user_id.clone() {
                 if let Some(config) = crate::apns::silent_fanout::global_config() {
                     let last_message_id = self
-                        .translator
+                        .encoder
                         .current_message_id()
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| {
-                            // Translator should always have a message_id
+                            // Encoder should always have a message_id
                             // cached by the time message_stop ships, but
-                            // if translator state was reset mid-turn we
+                            // if encoder state was reset mid-turn we
                             // fall back to the conversation id so the
                             // payload still parses on the client.
                             self.conversation_id.clone()
@@ -1761,25 +1760,26 @@ fn build_conversation_history(messages: &[ConversationMessage]) -> String {
 }
 
 // =============================================================================
-// T-49352BF5 — scope-cut acceptance tests
+// Streaming persistence invariants
 // =============================================================================
 //
-// These tests exercise the single-path Anthropic 8-event persistence pipeline
-// after the dual-write scaffold was removed. They confirm:
+// These tests exercise the Anthropic 8-event persistence pipeline. They
+// confirm:
 //
-//   1. Translator → `insert_conversation_event` → `get_events` round-trips
-//      produce ONLY Anthropic vocabulary event_types (no legacy `text`,
-//      `tool_use`, `thinking` strings ever land in the row).
+//   1. Encoder → `insert_conversation_event` → `get_events` round-trips
+//      produce ONLY Anthropic vocabulary event_types — no cc-sdk
+//      discriminants (`text`, `tool_use`, `thinking`) ever land in the row.
 //   2. A text-only turn, a tool-use turn, and a thinking turn each produce
 //      the canonical Anthropic frame ordering when replayed off the DB.
 //   3. Every persisted `event_data` payload parses as valid Anthropic JSON
 //      whose `type` field matches the row's `event_type`.
 //
-// If any dual-write code path regressed back into the emit pipeline these
-// assertions would detect it — the replayed event_types would include a
-// non-Anthropic tag, or the row counts would diverge from translator output.
+// If a non-Anthropic discriminant ever regressed back into the emit
+// pipeline these assertions would detect it — the replayed event_types
+// would include a non-Anthropic tag, or the row counts would diverge
+// from encoder output.
 #[cfg(test)]
-mod t_49352bf5_streaming_persistence_tests {
+mod streaming_persistence_tests {
     use super::*;
     use crate::agents::anthropic_events::ALL_EVENT_TYPES;
     use serde_json::json;
@@ -1787,11 +1787,11 @@ mod t_49352bf5_streaming_persistence_tests {
     use sqlx::ConnectOptions;
     use std::str::FromStr;
 
-    /// Allow-list of event_type strings any post-scope-cut row may carry.
+    /// Allow-list of event_type strings any persisted row may carry.
     /// These are the canonical 8 Anthropic streaming event type tags, as
-    /// exported by [`ALL_EVENT_TYPES`]. If a dual-write regression ever
-    /// sneaks a legacy `text`/`tool_use`/`thinking` row back into the
-    /// persistence path, this allow-list is what trips first.
+    /// exported by [`ALL_EVENT_TYPES`]. If a cc-sdk discriminant ever
+    /// sneaks through the persistence path, this allow-list is what
+    /// trips first.
     const ALLOWED_EVENT_TYPES: &[&str] = ALL_EVENT_TYPES;
 
     async fn fresh_test_pool() -> SqlitePool {
@@ -1868,7 +1868,7 @@ mod t_49352bf5_streaming_persistence_tests {
         pool
     }
 
-    /// Drive a sequence of cc-sdk StreamEvents through the translator, persist
+    /// Drive a sequence of cc-sdk StreamEvents through the encoder, persist
     /// every emitted Anthropic event via `insert_conversation_event`, then
     /// replay from the DB and return (event_types, parsed_json_values).
     async fn run_turn_and_replay(
@@ -1876,9 +1876,9 @@ mod t_49352bf5_streaming_persistence_tests {
         conversation_id: &str,
         events: &[StreamEvent],
     ) -> (Vec<String>, Vec<serde_json::Value>) {
-        let mut translator = AnthropicTranslator::new(conversation_id);
+        let mut encoder = AnthropicEventEncoder::new(conversation_id);
         for ev in events {
-            for ae in translator.translate(ev) {
+            for ae in encoder.encode(ev) {
                 let ae_type = ae.event_type();
                 let ae_json = serde_json::to_string(&ae).expect("serialize anthropic event");
                 conversations::insert_conversation_event(
@@ -2083,9 +2083,9 @@ mod t_49352bf5_streaming_persistence_tests {
         assert_eq!(thinking_delta["delta"]["thinking"], "Reasoning step...");
     }
 
-    /// Silencer: confirm that legacy cc-sdk router/replay tags are NOT
-    /// emitted onto the wire. If a dual-write regression snuck them in, this
-    /// test would see extra rows with event_type outside the allow-list.
+    /// Silencer: confirm that cc-sdk router/replay tags are NOT
+    /// emitted onto the wire. If they ever regressed into the pipeline,
+    /// this test would see extra rows with event_type outside the allow-list.
     #[tokio::test]
     async fn router_and_replay_tags_are_never_persisted() {
         let pool = fresh_test_pool().await;

@@ -1,21 +1,33 @@
-//! Translate internal [`StreamEvent`]s into the Anthropic Messages API
+//! Encode internal [`StreamEvent`]s into the Anthropic Messages API
 //! streaming vocabulary.
 //!
-//! The `ConversationWorker` emits a custom `StreamEvent` enum (`Text`,
-//! `ToolUse`, `Status`, ...) that the iOS app has consumed for months.
-//! T-49352BF5 layers the Anthropic 8-event vocabulary on top without
-//! breaking that path — every internal event is re-expressed as the
-//! equivalent sequence of Anthropic events, and `ConversationWorker` can
-//! then write either vocabulary (or both, dual-write).
+//! ## Why this module exists
+//!
+//! cc-sdk (the Claude Agent SDK we consume) does NOT expose the raw
+//! Anthropic SSE wire — it hands the application a `Message` enum
+//! (`User` / `Assistant` / `System` / `Result`) whose `Assistant` variant
+//! carries already-materialized `ContentBlock`s. Our `AgentExecutor`
+//! flattens that further into `StreamEvent` (`Text`, `ToolUse`,
+//! `Thinking`, `Result`, ...) so the rest of the worker can operate on a
+//! simple enum.
+//!
+//! Persistence and the live SSE wire, however, speak the Anthropic 8-event
+//! vocabulary (`message_start` / `content_block_start` /
+//! `content_block_delta` / `content_block_stop` / `message_delta` /
+//! `message_stop` / `ping` / `error`). This module is the single bridge
+//! that reconstructs that vocabulary from cc-sdk's shape. It is NOT a
+//! legacy compatibility layer — there is no other vocabulary on the wire,
+//! no feature flag, no alternate writer. The encoder is a structural
+//! consequence of cc-sdk's API shape.
 //!
 //! ## Mapping rules
 //!
-//! cc-sdk streams text/thinking/tool_use/tool_result content blocks on an
+//! cc-sdk reports text/thinking/tool_use/tool_result content blocks on an
 //! assistant turn, terminated by a `Result`. We model the turn as a single
 //! Anthropic message:
 //!
 //! ```text
-//! Status("running")              → (no v2 event — worker-internal lifecycle)
+//! Status("running")              → (no wire event — worker-internal lifecycle)
 //! first content block arrives    → message_start
 //! Text { content }               → content_block_start(text) (if no block open)
 //!                                  content_block_delta(text_delta)
@@ -38,10 +50,9 @@
 //!
 //! Router events (`RouterText`, `RouterToolUse`, `RouterToolResult`,
 //! `RouterResult`), title/org updates, user messages, and
-//! `ReplayComplete` aren't part of the Anthropic vocabulary — the
-//! translator keeps them OFF the v2 wire entirely. They still ride the
-//! v1 stream because `EVENT_VOCAB_MODE != modern_only` keeps the legacy
-//! writer active.
+//! `ReplayComplete` have no Anthropic equivalent. The encoder returns an
+//! empty frame list for them — they are simply not persisted and not
+//! broadcast on the wire.
 
 use crate::agents::anthropic_events::{
     AnthropicEvent, ApiError, ContentBlockDelta, ContentBlockStub, MessageDeltaBody, MessageStub,
@@ -57,11 +68,11 @@ enum OpenBlock {
     Thinking,
 }
 
-/// Stateful translator. One instance per assistant turn. After the
-/// terminal `Result`/`Error` is emitted, call [`AnthropicTranslator::reset`]
-/// (or drop the translator and build a fresh one) before the next turn —
+/// Stateful encoder. One instance per assistant turn. After the
+/// terminal `Result`/`Error` is emitted, call [`AnthropicEventEncoder::reset`]
+/// (or drop the encoder and build a fresh one) before the next turn —
 /// otherwise message_start / content-block indices will leak across turns.
-pub struct AnthropicTranslator {
+pub struct AnthropicEventEncoder {
     /// True after `message_start` has been emitted for the current turn.
     message_open: bool,
     /// Next content-block index to allocate.
@@ -85,7 +96,7 @@ pub struct AnthropicTranslator {
     current_message_id: Option<String>,
     /// Pending `client_id` (the client-supplied `Idempotency-Key` from
     /// T-A819D36B) to stamp onto the next `message_start` stub this
-    /// translator emits. Consumed on `open_message_if_needed`. The
+    /// encoder emits. Consumed on `open_message_if_needed`. The
     /// worker calls [`Self::set_pending_client_id`] at the top of each
     /// turn with the inbound header value (or `None` if the client
     /// didn't send one) so iOS's `MessageEchoService` can reconcile its
@@ -93,7 +104,7 @@ pub struct AnthropicTranslator {
     pending_client_id: Option<String>,
 }
 
-impl AnthropicTranslator {
+impl AnthropicEventEncoder {
     pub fn new(conversation_id: &str) -> Self {
         let conv_short = conversation_id
             .chars()
@@ -112,7 +123,7 @@ impl AnthropicTranslator {
     }
 
     /// Stage the `client_id` (Idempotency-Key) that should be echoed on
-    /// the next `message_start` frame this translator emits
+    /// the next `message_start` frame this encoder emits
     /// (T-A819D36B). The value is consumed the first time
     /// `open_message_if_needed` fires, so callers MUST call this BEFORE
     /// feeding the first `StreamEvent` of a new turn into
@@ -123,7 +134,7 @@ impl AnthropicTranslator {
         self.pending_client_id = client_id;
     }
 
-    /// True if the translator is currently inside a logical assistant
+    /// True if the encoder is currently inside a logical assistant
     /// message (has emitted `message_start` but not yet `message_stop`).
     pub fn is_message_open(&self) -> bool {
         self.message_open
@@ -131,7 +142,7 @@ impl AnthropicTranslator {
 
     /// Return the `message_id` of the most-recently-opened Anthropic
     /// message (format `msg_<conv_short>_<n>`), or `None` if
-    /// `message_start` has never been emitted for this translator.
+    /// `message_start` has never been emitted for this encoder.
     ///
     /// This is the ID that was attached to the most recent `message_start`
     /// frame and is the one external consumers should tag as
@@ -139,13 +150,13 @@ impl AnthropicTranslator {
     /// fan-out in T-90C7FAC4). The value is stable across a
     /// `message_start` / `message_stop` pair — it is NOT cleared by
     /// [`Self::reset`] or on-result, so callers who observe a
-    /// `message_stop` in the translator output can read it immediately
+    /// `message_stop` in the encoder output can read it immediately
     /// afterward.
     pub fn current_message_id(&self) -> Option<&str> {
         self.current_message_id.as_deref()
     }
 
-    /// Close the current turn and zero counters so the next translator
+    /// Close the current turn and zero counters so the next encoder
     /// call starts a fresh Anthropic message. Caller must have already
     /// drained the terminal events via [`Self::translate`] — `reset`
     /// does NOT flush anything.
@@ -156,12 +167,12 @@ impl AnthropicTranslator {
         self.current_block_index = 0;
     }
 
-    /// Translate a single internal `StreamEvent` into the sequence of
-    /// Anthropic events that should be emitted on the v2 wire.
+    /// Encode a single internal `StreamEvent` into the sequence of
+    /// Anthropic events that should be emitted on the wire.
     ///
     /// Returns an empty `Vec` for events that have no Anthropic
     /// equivalent (router events, title updates, replay markers).
-    pub fn translate(&mut self, event: &StreamEvent) -> Vec<AnthropicEvent> {
+    pub fn encode(&mut self, event: &StreamEvent) -> Vec<AnthropicEvent> {
         match event {
             StreamEvent::Text { content } => self.on_text(content),
             StreamEvent::Thinking { content } => self.on_thinking(content),
@@ -176,7 +187,7 @@ impl AnthropicTranslator {
             } => self.on_result(status, *is_error),
             StreamEvent::Status { status, message } => self.on_status(status, message.as_deref()),
             // Router + metadata events have no Anthropic equivalent —
-            // they flow only on the legacy (v1) channel.
+            // they are not persisted and not broadcast on the wire.
             StreamEvent::RouterText { .. }
             | StreamEvent::RouterToolUse { .. }
             | StreamEvent::RouterToolResult { .. }
@@ -451,15 +462,15 @@ mod tests {
 
     #[test]
     fn text_only_turn_produces_canonical_sequence() {
-        let mut tx = AnthropicTranslator::new("conv-abcdef1234");
+        let mut tx = AnthropicEventEncoder::new("conv-abcdef1234");
         let mut all = Vec::new();
-        all.extend(tx.translate(&StreamEvent::Text {
+        all.extend(tx.encode(&StreamEvent::Text {
             content: "Hello".into(),
         }));
-        all.extend(tx.translate(&StreamEvent::Text {
+        all.extend(tx.encode(&StreamEvent::Text {
             content: ", world".into(),
         }));
-        all.extend(tx.translate(&StreamEvent::Result {
+        all.extend(tx.encode(&StreamEvent::Result {
             session_id: "s1".into(),
             status: "success".into(),
             is_error: false,
@@ -481,14 +492,14 @@ mod tests {
 
     #[test]
     fn tool_use_turn_produces_input_json_delta() {
-        let mut tx = AnthropicTranslator::new("conv-abcd1234");
+        let mut tx = AnthropicEventEncoder::new("conv-abcd1234");
         let mut all = Vec::new();
-        all.extend(tx.translate(&StreamEvent::ToolUse {
+        all.extend(tx.encode(&StreamEvent::ToolUse {
             id: "toolu_1".into(),
             name: "search".into(),
             input: json!({"q": "rust"}),
         }));
-        all.extend(tx.translate(&StreamEvent::Result {
+        all.extend(tx.encode(&StreamEvent::Result {
             session_id: "s1".into(),
             status: "success".into(),
             is_error: false,
@@ -523,7 +534,7 @@ mod tests {
 
     #[test]
     fn thinking_block_uses_thinking_delta() {
-        let mut tx = AnthropicTranslator::new("conv-9999");
+        let mut tx = AnthropicEventEncoder::new("conv-9999");
         let all: Vec<_> = [
             StreamEvent::Thinking {
                 content: "Let me see...".into(),
@@ -538,7 +549,7 @@ mod tests {
             },
         ]
         .iter()
-        .flat_map(|e| tx.translate(e))
+        .flat_map(|e| tx.encode(e))
         .collect();
 
         // Thinking block opens, gets a thinking_delta, then CLOSES (content_block_stop)
@@ -566,8 +577,8 @@ mod tests {
 
     #[test]
     fn heartbeat_maps_to_ping() {
-        let mut tx = AnthropicTranslator::new("c");
-        let out = tx.translate(&StreamEvent::Status {
+        let mut tx = AnthropicEventEncoder::new("c");
+        let out = tx.encode(&StreamEvent::Status {
             status: "heartbeat".into(),
             message: None,
         });
@@ -575,27 +586,27 @@ mod tests {
     }
 
     #[test]
-    fn router_events_are_not_emitted_on_v2() {
-        let mut tx = AnthropicTranslator::new("c");
+    fn router_events_are_not_emitted_on_wire() {
+        let mut tx = AnthropicEventEncoder::new("c");
         assert!(tx
-            .translate(&StreamEvent::RouterText {
+            .encode(&StreamEvent::RouterText {
                 content: "x".into(),
             })
             .is_empty());
         assert!(tx
-            .translate(&StreamEvent::RouterToolUse {
+            .encode(&StreamEvent::RouterToolUse {
                 id: "a".into(),
                 name: "b".into(),
                 input: json!({}),
             })
             .is_empty());
         assert!(tx
-            .translate(&StreamEvent::TitleUpdate {
+            .encode(&StreamEvent::TitleUpdate {
                 title: "t".into(),
             })
             .is_empty());
         assert!(tx
-            .translate(&StreamEvent::ReplayComplete {
+            .encode(&StreamEvent::ReplayComplete {
                 total_events: 5,
                 agent_status: "running".into(),
             })
@@ -604,12 +615,12 @@ mod tests {
 
     #[test]
     fn failed_status_produces_error_and_message_stop() {
-        let mut tx = AnthropicTranslator::new("c");
+        let mut tx = AnthropicEventEncoder::new("c");
         // Open a text block first
-        let _ = tx.translate(&StreamEvent::Text {
+        let _ = tx.encode(&StreamEvent::Text {
             content: "hi".into(),
         });
-        let err = tx.translate(&StreamEvent::Status {
+        let err = tx.encode(&StreamEvent::Status {
             status: "failed".into(),
             message: Some("boom".into()),
         });
@@ -626,9 +637,9 @@ mod tests {
     /// the wire JSON (iOS's `MessageEchoService` decodes this exact key).
     #[test]
     fn message_start_echoes_pending_client_id() {
-        let mut tx = AnthropicTranslator::new("conv-idempo");
+        let mut tx = AnthropicEventEncoder::new("conv-idempo");
         tx.set_pending_client_id(Some("test-abc-123".to_string()));
-        let all: Vec<_> = tx.translate(&StreamEvent::Text {
+        let all: Vec<_> = tx.encode(&StreamEvent::Text {
             content: "hi".into(),
         });
         // First frame must be message_start carrying client_id.
@@ -639,15 +650,15 @@ mod tests {
         assert_eq!(v["message"]["client_id"], "test-abc-123");
     }
 
-    /// T-A819D36B: when no Idempotency-Key was supplied the translator
+    /// T-A819D36B: when no Idempotency-Key was supplied the encoder
     /// propagates `None` and serde skips the field entirely — iOS tolerates
     /// both "field absent" and "field: null", but the contract the artifact
     /// documents is "absent".
     #[test]
     fn message_start_omits_client_id_when_none() {
-        let mut tx = AnthropicTranslator::new("conv-no-idempo");
+        let mut tx = AnthropicEventEncoder::new("conv-no-idempo");
         // No call to set_pending_client_id — default is None.
-        let all: Vec<_> = tx.translate(&StreamEvent::Text {
+        let all: Vec<_> = tx.encode(&StreamEvent::Text {
             content: "hi".into(),
         });
         let ms = &all[0];
@@ -662,12 +673,12 @@ mod tests {
 
     /// T-A819D36B: the staged client_id is consumed by the FIRST
     /// `message_start` and does not leak onto subsequent ones. If the
-    /// translator is re-used for a second turn (same worker, same
-    /// translator instance, reset between turns) without restaging, the
+    /// encoder is re-used for a second turn (same worker, same
+    /// encoder instance, reset between turns) without restaging, the
     /// second turn's message_start must NOT echo the first turn's key.
     #[test]
     fn pending_client_id_is_consumed_once() {
-        let mut tx = AnthropicTranslator::new("conv-once");
+        let mut tx = AnthropicEventEncoder::new("conv-once");
         tx.set_pending_client_id(Some("key-1".to_string()));
 
         let turn1: Vec<_> = [
@@ -679,30 +690,30 @@ mod tests {
             },
         ]
         .iter()
-        .flat_map(|e| tx.translate(e))
+        .flat_map(|e| tx.encode(e))
         .collect();
         // Consume terminator to close the turn; then reset.
         tx.reset();
 
         // Second turn — NO set_pending_client_id, so client_id must be absent.
-        let turn2: Vec<_> = tx.translate(&StreamEvent::Text {
+        let turn2: Vec<_> = tx.encode(&StreamEvent::Text {
             content: "b".into(),
         });
 
-        let v1 = serde_json::to_value(&turn1[0]).unwrap();
-        assert_eq!(v1["message"]["client_id"], "key-1");
+        let turn1_json = serde_json::to_value(&turn1[0]).unwrap();
+        assert_eq!(turn1_json["message"]["client_id"], "key-1");
 
-        let v2 = serde_json::to_value(&turn2[0]).unwrap();
+        let turn2_json = serde_json::to_value(&turn2[0]).unwrap();
         assert!(
-            v2["message"].get("client_id").is_none(),
+            turn2_json["message"].get("client_id").is_none(),
             "second turn must not leak first turn's client_id, got {:?}",
-            v2
+            turn2_json
         );
     }
 
     #[test]
     fn tool_use_after_text_closes_text_block() {
-        let mut tx = AnthropicTranslator::new("c");
+        let mut tx = AnthropicEventEncoder::new("c");
         let all: Vec<_> = [
             StreamEvent::Text {
                 content: "I'll search.".into(),
@@ -722,7 +733,7 @@ mod tests {
             },
         ]
         .iter()
-        .flat_map(|e| tx.translate(e))
+        .flat_map(|e| tx.encode(e))
         .collect();
         assert_eq!(
             event_types(&all),

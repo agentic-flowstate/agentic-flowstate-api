@@ -1,7 +1,7 @@
 pub mod admin_logs;
 pub mod admin_reload;
 pub mod agent_runs;
-pub mod anthropic_translator;
+pub mod anthropic_event_encoder;
 pub mod auth;
 pub mod cad;
 pub mod chat_client_manager;

@@ -249,13 +249,14 @@ struct StoredBlockStop {
 /// # Vocabulary filtering
 ///
 /// Only events whose `event_type` is one of `content_block_start`,
-/// `content_block_delta`, or `content_block_stop` are considered —
-/// `message_start`, `message_stop`, `ping`, and legacy v1 rows (`text`,
-/// `tool_use`, etc.) are skipped. A `message_stop` ALSO marks any
-/// still-open blocks as stopped (defensive: the worker emits one
-/// `content_block_stop` per block before `message_stop`, but if that
-/// invariant is ever violated the walker must not emit phantom
-/// snapshots for a message that is conceptually complete).
+/// `content_block_delta`, or `content_block_stop` contribute block state.
+/// `message_start` resets per-message state, `message_stop` defensively
+/// closes any still-open blocks, and `ping` / `message_delta` / `error`
+/// are ignored. A `message_stop` ALSO marks any still-open blocks as
+/// stopped (defensive: the worker emits one `content_block_stop` per
+/// block before `message_stop`, but if that invariant is ever violated
+/// the walker must not emit phantom snapshots for a message that is
+/// conceptually complete).
 pub async fn reconstruct_state_up_to_cursor(
     pool: &SqlitePool,
     conversation_id: &str,
@@ -348,8 +349,8 @@ pub async fn reconstruct_state_up_to_cursor(
                 }
             }
             _ => {
-                // Everything else (ping, message_delta, error, v1 rows,
-                // future schema additions) is ignored.
+                // Everything else (ping, message_delta, error, future
+                // schema additions) contributes no block state.
             }
         }
     }
