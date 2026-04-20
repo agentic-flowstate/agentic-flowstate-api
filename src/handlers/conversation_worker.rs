@@ -1077,23 +1077,39 @@ impl ConversationWorker {
     }
 
     /// Emit a StreamEvent: store in DB and broadcast to all subscribers.
+    ///
+    /// Uses the server-side allocator (`insert_conversation_event`) so the
+    /// event_index comes from the DB under a BEGIN IMMEDIATE transaction —
+    /// safe under concurrent writers for the same conversation_id. The
+    /// worker no longer maintains a Rust-side counter; the index in the
+    /// broadcast tuple is whatever the allocator returned.
     async fn emit_event(&mut self, event: &StreamEvent) {
         let event_type = get_stream_event_type(event);
-        let current_index = self.event_index;
 
         if let Ok(json) = serde_json::to_string(event) {
-            let _ = conversations::store_event(
+            match conversations::insert_conversation_event(
                 &self.db,
                 &self.conversation_id,
-                current_index,
                 event_type,
                 &json,
-            ).await;
-
-            let broadcast_tx = get_broadcast_sender(&self.conversation_id).await;
-            let _ = broadcast_tx.send((current_index, json));
-
-            self.event_index += 1;
+                1,    // event_schema_version = 1 (legacy vocabulary)
+                None, // anthropic_event_type — set when dual-write lands (T-49352BF5)
+            )
+            .await
+            {
+                Ok(allocated_index) => {
+                    let broadcast_tx = get_broadcast_sender(&self.conversation_id).await;
+                    let _ = broadcast_tx.send((allocated_index, json));
+                    self.event_index = allocated_index + 1;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "[WORKER] Failed to persist event for {}: {}",
+                        self.conversation_id,
+                        e
+                    );
+                }
+            }
         }
     }
 
