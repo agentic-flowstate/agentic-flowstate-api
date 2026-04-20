@@ -91,6 +91,11 @@ pub struct ConversationWorker {
     /// One translator instance per worker — it survives the entire
     /// conversation and is reset between turns by cc-sdk's `Result` event.
     translator: AnthropicTranslator,
+    /// User id for the turn currently being processed. Populated at the
+    /// top of `process_message` from the inbound `WorkerMessage.user_id`
+    /// and consumed by `emit_event` to fan out silent pushes on
+    /// `message_stop` (T-90C7FAC4). `None` outside a turn.
+    current_user_id: Option<String>,
 }
 
 impl ConversationWorker {
@@ -113,6 +118,7 @@ impl ConversationWorker {
             last_router_organization: None,
             vocab_mode,
             translator,
+            current_user_id: None,
         }
     }
 
@@ -138,6 +144,7 @@ impl ConversationWorker {
             last_router_organization: None,
             vocab_mode,
             translator,
+            current_user_id: None,
         }
     }
 
@@ -227,6 +234,10 @@ impl ConversationWorker {
     async fn process_message(&mut self, mut msg: WorkerMessage) {
         // RAII guard: fires completion signal when this function exits (normal or early return)
         let _completion = CompletionGuard(msg.completion_tx.take());
+        // Cache the turn's owner so `emit_event` can fan out silent
+        // pushes on `message_stop` without plumbing user_id through
+        // every call site (T-90C7FAC4).
+        self.current_user_id = Some(msg.user_id.clone());
         // Clear stale events from previous message but keep event_index monotonically
         // increasing. Resetting to 0 here was causing the "one turn late" bug: the app's
         // SSE cursor (e.g., lastEventIndex=50) would be higher than all new events (0,1,2...),
@@ -1150,11 +1161,17 @@ impl ConversationWorker {
         };
 
         if self.vocab_mode.writes_legacy() {
+            // Payload is JSON text. mime=None defaults to "application/json"
+            // inside the allocator (T-E184E642). When legacy_json.len() > 4096
+            // the allocator transparently offloads to event_blobs and writes
+            // the canonical sentinel; the broadcast below still ships the
+            // real JSON to live SSE subscribers.
             match conversations::insert_conversation_event(
                 &self.db,
                 &self.conversation_id,
                 legacy_event_type,
-                &legacy_json,
+                legacy_json.as_bytes(),
+                None, // mime defaults to application/json
                 1,    // event_schema_version = 1 (legacy vocabulary)
                 None, // anthropic_event_type unset for v1 rows
             )
@@ -1179,6 +1196,14 @@ impl ConversationWorker {
         // Translate the StreamEvent into a sequence of Anthropic events.
         // An event may produce zero frames (router/metadata events), one
         // frame (a text_delta), or many (tool_use: start + delta + stop).
+        //
+        // After the v2 write loop, if this StreamEvent produced at least
+        // one `message_stop` that was successfully persisted, we trigger
+        // the silent-push fan-out (T-90C7FAC4) so every registered
+        // device for the turn's owner gets a wake signal. The fan-out
+        // is fire-and-forget — spawned onto its own tokio task so it
+        // never blocks the SSE stream or holds the worker's state.
+        let mut message_stop_persisted = false;
         if self.vocab_mode.writes_modern() {
             let anthropic_events = self.translator.translate(event);
             for ae in anthropic_events {
@@ -1198,7 +1223,8 @@ impl ConversationWorker {
                     &self.db,
                     &self.conversation_id,
                     ae_type,
-                    &ae_json,
+                    ae_json.as_bytes(),
+                    None,         // mime defaults to application/json
                     2,            // event_schema_version = 2 (Anthropic vocabulary)
                     Some(ae_type),
                 )
@@ -1217,6 +1243,9 @@ impl ConversationWorker {
                         } else {
                             self.event_index = allocated_index + 1;
                         }
+                        if ae_type == "message_stop" {
+                            message_stop_persisted = true;
+                        }
                     }
                     Err(e) => {
                         tracing::error!(
@@ -1225,6 +1254,62 @@ impl ConversationWorker {
                             e
                         );
                     }
+                }
+            }
+        }
+
+        // Silent-push fan-out hook (T-90C7FAC4). Only fires when:
+        //   1. A v2 `message_stop` row was successfully committed above.
+        //   2. We have a cached user_id for this turn (set at the top
+        //      of `process_message`).
+        //   3. The process-wide silent-push config is installed (always
+        //      true when main.rs startup succeeded).
+        //
+        // The config carries the `enabled` flag; when disabled the
+        // fan-out still runs and emits
+        // `push_attempts_total{result="skipped_disabled"}` for every
+        // registered device so dashboards stay accurate.
+        //
+        // `tokio::spawn` detaches the task so we return to the SSE
+        // stream immediately. We intentionally clone every value we
+        // need into the task — the worker holds no lock across the
+        // spawn and the fan-out never touches the worker state.
+        if message_stop_persisted {
+            if let Some(user_id) = self.current_user_id.clone() {
+                if let Some(config) = crate::apns::silent_fanout::global_config() {
+                    let last_message_id = self
+                        .translator
+                        .current_message_id()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            // Translator should always have a message_id
+                            // cached by the time message_stop ships, but
+                            // if translator state was reset mid-turn we
+                            // fall back to the conversation id so the
+                            // payload still parses on the client.
+                            self.conversation_id.clone()
+                        });
+                    let pool = self.db.clone();
+                    let conv_id = self.conversation_id.clone();
+                    let enabled = config.enabled;
+                    let sender = config.sender.clone();
+                    tokio::spawn(async move {
+                        crate::apns::silent_fanout::fan_out_silent_push(
+                            pool,
+                            sender,
+                            enabled,
+                            user_id,
+                            conv_id,
+                            last_message_id,
+                        )
+                        .await;
+                    });
+                } else {
+                    tracing::debug!(
+                        target: "silent_push",
+                        conversation_id = %self.conversation_id,
+                        "[SILENT_PUSH_FANOUT] global config not installed — skipping fan-out (dev env?)"
+                    );
                 }
             }
         }
