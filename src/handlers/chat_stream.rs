@@ -203,13 +203,28 @@ pub fn create_conversation_reconnect_stream(
         let mut event_count = 0usize;
         let mut last_event_index: i32 = -1;
 
-        // Phase 1: Replay stored events
+        // Phase 1: Replay stored events.
+        // load_event_payload_str materializes blob-offloaded payloads
+        // (T-E184E642 / v46 event_blobs table) back into raw JSON. Inline
+        // events round-trip as a cheap clone. Callers must NEVER ship
+        // `event.event_data` directly — for offloaded events that value
+        // is the `{"$blob":...}` sentinel, which would break SSE parsers.
         for db_event in &events {
             event_count += 1;
             last_event_index = db_event.event_index;
+            let payload = match conversations::load_event_payload_str(&db, db_event).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        "[RECONNECT] Failed to materialize payload for event {}/{}: {}",
+                        db_event.conversation_id, db_event.event_index, e
+                    );
+                    continue;
+                }
+            };
             yield Ok(Event::default()
                 .id(db_event.event_index.to_string())
-                .data(db_event.event_data.clone()));
+                .data(payload));
         }
 
         // Send replay_complete
@@ -247,24 +262,44 @@ pub fn create_conversation_reconnect_stream(
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!("[RECONNECT] Broadcast lagged by {} events for {}, falling back to DB", n, conversation_id);
-                                // Catch up from DB
+                                // Catch up from DB — materialize blob payloads.
                                 if let Ok(missed) = conversations::get_events_after(&db, &conversation_id, last_event_index).await {
                                     for ev in &missed {
                                         last_event_index = ev.event_index;
+                                        let payload = match conversations::load_event_payload_str(&db, ev).await {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "[RECONNECT] Failed to materialize payload for event {}/{}: {}",
+                                                    ev.conversation_id, ev.event_index, e
+                                                );
+                                                continue;
+                                            }
+                                        };
                                         yield Ok(Event::default()
                                             .id(ev.event_index.to_string())
-                                            .data(ev.event_data.clone()));
+                                            .data(payload));
                                     }
                                 }
                             }
                             Err(broadcast::error::RecvError::Closed) => {
-                                // Persister finished — agent is done
-                                // Fetch any remaining events from DB
+                                // Persister finished — agent is done.
+                                // Fetch any remaining events from DB and materialize blob payloads.
                                 if let Ok(final_events) = conversations::get_events_after(&db, &conversation_id, last_event_index).await {
                                     for ev in &final_events {
+                                        let payload = match conversations::load_event_payload_str(&db, ev).await {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    "[RECONNECT] Failed to materialize payload for event {}/{}: {}",
+                                                    ev.conversation_id, ev.event_index, e
+                                                );
+                                                continue;
+                                            }
+                                        };
                                         yield Ok(Event::default()
                                             .id(ev.event_index.to_string())
-                                            .data(ev.event_data.clone()));
+                                            .data(payload));
                                     }
                                 }
                                 let done = StreamEvent::Status {

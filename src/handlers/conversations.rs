@@ -321,18 +321,35 @@ pub async fn get_conversation_checkpoint(
         Some("running") | Some("pending")
     );
 
-    let recent_events = if include_active {
-        conversations::get_active_run_events(&pool, &id, 200)
+    let recent_events: Vec<RecentEvent> = if include_active {
+        let raw = conversations::get_active_run_events(&pool, &id, 200)
             .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| RecentEvent {
+            .unwrap_or_default();
+        // Materialize payloads via load_event_payload_str so blob-offloaded
+        // events (T-E184E642) surface the real JSON to the client, not the
+        // `{"$blob":...}` sentinel. Inline rows round-trip as a cheap clone.
+        let mut out = Vec::with_capacity(raw.len());
+        for e in raw {
+            let event_data = match conversations::load_event_payload_str(&pool, &e).await {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::error!(
+                        "Failed to materialize payload for event {}/{}: {}",
+                        e.conversation_id,
+                        e.event_index,
+                        err
+                    );
+                    continue;
+                }
+            };
+            out.push(RecentEvent {
                 event_index: e.event_index,
                 event_type: e.event_type,
-                event_data: e.event_data,
+                event_data,
                 created_at: e.created_at,
-            })
-            .collect()
+            });
+        }
+        out
     } else {
         Vec::new()
     };
