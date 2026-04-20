@@ -127,6 +127,13 @@ impl AnthropicEvent {
 /// Anthropic sends the full Message header with an empty `content` array;
 /// the content is streamed via `content_block_*` frames. Fields that aren't
 /// known yet (`stop_reason`, `stop_sequence`) are null.
+///
+/// `client_id` (T-A819D36B) carries the `Idempotency-Key` the iOS client
+/// supplied when POSTing the user message that triggered this assistant
+/// turn. iOS's `MessageEchoService.reconcileServerMessageStart` matches on
+/// this value to lock the optimistic-echo row to the server's canonical
+/// `id`. When no Idempotency-Key was supplied, the field is `None` and
+/// serialization skips it entirely — iOS tolerates both absent and `null`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageStub {
     pub id: String,
@@ -148,11 +155,20 @@ pub struct MessageStub {
     pub stop_sequence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Optimistic-echo reconciliation key (T-A819D36B). Carries the
+    /// `Idempotency-Key` the client supplied on the POST that triggered
+    /// this assistant turn. iOS's `MessageEchoService` matches on this
+    /// value to promote its local-echo row. `None` when absent on the
+    /// request — serialization skips the field in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 impl MessageStub {
     /// Build a fresh `message_start` stub for an assistant message.
     /// `model` can be `None` when cc-sdk doesn't surface the model id.
+    /// `client_id` defaults to `None`; use [`Self::with_client_id`] to
+    /// attach the optimistic-echo reconciliation key (T-A819D36B).
     pub fn new_assistant(id: impl Into<String>, model: Option<String>) -> Self {
         Self {
             id: id.into(),
@@ -163,7 +179,17 @@ impl MessageStub {
             stop_reason: None,
             stop_sequence: None,
             usage: None,
+            client_id: None,
         }
+    }
+
+    /// Attach a `client_id` (the request's `Idempotency-Key`) to this
+    /// stub so the emitted `message_start` frame echoes it back to the
+    /// client. Used by the turn pipeline to thread the header value from
+    /// the HTTP layer all the way into the SSE payload iOS decodes.
+    pub fn with_client_id(mut self, client_id: Option<String>) -> Self {
+        self.client_id = client_id;
+        self
     }
 }
 
@@ -304,6 +330,51 @@ mod tests {
         );
         let round: AnthropicEvent = serde_json::from_value(v).unwrap();
         assert_eq!(round, ev);
+    }
+
+    /// T-A819D36B: `client_id` echoes on the wire when set, is skipped when absent.
+    /// This is the contract iOS `MessageEchoService.reconcileServerMessageStart`
+    /// depends on for optimistic-echo reconciliation.
+    #[test]
+    fn message_start_with_client_id_wire_shape() {
+        let ev = AnthropicEvent::MessageStart {
+            message: MessageStub::new_assistant("msg_abc123", Some("claude-opus-4-7".to_string()))
+                .with_client_id(Some("test-abc-123".to_string())),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_abc123",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-opus-4-7",
+                    "content": [],
+                    "client_id": "test-abc-123"
+                }
+            })
+        );
+        // Round-trip: deserialize preserves the client_id.
+        let round: AnthropicEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(round, ev);
+    }
+
+    #[test]
+    fn message_start_without_client_id_skips_field() {
+        let ev = AnthropicEvent::MessageStart {
+            message: MessageStub::new_assistant("msg_abc123", None).with_client_id(None),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        // The `client_id` key MUST NOT appear when value is None.
+        assert!(
+            v.get("message")
+                .and_then(|m| m.get("client_id"))
+                .is_none(),
+            "client_id must be skipped when None, got: {}",
+            v
+        );
     }
 
     #[test]

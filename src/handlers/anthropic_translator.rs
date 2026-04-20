@@ -83,6 +83,14 @@ pub struct AnthropicTranslator {
     /// frame (e.g. the silent-push fan-out) can tag it. Cleared only
     /// when the next `message_start` overwrites it.
     current_message_id: Option<String>,
+    /// Pending `client_id` (the client-supplied `Idempotency-Key` from
+    /// T-A819D36B) to stamp onto the next `message_start` stub this
+    /// translator emits. Consumed on `open_message_if_needed`. The
+    /// worker calls [`Self::set_pending_client_id`] at the top of each
+    /// turn with the inbound header value (or `None` if the client
+    /// didn't send one) so iOS's `MessageEchoService` can reconcile its
+    /// optimistic-echo row when it sees the matching frame.
+    pending_client_id: Option<String>,
 }
 
 impl AnthropicTranslator {
@@ -99,7 +107,20 @@ impl AnthropicTranslator {
             message_counter: 0,
             conv_short,
             current_message_id: None,
+            pending_client_id: None,
         }
+    }
+
+    /// Stage the `client_id` (Idempotency-Key) that should be echoed on
+    /// the next `message_start` frame this translator emits
+    /// (T-A819D36B). The value is consumed the first time
+    /// `open_message_if_needed` fires, so callers MUST call this BEFORE
+    /// feeding the first `StreamEvent` of a new turn into
+    /// [`Self::translate`]. Pass `None` to clear a prior staged value —
+    /// a missing `Idempotency-Key` header MUST propagate end-to-end as
+    /// `None` (no fallbacks, per the ticket ground rules).
+    pub fn set_pending_client_id(&mut self, client_id: Option<String>) {
+        self.pending_client_id = client_id;
     }
 
     /// True if the translator is currently inside a logical assistant
@@ -172,8 +193,13 @@ impl AnthropicTranslator {
             self.message_counter += 1;
             let id = format!("msg_{}_{}", self.conv_short, self.message_counter);
             self.current_message_id = Some(id.clone());
+            // Consume the pending Idempotency-Key (T-A819D36B). `.take()`
+            // leaves `None` behind so a second message within the same
+            // turn (shouldn't happen, but guard it) doesn't re-echo a
+            // stale client_id.
+            let client_id = self.pending_client_id.take();
             out.push(AnthropicEvent::MessageStart {
-                message: MessageStub::new_assistant(id, None),
+                message: MessageStub::new_assistant(id, None).with_client_id(client_id),
             });
             self.message_open = true;
             self.next_block_index = 0;
@@ -591,6 +617,86 @@ mod tests {
         assert_eq!(
             event_types(&err),
             vec!["content_block_stop", "error", "message_stop"]
+        );
+    }
+
+    /// T-A819D36B: the Idempotency-Key staged via
+    /// `set_pending_client_id` must appear on the `message_start` frame's
+    /// `client_id` field, which serializes as snake_case `client_id` in
+    /// the wire JSON (iOS's `MessageEchoService` decodes this exact key).
+    #[test]
+    fn message_start_echoes_pending_client_id() {
+        let mut tx = AnthropicTranslator::new("conv-idempo");
+        tx.set_pending_client_id(Some("test-abc-123".to_string()));
+        let all: Vec<_> = tx.translate(&StreamEvent::Text {
+            content: "hi".into(),
+        });
+        // First frame must be message_start carrying client_id.
+        let ms = &all[0];
+        assert_eq!(ms.event_type(), "message_start");
+        let v = serde_json::to_value(ms).unwrap();
+        assert_eq!(v["type"], "message_start");
+        assert_eq!(v["message"]["client_id"], "test-abc-123");
+    }
+
+    /// T-A819D36B: when no Idempotency-Key was supplied the translator
+    /// propagates `None` and serde skips the field entirely — iOS tolerates
+    /// both "field absent" and "field: null", but the contract the artifact
+    /// documents is "absent".
+    #[test]
+    fn message_start_omits_client_id_when_none() {
+        let mut tx = AnthropicTranslator::new("conv-no-idempo");
+        // No call to set_pending_client_id — default is None.
+        let all: Vec<_> = tx.translate(&StreamEvent::Text {
+            content: "hi".into(),
+        });
+        let ms = &all[0];
+        assert_eq!(ms.event_type(), "message_start");
+        let v = serde_json::to_value(ms).unwrap();
+        assert!(
+            v["message"].get("client_id").is_none(),
+            "client_id must be serde-skipped when None, got {:?}",
+            v
+        );
+    }
+
+    /// T-A819D36B: the staged client_id is consumed by the FIRST
+    /// `message_start` and does not leak onto subsequent ones. If the
+    /// translator is re-used for a second turn (same worker, same
+    /// translator instance, reset between turns) without restaging, the
+    /// second turn's message_start must NOT echo the first turn's key.
+    #[test]
+    fn pending_client_id_is_consumed_once() {
+        let mut tx = AnthropicTranslator::new("conv-once");
+        tx.set_pending_client_id(Some("key-1".to_string()));
+
+        let turn1: Vec<_> = [
+            StreamEvent::Text { content: "a".into() },
+            StreamEvent::Result {
+                session_id: "s".into(),
+                status: "success".into(),
+                is_error: false,
+            },
+        ]
+        .iter()
+        .flat_map(|e| tx.translate(e))
+        .collect();
+        // Consume terminator to close the turn; then reset.
+        tx.reset();
+
+        // Second turn — NO set_pending_client_id, so client_id must be absent.
+        let turn2: Vec<_> = tx.translate(&StreamEvent::Text {
+            content: "b".into(),
+        });
+
+        let v1 = serde_json::to_value(&turn1[0]).unwrap();
+        assert_eq!(v1["message"]["client_id"], "key-1");
+
+        let v2 = serde_json::to_value(&turn2[0]).unwrap();
+        assert!(
+            v2["message"].get("client_id").is_none(),
+            "second turn must not leak first turn's client_id, got {:?}",
+            v2
         );
     }
 

@@ -45,6 +45,14 @@ pub struct WorkerMessage {
     /// so the SSE handler exits only when THIS message is done (not on terminal
     /// events from a prior message in the same conversation).
     pub completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Optional `Idempotency-Key` the client supplied on the HTTP POST
+    /// that triggered this turn (T-A819D36B). Threaded from the handler
+    /// → [`WorkerMessage`] → [`AnthropicTranslator::set_pending_client_id`]
+    /// so the `message_start` SSE frame echoes it back as
+    /// `message.client_id`. iOS's `MessageEchoService.reconcileServerMessageStart`
+    /// matches on this value to lock its optimistic-echo row.
+    /// `None` when the header was absent — no fallbacks.
+    pub client_id: Option<String>,
 }
 
 /// RAII guard that fires a oneshot completion signal on drop.
@@ -294,6 +302,13 @@ impl ConversationWorker {
         // pushes on `message_stop` without plumbing user_id through
         // every call site (T-90C7FAC4).
         self.current_user_id = Some(msg.user_id.clone());
+        // Stage the inbound Idempotency-Key (T-A819D36B) onto the
+        // translator BEFORE any StreamEvent is translated. The translator
+        // consumes it on the first `open_message_if_needed` call (i.e.,
+        // the next `message_start` frame). When `None`, it stays `None`
+        // end-to-end — no synthetic fallbacks.
+        self.translator
+            .set_pending_client_id(msg.client_id.clone());
         // Refresh the vocab-mode snapshot for this turn. The worker is
         // long-lived (10-min idle timeout), so without this refresh an
         // admin flip would only be picked up after the worker died and

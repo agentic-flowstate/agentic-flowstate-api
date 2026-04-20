@@ -1,5 +1,6 @@
 use axum::{
     extract::{Extension, State},
+    http::HeaderMap,
     response::Response,
     Json,
 };
@@ -26,9 +27,15 @@ pub async fn full_access_chat(
     State(db): State<Arc<SqlitePool>>,
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
+    headers: HeaderMap,
     Json(req): Json<FullAccessChatRequest>,
 ) -> Response {
     tracing::info!("=== FULL_ACCESS_CHAT START === user={}", user.user_id);
+
+    let client_id = match chat_stream::extract_client_id(&headers) {
+        Ok(v) => v,
+        Err(e) => return chat_stream::malformed_idempotency_key_response(e),
+    };
 
     let claude_md = std::fs::read_to_string("/Users/jarvisgpt/projects/CLAUDE.md")
         .unwrap_or_else(|e| format!("(Failed to read CLAUDE.md: {})", e));
@@ -52,5 +59,6 @@ pub async fn full_access_chat(
         config,
         user.user_id,
         req.images,
+        client_id,
     )
 }

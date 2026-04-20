@@ -1,5 +1,6 @@
 use axum::{
     extract::{Extension, State},
+    http::HeaderMap,
     response::Response,
     Json,
 };
@@ -40,9 +41,15 @@ pub async fn home_planner_chat(
     State(db): State<Arc<SqlitePool>>,
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
+    headers: HeaderMap,
     Json(req): Json<HomePlannerRequest>,
 ) -> Response {
     tracing::info!("=== HOME_PLANNER_CHAT START === user={}", user.user_id);
+
+    let client_id = match chat_stream::extract_client_id(&headers) {
+        Ok(v) => v,
+        Err(e) => return chat_stream::malformed_idempotency_key_response(e),
+    };
 
     // Look up user's display name
     let user_name = match ticketing_system::users::get_user(&db, &user.user_id).await {
@@ -93,5 +100,6 @@ pub async fn home_planner_chat(
         config,
         user.user_id,
         req.images,
+        client_id,
     )
 }

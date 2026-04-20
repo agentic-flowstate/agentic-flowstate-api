@@ -1,5 +1,6 @@
 use axum::{
     extract::{Extension, State},
+    http::HeaderMap,
     response::Response,
     Json,
 };
@@ -31,9 +32,15 @@ pub async fn scoped_workspace_chat(
     State(db): State<Arc<SqlitePool>>,
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
+    headers: HeaderMap,
     Json(req): Json<ScopedWorkspaceChatRequest>,
 ) -> Response {
     tracing::info!("=== SCOPED_WORKSPACE_CHAT START === user={}", user.user_id);
+
+    let client_id = match chat_stream::extract_client_id(&headers) {
+        Ok(v) => v,
+        Err(e) => return chat_stream::malformed_idempotency_key_response(e),
+    };
 
     let display_name = lookup_display_name(&db, &user.user_id).await;
 
@@ -56,6 +63,7 @@ pub async fn scoped_workspace_chat(
         config,
         user.user_id,
         req.images,
+        client_id,
     )
 }
 

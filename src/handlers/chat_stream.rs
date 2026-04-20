@@ -105,6 +105,7 @@ pub fn chat(
     config: ChatConfig,
     user_id: String,
     images: Option<Vec<ChatImageData>>,
+    client_id: Option<String>,
 ) -> Response {
     // ---- Rate-limit admission (T-C410DD96). ----
     //
@@ -189,6 +190,7 @@ pub fn chat(
                 config,
                 images,
                 completion_tx: Some(completion_tx),
+                client_id,
             })
             .await
             .is_err()
@@ -242,6 +244,88 @@ pub fn chat(
     });
 
     create_sse_stream_raw(rx, wrapper_conv_id).into_response()
+}
+
+/// Extract and validate an `Idempotency-Key` header (T-A819D36B).
+///
+/// The iOS client sets this header to the per-outbox-row UUID it uses
+/// locally to key optimistic-echo rows. The server echoes it back in
+/// the `message_start` SSE frame's `client_id` field so
+/// `MessageEchoService.reconcileServerMessageStart` can promote the
+/// local echo to server-confirmed.
+///
+/// Validation rules:
+///
+/// * Absent header → `Ok(None)`. This is the expected path for web
+///   clients and any call that doesn't participate in the optimistic-echo
+///   protocol. NO fallback / NO synthetic value — `None` propagates
+///   end-to-end so the emitted frame simply omits `client_id`.
+/// * Non-ASCII bytes → `Err(IdempotencyKeyError::Malformed)`. Header
+///   values are ASCII-only per RFC 7230; any other bytes are a client
+///   bug worth surfacing as 400.
+/// * Length > 128 chars → `Err(IdempotencyKeyError::Malformed)`. UUIDs
+///   are 36 chars; 128 is a generous ceiling that still stops
+///   accidental body content leaking into the header slot.
+/// * Non-printable characters (below 0x20 or DEL 0x7F) →
+///   `Err(IdempotencyKeyError::Malformed)`. Matches the iOS-side UUID
+///   alphabet plus common punctuation without opening up to framing
+///   attacks.
+/// * Empty string → `Err(IdempotencyKeyError::Malformed)`. An empty key
+///   is semantically meaningless and almost certainly a client bug.
+///
+/// The header name check is case-insensitive per `HeaderMap` semantics.
+pub fn extract_client_id(
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<String>, IdempotencyKeyError> {
+    let Some(raw) = headers.get("Idempotency-Key") else {
+        return Ok(None);
+    };
+    let s = raw
+        .to_str()
+        .map_err(|_| IdempotencyKeyError::Malformed("non-ASCII bytes"))?;
+    if s.is_empty() {
+        return Err(IdempotencyKeyError::Malformed("empty value"));
+    }
+    if s.len() > 128 {
+        return Err(IdempotencyKeyError::Malformed("exceeds 128 chars"));
+    }
+    if s.chars()
+        .any(|c| (c as u32) < 0x20 || (c as u32) == 0x7F)
+    {
+        return Err(IdempotencyKeyError::Malformed(
+            "contains non-printable characters",
+        ));
+    }
+    Ok(Some(s.to_string()))
+}
+
+/// Error returned by [`extract_client_id`] when the `Idempotency-Key`
+/// header is present but violates the validation rules. Handlers map
+/// this to a 400 Bad Request response with a short diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotencyKeyError {
+    Malformed(&'static str),
+}
+
+impl IdempotencyKeyError {
+    pub fn detail(&self) -> &'static str {
+        match self {
+            IdempotencyKeyError::Malformed(d) => d,
+        }
+    }
+}
+
+/// Build a 400 response for a malformed `Idempotency-Key` header.
+/// Shared helper so every chat handler returns the same shape.
+pub fn malformed_idempotency_key_response(err: IdempotencyKeyError) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "malformed_idempotency_key",
+            "detail": err.detail(),
+        })),
+    )
+        .into_response()
 }
 
 /// Build the 429 response emitted when the per-(user, conversation) rate
@@ -455,5 +539,68 @@ pub fn create_conversation_reconnect_stream(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod idempotency_key_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            let name: axum::http::HeaderName = k.parse().unwrap();
+            h.insert(name, HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn absent_header_yields_none() {
+        let h = HeaderMap::new();
+        assert_eq!(extract_client_id(&h).unwrap(), None);
+    }
+
+    #[test]
+    fn well_formed_uuid_passes() {
+        let h = hdrs(&[("Idempotency-Key", "01H2X9GK8X7C8ZABCDEF01234567")]);
+        assert_eq!(
+            extract_client_id(&h).unwrap(),
+            Some("01H2X9GK8X7C8ZABCDEF01234567".to_string())
+        );
+    }
+
+    #[test]
+    fn lowercase_header_name_passes() {
+        // HeaderMap matches case-insensitively, so lowercase works too.
+        let h = hdrs(&[("idempotency-key", "abc-123")]);
+        assert_eq!(extract_client_id(&h).unwrap(), Some("abc-123".to_string()));
+    }
+
+    #[test]
+    fn empty_value_rejected() {
+        let h = hdrs(&[("Idempotency-Key", "")]);
+        assert!(matches!(
+            extract_client_id(&h),
+            Err(IdempotencyKeyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn too_long_rejected() {
+        let long = "a".repeat(129);
+        let h = hdrs(&[("Idempotency-Key", long.as_str())]);
+        assert!(matches!(
+            extract_client_id(&h),
+            Err(IdempotencyKeyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn at_boundary_length_accepted() {
+        let max = "a".repeat(128);
+        let h = hdrs(&[("Idempotency-Key", max.as_str())]);
+        assert_eq!(extract_client_id(&h).unwrap(), Some(max));
     }
 }
