@@ -33,6 +33,12 @@ struct AppState {
     db: Arc<sqlx::SqlitePool>,
     chat_manager: Arc<ChatClientManager>,
     apns: Option<Arc<apns::ApnsService>>,
+    /// Silent-push sender (apns-h2 based) used by the durable chat
+    /// streaming pipeline. Always present in app state; internally holds
+    /// an `OnceCell` that is only populated when APNS_SILENT_ENABLED=true
+    /// at startup. Handlers must call `send_silent_push` and handle
+    /// `ApnsSilentError::NotInitialized` when silent push is disabled.
+    apns_silent: Arc<apns::ApnsClient>,
 }
 
 impl FromRef<AppState> for Arc<sqlx::SqlitePool> {
@@ -44,6 +50,12 @@ impl FromRef<AppState> for Arc<sqlx::SqlitePool> {
 impl FromRef<AppState> for Arc<ChatClientManager> {
     fn from_ref(state: &AppState) -> Self {
         state.chat_manager.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<apns::ApnsClient> {
+    fn from_ref(state: &AppState) -> Self {
+        state.apns_silent.clone()
     }
 }
 
@@ -140,10 +152,35 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("APNs push notification service initialized");
     }
 
+    // Initialize silent-push sender (durable chat streaming wake signals).
+    // Gated on APNS_SILENT_ENABLED to avoid forcing every dev box to have a
+    // provisioned .p8 key. When enabled, ALL five env vars are required —
+    // init() returns an error that we propagate via `?`, crashing startup.
+    let apns_silent = Arc::new(apns::ApnsClient::new());
+    let silent_enabled = std::env::var("APNS_SILENT_ENABLED")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
+    if silent_enabled {
+        let cfg = apns_silent.init_from_env().map_err(|e| {
+            tracing::error!("[APNS_SILENT] init failed: {}", e);
+            anyhow::anyhow!("APNs silent push init failed: {}", e)
+        })?;
+        tracing::info!(
+            "[APNS_SILENT] initialized (bundle_id={}, sandbox={}, team={}, key={})",
+            cfg.bundle_id,
+            cfg.use_sandbox,
+            cfg.team_id,
+            cfg.key_id
+        );
+    } else {
+        tracing::info!("[APNS_SILENT] disabled (APNS_SILENT_ENABLED not set to true)");
+    }
+
     let app_state = AppState {
         db: db_pool.clone(),
         chat_manager,
         apns,
+        apns_silent,
     };
 
     // Clone db_pool for shutdown handler before building router (which moves app_state)

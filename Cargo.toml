@@ -70,6 +70,8 @@ base64 = "0.22"
 lazy_static = "1.4"
 # APNs push notifications (JWT signing)
 jsonwebtoken = "9"
+# APNs HTTP/2 client (Threema fork) for silent / background pushes
+apns-h2 = "0.11"
 
 # IMAP for email fetching
 async-imap = "0.10"
