@@ -9,6 +9,7 @@ mod models;
 mod nightly_scheduler;
 mod observability;
 mod request_logger;
+mod retention;
 pub mod safety;
 pub mod system_log_helper;
 
@@ -179,6 +180,26 @@ async fn main() -> anyhow::Result<()> {
     // Nightly scheduler DISABLED — do not re-enable until conversation integration is validated.
     // nightly_scheduler::start_nightly_scheduler(db_pool.clone(), shutdown_token.child_token());
     tracing::info!("Nightly scheduler is DISABLED");
+
+    // Conversation-events retention prune (T-65DA4D32). Fires once per
+    // day at RETENTION_RUN_HOUR_UTC (default 03:00 UTC). Set
+    // RETENTION_RUN_ON_STARTUP=1 to also run immediately on boot. Tunables
+    // (age_days, min_keep, batch_size) are read from env with safe
+    // defaults — see `retention::RetentionConfig::from_env`.
+    {
+        let retention_config = retention::RetentionConfig::from_env();
+        tracing::info!(
+            "Retention scheduler starting (age_days={}, min_keep={}, batch_size={})",
+            retention_config.age_days,
+            retention_config.min_keep_per_conversation,
+            retention_config.batch_size
+        );
+        retention::scheduler::spawn_retention_loop(
+            db_pool.clone(),
+            retention_config,
+            shutdown_token.child_token(),
+        );
+    }
 
     // Create chat client manager for persistent ClaudeSDKClient instances
     let chat_manager = Arc::new(ChatClientManager::new());

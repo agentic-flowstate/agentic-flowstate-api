@@ -59,6 +59,16 @@ pub const METRIC_EVENTS_GAP_DETECTED: &str = "events_gap_detected_total";
 pub const METRIC_CLIENTS_SESSION_START: &str = "clients_session_start_total";
 pub const METRIC_CLIENTS_MODERN_RATIO: &str = "clients_modern_session_ratio";
 
+// Retention prune metrics (T-65DA4D32). Emitted by `src/retention/prune.rs`
+// after every scheduled sweep so operators can confirm (a) the prune is
+// running, (b) it's keeping up with ingest volume, and (c) the fleet's
+// oldest surviving event is inside the retention window — the precondition
+// for the resume-token 410 Gone contract to be meaningful.
+pub const METRIC_RETENTION_ROWS_DELETED: &str = "retention_rows_deleted_total";
+pub const METRIC_RETENTION_PRUNE_DURATION_MS: &str = "retention_prune_duration_ms";
+pub const METRIC_RETENTION_CONVERSATIONS_TOUCHED: &str = "retention_conversations_touched";
+pub const METRIC_RETENTION_EARLIEST_AGE_SECS: &str = "retention_earliest_remaining_event_age_seconds";
+
 // ---------------------------------------------------------------------------
 // Enums for metric labels. Display impls produce the exact label string
 // that Prometheus will see — no runtime string building at call sites.
