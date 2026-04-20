@@ -231,7 +231,7 @@ impl ApnsService {
         conversation_id: Option<&str>,
         agent_name: Option<&str>,
     ) -> Result<(), String> {
-        let tokens = match ticketing_system::device_tokens::get_tokens_for_user(db, user_id).await {
+        let tokens = match ticketing_system::device_tokens::get_active_tokens_for_user(db, user_id).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("[APNS] DB error fetching tokens for user {}: {}", user_id, e);
@@ -250,10 +250,10 @@ impl ApnsService {
                 Ok(()) => {}
                 Err(reason) => {
                     tracing::warn!("[APNS] Send failed for user {}: {}", user_id, reason);
-                    // Remove invalid tokens
+                    // Soft-delete invalid tokens so they stop being pushed to.
                     if reason == "BadDeviceToken" || reason == "Unregistered" || reason == "DeviceTokenNotForTopic" {
-                        tracing::info!("[APNS] Removing invalid token for user {}", user_id);
-                        let _ = ticketing_system::device_tokens::remove_token(db, token).await;
+                        tracing::info!("[APNS] Soft-deleting invalid token for user {}", user_id);
+                        let _ = ticketing_system::device_tokens::soft_delete_device_token(db, user_id, token).await;
                     }
                 }
             }

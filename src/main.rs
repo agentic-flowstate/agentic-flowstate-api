@@ -720,6 +720,14 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::device_tokens::register_device_token)
             .delete(handlers::device_tokens::remove_device_token))
 
+        // v1 device registration endpoints — rich contract used by the
+        // durable-streaming iOS client. Upsert on POST, list active on GET.
+        // Soft-delete is driven server-side by APNs 410 responses, not via
+        // a DELETE endpoint.
+        .route("/v1/devices",
+            post(handlers::device_tokens::register_device)
+            .get(handlers::device_tokens::list_devices))
+
         // CAD file routes (LaminarForge 3D models)
         .route("/api/cad/files",
             get(handlers::cad::list_cad_files))
