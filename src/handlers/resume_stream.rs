@@ -73,6 +73,7 @@ use crate::retention::{self, prune as retention_prune, RetentionConfig};
 
 use super::chat_stream::get_broadcast_sender;
 use super::resume_cursor::{extract_cursor, CursorError, ResumeCursor, ResumeQuery};
+use super::resume_snapshot::{reconstruct_state_up_to_cursor, synthesize_snapshot_events};
 use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
 
 /// Canonical SSE reconnect endpoint:
@@ -352,6 +353,76 @@ fn build_resume_stream(
         // returns everything strictly greater than N, which is exactly the
         // contract the client expects.
         let after = cursor.event_index.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+
+        // ---- Phase 1a: synthetic resumption snapshot (T-F8F986A9). ----
+        //
+        // When the cursor lands INSIDE an in-progress content block —
+        // between two `text_delta`s, mid `input_json_delta`, mid
+        // `thinking_delta` — the naive forward replay would leave the
+        // client's UI with a half-rendered block that never gets filled
+        // in. Walk the persisted log up to and including the cursor,
+        // rebuild the authoritative state of each still-open block, and
+        // emit one `content_block_snapshot` frame per block BEFORE the
+        // forward events. Clients treat the snapshot as an idempotent
+        // REPLACEMENT for their local copy of that block.
+        //
+        // Each synthetic frame is stamped with `id: <cursor>` (NOT a new
+        // event_index) so the forward cursor is never polluted — if the
+        // client drops again the server will re-derive an equivalent
+        // snapshot from the same cursor position. See
+        // `handlers::resume_snapshot` module docs.
+        //
+        // Skipped entirely on fresh streams (`cursor.is_resume() == false`) —
+        // a client that hasn't seen anything yet has no half-rendered
+        // state to heal.
+        if cursor.is_resume() {
+            match reconstruct_state_up_to_cursor(&db, &conversation_id, cursor.event_index).await {
+                Ok(states) if !states.is_empty() => {
+                    let snapshots = synthesize_snapshot_events(&states);
+                    tracing::info!(
+                        conversation_id = %conversation_id,
+                        cursor = cursor.event_index,
+                        unstopped_blocks = states.len(),
+                        "resume stream: emitting synthetic content_block_snapshot frames"
+                    );
+                    for snap in snapshots {
+                        let payload = match serde_json::to_string(&snap) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(
+                                    conversation_id = %conversation_id,
+                                    cursor = cursor.event_index,
+                                    error = %e,
+                                    "resume stream: snapshot serialization failed — skipping frame"
+                                );
+                                continue;
+                            }
+                        };
+                        record_stream_event_emitted(&conversation_id, payload.len());
+                        yield Ok(Event::default()
+                            .id(cursor.event_index.to_string())
+                            .event("content_block_snapshot")
+                            .data(payload));
+                    }
+                }
+                Ok(_) => {
+                    // No unstopped blocks — nothing to heal.
+                }
+                Err(e) => {
+                    // Reconstruction failure is non-fatal: we skip the
+                    // snapshot and fall through to naive forward replay.
+                    // Worst case the client sees a half-rendered block
+                    // until the next complete turn overwrites it — the
+                    // stream itself stays alive.
+                    tracing::error!(
+                        conversation_id = %conversation_id,
+                        cursor = cursor.event_index,
+                        error = %e,
+                        "resume stream: snapshot reconstruction failed — continuing without snapshot"
+                    );
+                }
+            }
+        }
 
         let replay = match conversations::get_events_after(&db, &conversation_id, after).await {
             Ok(v) => v,
@@ -1164,4 +1235,188 @@ mod tests {
         assert_eq!(frames[0].0, "5");
         assert_eq!(frames[4].0, "9");
     }
+
+    /// Integration test for T-F8F986A9: client reconnects with a cursor
+    /// landing mid-text-stream. The build_resume_stream pipeline must
+    /// emit exactly ONE `content_block_snapshot` frame BEFORE any
+    /// forward-replay frames, stamped with `id: <cursor>` (not a new
+    /// event_index) and carrying the accumulated text prefix in its
+    /// payload.
+    #[tokio::test]
+    async fn resume_with_midblock_cursor_emits_snapshot_before_replay() {
+        let pool = fresh_pool().await;
+        insert_conversation(&pool, "c-snap-integ").await;
+
+        // Seed a turn the worker was streaming when the client dropped:
+        //   idx 0: message_start
+        //   idx 1: content_block_start  (text block 0)
+        //   idx 2: content_block_delta  ("hel")
+        //   idx 3: content_block_delta  ("lo ")        <- cursor lands here
+        //   idx 4: content_block_delta  ("world")
+        //   idx 5: content_block_stop
+        //   idx 6: message_stop
+        insert_event(
+            &pool,
+            "c-snap-integ",
+            0,
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_x","type":"message","role":"assistant","content":[]}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "c-snap-integ",
+            1,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "c-snap-integ",
+            2,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "c-snap-integ",
+            3,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo "}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "c-snap-integ",
+            4,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "c-snap-integ",
+            5,
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "c-snap-integ",
+            6,
+            "message_stop",
+            r#"{"type":"message_stop"}"#,
+        )
+        .await;
+
+        let cursor = ResumeCursor {
+            event_index: 3,
+            source: CursorSource::LastEventIdHeader,
+        };
+        let s = build_resume_stream(
+            pool.clone(),
+            "c-snap-integ".to_string(),
+            cursor,
+            "none".to_string(),
+        );
+        let boxed: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(s);
+        let frames = collect_stream(boxed).await;
+
+        // Expected frames in order:
+        //   [0] snapshot     id=3 event=content_block_snapshot  text="hello "
+        //   [1] delta idx4   id=4 event=content_block_delta     text="world"
+        //   [2] stop         id=5 event=content_block_stop
+        //   [3] message_stop id=6 event=message_stop
+        assert_eq!(frames.len(), 4, "expected 4 frames, got {:#?}", frames);
+
+        let (snap_id, snap_evt, snap_data) = &frames[0];
+        assert_eq!(snap_id, "3", "snapshot must be stamped with cursor id");
+        assert_eq!(snap_evt, "content_block_snapshot");
+        // The snapshot payload must carry the accumulated prefix of
+        // everything the client saw through the cursor (deltas at idx 2
+        // and idx 3 only — NOT idx 4).
+        let snap_json: serde_json::Value =
+            serde_json::from_str(snap_data).expect("snapshot data is JSON");
+        assert_eq!(snap_json["type"], "content_block_snapshot");
+        assert_eq!(snap_json["index"], 0);
+        assert_eq!(snap_json["block"]["type"], "text");
+        assert_eq!(snap_json["block"]["text"], "hello ");
+
+        // The forward-replay phase must pick up strictly after the
+        // cursor — no re-emission of events <= 3.
+        assert_eq!(frames[1].0, "4");
+        assert_eq!(frames[1].1, "content_block_delta");
+        assert_eq!(frames[2].0, "5");
+        assert_eq!(frames[2].1, "content_block_stop");
+        assert_eq!(frames[3].0, "6");
+        assert_eq!(frames[3].1, "message_stop");
+    }
+
+    /// Fresh-stream guard for T-F8F986A9: cursor = -1 MUST NOT emit any
+    /// snapshot frames, even when the log contains in-progress blocks.
+    /// The new client has seen nothing — there is no half-rendered state
+    /// to heal, and emitting a snapshot would pre-fill a UI before the
+    /// client has rendered `content_block_start`.
+    #[tokio::test]
+    async fn fresh_stream_does_not_emit_snapshot() {
+        let pool = fresh_pool().await;
+        insert_conversation(&pool, "c-fresh-snap").await;
+
+        // Seed a half-rendered block. A resume with cursor >= 2 would
+        // normally emit a snapshot; cursor = -1 must not.
+        insert_event(
+            &pool,
+            "c-fresh-snap",
+            0,
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_y","type":"message","role":"assistant","content":[]}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "c-fresh-snap",
+            1,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        )
+        .await;
+        insert_event(
+            &pool,
+            "c-fresh-snap",
+            2,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}"#,
+        )
+        .await;
+
+        let cursor = ResumeCursor {
+            event_index: -1,
+            source: CursorSource::FreshStream,
+        };
+        let s = build_resume_stream(
+            pool.clone(),
+            "c-fresh-snap".to_string(),
+            cursor,
+            "none".to_string(),
+        );
+        let boxed: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(s);
+        let frames = collect_stream(boxed).await;
+
+        // No snapshot allowed. Just the 3 stored events at ids 0, 1, 2.
+        assert_eq!(frames.len(), 3);
+        for f in &frames {
+            assert_ne!(
+                f.1, "content_block_snapshot",
+                "fresh stream must not emit a snapshot frame: {:?}",
+                f
+            );
+        }
+        assert_eq!(frames[0].0, "0");
+        assert_eq!(frames[1].0, "1");
+        assert_eq!(frames[2].0, "2");
+    }
+
 }

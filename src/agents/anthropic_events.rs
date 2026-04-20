@@ -77,6 +77,31 @@ pub enum AnthropicEvent {
     Error {
         error: ApiError,
     },
+    /// Synthetic resumption snapshot for a mid-stream content block
+    /// (T-F8F986A9). Emitted by the resume stream replay path BEFORE
+    /// forward-emission continues, ONLY for blocks whose stored log
+    /// shows `content_block_start` + some deltas but no matching
+    /// `content_block_stop` at the resume cursor. The `block` field
+    /// carries the fully-reconstructed state of the block (accumulated
+    /// text / input_json / thinking + signature) so the client can
+    /// replace its half-rendered local copy authoritatively without
+    /// having to replay every delta frame it already saw.
+    ///
+    /// Wire shape mirrors Anthropic's documented snapshot event:
+    /// `{"type":"content_block_snapshot","index":N,"block":{...}}`.
+    ///
+    /// The event is transport-only — it is NOT persisted to
+    /// `conversation_events`. The resume handler stamps it with
+    /// `id: <cursor>` (the client's Last-Event-ID) rather than a new
+    /// event_index so the forward cursor is never polluted. On a
+    /// subsequent reconnect with the same Last-Event-ID the server will
+    /// re-emit an equivalent snapshot derived fresh from the DB —
+    /// clients must treat snapshots as idempotent replacements, not
+    /// cumulative deltas.
+    ContentBlockSnapshot {
+        index: u32,
+        block: ContentBlockStub,
+    },
 }
 
 impl AnthropicEvent {
@@ -92,6 +117,7 @@ impl AnthropicEvent {
             AnthropicEvent::MessageStop => "message_stop",
             AnthropicEvent::Ping => "ping",
             AnthropicEvent::Error { .. } => "error",
+            AnthropicEvent::ContentBlockSnapshot { .. } => "content_block_snapshot",
         }
     }
 }

@@ -35,6 +35,7 @@ pub mod meetings;
 pub mod memberships;
 pub mod quick_commands;
 pub mod resume_cursor;
+pub mod resume_snapshot;
 pub mod resume_stream;
 pub mod scoped_workspace_chat;
 pub mod slices;
