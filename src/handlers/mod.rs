@@ -39,6 +39,7 @@ pub mod resume_stream;
 pub mod scoped_workspace_chat;
 pub mod slices;
 pub mod spanish_flashcards;
+pub mod sse_keepalive;
 pub mod ticket_history;
 pub mod tickets;
 pub mod title_generator;

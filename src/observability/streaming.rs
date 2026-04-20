@@ -54,6 +54,9 @@ pub const METRIC_STREAM_RESUME: &str = "stream_resume_total";
 pub const METRIC_STREAM_COLD_START: &str = "stream_cold_start_total";
 pub const METRIC_STREAM_RESUME_RATIO: &str = "stream_resume_ratio";
 pub const METRIC_STREAM_CURSOR_EXPIRED: &str = "stream_cursor_expired_410_total";
+/// Counter: `ping` keepalive frames shipped downstream. Incremented by
+/// the SSE keepalive wrapper (T-CFFAF032). One increment per frame.
+pub const METRIC_STREAM_KEEPALIVE_SENT: &str = "stream_keepalive_sent_total";
 pub const METRIC_PUSH_SENT: &str = "push_sent_total";
 pub const METRIC_EVENTS_GAP_DETECTED: &str = "events_gap_detected_total";
 pub const METRIC_CLIENTS_SESSION_START: &str = "clients_session_start_total";
@@ -67,7 +70,8 @@ pub const METRIC_CLIENTS_MODERN_RATIO: &str = "clients_modern_session_ratio";
 pub const METRIC_RETENTION_ROWS_DELETED: &str = "retention_rows_deleted_total";
 pub const METRIC_RETENTION_PRUNE_DURATION_MS: &str = "retention_prune_duration_ms";
 pub const METRIC_RETENTION_CONVERSATIONS_TOUCHED: &str = "retention_conversations_touched";
-pub const METRIC_RETENTION_EARLIEST_AGE_SECS: &str = "retention_earliest_remaining_event_age_seconds";
+pub const METRIC_RETENTION_EARLIEST_AGE_SECS: &str =
+    "retention_earliest_remaining_event_age_seconds";
 
 // ---------------------------------------------------------------------------
 // Enums for metric labels. Display impls produce the exact label string
@@ -100,6 +104,12 @@ pub enum DisconnectReason {
     /// Client sent a `starting_after` cursor older than the oldest
     /// retained event and was served 410 Gone before the stream opened.
     CursorExpired,
+    /// Server received SIGTERM / Ctrl+C and is draining active streams.
+    /// The keepalive wrapper watches a process-wide `CancellationToken`
+    /// and terminates the stream cleanly with a `message:end
+    /// reason:server_shutdown` frame so the client can reconnect to the
+    /// next replica (T-CFFAF032).
+    ServerShutdown,
     /// Stream terminated due to an unhandled error (DB failure, broadcast
     /// panic, worker crash).
     Error,
@@ -115,6 +125,7 @@ impl fmt::Display for DisconnectReason {
             DisconnectReason::ServerIdleTimeout => "server_idle_timeout",
             DisconnectReason::KeepaliveTimeout => "keepalive_timeout",
             DisconnectReason::CursorExpired => "cursor_expired",
+            DisconnectReason::ServerShutdown => "server_shutdown",
             DisconnectReason::Error => "error",
             DisconnectReason::Normal => "normal",
         })
@@ -303,6 +314,24 @@ pub fn record_stream_event_emitted(conversation_id: &str, bytes: usize) {
     );
 }
 
+/// Observed a `ping` keepalive frame being pushed downstream. Used by
+/// the SSE keepalive wrapper (T-CFFAF032) so operators can chart ping
+/// cadence per endpoint and catch stuck-interval regressions.
+///
+/// The counter is unlabeled — pings are uniform across all streams, and
+/// adding a per-conversation label would explode cardinality. If you
+/// need to localize a regression, correlate against the structured
+/// `tracing::trace!` log which carries the conversation_id.
+pub fn record_keepalive_sent(conversation_id: &str) {
+    counter!(METRIC_STREAM_KEEPALIVE_SENT).increment(1);
+    tracing::trace!(
+        target: "observability.streaming",
+        event = "stream.keepalive_sent",
+        conversation_id = %conversation_id,
+        "keepalive ping emitted"
+    );
+}
+
 /// Observed a `starting_after` cursor that sits below the oldest
 /// retained event. Emitted alongside the 410 Gone response.
 pub fn record_cursor_expired(conversation_id: &str, requested_cursor: i32, oldest_retained: i32) {
@@ -457,6 +486,7 @@ mod tests {
             (DisconnectReason::ServerIdleTimeout, "server_idle_timeout"),
             (DisconnectReason::KeepaliveTimeout, "keepalive_timeout"),
             (DisconnectReason::CursorExpired, "cursor_expired"),
+            (DisconnectReason::ServerShutdown, "server_shutdown"),
             (DisconnectReason::Error, "error"),
             (DisconnectReason::Normal, "normal"),
         ];

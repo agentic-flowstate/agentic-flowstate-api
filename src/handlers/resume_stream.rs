@@ -72,6 +72,7 @@ use crate::retention::{self, prune as retention_prune, RetentionConfig};
 
 use super::chat_stream::get_broadcast_sender;
 use super::resume_cursor::{extract_cursor, CursorError, ResumeCursor, ResumeQuery};
+use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
 
 /// Canonical SSE reconnect endpoint:
 /// `GET /v1/conversations/:id/events`.
@@ -222,17 +223,29 @@ pub async fn resume_conversation_stream(
     };
 
     // ---- 6. Build the SSE body stream. ----
+    //
+    // Layer the stream from inside out:
+    //   (a) `build_resume_stream`: replay + live-tail events
+    //   (b) `StreamCloseGuard`: RAII metric emission on drop
+    //   (c) `wrap_stream_with_keepalive`: Anthropic-vocab `ping` frames
+    //       every 15s, 10-minute server-side idle timeout, graceful
+    //       shutdown on SIGTERM (T-CFFAF032).
+    //
+    // The `.keep_alive(...)` call on `Sse` is set to 1h so axum's
+    // built-in comment-ping generator NEVER fires — we own the ping
+    // cadence end-to-end via the keepalive wrapper so frames are
+    // named-event `ping` (which our iOS reader and idle-timer both
+    // understand), not `: ping\n` comment lines.
     let inner = build_resume_stream(pool.clone(), id.clone(), cursor, checkpoint_status);
     let inner_boxed: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
         Box::pin(inner);
-    let guarded = StreamCloseGuard::new(id, inner_boxed);
+    let guarded = StreamCloseGuard::new(id.clone(), inner_boxed);
+    let guarded_boxed: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> =
+        Box::pin(guarded);
+    let hardened = wrap_stream_with_keepalive(guarded_boxed, KeepaliveConfig::from_env(), id);
 
-    Sse::new(Box::pin(guarded) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("ping"),
-        )
+    Sse::new(Box::pin(hardened) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(3600)))
         .into_response()
 }
 

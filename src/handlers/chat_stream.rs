@@ -18,6 +18,7 @@ use serde::Deserialize;
 use super::chat_client_manager::ChatClientManager;
 use super::conversation_worker::WorkerMessage;
 use super::conversation_worker_manager::WORKER_MANAGER;
+use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
 use crate::agents::{AgentType, StreamEvent};
 use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
 
@@ -85,6 +86,15 @@ pub fn chat(
     images: Option<Vec<ChatImageData>>,
 ) -> SseStream {
     let (tx, rx) = mpsc::channel::<(i32, String)>(100);
+
+    // Capture the conversation_id early so the outer SSE wrapper (keepalive
+    // + idle timeout + shutdown) can attribute pings/closes to the right
+    // conversation in logs and metrics. The task-local copy inside the
+    // spawn handles the request-is-missing path by emitting a failed
+    // status; the wrapper here uses a safe placeholder for that case.
+    let wrapper_conv_id = conversation_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
 
     tokio::spawn(async move {
         let conv_id = match conversation_id {
@@ -175,23 +185,36 @@ pub fn chat(
         }
     });
 
-    create_sse_stream_raw(rx)
+    create_sse_stream_raw(rx, wrapper_conv_id)
 }
 
 /// Create SSE stream from raw (index, json) broadcast tuples.
-fn create_sse_stream_raw(rx: mpsc::Receiver<(i32, String)>) -> SseStream {
+///
+/// The inner event stream is wrapped with the production-hardening
+/// keepalive layer (T-CFFAF032): Anthropic-vocabulary `ping` frames
+/// every 15s (cadence resets on every real event), a 10-minute idle
+/// timeout that emits a terminal `message:end reason:server_idle_timeout`
+/// frame, and a graceful-shutdown hook that emits
+/// `message:end reason:server_shutdown` when the process receives
+/// SIGTERM. The former in-tree `KeepAlive::new().text("ping")` helper
+/// emitted comment-style pings which our iOS reader ignores — we
+/// switched to the Anthropic-compatible named-event form so idle
+/// tracking works end-to-end.
+fn create_sse_stream_raw(rx: mpsc::Receiver<(i32, String)>, conversation_id: String) -> SseStream {
     let stream = stream! {
         let mut rx = ReceiverStream::new(rx);
         while let Some((index, json)) = futures::StreamExt::next(&mut rx).await {
             yield Ok(Event::default().id(index.to_string()).data(json));
         }
     };
-    Sse::new(Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(30))
-                .text("ping"),
-        )
+    let inner: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>> = Box::pin(stream);
+    let wrapped = wrap_stream_with_keepalive(inner, KeepaliveConfig::from_env(), conversation_id);
+    // axum's built-in KeepAlive helper is disabled here (interval=1h) —
+    // we own the ping cadence via wrap_stream_with_keepalive so the
+    // frames are Anthropic-vocab `ping` events, not `: ping\n\n`
+    // comments.
+    Sse::new(Box::pin(wrapped) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(3600)))
 }
 
 /// Create an SSE stream that replays stored events for a conversation, then

@@ -173,6 +173,22 @@ async fn main() -> anyhow::Result<()> {
     // When cancelled, all tasks using a child token will break out of their loops.
     let shutdown_token = CancellationToken::new();
 
+    // Register the shutdown token with the SSE keepalive subsystem so active
+    // SSE streams drain cleanly on SIGTERM / Ctrl+C with a
+    // `message:end reason:server_shutdown` frame (T-CFFAF032). Handlers pull
+    // this token via `handlers::sse_keepalive::shutdown_token()` without
+    // needing to plumb AppState through — the keepalive wrapper is invoked
+    // from many call sites (chat_stream, resume_stream, full_access_chat,
+    // home_planner, workspace_manager, ...) and a global install keeps the
+    // signature stable.
+    if handlers::sse_keepalive::install_shutdown_token(shutdown_token.clone()).is_err() {
+        tracing::warn!(
+            "[SSE_KEEPALIVE] shutdown token already installed — ignoring (likely a test)"
+        );
+    } else {
+        tracing::info!("[SSE_KEEPALIVE] shutdown token registered");
+    }
+
     // Start email fetcher background task (queries email_accounts table each cycle)
     tracing::info!("Starting email fetcher (hot-reload from database)");
     email_fetcher::start_email_fetcher(db_pool.clone(), shutdown_token.child_token());
