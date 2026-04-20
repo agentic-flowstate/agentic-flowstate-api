@@ -869,6 +869,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::reconnect_conversation_stream),
         )
         .route(
+            "/api/v1/conversations/:id/events",
+            get(handlers::resume_stream::resume_conversation_stream),
+        )
+        .route(
             "/api/conversations/:id/messages",
             get(handlers::list_messages).post(handlers::add_message),
         )
