@@ -542,6 +542,15 @@ impl ConversationWorker {
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         heartbeat.tick().await; // consume immediate first tick
         let mut last_message_time = Instant::now();
+        // WORKAROUND for cc-sdk 0.6.0: parse_user_message drops User messages with array
+        // content (i.e., all tool_result messages from Claude CLI), so ContentBlock::ToolResult
+        // never reaches us via the SDK stream. We synthesize completion events by tracking
+        // in-flight tool_use IDs and flushing them when the next Assistant message arrives
+        // (Claude CLI runs tools synchronously between messages, so by the next Assistant
+        // message the tool is definitely done) or on Result. Without this the client never
+        // receives toolUseEnd, so the interrupt sweep in ChatLabViewModel marks tool cards
+        // as `⚠︎ interrupted` and the UI shows them in the error state.
+        let mut pending_tool_ids: Vec<String> = Vec::new();
 
         loop {
             tokio::select! {
@@ -552,6 +561,34 @@ impl ConversationWorker {
                             last_message_time = Instant::now();
 
                             if let Message::Assistant { message: assistant_msg } = &sdk_msg {
+                                // Before processing this assistant turn's blocks, flush any
+                                // tool_uses from the PREVIOUS assistant turn as synthetic
+                                // ToolResults — they're guaranteed to have completed because
+                                // Claude CLI runs tools synchronously between Assistant
+                                // messages but cc-sdk drops the intervening tool_result User
+                                // message (see note at loop init).
+                                if !pending_tool_ids.is_empty() {
+                                    for tool_id in pending_tool_ids.drain(..) {
+                                        tracing::debug!(
+                                            "[WORKER] Synthesizing ToolResult for pending tool_use_id={} (cc-sdk dropped the actual result message)",
+                                            tool_id
+                                        );
+                                        if let Err(e) = conversations::update_tool_call_result(
+                                            &self.db,
+                                            &tool_id,
+                                            "",
+                                            false,
+                                        ).await {
+                                            tracing::error!("[WORKER] Failed to update synth tool result: {}", e);
+                                        }
+                                        self.emit_event(&StreamEvent::ToolResult {
+                                            tool_use_id: tool_id,
+                                            content: String::new(),
+                                            is_error: false,
+                                        }).await;
+                                    }
+                                }
+
                                 for block in &assistant_msg.content {
                                     match block {
                                         ContentBlock::Text(text_content) => {
@@ -606,6 +643,8 @@ impl ConversationWorker {
                                                 name: tool_use.name.clone(),
                                                 input: tool_use.input.clone(),
                                             }).await;
+                                            // Track for synthetic ToolResult on next Assistant / Result
+                                            pending_tool_ids.push(tool_use.id.clone());
                                         }
                                         ContentBlock::ToolResult(tool_result) => {
                                             let content = match &tool_result.content {
@@ -630,6 +669,9 @@ impl ConversationWorker {
                                                 content,
                                                 is_error: tool_result.is_error.unwrap_or(false),
                                             }).await;
+                                            // Remove from pending so we don't synthesize a
+                                            // second event when cc-sdk eventually ships the fix.
+                                            pending_tool_ids.retain(|id| id != &tool_result.tool_use_id);
                                         }
                                         ContentBlock::Thinking(thinking) => {
                                             self.emit_event(&StreamEvent::Thinking {
@@ -659,6 +701,32 @@ impl ConversationWorker {
                             // Check for result message
                             if let Message::Result { session_id: sess_id, is_error, subtype, usage, .. } = &sdk_msg {
                                 tracing::info!("[WORKER] Result: subtype={}, is_error={}", subtype, is_error);
+
+                                // Flush any still-pending tool_uses as synthetic ToolResults.
+                                // On the is_error=true path these were likely killed by the
+                                // SDK/CLI and didn't actually finish; mark them as errors so
+                                // the UI shows the correct state.
+                                if !pending_tool_ids.is_empty() {
+                                    for tool_id in pending_tool_ids.drain(..) {
+                                        tracing::debug!(
+                                            "[WORKER] Synthesizing final ToolResult for tool_use_id={} at Result (is_error={})",
+                                            tool_id, is_error
+                                        );
+                                        if let Err(e) = conversations::update_tool_call_result(
+                                            &self.db,
+                                            &tool_id,
+                                            "",
+                                            *is_error,
+                                        ).await {
+                                            tracing::error!("[WORKER] Failed to update synth tool result at Result: {}", e);
+                                        }
+                                        self.emit_event(&StreamEvent::ToolResult {
+                                            tool_use_id: tool_id,
+                                            content: String::new(),
+                                            is_error: *is_error,
+                                        }).await;
+                                    }
+                                }
 
                                 // Track token usage
                                 if let Some(usage_json) = usage {
@@ -772,6 +840,17 @@ impl ConversationWorker {
                         }
                         Some(Err(e)) => {
                             tracing::error!("[WORKER] Error receiving message #{}: {}", message_count, e);
+                            // Flush pending tool_uses as errored — we don't know if they
+                            // finished, but the stream is dying; better to mark them error
+                            // than leave the UI stuck in Running.
+                            for tool_id in pending_tool_ids.drain(..) {
+                                let _ = conversations::update_tool_call_result(&self.db, &tool_id, "", true).await;
+                                self.emit_event(&StreamEvent::ToolResult {
+                                    tool_use_id: tool_id,
+                                    content: String::new(),
+                                    is_error: true,
+                                }).await;
+                            }
                             // Mark checkpoint as interrupted so it doesn't block restarts
                             let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
                             self.emit_event(&StreamEvent::Status {
@@ -790,6 +869,15 @@ impl ConversationWorker {
                                 resume_session_id,
                                 tool_call_count
                             );
+                            // Flush pending tool_uses as errored on stream-ended-without-Result.
+                            for tool_id in pending_tool_ids.drain(..) {
+                                let _ = conversations::update_tool_call_result(&self.db, &tool_id, "", true).await;
+                                self.emit_event(&StreamEvent::ToolResult {
+                                    tool_use_id: tool_id,
+                                    content: String::new(),
+                                    is_error: true,
+                                }).await;
+                            }
                             // Mark checkpoint as interrupted — stream ended unexpectedly
                             let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
                             // Emit visible status so the user knows the agent stopped

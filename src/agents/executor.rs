@@ -177,6 +177,11 @@ impl AgentExecutor {
                 } else {
                     let mut response_stream = sdk_client.receive_messages().await;
                     let mut message_count = 0u32;
+                    // See conversation_worker.rs for detailed explanation: cc-sdk 0.6.0 drops
+                    // tool_result User messages, so we synthesize StreamEvent::ToolResult
+                    // events when tools are known to have completed (next Assistant turn or
+                    // final Result).
+                    let mut pending_tool_ids: Vec<String> = Vec::new();
 
                     while let Some(message_result) = response_stream.next().await {
                         message_count += 1;
@@ -191,6 +196,29 @@ impl AgentExecutor {
                                 tracing::info!("Received message #{}: type={}", message_count, msg_type);
 
                                 if let Message::Assistant { message: assistant_msg } = &message {
+                                    // Flush pending tool_uses from the previous Assistant
+                                    // turn as synthetic ToolResults.
+                                    if !pending_tool_ids.is_empty() {
+                                        if let Some(ref tx) = event_tx {
+                                            for tool_id in pending_tool_ids.drain(..) {
+                                                tracing::debug!(
+                                                    "[EXECUTOR] Synthesizing ToolResult for pending tool_use_id={}",
+                                                    tool_id
+                                                );
+                                                let event = StreamEvent::ToolResult {
+                                                    tool_use_id: tool_id,
+                                                    content: String::new(),
+                                                    is_error: false,
+                                                };
+                                                if let Err(e) = tx.send(event).await {
+                                                    tracing::warn!("Failed to send synth tool_result: {}", e);
+                                                }
+                                            }
+                                        } else {
+                                            pending_tool_ids.clear();
+                                        }
+                                    }
+
                                     for block in &assistant_msg.content {
                                         match block {
                                             ContentBlock::Text(text_content) => {
@@ -218,6 +246,7 @@ impl AgentExecutor {
                                                         tracing::warn!("Failed to send tool_use event: {}", e);
                                                     }
                                                 }
+                                                pending_tool_ids.push(tool_use.id.clone());
                                             }
                                             ContentBlock::ToolResult(tool_result) => {
                                                 tracing::debug!(
@@ -238,6 +267,7 @@ impl AgentExecutor {
                                                         tracing::warn!("Failed to send tool_result event: {}", e);
                                                     }
                                                 }
+                                                pending_tool_ids.retain(|id| id != &tool_result.tool_use_id);
                                             }
                                             ContentBlock::Thinking(thinking) => {
                                                 tracing::debug!("Thinking: {} chars", thinking.thinking.len());
@@ -267,6 +297,29 @@ impl AgentExecutor {
                                     if let Some(result_text) = result {
                                         tracing::info!("Result text: {} chars", result_text.len());
                                     }
+                                    // Flush any remaining pending tool_uses as synthetic
+                                    // results before firing Result, so the client sees all
+                                    // toolUseEnd events before the done event.
+                                    if !pending_tool_ids.is_empty() {
+                                        if let Some(ref tx) = event_tx {
+                                            for tool_id in pending_tool_ids.drain(..) {
+                                                tracing::debug!(
+                                                    "[EXECUTOR] Final synth ToolResult for tool_use_id={} (is_error={})",
+                                                    tool_id, is_error
+                                                );
+                                                let event = StreamEvent::ToolResult {
+                                                    tool_use_id: tool_id,
+                                                    content: String::new(),
+                                                    is_error: *is_error,
+                                                };
+                                                if let Err(e) = tx.send(event).await {
+                                                    tracing::warn!("Failed to send final synth tool_result: {}", e);
+                                                }
+                                            }
+                                        } else {
+                                            pending_tool_ids.clear();
+                                        }
+                                    }
                                     // Capture SDK session_id for future resume (separate from our DB session_id)
                                     cc_session_id = Some(sess_id.clone());
                                     if *is_error {
@@ -294,6 +347,18 @@ impl AgentExecutor {
                             }
                             Err(e) => {
                                 tracing::error!("Error receiving message #{}: {}", message_count, e);
+                                // Flush pending tool_uses as errored so the UI exits the
+                                // Running state rather than being stuck forever.
+                                if let Some(ref tx) = event_tx {
+                                    for tool_id in pending_tool_ids.drain(..) {
+                                        let event = StreamEvent::ToolResult {
+                                            tool_use_id: tool_id,
+                                            content: String::new(),
+                                            is_error: true,
+                                        };
+                                        let _ = tx.send(event).await;
+                                    }
+                                }
                                 status = AgentRunStatus::Failed;
                                 break;
                             }
