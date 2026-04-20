@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use ticketing_system::models::ClientEventInput;
 
-/// POST /api/telemetry/events — accepts a JSON array of client events (max 100)
+/// POST /api/telemetry/events — accepts a JSON array of client events (max 1000)
 pub async fn ingest_events(
     State(pool): State<Arc<SqlitePool>>,
     Json(events): Json<Vec<ClientEventInput>>,
@@ -19,10 +19,10 @@ pub async fn ingest_events(
     if events.is_empty() {
         return (StatusCode::OK, Json(json!({"accepted": 0}))).into_response();
     }
-    if events.len() > 100 {
+    if events.len() > 1000 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Maximum 100 events per request"})),
+            Json(json!({"error": "Maximum 1000 events per request"})),
         )
             .into_response();
     }
