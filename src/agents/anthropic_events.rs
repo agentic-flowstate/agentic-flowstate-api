@@ -105,8 +105,8 @@ pub enum AnthropicEvent {
 }
 
 impl AnthropicEvent {
-    /// The Anthropic event-type string used for the
-    /// `anthropic_event_type` column in `conversation_events`.
+    /// The Anthropic event-type string used for the `event_type`
+    /// column in `conversation_events`.
     pub fn event_type(&self) -> &'static str {
         match self {
             AnthropicEvent::MessageStart { .. } => "message_start",

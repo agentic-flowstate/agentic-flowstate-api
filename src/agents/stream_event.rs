@@ -1,27 +1,17 @@
 //! The internal `StreamEvent` enum emitted by the agent runtime.
 //!
-//! `StreamEvent` is the sole on-the-wire representation of an agent turn
-//! as seen by the legacy (v1) dual-write path: every emitted event is
-//! serialized to JSON with the `serde(tag = "type", rename_all = "snake_case")`
-//! shape and stored as `conversation_events.event_data`. The Anthropic
-//! translator consumes the same enum shape and re-expresses each event as
-//! a sequence of v2 `AnthropicEvent` frames (see
-//! `crate::handlers::anthropic_translator`).
+//! The agent runtime produces `StreamEvent`s; the [`AnthropicTranslator`]
+//! consumes the enum and re-expresses each event as a sequence of
+//! Anthropic vocabulary frames (see `crate::handlers::anthropic_translator`).
+//! `StreamEvent` itself is not persisted — only the translated Anthropic
+//! frames land in `conversation_events`.
 //!
-//! Isolating the enum in its own small file (rather than inside the
-//! bigger `types.rs`) lets the `backfill_v2_events` binary re-hydrate
-//! historical v1 payloads via `crate::agents::stream_event::StreamEvent`
-//! without pulling in `types.rs`'s `agents.json`-loading static init.
+//! [`AnthropicTranslator`]: crate::handlers::anthropic_translator::AnthropicTranslator
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Structured streaming event for agent execution.
-///
-/// `Deserialize` is derived so the v2 backfill (`bin/backfill_v2_events.rs`)
-/// can re-hydrate historical v1 rows from `conversation_events.event_data`
-/// and re-run them through the Anthropic translator without reimplementing
-/// the translation logic. Live emission callers only need `Serialize`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
     /// Text content from the assistant

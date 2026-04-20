@@ -1,6 +1,6 @@
 {
   "title": "Durable Streaming (T-56987678)",
-  "description": "Observability for SSE stream lifecycle, APNs silent push delivery, event_index gap detection, and the modern-vocab rollout gate. Every panel maps 1:1 to a metric emitted by src/observability/streaming.rs. If a panel goes blank, the emission site in handlers/chat_stream.rs, handlers/conversation_worker.rs, or apns/silent_fanout.rs regressed — NOT the dashboard.",
+  "description": "Observability for SSE stream lifecycle, APNs silent push delivery, and event_index gap detection. Every panel maps 1:1 to a metric emitted by src/observability/streaming.rs. If a panel goes blank, the emission site in handlers/chat_stream.rs, handlers/conversation_worker.rs, or apns/silent_fanout.rs regressed — NOT the dashboard.",
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
@@ -121,7 +121,7 @@
     {
       "id": 6,
       "title": "Bytes emitted per second",
-      "description": "stream_bytes_emitted_total — serialized JSON payload bytes shipped to clients. Divide by stream_events_emitted_total for mean event size. Watch this during vocab migration — modern events are narrower.",
+      "description": "stream_bytes_emitted_total — serialized JSON payload bytes shipped to clients. Divide by stream_events_emitted_total for mean event size.",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
@@ -255,77 +255,19 @@
     },
     {
       "id": 12,
-      "title": "Client session_start by platform + vocab",
-      "description": "clients_session_start_total labeled by platform + client_version + vocab. Emitted once per device registration. The vocab label is the gate for event_vocab_mode flip: when every session is `vocab=modern` for 14d consecutively, operations can flip to modern_only.",
+      "title": "Client session_start by platform",
+      "description": "clients_session_start_total labeled by platform + client_version. Emitted once per device registration.",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 38 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 38 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum by (platform, vocab) (rate(clients_session_start_total[15m]))",
-          "legendFormat": "{{platform}} / {{vocab}}"
+          "expr": "sum by (platform, client_version) (rate(clients_session_start_total[15m]))",
+          "legendFormat": "{{platform}} @ {{client_version}}"
         }
       ],
       "fieldConfig": {
         "defaults": { "unit": "ops" }
-      }
-    },
-    {
-      "id": 13,
-      "title": "Modern-vocab session ratio (rollout gate)",
-      "description": "clients_modern_session_ratio gauge = modern_sessions / total_sessions (since process start). This is THE rollout-gate signal for event_vocab_mode=modern_only. Operator flip rule: ratio ≥ 0.999 for 14 consecutive days. Resetting a deployment resets the counter — do not flip purely on a short window.",
-      "type": "stat",
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 38 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "targets": [
-        {
-          "expr": "clients_modern_session_ratio",
-          "legendFormat": "modern ratio"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percentunit",
-          "min": 0,
-          "max": 1,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "red", "value": null },
-              { "color": "yellow", "value": 0.5 },
-              { "color": "green", "value": 0.999 }
-            ]
-          }
-        }
-      }
-    },
-    {
-      "id": 14,
-      "title": "Rollout gate — 14-day consecutive green",
-      "description": "PromQL boolean: 1 when `clients_modern_session_ratio >= 0.999` continuously for 14d, else 0. Wire an alert on `== 1` to notify operations they may flip event_vocab_mode.",
-      "type": "stat",
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 38 },
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "targets": [
-        {
-          "expr": "min_over_time(clients_modern_session_ratio[14d]) >= bool 0.999",
-          "legendFormat": "flip allowed?"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "mappings": [
-            { "type": "value", "options": { "0": { "text": "HOLD" }, "1": { "text": "FLIP READY" } } }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "yellow", "value": null },
-              { "color": "green", "value": 1 }
-            ]
-          }
-        }
       }
     }
   ]

@@ -170,19 +170,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Resolve event-vocabulary mode with env+DB precedence (T-257C060D).
-    // Env var wins and overwrites the DB row; otherwise the DB row wins;
-    // otherwise the default (dual) is seeded. Invalid env var or corrupt
-    // DB row fails startup loudly — there is no silent fallback.
-    let vocab_mode = handlers::admin_feature_flags::bootstrap_event_vocab_mode(&db_pool)
-        .await
-        .map_err(|e| {
-            tracing::error!("[EVENT_VOCAB] bootstrap failed: {:?}", e);
-            e
-        })?;
-    handlers::event_vocab::init_global(vocab_mode);
-    tracing::info!("[EVENT_VOCAB] mode = {}", vocab_mode);
-
     // Create shutdown token for coordinated cancellation of all background tasks.
     // When cancelled, all tasks using a child token will break out of their loops.
     let shutdown_token = CancellationToken::new();
@@ -421,12 +408,6 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-
-    // Feature-flags refresher (T-257C060D): every 30s, re-read
-    // feature_flags.event_vocab_mode and republish the in-memory
-    // ArcSwap if it differs. Keeps multi-instance deployments
-    // convergent on an admin PUT.
-    handlers::admin_feature_flags::spawn_refresher(db_pool.clone(), shutdown_token.child_token());
 
     // Deferred restart watcher: polls every 10 seconds for queued restarts.
     // When a restart is pending AND no active agent runs remain, executes the restart.
@@ -1079,12 +1060,6 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/client-events",
             get(handlers::client_telemetry::list_client_events),
-        )
-        // Runtime-flippable feature flag: event vocab mode (T-257C060D)
-        .route(
-            "/api/admin/feature-flags/event_vocab_mode",
-            get(handlers::admin_feature_flags::get_event_vocab_mode)
-                .put(handlers::admin_feature_flags::put_event_vocab_mode),
         )
         .route(
             "/api/meeting-agent/chat",

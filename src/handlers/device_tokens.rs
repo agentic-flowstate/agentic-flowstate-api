@@ -27,9 +27,8 @@ use ticketing_system::device_tokens::{
 };
 use ticketing_system::SqlitePool;
 
-use super::event_vocab::{self, EventVocabMode};
 use crate::auth_middleware::AuthenticatedUser;
-use crate::observability::streaming::{record_session_start, ClientPlatform, SessionVocab};
+use crate::observability::streaming::{record_session_start, ClientPlatform};
 
 // ---------------------------------------------------------------------------
 // POST /v1/devices
@@ -134,20 +133,12 @@ pub async fn register_device(
         row.bundle_id
     );
 
-    // T-56987678: emit `clients_session_start_total` + `clients_modern_session_ratio`
-    // on every device registration. This is the only path iOS clients call at
-    // launch before streaming, so it's the canonical session-start signal for
-    // the rollout gate on `event_vocab_mode`.
-    //
-    // Vocab label is derived from the in-memory feature-flag: legacy-only and
-    // dual-write clients bucket as `legacy`; modern-only buckets as `modern`.
+    // T-56987678: emit `clients_session_start_total` on every device
+    // registration. This is the only path iOS clients call at launch before
+    // streaming, so it's the canonical session-start signal.
     let platform = ClientPlatform::parse(&req.platform);
-    let vocab = match event_vocab::current_mode() {
-        EventVocabMode::ModernOnly => SessionVocab::Modern,
-        _ => SessionVocab::Legacy,
-    };
     let version = req.client_version.as_deref().unwrap_or("unknown");
-    record_session_start(&user.user_id, platform, version, vocab);
+    record_session_start(&user.user_id, platform, version);
 
     Ok((StatusCode::OK, Json(row.into())))
 }

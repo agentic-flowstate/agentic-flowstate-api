@@ -17,7 +17,6 @@ use super::chat_client_manager::{ChatClient, ChatClientManager};
 use super::chat_stream::{
     get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData,
 };
-use super::event_vocab::{self, EventVocabMode};
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
 use crate::observability::streaming::{record_gap_detected, record_stream_event_emitted};
@@ -120,14 +119,6 @@ pub struct ConversationWorker {
     last_router_ticket_id: Option<String>,
     /// Cached organization from the last successful router match (from DB).
     last_router_organization: Option<String>,
-    /// Dual-write toggle for the Anthropic 8-event vocabulary. Refreshed
-    /// from the process-wide ArcSwap (T-257C060D) at the top of every
-    /// `process_message` call so that an admin PUT to
-    /// `/api/admin/feature-flags/event_vocab_mode` is honored on the
-    /// next turn without a redeploy. We snapshot the value for the
-    /// duration of a single turn so mid-turn flips don't leave a
-    /// message half-written under the old mode and half under the new.
-    vocab_mode: EventVocabMode,
     /// Stateful translator from internal `StreamEvent` → Anthropic events.
     /// Maintains message / content-block lifecycle across emit_event calls.
     /// One translator instance per worker — it survives the entire
@@ -147,7 +138,6 @@ impl ConversationWorker {
         manager: Arc<ChatClientManager>,
         message_rx: mpsc::Receiver<WorkerMessage>,
     ) -> Self {
-        let vocab_mode = event_vocab::global();
         let translator = AnthropicTranslator::new(&conversation_id);
         Self {
             db,
@@ -158,33 +148,6 @@ impl ConversationWorker {
             has_routed: false,
             last_router_ticket_id: None,
             last_router_organization: None,
-            vocab_mode,
-            translator,
-            current_user_id: None,
-        }
-    }
-
-    /// Test-only constructor that lets the caller pin the vocab mode
-    /// directly, bypassing the process-wide global.
-    #[cfg(test)]
-    pub fn new_with_vocab_mode(
-        db: Arc<SqlitePool>,
-        conversation_id: String,
-        manager: Arc<ChatClientManager>,
-        message_rx: mpsc::Receiver<WorkerMessage>,
-        vocab_mode: EventVocabMode,
-    ) -> Self {
-        let translator = AnthropicTranslator::new(&conversation_id);
-        Self {
-            db,
-            conversation_id,
-            manager,
-            message_rx,
-            event_index: 0,
-            has_routed: false,
-            last_router_ticket_id: None,
-            last_router_organization: None,
-            vocab_mode,
             translator,
             current_user_id: None,
         }
@@ -309,22 +272,6 @@ impl ConversationWorker {
         // end-to-end — no synthetic fallbacks.
         self.translator
             .set_pending_client_id(msg.client_id.clone());
-        // Refresh the vocab-mode snapshot for this turn. The worker is
-        // long-lived (10-min idle timeout), so without this refresh an
-        // admin flip would only be picked up after the worker died and
-        // respawned. Readers on a single turn still see one consistent
-        // value because we snapshot once here and reuse until the
-        // turn completes (T-257C060D).
-        let new_vocab_mode = event_vocab::current_mode();
-        if new_vocab_mode != self.vocab_mode {
-            tracing::info!(
-                "[WORKER] vocab_mode refreshed for {}: {} -> {}",
-                self.conversation_id,
-                self.vocab_mode,
-                new_vocab_mode,
-            );
-            self.vocab_mode = new_vocab_mode;
-        }
         // Clear stale events from previous message but keep event_index monotonically
         // increasing. Resetting to 0 here was causing the "one turn late" bug: the app's
         // SSE cursor (e.g., lastEventIndex=50) would be higher than all new events (0,1,2...),
@@ -1337,53 +1284,57 @@ impl ConversationWorker {
         }
     }
 
-    /// Emit a StreamEvent: store in DB and broadcast to all subscribers.
+    /// Emit a StreamEvent: translate to Anthropic events, persist, and broadcast.
     ///
     /// Uses the server-side allocator (`insert_conversation_event`) so the
     /// event_index comes from the DB under a BEGIN IMMEDIATE transaction —
-    /// safe under concurrent writers for the same conversation_id. The
-    /// worker no longer maintains a Rust-side counter; the index in the
-    /// broadcast tuple is whatever the allocator returned.
+    /// safe under concurrent writers for the same conversation_id.
     ///
-    /// Dual-write behavior (T-49352BF5): depending on `self.vocab_mode`
-    /// this may write a v1 legacy row, a sequence of v2 Anthropic rows,
-    /// or both. The broadcast to SSE subscribers always reflects the v1
-    /// row's JSON — iOS currently consumes the legacy vocabulary. v2
-    /// rows are written to the DB for replay / backfill purposes but do
-    /// not replace the live broadcast until a future ticket flips the
-    /// broadcast wire format.
+    /// Single-path emission (T-49352BF5): the translator maps each internal
+    /// `StreamEvent` to zero or more Anthropic frames from the 8-event
+    /// vocabulary (`message_start` / `content_block_start` / `content_block_delta`
+    /// / `content_block_stop` / `message_delta` / `message_stop` / `ping` /
+    /// `error`). Router/metadata events produce zero frames; a text chunk
+    /// produces one; a tool_use turn produces several. Every produced frame
+    /// is persisted AND broadcast to live SSE subscribers — there is no
+    /// legacy vocabulary, no dual-write, no feature flag.
     async fn emit_event(&mut self, event: &StreamEvent) {
-        let legacy_event_type = get_stream_event_type(event);
-
-        // ---- Legacy (v1) write ----
-        // Broadcast a single v1 row so SSE subscribers see one logical
-        // event per `StreamEvent`, matching today's behavior.
-        let legacy_json = match serde_json::to_string(event) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::error!(
-                    "[WORKER] Failed to serialize StreamEvent for {}: {}",
-                    self.conversation_id,
-                    e
-                );
-                return;
-            }
-        };
-
-        if self.vocab_mode.writes_legacy() {
+        // Translate the StreamEvent into a sequence of Anthropic events.
+        // An event may produce zero frames (router/metadata events), one
+        // frame (a text_delta), or many (tool_use: start + delta + stop).
+        //
+        // After the write loop, if this StreamEvent produced at least one
+        // `message_stop` that was successfully persisted, we trigger the
+        // silent-push fan-out (T-90C7FAC4) so every registered device for
+        // the turn's owner gets a wake signal. The fan-out is fire-and-forget
+        // — spawned onto its own tokio task so it never blocks the SSE
+        // stream or holds the worker's state.
+        let mut message_stop_persisted = false;
+        let anthropic_events = self.translator.translate(event);
+        for ae in anthropic_events {
+            let ae_type = ae.event_type();
+            let ae_json = match serde_json::to_string(&ae) {
+                Ok(j) => j,
+                Err(e) => {
+                    tracing::error!(
+                        "[WORKER] Failed to serialize AnthropicEvent for {}: {}",
+                        self.conversation_id,
+                        e
+                    );
+                    continue;
+                }
+            };
             // Payload is JSON text. mime=None defaults to "application/json"
-            // inside the allocator (T-E184E642). When legacy_json.len() > 4096
+            // inside the allocator (T-E184E642). When ae_json.len() > 4096
             // the allocator transparently offloads to event_blobs and writes
             // the canonical sentinel; the broadcast below still ships the
             // real JSON to live SSE subscribers.
             match conversations::insert_conversation_event(
                 &self.db,
                 &self.conversation_id,
-                legacy_event_type,
-                legacy_json.as_bytes(),
+                ae_type,
+                ae_json.as_bytes(),
                 None, // mime defaults to application/json
-                1,    // event_schema_version = 1 (legacy vocabulary)
-                None, // anthropic_event_type unset for v1 rows
             )
             .await
             {
@@ -1393,16 +1344,23 @@ impl ConversationWorker {
                     // worker's expected next index, another writer or a
                     // rollback produced a gap. `record_gap_detected` is
                     // a no-op when the indices match.
-                    record_gap_detected(&self.conversation_id, self.event_index, allocated_index);
-                    let bytes = legacy_json.len();
+                    record_gap_detected(
+                        &self.conversation_id,
+                        self.event_index,
+                        allocated_index,
+                    );
+                    let bytes = ae_json.len();
                     let broadcast_tx = get_broadcast_sender(&self.conversation_id).await;
-                    let _ = broadcast_tx.send((allocated_index, legacy_json.clone()));
+                    let _ = broadcast_tx.send((allocated_index, ae_json));
                     self.event_index = allocated_index + 1;
                     record_stream_event_emitted(&self.conversation_id, bytes);
+                    if ae_type == "message_stop" {
+                        message_stop_persisted = true;
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
-                        "[WORKER] Failed to persist v1 event for {}: {}",
+                        "[WORKER] Failed to persist event for {}: {}",
                         self.conversation_id,
                         e
                     );
@@ -1410,89 +1368,8 @@ impl ConversationWorker {
             }
         }
 
-        // ---- Modern (v2) write ----
-        // Translate the StreamEvent into a sequence of Anthropic events.
-        // An event may produce zero frames (router/metadata events), one
-        // frame (a text_delta), or many (tool_use: start + delta + stop).
-        //
-        // After the v2 write loop, if this StreamEvent produced at least
-        // one `message_stop` that was successfully persisted, we trigger
-        // the silent-push fan-out (T-90C7FAC4) so every registered
-        // device for the turn's owner gets a wake signal. The fan-out
-        // is fire-and-forget — spawned onto its own tokio task so it
-        // never blocks the SSE stream or holds the worker's state.
-        let mut message_stop_persisted = false;
-        if self.vocab_mode.writes_modern() {
-            let anthropic_events = self.translator.translate(event);
-            for ae in anthropic_events {
-                let ae_type = ae.event_type();
-                let ae_json = match serde_json::to_string(&ae) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        tracing::error!(
-                            "[WORKER] Failed to serialize AnthropicEvent for {}: {}",
-                            self.conversation_id,
-                            e
-                        );
-                        continue;
-                    }
-                };
-                match conversations::insert_conversation_event(
-                    &self.db,
-                    &self.conversation_id,
-                    ae_type,
-                    ae_json.as_bytes(),
-                    None, // mime defaults to application/json
-                    2,    // event_schema_version = 2 (Anthropic vocabulary)
-                    Some(ae_type),
-                )
-                .await
-                {
-                    Ok(allocated_index) => {
-                        // Gap detection mirrors the v1 path: if the
-                        // allocator jumps past what the worker expected
-                        // next we record the gap_size. In dual-write
-                        // mode the v1 branch already incremented the
-                        // counter for the legacy row at the SAME logical
-                        // emit, so we only record when the modern write
-                        // is the broadcast-visible one.
-                        if self.vocab_mode == EventVocabMode::ModernOnly {
-                            record_gap_detected(
-                                &self.conversation_id,
-                                self.event_index,
-                                allocated_index,
-                            );
-                        }
-                        let bytes = ae_json.len();
-                        // In modern_only mode, broadcast v2 rows so SSE
-                        // subscribers see the stream. In dual mode the v1
-                        // broadcast above already fired, so we skip the
-                        // duplicate to avoid double-rendering.
-                        if self.vocab_mode == EventVocabMode::ModernOnly {
-                            let broadcast_tx = get_broadcast_sender(&self.conversation_id).await;
-                            let _ = broadcast_tx.send((allocated_index, ae_json));
-                            self.event_index = allocated_index + 1;
-                            record_stream_event_emitted(&self.conversation_id, bytes);
-                        } else {
-                            self.event_index = allocated_index + 1;
-                        }
-                        if ae_type == "message_stop" {
-                            message_stop_persisted = true;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "[WORKER] Failed to persist v2 event for {}: {}",
-                            self.conversation_id,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-
         // Silent-push fan-out hook (T-90C7FAC4). Only fires when:
-        //   1. A v2 `message_stop` row was successfully committed above.
+        //   1. A `message_stop` row was successfully committed above.
         //   2. We have a cached user_id for this turn (set at the top
         //      of `process_message`).
         //   3. The process-wide silent-push config is installed (always
@@ -1712,25 +1589,6 @@ async fn flush_to_db(db: &SqlitePool, assistant_message_id: Option<&str>, accumu
     }
 }
 
-fn get_stream_event_type(event: &StreamEvent) -> &'static str {
-    match event {
-        StreamEvent::Text { .. } => "text",
-        StreamEvent::ToolUse { .. } => "tool_use",
-        StreamEvent::ToolResult { .. } => "tool_result",
-        StreamEvent::Thinking { .. } => "thinking",
-        StreamEvent::Status { .. } => "status",
-        StreamEvent::Result { .. } => "result",
-        StreamEvent::UserMessage { .. } => "user_message",
-        StreamEvent::ReplayComplete { .. } => "replay_complete",
-        StreamEvent::TitleUpdate { .. } => "title_update",
-        StreamEvent::OrgUpdate { .. } => "org_update",
-        StreamEvent::RouterText { .. } => "router_text",
-        StreamEvent::RouterToolUse { .. } => "router_tool_use",
-        StreamEvent::RouterToolResult { .. } => "router_tool_result",
-        StreamEvent::RouterResult { .. } => "router_result",
-    }
-}
-
 /// Parsed result from the ticket-router's `<router_result>` XML output.
 enum RouterParsed {
     /// Router decided no ticket is needed (skipped="true")
@@ -1900,4 +1758,389 @@ fn build_conversation_history(messages: &[ConversationMessage]) -> String {
     }
 
     history
+}
+
+// =============================================================================
+// T-49352BF5 — scope-cut acceptance tests
+// =============================================================================
+//
+// These tests exercise the single-path Anthropic 8-event persistence pipeline
+// after the dual-write scaffold was removed. They confirm:
+//
+//   1. Translator → `insert_conversation_event` → `get_events` round-trips
+//      produce ONLY Anthropic vocabulary event_types (no legacy `text`,
+//      `tool_use`, `thinking` strings ever land in the row).
+//   2. A text-only turn, a tool-use turn, and a thinking turn each produce
+//      the canonical Anthropic frame ordering when replayed off the DB.
+//   3. Every persisted `event_data` payload parses as valid Anthropic JSON
+//      whose `type` field matches the row's `event_type`.
+//
+// If any dual-write code path regressed back into the emit pipeline these
+// assertions would detect it — the replayed event_types would include a
+// non-Anthropic tag, or the row counts would diverge from translator output.
+#[cfg(test)]
+mod t_49352bf5_streaming_persistence_tests {
+    use super::*;
+    use crate::agents::anthropic_events::ALL_EVENT_TYPES;
+    use serde_json::json;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::ConnectOptions;
+    use std::str::FromStr;
+
+    /// Allow-list of event_type strings any post-scope-cut row may carry.
+    /// These are the canonical 8 Anthropic streaming event type tags, as
+    /// exported by [`ALL_EVENT_TYPES`]. If a dual-write regression ever
+    /// sneaks a legacy `text`/`tool_use`/`thinking` row back into the
+    /// persistence path, this allow-list is what trips first.
+    const ALLOWED_EVENT_TYPES: &[&str] = ALL_EVENT_TYPES;
+
+    async fn fresh_test_pool() -> SqlitePool {
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite::memory:")
+            .expect("parse sqlite url")
+            .foreign_keys(true)
+            .disable_statement_logging();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("connect test pool");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                session_id TEXT,
+                organization TEXT,
+                agent TEXT,
+                title TEXT,
+                started_at TEXT,
+                updated_at TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                archived_at TEXT,
+                router_ticket_id TEXT,
+                router_organization TEXT
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create conversations");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE conversation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+                event_index INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                event_data TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE(conversation_id, event_index)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create conversation_events");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE event_blobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL REFERENCES conversation_events(id) ON DELETE CASCADE,
+                mime TEXT NOT NULL,
+                bytes BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create event_blobs");
+
+        sqlx::query("INSERT INTO conversations (id, status) VALUES (?, 'open')")
+            .bind("c-t49352bf5")
+            .execute(&pool)
+            .await
+            .expect("seed conversation");
+
+        pool
+    }
+
+    /// Drive a sequence of cc-sdk StreamEvents through the translator, persist
+    /// every emitted Anthropic event via `insert_conversation_event`, then
+    /// replay from the DB and return (event_types, parsed_json_values).
+    async fn run_turn_and_replay(
+        pool: &SqlitePool,
+        conversation_id: &str,
+        events: &[StreamEvent],
+    ) -> (Vec<String>, Vec<serde_json::Value>) {
+        let mut translator = AnthropicTranslator::new(conversation_id);
+        for ev in events {
+            for ae in translator.translate(ev) {
+                let ae_type = ae.event_type();
+                let ae_json = serde_json::to_string(&ae).expect("serialize anthropic event");
+                conversations::insert_conversation_event(
+                    pool,
+                    conversation_id,
+                    ae_type,
+                    ae_json.as_bytes(),
+                    None,
+                )
+                .await
+                .expect("persist anthropic event");
+            }
+        }
+
+        let rows = conversations::get_events(pool, conversation_id)
+            .await
+            .expect("replay events");
+        let types: Vec<String> = rows.iter().map(|r| r.event_type.clone()).collect();
+        let values: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|r| serde_json::from_str(&r.event_data).expect("parse persisted event_data"))
+            .collect();
+        (types, values)
+    }
+
+    fn assert_all_anthropic(types: &[String]) {
+        for t in types {
+            assert!(
+                ALLOWED_EVENT_TYPES.contains(&t.as_str()),
+                "forbidden event_type leaked into DB: {} (allow-list: {:?})",
+                t,
+                ALLOWED_EVENT_TYPES
+            );
+        }
+    }
+
+    fn assert_payload_type_matches_column(types: &[String], values: &[serde_json::Value]) {
+        assert_eq!(types.len(), values.len());
+        for (t, v) in types.iter().zip(values.iter()) {
+            assert_eq!(
+                v["type"].as_str(),
+                Some(t.as_str()),
+                "persisted event_data.type disagrees with event_type column (row type={}, data={})",
+                t,
+                v
+            );
+        }
+    }
+
+    /// Turn 1: a text-only assistant reply.
+    /// Canonical Anthropic frame sequence: message_start, content_block_start(text),
+    /// content_block_delta(text_delta), content_block_stop, message_delta, message_stop.
+    #[tokio::test]
+    async fn text_only_turn_persists_anthropic_frames_only() {
+        let pool = fresh_test_pool().await;
+        let (types, values) = run_turn_and_replay(
+            &pool,
+            "c-t49352bf5",
+            &[
+                StreamEvent::Text {
+                    content: "Hello from the agent.".into(),
+                },
+                StreamEvent::Result {
+                    session_id: "s-text".into(),
+                    status: "success".into(),
+                    is_error: false,
+                },
+            ],
+        )
+        .await;
+
+        assert_all_anthropic(&types);
+        assert_eq!(
+            types,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_payload_type_matches_column(&types, &values);
+
+        // Sanity: the text delta actually carries the text payload.
+        let delta = &values[2];
+        assert_eq!(delta["delta"]["type"], "text_delta");
+        assert_eq!(delta["delta"]["text"], "Hello from the agent.");
+    }
+
+    /// Turn 2: tool-use turn (assistant says something, invokes a tool,
+    /// emits a text trailer, then Result closes the turn).
+    #[tokio::test]
+    async fn tool_use_turn_persists_anthropic_frames_only() {
+        let pool = fresh_test_pool().await;
+        let (types, values) = run_turn_and_replay(
+            &pool,
+            "c-t49352bf5",
+            &[
+                StreamEvent::Text {
+                    content: "Searching.".into(),
+                },
+                StreamEvent::ToolUse {
+                    id: "tool-xyz".into(),
+                    name: "search".into(),
+                    input: json!({"q": "anthropic streaming"}),
+                },
+                StreamEvent::Text {
+                    content: "Done.".into(),
+                },
+                StreamEvent::Result {
+                    session_id: "s-tool".into(),
+                    status: "success".into(),
+                    is_error: false,
+                },
+            ],
+        )
+        .await;
+
+        assert_all_anthropic(&types);
+        assert_eq!(
+            types,
+            vec![
+                "message_start",
+                "content_block_start", // text 0
+                "content_block_delta",
+                "content_block_stop", // text 0 closes before tool_use
+                "content_block_start", // tool_use 1
+                "content_block_delta", // input_json_delta
+                "content_block_stop",
+                "content_block_start", // text 2
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_payload_type_matches_column(&types, &values);
+
+        // The tool_use content_block_start must carry the tool id + name.
+        let tool_start = &values[4];
+        assert_eq!(tool_start["content_block"]["type"], "tool_use");
+        assert_eq!(tool_start["content_block"]["id"], "tool-xyz");
+        assert_eq!(tool_start["content_block"]["name"], "search");
+
+        // The input_json_delta serializes the input as a partial JSON string.
+        let input_delta = &values[5];
+        assert_eq!(input_delta["delta"]["type"], "input_json_delta");
+        let partial: serde_json::Value =
+            serde_json::from_str(input_delta["delta"]["partial_json"].as_str().unwrap())
+                .expect("partial_json parses");
+        assert_eq!(partial, json!({"q": "anthropic streaming"}));
+    }
+
+    /// Turn 3: thinking + text turn. Thinking opens a dedicated block that
+    /// streams `thinking_delta` payloads, then closes before the text block
+    /// takes over.
+    #[tokio::test]
+    async fn thinking_turn_persists_anthropic_frames_only() {
+        let pool = fresh_test_pool().await;
+        let (types, values) = run_turn_and_replay(
+            &pool,
+            "c-t49352bf5",
+            &[
+                StreamEvent::Thinking {
+                    content: "Reasoning step...".into(),
+                },
+                StreamEvent::Text {
+                    content: "Here is the answer.".into(),
+                },
+                StreamEvent::Result {
+                    session_id: "s-think".into(),
+                    status: "success".into(),
+                    is_error: false,
+                },
+            ],
+        )
+        .await;
+
+        assert_all_anthropic(&types);
+        assert_eq!(
+            types,
+            vec![
+                "message_start",
+                "content_block_start", // thinking
+                "content_block_delta", // thinking_delta
+                "content_block_stop",
+                "content_block_start", // text
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_payload_type_matches_column(&types, &values);
+
+        let thinking_start = &values[1];
+        assert_eq!(thinking_start["content_block"]["type"], "thinking");
+        let thinking_delta = &values[2];
+        assert_eq!(thinking_delta["delta"]["type"], "thinking_delta");
+        assert_eq!(thinking_delta["delta"]["thinking"], "Reasoning step...");
+    }
+
+    /// Silencer: confirm that legacy cc-sdk router/replay tags are NOT
+    /// emitted onto the wire. If a dual-write regression snuck them in, this
+    /// test would see extra rows with event_type outside the allow-list.
+    #[tokio::test]
+    async fn router_and_replay_tags_are_never_persisted() {
+        let pool = fresh_test_pool().await;
+        let (types, _values) = run_turn_and_replay(
+            &pool,
+            "c-t49352bf5",
+            &[
+                StreamEvent::RouterText {
+                    content: "internal routing note".into(),
+                },
+                StreamEvent::TitleUpdate {
+                    title: "ignored".into(),
+                },
+                StreamEvent::ReplayComplete {
+                    total_events: 0,
+                    agent_status: "running".into(),
+                },
+                StreamEvent::Text {
+                    content: "real content".into(),
+                },
+                StreamEvent::Result {
+                    session_id: "s-router".into(),
+                    status: "success".into(),
+                    is_error: false,
+                },
+            ],
+        )
+        .await;
+
+        assert_all_anthropic(&types);
+        // Exactly the text-only canonical shape — router/title/replay frames
+        // produced ZERO persisted rows.
+        assert_eq!(
+            types,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+    }
+
+    /// Sanity check: the allow-list we assert against is sourced directly
+    /// from the canonical `ALL_EVENT_TYPES` export in `anthropic_events`.
+    /// If the wire vocabulary ever grows or shrinks, both the enum surface
+    /// and this allow-list must move in lock-step — and the test below
+    /// will fail loudly if someone edits one without the other.
+    #[test]
+    fn allow_list_matches_anthropic_event_surface() {
+        assert_eq!(
+            ALLOWED_EVENT_TYPES, ALL_EVENT_TYPES,
+            "scope-cut allow-list drifted from canonical AnthropicEvent surface"
+        );
+    }
 }

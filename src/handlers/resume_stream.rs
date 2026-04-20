@@ -753,9 +753,6 @@ mod tests {
                 event_type TEXT NOT NULL,
                 event_data TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                event_schema_version INTEGER NOT NULL DEFAULT 1,
-                anthropic_event_type TEXT,
-                backfill_source_event_id INTEGER,
                 UNIQUE(conversation_id, event_index)
             )
             "#,

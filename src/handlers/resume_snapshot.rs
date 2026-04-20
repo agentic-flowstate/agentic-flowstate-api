@@ -70,14 +70,6 @@
 //!
 //! ## Not covered
 //!
-//! * v1 (legacy) event vocabulary rows. The snapshot pattern is a
-//!   property of the Anthropic 8-event vocabulary; v1 rows carry flat
-//!   `Text { content }` / `ToolUse { id, name, input }` events that are
-//!   never "mid-block" in the transport sense — the client rendered each
-//!   event atomically. Walking v1 rows in this module would produce
-//!   phantom snapshots. The walker therefore filters to rows whose
-//!   `event_schema_version = 2` (or whose `event_type` is already one of
-//!   the Anthropic content_block_* names, for pre-v44 rows).
 //! * Fresh streams (`cursor = -1`). The handler skips the walker
 //!   entirely — there is no "half-rendered state" to heal when the
 //!   client has not seen anything yet. The public
@@ -116,7 +108,7 @@ pub enum ContentBlockKind {
 impl ContentBlockKind {
     /// Label value for the `block_kind` Prometheus label. Must match
     /// Anthropic's canonical block type string so dashboards can join
-    /// against `anthropic_event_type` analytics.
+    /// against the `event_type` column analytics.
     pub fn as_label(self) -> &'static str {
         match self {
             ContentBlockKind::Text => "text",
@@ -600,9 +592,6 @@ mod tests {
                 event_type TEXT NOT NULL,
                 event_data TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
-                event_schema_version INTEGER NOT NULL DEFAULT 1,
-                anthropic_event_type TEXT,
-                backfill_source_event_id INTEGER,
                 UNIQUE(conversation_id, event_index)
             )
             "#,
@@ -639,15 +628,14 @@ mod tests {
         let now = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO conversation_events \
-             (conversation_id, event_index, event_type, event_data, created_at, event_schema_version, anthropic_event_type) \
-             VALUES (?, ?, ?, ?, ?, 2, ?)",
+             (conversation_id, event_index, event_type, event_data, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind("c-snap")
         .bind(index)
         .bind(event_type)
         .bind(payload.to_string())
         .bind(now)
-        .bind(event_type)
         .execute(pool)
         .await
         .unwrap();

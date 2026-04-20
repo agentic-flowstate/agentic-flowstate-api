@@ -21,18 +21,7 @@
 //! | `stream_cursor_expired_410_total`      | counter    | Rejects for `starting_after` below oldest_retained — 410 Gone.  |
 //! | `push_sent_total`                      | counter    | APNs silent-push attempts, labeled by `result` + `apns_status`. |
 //! | `events_gap_detected_total`            | counter    | event_index allocator saw a skip (missing index), by size.      |
-//! | `clients_session_start_total`          | counter    | Client session_start events, labeled by platform+version+vocab. |
-//! | `clients_modern_session_ratio`         | gauge      | Fraction of recent session_start with vocab=modern.             |
-//!
-//! ## Rollout gate
-//!
-//! `clients_modern_session_ratio` is the gauge that drives the
-//! `event_vocab_mode -> modern_only` flip. When the gauge has been ≥ 0.999
-//! for 14 consecutive days, operations flips the flag via the
-//! `/api/admin/feature-flags/event_vocab_mode` endpoint.
-//!
-//! The gauge is computed inline from an EMA of the last N session_start
-//! events so it is cheap to read.
+//! | `clients_session_start_total`          | counter    | Client session_start events, labeled by platform+version.       |
 
 use std::borrow::Cow;
 use std::fmt;
@@ -66,7 +55,6 @@ pub const METRIC_STREAM_KEEPALIVE_SENT: &str = "stream_keepalive_sent_total";
 pub const METRIC_PUSH_SENT: &str = "push_sent_total";
 pub const METRIC_EVENTS_GAP_DETECTED: &str = "events_gap_detected_total";
 pub const METRIC_CLIENTS_SESSION_START: &str = "clients_session_start_total";
-pub const METRIC_CLIENTS_MODERN_RATIO: &str = "clients_modern_session_ratio";
 
 // Retention prune metrics (T-65DA4D32). Emitted by `src/retention/prune.rs`
 // after every scheduled sweep so operators can confirm (a) the prune is
@@ -208,23 +196,6 @@ impl ClientPlatform {
             "web" | "macos" | "desktop" => ClientPlatform::Web,
             _ => ClientPlatform::Unknown,
         }
-    }
-}
-
-/// Vocab label for `clients_session_start_total`. The ratio of
-/// `modern` to total is the rollout-gate query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SessionVocab {
-    Legacy,
-    Modern,
-}
-
-impl fmt::Display for SessionVocab {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            SessionVocab::Legacy => "legacy",
-            SessionVocab::Modern => "modern",
-        })
     }
 }
 
@@ -428,42 +399,25 @@ pub fn record_gap_detected(conversation_id: &str, expected: i32, actual: i32) {
 }
 
 // ---------------------------------------------------------------------------
-// Client session-start: the "new iOS client sessions" ratio that drives
-// the event_vocab_mode rollout gate.
+// Client session-start counter.
 // ---------------------------------------------------------------------------
 
-static MODERN_SESSIONS: AtomicU64 = AtomicU64::new(0);
-static TOTAL_SESSIONS: AtomicU64 = AtomicU64::new(0);
-
 /// Observed a client session_start. Updates:
-///   * `clients_session_start_total{platform, client_version, vocab}` counter +1
-///   * `clients_modern_session_ratio` gauge = modern / total
+///   * `clients_session_start_total{platform, client_version}` counter +1
 pub fn record_session_start(
     user_id: &str,
     platform: ClientPlatform,
     client_version: &str,
-    vocab: SessionVocab,
 ) {
     let platform_label: Cow<'static, str> = platform.to_string().into();
     let version_label: Cow<'static, str> = client_version.to_string().into();
-    let vocab_label: Cow<'static, str> = vocab.to_string().into();
 
     counter!(
         METRIC_CLIENTS_SESSION_START,
-        "platform" => platform_label.clone(),
-        "client_version" => version_label.clone(),
-        "vocab" => vocab_label.clone(),
+        "platform" => platform_label,
+        "client_version" => version_label,
     )
     .increment(1);
-
-    let total = TOTAL_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1;
-    let modern = if matches!(vocab, SessionVocab::Modern) {
-        MODERN_SESSIONS.fetch_add(1, Ordering::Relaxed) + 1
-    } else {
-        MODERN_SESSIONS.load(Ordering::Relaxed)
-    };
-    let ratio = modern as f64 / total as f64;
-    gauge!(METRIC_CLIENTS_MODERN_RATIO).set(ratio);
 
     tracing::info!(
         target: "observability.streaming",
@@ -471,8 +425,6 @@ pub fn record_session_start(
         user_id = %user_id,
         platform = %platform,
         client_version = %client_version,
-        vocab = %vocab,
-        modern_ratio = ratio,
         "client session start"
     );
 }
@@ -483,15 +435,13 @@ pub fn record_session_start(
 // reset the counters before each test that reads them.
 // ---------------------------------------------------------------------------
 
-/// Reset the in-memory atomic ratios (`resume/cold`, `modern/total`).
-/// Test-only. Does NOT reset Prometheus counters — those are additive
-/// by design and are snapshot by the per-test render asserts.
+/// Reset the in-memory atomic resume/cold ratio counters. Test-only.
+/// Does NOT reset Prometheus counters — those are additive by design
+/// and are snapshot by the per-test render asserts.
 #[cfg(test)]
 pub(crate) fn reset_ratios_for_test() {
     RESUME_OPENS.store(0, Ordering::SeqCst);
     COLD_OPENS.store(0, Ordering::SeqCst);
-    MODERN_SESSIONS.store(0, Ordering::SeqCst);
-    TOTAL_SESSIONS.store(0, Ordering::SeqCst);
 }
 
 /// Process-wide mutex used by tests that read Prometheus registry
@@ -585,30 +535,31 @@ mod tests {
         assert_eq!((after_gap - before_gap) as u64, 3);
     }
 
-    /// session_start must update three metrics atomically: the labeled
-    /// counter, the total counter (derived from the labeled one), and
-    /// the modern-ratio gauge. We assert the gauge lands at the
-    /// expected value after a known sequence.
+    /// session_start must increment the labeled counter (platform, client_version).
     #[tokio::test]
-    async fn session_start_updates_modern_ratio_gauge() {
+    async fn session_start_increments_counter() {
         let _guard = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         super::super::install_for_test();
-        reset_ratios_for_test();
 
-        // Three legacy, one modern → ratio = 0.25
-        record_session_start("u1", ClientPlatform::Ios, "15", SessionVocab::Legacy);
-        record_session_start("u1", ClientPlatform::Ios, "15", SessionVocab::Legacy);
-        record_session_start("u1", ClientPlatform::Ios, "15", SessionVocab::Legacy);
-        record_session_start("u1", ClientPlatform::Ios, "16", SessionVocab::Modern);
+        let before = super::super::render_prometheus().unwrap_or_default();
+        let before_v = labeled_counter(
+            &before,
+            METRIC_CLIENTS_SESSION_START,
+            &[("platform", "ios"), ("client_version", "17")],
+        )
+        .unwrap_or(0.0);
 
-        let text = super::super::render_prometheus().expect("exporter installed");
-        let ratio = line_value(&text, METRIC_CLIENTS_MODERN_RATIO).expect("gauge emitted");
-        assert!(
-            (ratio - 0.25).abs() < 1e-9,
-            "expected 0.25, got {} ({})",
-            ratio,
-            text,
-        );
+        record_session_start("u1", ClientPlatform::Ios, "17");
+        record_session_start("u1", ClientPlatform::Ios, "17");
+
+        let after = super::super::render_prometheus().expect("exporter installed");
+        let after_v = labeled_counter(
+            &after,
+            METRIC_CLIENTS_SESSION_START,
+            &[("platform", "ios"), ("client_version", "17")],
+        )
+        .expect("counter present");
+        assert_eq!((after_v - before_v) as u64, 2);
     }
 
     /// resume vs cold-start ratio gauge: 2 resume + 2 cold = 0.5

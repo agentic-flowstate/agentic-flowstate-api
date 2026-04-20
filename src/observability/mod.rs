@@ -206,8 +206,8 @@ mod tests {
         use crate::observability::streaming::{
             record_cursor_expired, record_gap_detected, record_push_sent, record_session_start,
             record_stream_closed, record_stream_event_emitted, record_stream_opened,
-            ClientPlatform, DisconnectReason, PushResult, SessionVocab,
-            METRIC_CLIENTS_MODERN_RATIO, METRIC_CLIENTS_SESSION_START, METRIC_EVENTS_GAP_DETECTED,
+            ClientPlatform, DisconnectReason, PushResult,
+            METRIC_CLIENTS_SESSION_START, METRIC_EVENTS_GAP_DETECTED,
             METRIC_PUSH_SENT, METRIC_STREAM_BYTES_EMITTED, METRIC_STREAM_CLOSED,
             METRIC_STREAM_COLD_START, METRIC_STREAM_CONCURRENT, METRIC_STREAM_CURSOR_EXPIRED,
             METRIC_STREAM_DURATION_MS, METRIC_STREAM_EVENTS_EMITTED, METRIC_STREAM_OPENED,
@@ -256,19 +256,9 @@ mod tests {
         // 4. Gap detection: allocator skipped 2 indices on conv-A.
         record_gap_detected("conv-A", 10, 12);
 
-        // 5. Client session_start: mix of modern + legacy.
-        record_session_start(
-            "user-alpha",
-            ClientPlatform::Ios,
-            "1.23.0",
-            SessionVocab::Modern,
-        );
-        record_session_start(
-            "user-beta",
-            ClientPlatform::Ios,
-            "1.23.0",
-            SessionVocab::Legacy,
-        );
+        // 5. Client session_start.
+        record_session_start("user-alpha", ClientPlatform::Ios, "1.23.0");
+        record_session_start("user-beta", ClientPlatform::Ios, "1.23.0");
 
         // Drive the exact same handler main.rs wires to /metrics. We
         // skip the Router layer here because `tower::ServiceExt::oneshot`
@@ -301,7 +291,6 @@ mod tests {
             METRIC_PUSH_SENT,
             METRIC_EVENTS_GAP_DETECTED,
             METRIC_CLIENTS_SESSION_START,
-            METRIC_CLIENTS_MODERN_RATIO,
         ] {
             assert!(
                 body.contains(name),
@@ -327,23 +316,6 @@ mod tests {
             (ratio_value - (2.0 / 3.0)).abs() < 1e-9,
             "resume_ratio expected 0.6667, got {}",
             ratio_value
-        );
-
-        // Modern-session ratio: 1 modern / 2 total = 0.5
-        let modern_line = body
-            .lines()
-            .find(|l| l.starts_with(METRIC_CLIENTS_MODERN_RATIO))
-            .expect("modern-ratio line present");
-        let modern_value: f64 = modern_line
-            .split_whitespace()
-            .next_back()
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert!(
-            (modern_value - 0.5).abs() < 1e-9,
-            "modern_ratio expected 0.5, got {}",
-            modern_value
         );
 
         // Concurrent-streams gauge must have returned to its pre-test

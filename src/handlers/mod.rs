@@ -1,4 +1,3 @@
-pub mod admin_feature_flags;
 pub mod admin_logs;
 pub mod admin_reload;
 pub mod agent_runs;
@@ -23,7 +22,6 @@ pub mod email_events;
 pub mod email_thread_tickets;
 pub mod emails;
 pub mod epics;
-pub mod event_vocab;
 pub mod focus;
 pub mod full_access_chat;
 pub mod health;
