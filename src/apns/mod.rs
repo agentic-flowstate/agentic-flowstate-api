@@ -14,6 +14,7 @@
 
 pub mod alert;
 pub mod silent;
+pub mod silent_fanout;
 
 pub use alert::ApnsService;
 pub use silent::{ApnsClient, ApnsSilentError};

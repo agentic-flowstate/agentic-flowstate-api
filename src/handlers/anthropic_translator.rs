@@ -78,6 +78,11 @@ pub struct AnthropicTranslator {
     /// Short prefix of the conversation id, cached for message_id
     /// construction.
     conv_short: String,
+    /// The `message_id` attached to the most recent `message_start`.
+    /// Retained across `message_stop` so callers that observe the stop
+    /// frame (e.g. the silent-push fan-out) can tag it. Cleared only
+    /// when the next `message_start` overwrites it.
+    current_message_id: Option<String>,
 }
 
 impl AnthropicTranslator {
@@ -93,6 +98,7 @@ impl AnthropicTranslator {
             current_block_index: 0,
             message_counter: 0,
             conv_short,
+            current_message_id: None,
         }
     }
 
@@ -100,6 +106,22 @@ impl AnthropicTranslator {
     /// message (has emitted `message_start` but not yet `message_stop`).
     pub fn is_message_open(&self) -> bool {
         self.message_open
+    }
+
+    /// Return the `message_id` of the most-recently-opened Anthropic
+    /// message (format `msg_<conv_short>_<n>`), or `None` if
+    /// `message_start` has never been emitted for this translator.
+    ///
+    /// This is the ID that was attached to the most recent `message_start`
+    /// frame and is the one external consumers should tag as
+    /// `last_message_id` on downstream signals (e.g. the silent-push
+    /// fan-out in T-90C7FAC4). The value is stable across a
+    /// `message_start` / `message_stop` pair — it is NOT cleared by
+    /// [`Self::reset`] or on-result, so callers who observe a
+    /// `message_stop` in the translator output can read it immediately
+    /// afterward.
+    pub fn current_message_id(&self) -> Option<&str> {
+        self.current_message_id.as_deref()
     }
 
     /// Close the current turn and zero counters so the next translator
@@ -149,6 +171,7 @@ impl AnthropicTranslator {
         if !self.message_open {
             self.message_counter += 1;
             let id = format!("msg_{}_{}", self.conv_short, self.message_counter);
+            self.current_message_id = Some(id.clone());
             out.push(AnthropicEvent::MessageStart {
                 message: MessageStub::new_assistant(id, None),
             });

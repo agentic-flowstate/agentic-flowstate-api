@@ -186,6 +186,23 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("[APNS_SILENT] disabled (APNS_SILENT_ENABLED not set to true)");
     }
 
+    // Register the silent-push sender in the process-wide registry so the
+    // ConversationWorker fan-out hook (T-90C7FAC4) can access it without
+    // plumbing AppState through WORKER_MANAGER. The global captures both
+    // the sender Arc and the enabled flag — when disabled the fan-out
+    // still emits `push_attempts_total{result="skipped_disabled"}` for
+    // every registered device token so dashboards stay accurate.
+    match apns::silent_fanout::init_global(apns::silent_fanout::SilentPushConfig {
+        enabled: silent_enabled,
+        sender: apns_silent.clone(),
+    }) {
+        Ok(()) => tracing::info!(
+            "[APNS_SILENT] fan-out registry installed (enabled={})",
+            silent_enabled
+        ),
+        Err(e) => tracing::warn!("[APNS_SILENT] fan-out registry already initialized: {}", e),
+    }
+
     let app_state = AppState {
         db: db_pool.clone(),
         chat_manager,
