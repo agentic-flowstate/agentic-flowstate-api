@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -8,6 +9,15 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
+const REQUIRED_CODEX_PATH_ENTRIES: &[&str] = &[
+    "/opt/homebrew/opt/node@20/bin",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+];
 // Scoped workspace and the ticket router are MCP-only surfaces. Disable
 // shell, plugin, and tool-discovery features so Codex cannot widen itself
 // back into desktop or local-file access during those turns.
@@ -126,11 +136,34 @@ pub fn normalize_reasoning_effort(effort: &str) -> &str {
     }
 }
 
+fn launchd_safe_path_from(existing_path: Option<&OsStr>) -> OsString {
+    let mut entries: Vec<String> = REQUIRED_CODEX_PATH_ENTRIES
+        .iter()
+        .map(|entry| entry.to_string())
+        .collect();
+
+    if let Some(existing) = existing_path {
+        for entry in std::env::split_paths(&existing) {
+            let entry = entry.to_string_lossy().to_string();
+            if !entry.is_empty() && !entries.iter().any(|existing| existing == &entry) {
+                entries.push(entry);
+            }
+        }
+    }
+
+    OsString::from(entries.join(":"))
+}
+
+fn launchd_safe_path() -> OsString {
+    launchd_safe_path_from(std::env::var_os("PATH").as_deref())
+}
+
 pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCodexExec, String> {
     let normalized_effort = normalize_reasoning_effort(options.reasoning_effort);
 
     let mut command = Command::new("codex");
     command.current_dir(options.working_dir);
+    command.env("PATH", launchd_safe_path());
 
     if let Some(session_id) = options.resume_session_id {
         command
@@ -451,6 +484,24 @@ mod tests {
         assert_eq!(normalize_reasoning_effort("xhigh"), "xhigh");
         assert_eq!(normalize_reasoning_effort("max"), "xhigh");
         assert_eq!(normalize_reasoning_effort("unknown"), "medium");
+    }
+
+    #[test]
+    fn launchd_safe_path_prepends_required_entries() {
+        let path = launchd_safe_path_from(Some(OsStr::new("/custom/bin:/usr/bin")));
+        assert_eq!(
+            path.to_string_lossy(),
+            "/opt/homebrew/opt/node@20/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/custom/bin"
+        );
+    }
+
+    #[test]
+    fn launchd_safe_path_handles_missing_existing_path() {
+        let path = launchd_safe_path_from(None);
+        assert_eq!(
+            path.to_string_lossy(),
+            "/opt/homebrew/opt/node@20/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        );
     }
 
     #[test]
