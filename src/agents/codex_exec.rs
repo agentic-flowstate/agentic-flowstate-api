@@ -32,6 +32,8 @@ pub struct CodexExecOptions<'a> {
     pub prompt: &'a str,
     pub sandbox: CodexSandboxMode,
     pub bypass_approvals_and_sandbox: bool,
+    pub resume_session_id: Option<&'a str>,
+    pub ephemeral: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -91,30 +93,50 @@ pub fn normalize_reasoning_effort(effort: &str) -> &str {
 }
 
 pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCodexExec, String> {
-    let developer_instructions = serde_json::to_string(options.system_prompt)
-        .map_err(|e| format!("Failed to encode Codex developer instructions: {e}"))?;
     let normalized_effort = normalize_reasoning_effort(options.reasoning_effort);
 
     let mut command = Command::new("codex");
+    command.current_dir(options.working_dir);
+
+    if let Some(session_id) = options.resume_session_id {
+        command
+            .arg("exec")
+            .arg("resume")
+            .arg("--json")
+            .arg("--skip-git-repo-check")
+            .arg(session_id);
+    } else {
+        command
+            .arg("exec")
+            .arg("--json")
+            .arg("--skip-git-repo-check")
+            .arg("-C")
+            .arg(options.working_dir);
+
+        if options.ephemeral {
+            command.arg("--ephemeral");
+        }
+    }
+
     command
-        .arg("exec")
-        .arg("--json")
-        .arg("--ephemeral")
-        .arg("--skip-git-repo-check")
-        .arg("-C")
-        .arg(options.working_dir)
         .arg("-m")
         .arg(resolve_codex_model(options.model))
         .arg("-c")
         .arg("forced_login_method=\"chatgpt\"")
         .arg("-c")
-        .arg(format!("model_reasoning_effort=\"{normalized_effort}\""))
-        .arg("-c")
-        .arg(format!("developer_instructions={developer_instructions}"));
+        .arg(format!("model_reasoning_effort=\"{normalized_effort}\""));
+
+    if !options.system_prompt.is_empty() {
+        let developer_instructions = serde_json::to_string(options.system_prompt)
+            .map_err(|e| format!("Failed to encode Codex developer instructions: {e}"))?;
+        command
+            .arg("-c")
+            .arg(format!("developer_instructions={developer_instructions}"));
+    }
 
     if options.bypass_approvals_and_sandbox {
         command.arg("--dangerously-bypass-approvals-and-sandbox");
-    } else {
+    } else if options.resume_session_id.is_none() {
         command.arg("--sandbox").arg(options.sandbox.as_str());
     }
 
@@ -217,6 +239,8 @@ pub async fn run_codex_text(
         prompt,
         sandbox: CodexSandboxMode::ReadOnly,
         bypass_approvals_and_sandbox: false,
+        resume_session_id: None,
+        ephemeral: true,
     })
     .await?;
     let mut last_agent_message = None;

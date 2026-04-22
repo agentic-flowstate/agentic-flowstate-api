@@ -1457,6 +1457,8 @@ impl ConversationWorker {
             prompt: "Route this message.",
             sandbox: CodexSandboxMode::ReadOnly,
             bypass_approvals_and_sandbox: false,
+            resume_session_id: None,
+            ephemeral: true,
         })
         .await?;
 
@@ -1641,6 +1643,8 @@ impl ConversationWorker {
             prompt: final_message,
             sandbox: CodexSandboxMode::DangerFullAccess,
             bypass_approvals_and_sandbox: true,
+            resume_session_id: None,
+            ephemeral: true,
         })
         .await
         {

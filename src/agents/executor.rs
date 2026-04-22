@@ -1,66 +1,205 @@
-use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig, PermissionMode, McpServerConfig};
-use futures::StreamExt;
-use tokio::sync::mpsc;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tokio::sync::mpsc;
 
-use super::{AgentType, AgentRun, AgentRunStatus, TicketContext, StreamEvent, EmailOutput};
+use super::codex_exec::{spawn_codex_exec, CodexExecEvent, CodexExecOptions, CodexSandboxMode};
 use super::prompts::load_prompt;
+use super::{AgentRun, AgentRunStatus, AgentType, EmailOutput, StreamEvent, TicketContext};
 
-/// Build ClaudeCodeOptions for an agent type, optionally resuming from a previous session.
-pub fn build_agent_options(
+pub struct CodexAgentTurnResult {
+    pub output_summary: String,
+    pub tool_call_count: i32,
+    pub runtime_session_id: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+fn codex_policy_for_agent_type(agent_type: &AgentType) -> (CodexSandboxMode, bool) {
+    match agent_type {
+        AgentType::Execution | AgentType::MeetingAgent | AgentType::FullAccess => {
+            (CodexSandboxMode::DangerFullAccess, true)
+        }
+        _ => (CodexSandboxMode::ReadOnly, false),
+    }
+}
+
+fn build_agent_prompt(
     agent_type: &AgentType,
+    ticket_context: &TicketContext,
+    previous_output: Option<&str>,
+    selected_context: Option<&str>,
+    sender_info: Option<&str>,
+) -> String {
+    let mut context_sections = Vec::new();
+
+    if let Some(prev) = previous_output {
+        let tag = match agent_type {
+            AgentType::Planning => "research_output",
+            AgentType::Execution => "implementation_plan",
+            AgentType::Evaluation => "prior_outputs",
+            AgentType::ResearchSynthesis => "research_findings",
+            AgentType::TicketPlanner => "research_synthesis",
+            AgentType::TicketCreator => "ticket_plan",
+            AgentType::DocDrafter => "research_output",
+            _ => "prior_context",
+        };
+        context_sections.push(format!("<{tag}>\n{prev}\n</{tag}>"));
+    }
+
+    if let Some(ctx) = selected_context {
+        context_sections.push(format!("<selected_context>\n{ctx}\n</selected_context>"));
+    }
+
+    if let Some(info) = sender_info {
+        context_sections.push(format!("<sender_info>\n{info}\n</sender_info>"));
+    }
+
+    if context_sections.is_empty() {
+        format!(
+            "Work on this ticket:\n\nTitle: {}\nIntent: {}",
+            ticket_context.title, ticket_context.intent
+        )
+    } else {
+        format!(
+            "{}\n\nWork on this ticket:\n\nTitle: {}\nIntent: {}",
+            context_sections.join("\n\n"),
+            ticket_context.title,
+            ticket_context.intent
+        )
+    }
+}
+
+fn finalize_output(output_parts: &[String]) -> Option<String> {
+    if output_parts.is_empty() {
+        return None;
+    }
+
+    let full_output = output_parts.join("\n\n");
+    if full_output.len() > 100000 {
+        let end = (0..=100000)
+            .rev()
+            .find(|&i| full_output.is_char_boundary(i))
+            .unwrap_or(0);
+        Some(format!("{}...\n\n[Output truncated]", &full_output[..end]))
+    } else {
+        Some(full_output)
+    }
+}
+
+pub async fn run_codex_agent_turn(
+    agent_type: &AgentType,
+    working_dir: &Path,
     system_prompt: &str,
-    working_dir: &std::path::Path,
-    cc_session_id: Option<&str>,
-) -> ClaudeCodeOptions {
-    let tools_list: Vec<String> = agent_type
-        .allowed_tools()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    prompt: &str,
+    resume_session_id: Option<&str>,
+    persist_session: bool,
+    event_tx: Option<mpsc::Sender<StreamEvent>>,
+    result_session_id: &str,
+) -> Result<CodexAgentTurnResult> {
+    let (sandbox, bypass_approvals_and_sandbox) = codex_policy_for_agent_type(agent_type);
+    let mut turn = spawn_codex_exec(CodexExecOptions {
+        model: agent_type.model(),
+        reasoning_effort: agent_type.effort(),
+        system_prompt,
+        working_dir,
+        prompt,
+        sandbox,
+        bypass_approvals_and_sandbox,
+        resume_session_id,
+        ephemeral: !persist_session,
+    })
+    .await
+    .map_err(anyhow::Error::msg)?;
 
-    let has_mcp_tools = tools_list.iter().any(|t| t.starts_with("mcp__"));
+    let mut output_parts = Vec::new();
+    let mut tool_call_count = 0;
+    let mut runtime_session_id = resume_session_id.map(str::to_string);
+    let mut usage = (0_i64, 0_i64);
 
-    let mut builder = ClaudeCodeOptions::builder()
-        .system_prompt(system_prompt)
-        .model(agent_type.model())
-        .tools(ToolsConfig::list(tools_list.clone()))
-        .allowed_tools(tools_list)
-        .disallowed_tools(crate::safety::disallowed_tools())
-        .permission_mode(PermissionMode::BypassPermissions)
-        .cwd(working_dir);
+    while let Some(event) = turn.events.recv().await {
+        match event {
+            CodexExecEvent::ThreadStarted { thread_id } => {
+                runtime_session_id = Some(thread_id);
+            }
+            CodexExecEvent::AgentMessage { text } => {
+                if text.is_empty() {
+                    continue;
+                }
+                output_parts.push(text.clone());
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(StreamEvent::Text { content: text }).await;
+                }
+            }
+            CodexExecEvent::ToolCallStarted { id, name, input } => {
+                tool_call_count += 1;
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(StreamEvent::ToolUse { id, name, input }).await;
+                }
+            }
+            CodexExecEvent::ToolCallCompleted {
+                id,
+                content,
+                is_error,
+            } => {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx
+                        .send(StreamEvent::ToolResult {
+                            tool_use_id: id,
+                            content,
+                            is_error,
+                        })
+                        .await;
+                }
+            }
+            CodexExecEvent::TurnCompleted {
+                input_tokens,
+                output_tokens,
+            } => {
+                usage = (input_tokens, output_tokens);
+            }
+        }
+    }
 
-    if has_mcp_tools {
-        let mcp_binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../agentic-flowstate-mcp/target/release/agentic_mcp");
-        let mcp_binary = mcp_binary.canonicalize().unwrap_or(mcp_binary);
-        builder = builder.add_mcp_server(
-            "agentic-mcp",
-            McpServerConfig::Stdio {
-                command: mcp_binary.to_string_lossy().to_string(),
-                args: None,
-                env: None,
-            },
+    let outcome = turn.wait().await.map_err(anyhow::Error::msg)?;
+    let stderr_text = outcome.stderr_text.trim();
+
+    if !outcome.exit_status.success() {
+        if stderr_text.is_empty() {
+            anyhow::bail!("codex exec failed with status {}", outcome.exit_status);
+        }
+        anyhow::bail!(
+            "codex exec failed with status {}: {}",
+            outcome.exit_status,
+            stderr_text
         );
     }
 
-    if let Some(turns) = agent_type.max_turns() {
-        builder = builder.max_turns(turns);
+    let output_summary =
+        finalize_output(&output_parts).ok_or_else(|| anyhow::anyhow!("No output from agent"))?;
+    let emitted_session_id = runtime_session_id
+        .clone()
+        .unwrap_or_else(|| result_session_id.to_string());
+
+    if let Some(ref tx) = event_tx {
+        let _ = tx
+            .send(StreamEvent::Result {
+                session_id: emitted_session_id,
+                status: "success".to_string(),
+                is_error: false,
+            })
+            .await;
     }
 
-    // Enable adaptive thinking via --effort flag (Opus 4.7 xhigh recommended)
-    builder = builder.add_extra_arg("effort", Some(agent_type.effort().to_string()));
-
-    if let Some(sid) = cc_session_id {
-        builder = builder.resume(sid.to_string());
-    }
-
-    builder.build()
+    Ok(CodexAgentTurnResult {
+        output_summary,
+        tool_call_count,
+        runtime_session_id,
+        input_tokens: usage.0,
+        output_tokens: usage.1,
+    })
 }
 
-/// Executes agents using the Claude Code CLI via cc-sdk ClaudeSDKClient.
 pub struct AgentExecutor {
     working_dir: PathBuf,
 }
@@ -70,14 +209,6 @@ impl AgentExecutor {
         Self { working_dir }
     }
 
-    /// Execute an agent for a specific ticket.
-    ///
-    /// Returns the completed AgentRun with session_id and output summary.
-    /// If event_tx is provided, structured events are sent for real-time UI updates.
-    /// `selected_context` is used by the email agent to inject outputs from multiple selected agent runs.
-    /// `sender_info` is used by the email agent to populate the signature with user contact details.
-    /// Returns the completed AgentRun and the still-connected ClaudeSDKClient
-    /// so it can be stored in ChatClientManager for follow-up messages.
     pub async fn execute(
         &self,
         agent_type: AgentType,
@@ -86,11 +217,10 @@ impl AgentExecutor {
         selected_context: Option<String>,
         sender_info: Option<String>,
         event_tx: Option<mpsc::Sender<StreamEvent>>,
-    ) -> Result<(AgentRun, ClaudeSDKClient)> {
+    ) -> Result<AgentRun> {
         let started_at = chrono::Utc::now().to_rfc3339();
         let session_id = uuid::Uuid::new_v4().to_string();
 
-        // Build prompt variables — only small context goes in system prompt
         let mut vars = HashMap::new();
         vars.insert("epic_id".to_string(), ticket_context.epic_id.clone());
         vars.insert("slice_id".to_string(), ticket_context.slice_id.clone());
@@ -98,13 +228,18 @@ impl AgentExecutor {
         vars.insert("ticket_title".to_string(), ticket_context.title.clone());
         vars.insert("ticket_intent".to_string(), ticket_context.intent.clone());
 
-        // Load system prompt — role + rules only, no large data
-        let system_prompt = load_prompt(agent_type.as_str(), vars)
-            .context("Failed to load agent prompt")?;
+        let system_prompt =
+            load_prompt(agent_type.as_str(), vars).context("Failed to load agent prompt")?;
+        let prompt = build_agent_prompt(
+            &agent_type,
+            &ticket_context,
+            previous_output.as_deref(),
+            selected_context.as_deref(),
+            sender_info.as_deref(),
+        );
 
-        // Log what we're about to do
         tracing::info!(
-            "Starting agent execution: type={}, ticket={}, model={}",
+            "Starting agent execution via codex exec: type={}, ticket={}, model={}",
             agent_type.as_str(),
             ticket_context.ticket_id,
             agent_type.model()
@@ -114,331 +249,40 @@ impl AgentExecutor {
         tracing::info!("Tools config: {:?}", agent_type.allowed_tools());
         tracing::info!("Max turns: {:?}", agent_type.max_turns());
 
-        let options = build_agent_options(&agent_type, &system_prompt, &self.working_dir, None);
-
-        // Build user message: large data at top (XML-tagged), task at bottom
-        // Per Anthropic best practices: data first, instructions last
-        let mut context_sections = Vec::new();
-
-        if let Some(prev) = &previous_output {
-            let tag = match agent_type {
-                AgentType::Planning => "research_output",
-                AgentType::Execution => "implementation_plan",
-                AgentType::Evaluation => "prior_outputs",
-                AgentType::ResearchSynthesis => "research_findings",
-                AgentType::TicketPlanner => "research_synthesis",
-                AgentType::TicketCreator => "ticket_plan",
-                AgentType::DocDrafter => "research_output",
-                _ => "prior_context",
-            };
-            context_sections.push(format!("<{}>\n{}\n</{}>", tag, prev, tag));
-        }
-
-        if let Some(ctx) = &selected_context {
-            context_sections.push(format!("<selected_context>\n{}\n</selected_context>", ctx));
-        }
-
-        if let Some(info) = &sender_info {
-            context_sections.push(format!("<sender_info>\n{}\n</sender_info>", info));
-        }
-
-        let prompt = if context_sections.is_empty() {
-            format!(
-                "Work on this ticket:\n\nTitle: {}\nIntent: {}",
-                ticket_context.title, ticket_context.intent
-            )
-        } else {
-            format!(
-                "{}\n\nWork on this ticket:\n\nTitle: {}\nIntent: {}",
-                context_sections.join("\n\n"),
-                ticket_context.title,
-                ticket_context.intent
-            )
-        };
-
-        let mut output_parts = Vec::new();
-        let mut status = AgentRunStatus::Running;
-        let actual_session_id = session_id.clone();
-        let mut tool_call_count: i32 = 0;
-        let mut cc_session_id: Option<String> = None;
-
-        tracing::info!("Creating ClaudeSDKClient...");
-        let query_start = std::time::Instant::now();
-
-        let mut sdk_client = ClaudeSDKClient::new(options);
-
-        match sdk_client.connect(None).await {
-            Ok(_) => {
-                tracing::info!("Client connected in {:?}", query_start.elapsed());
-
-                if let Err(e) = sdk_client.send_user_message(prompt).await {
-                    tracing::error!("Failed to send message: {}", e);
-                    status = AgentRunStatus::Failed;
-                } else {
-                    let mut response_stream = sdk_client.receive_messages().await;
-                    let mut message_count = 0u32;
-                    // See conversation_worker.rs for detailed explanation: cc-sdk 0.6.0 drops
-                    // tool_result User messages, so we synthesize StreamEvent::ToolResult
-                    // events when tools are known to have completed (next Assistant turn or
-                    // final Result).
-                    let mut pending_tool_ids: Vec<String> = Vec::new();
-
-                    while let Some(message_result) = response_stream.next().await {
-                        message_count += 1;
-                        match message_result {
-                            Ok(message) => {
-                                let msg_type = match &message {
-                                    Message::System { .. } => "System",
-                                    Message::Assistant { .. } => "Assistant",
-                                    Message::User { .. } => "User",
-                                    Message::Result { .. } => "Result",
-                                };
-                                tracing::info!("Received message #{}: type={}", message_count, msg_type);
-
-                                if let Message::Assistant { message: assistant_msg } = &message {
-                                    // Flush pending tool_uses from the previous Assistant
-                                    // turn as synthetic ToolResults.
-                                    if !pending_tool_ids.is_empty() {
-                                        if let Some(ref tx) = event_tx {
-                                            for tool_id in pending_tool_ids.drain(..) {
-                                                tracing::debug!(
-                                                    "[EXECUTOR] Synthesizing ToolResult for pending tool_use_id={}",
-                                                    tool_id
-                                                );
-                                                let event = StreamEvent::ToolResult {
-                                                    tool_use_id: tool_id,
-                                                    content: String::new(),
-                                                    is_error: false,
-                                                };
-                                                if let Err(e) = tx.send(event).await {
-                                                    tracing::warn!("Failed to send synth tool_result: {}", e);
-                                                }
-                                            }
-                                        } else {
-                                            pending_tool_ids.clear();
-                                        }
-                                    }
-
-                                    for block in &assistant_msg.content {
-                                        match block {
-                                            ContentBlock::Text(text_content) => {
-                                                tracing::debug!("Assistant text: {} chars", text_content.text.len());
-                                                output_parts.push(text_content.text.clone());
-
-                                                if let Some(ref tx) = event_tx {
-                                                    let event = StreamEvent::Text { content: text_content.text.clone() };
-                                                    if let Err(e) = tx.send(event).await {
-                                                        tracing::warn!("Failed to send text event: {}", e);
-                                                    }
-                                                }
-                                            }
-                                            ContentBlock::ToolUse(tool_use) => {
-                                                tool_call_count += 1;
-                                                tracing::info!("Tool use: {} ({}) [#{}]", tool_use.name, tool_use.id, tool_call_count);
-
-                                                if let Some(ref tx) = event_tx {
-                                                    let event = StreamEvent::ToolUse {
-                                                        id: tool_use.id.clone(),
-                                                        name: tool_use.name.clone(),
-                                                        input: tool_use.input.clone(),
-                                                    };
-                                                    if let Err(e) = tx.send(event).await {
-                                                        tracing::warn!("Failed to send tool_use event: {}", e);
-                                                    }
-                                                }
-                                                pending_tool_ids.push(tool_use.id.clone());
-                                            }
-                                            ContentBlock::ToolResult(tool_result) => {
-                                                tracing::debug!(
-                                                    "ToolResult block from stream: {}",
-                                                    tool_result.tool_use_id
-                                                );
-
-                                                if let Some(ref tx) = event_tx {
-                                                    let content = tool_result.content.as_ref()
-                                                        .map(|c| serde_json::to_string(c).unwrap_or_default())
-                                                        .unwrap_or_default();
-                                                    let event = StreamEvent::ToolResult {
-                                                        tool_use_id: tool_result.tool_use_id.clone(),
-                                                        content,
-                                                        is_error: tool_result.is_error.unwrap_or(false),
-                                                    };
-                                                    if let Err(e) = tx.send(event).await {
-                                                        tracing::warn!("Failed to send tool_result event: {}", e);
-                                                    }
-                                                }
-                                                pending_tool_ids.retain(|id| id != &tool_result.tool_use_id);
-                                            }
-                                            ContentBlock::Thinking(thinking) => {
-                                                tracing::debug!("Thinking: {} chars", thinking.thinking.len());
-
-                                                if let Some(ref tx) = event_tx {
-                                                    let event = StreamEvent::Thinking { content: thinking.thinking.clone() };
-                                                    if let Err(e) = tx.send(event).await {
-                                                        tracing::warn!("Failed to send thinking event: {}", e);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if let Message::Result {
-                                    subtype,
-                                    session_id: sess_id,
-                                    is_error,
-                                    result,
-                                    ..
-                                } = &message {
-                                    tracing::info!(
-                                        "Result message: subtype={}, is_error={}, session_id={}",
-                                        subtype, is_error, sess_id
-                                    );
-                                    if let Some(result_text) = result {
-                                        tracing::info!("Result text: {} chars", result_text.len());
-                                    }
-                                    // Flush any remaining pending tool_uses as synthetic
-                                    // results before firing Result, so the client sees all
-                                    // toolUseEnd events before the done event.
-                                    if !pending_tool_ids.is_empty() {
-                                        if let Some(ref tx) = event_tx {
-                                            for tool_id in pending_tool_ids.drain(..) {
-                                                tracing::debug!(
-                                                    "[EXECUTOR] Final synth ToolResult for tool_use_id={} (is_error={})",
-                                                    tool_id, is_error
-                                                );
-                                                let event = StreamEvent::ToolResult {
-                                                    tool_use_id: tool_id,
-                                                    content: String::new(),
-                                                    is_error: *is_error,
-                                                };
-                                                if let Err(e) = tx.send(event).await {
-                                                    tracing::warn!("Failed to send final synth tool_result: {}", e);
-                                                }
-                                            }
-                                        } else {
-                                            pending_tool_ids.clear();
-                                        }
-                                    }
-                                    // Capture SDK session_id for future resume (separate from our DB session_id)
-                                    cc_session_id = Some(sess_id.clone());
-                                    if *is_error {
-                                        tracing::error!("Agent returned error result");
-                                        status = AgentRunStatus::Failed;
-                                    } else if subtype == "success" {
-                                        tracing::info!("Agent completed successfully");
-                                        status = AgentRunStatus::Completed;
-                                    }
-
-                                    if let Some(ref tx) = event_tx {
-                                        let event = StreamEvent::Result {
-                                            session_id: sess_id.clone(),
-                                            status: subtype.clone(),
-                                            is_error: *is_error,
-                                        };
-                                        if let Err(e) = tx.send(event).await {
-                                            tracing::warn!("Failed to send result event: {}", e);
-                                        }
-                                    }
-
-                                    tracing::info!("Breaking out of stream loop after Result message");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Error receiving message #{}: {}", message_count, e);
-                                // Flush pending tool_uses as errored so the UI exits the
-                                // Running state rather than being stuck forever.
-                                if let Some(ref tx) = event_tx {
-                                    for tool_id in pending_tool_ids.drain(..) {
-                                        let event = StreamEvent::ToolResult {
-                                            tool_use_id: tool_id,
-                                            content: String::new(),
-                                            is_error: true,
-                                        };
-                                        let _ = tx.send(event).await;
-                                    }
-                                }
-                                status = AgentRunStatus::Failed;
-                                break;
-                            }
-                        }
-                    }
-
-                    tracing::info!(
-                        "Stream ended after {} messages, total time: {:?}",
-                        message_count,
-                        query_start.elapsed()
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!("Client connect failed after {:?}: {}", query_start.elapsed(), e);
-                status = AgentRunStatus::Failed;
-            }
-        }
-
-        // If we never got a result message, assume completed if we got output
-        if status == AgentRunStatus::Running {
-            tracing::warn!(
-                "No Result message received, inferring status from output (parts={})",
-                output_parts.len()
-            );
-            status = if output_parts.is_empty() {
-                tracing::error!("No output received, marking as failed");
-                AgentRunStatus::Failed
-            } else {
-                tracing::info!("Got {} output parts, marking as completed", output_parts.len());
-                AgentRunStatus::Completed
-            };
-        }
+        let turn = run_codex_agent_turn(
+            &agent_type,
+            &self.working_dir,
+            &system_prompt,
+            &prompt,
+            None,
+            true,
+            event_tx,
+            &session_id,
+        )
+        .await?;
 
         let completed_at = chrono::Utc::now().to_rfc3339();
-        let output_summary = if output_parts.is_empty() {
-            None
-        } else {
-            let full_output = output_parts.join("\n\n");
-            if full_output.len() > 100000 {
-                let end = (0..=100000).rev().find(|&i| full_output.is_char_boundary(i)).unwrap_or(0);
-                Some(format!("{}...\n\n[Output truncated]", &full_output[..end]))
-            } else {
-                Some(full_output)
-            }
-        };
-
-        tracing::info!(
-            "Agent run complete: status={:?}, output_len={}, session={}",
-            status,
-            output_summary.as_ref().map(|s| s.len()).unwrap_or(0),
-            actual_session_id
-        );
-
-        // Parse email output if this is an email agent
         let email_output = if agent_type == AgentType::Email {
-            output_summary.as_ref().and_then(|s| EmailOutput::parse(s))
+            EmailOutput::parse(&turn.output_summary)
         } else {
             None
         };
 
-        tracing::info!("[AGENT-RUN] tool_call_count={}", tool_call_count);
-
-        let agent_run = AgentRun {
-            session_id: actual_session_id,
+        Ok(AgentRun {
+            session_id,
             organization: None,
             ticket_id: Some(ticket_context.ticket_id),
             epic_id: Some(ticket_context.epic_id),
             slice_id: Some(ticket_context.slice_id),
             agent_type: agent_type.as_str().to_string(),
-            status,
+            status: AgentRunStatus::Completed,
             started_at,
             completed_at: Some(completed_at),
             input_message: ticket_context.intent,
-            output_summary,
+            output_summary: Some(turn.output_summary),
             email_output,
-            tool_call_count,
-            cc_session_id,
-        };
-
-        Ok((agent_run, sdk_client))
+            tool_call_count: turn.tool_call_count,
+            cc_session_id: turn.runtime_session_id,
+        })
     }
 }
