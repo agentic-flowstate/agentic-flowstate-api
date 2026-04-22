@@ -135,7 +135,7 @@ pub struct GenerateCardsResponse {
 
 /// POST /api/spanish/sections/:section_id/generate
 ///
-/// Uses Claude Haiku via cc-sdk to generate new vocabulary for the given
+/// Uses Codex to generate new vocabulary for the given
 /// section. Deduplicates against the section's existing words before inserting.
 pub async fn generate_spanish_cards(
     State(db): State<Arc<SqlitePool>>,
@@ -153,7 +153,7 @@ pub async fn generate_spanish_cards(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let count = body.count.clamp(1, 30);
-    let new_words = call_haiku_generate(&section.title, count, &existing)
+    let new_words = call_codex_generate(&section.title, count, &existing)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("generation failed: {e}")))?;
 
@@ -184,14 +184,13 @@ pub async fn generate_spanish_cards(
     }))
 }
 
-/// Invokes Claude Haiku through cc-sdk to produce N deduped vocabulary entries.
-async fn call_haiku_generate(
+/// Invokes Codex to produce N deduped vocabulary entries.
+async fn call_codex_generate(
     section_title: &str,
     count: usize,
     existing: &[String],
 ) -> anyhow::Result<Vec<(String, String, bool)>> {
-    use cc_sdk::{ClaudeCodeOptions, ClaudeSDKClient, ContentBlock, Message, PermissionMode, ToolsConfig};
-    use futures::StreamExt;
+    use crate::agents::codex_exec::{resolve_codex_model, run_codex_text};
 
     let existing_list = if existing.is_empty() {
         "(none yet)".to_string()
@@ -217,43 +216,15 @@ async fn call_haiku_generate(
          [{{\"spanish\": \"palabra\", \"english\": \"word\", \"is_phrase\": false}}]"
     );
 
-    let options = ClaudeCodeOptions::builder()
-        .system_prompt(system_prompt)
-        .model("haiku")
-        .tools(ToolsConfig::none())
-        .max_turns(1)
-        .permission_mode(PermissionMode::BypassPermissions)
-        .cwd(std::path::Path::new("/tmp"))
-        .build();
-
-    let mut sdk_client = ClaudeSDKClient::new(options);
-    sdk_client
-        .connect(None)
-        .await
-        .map_err(|e| anyhow::anyhow!("cc-sdk connect failed: {e}"))?;
-    sdk_client
-        .send_user_message(user_prompt)
-        .await
-        .map_err(|e| anyhow::anyhow!("cc-sdk send failed: {e}"))?;
-
-    let mut stream = sdk_client.receive_messages().await;
-    let mut output_parts: Vec<String> = Vec::new();
-    while let Some(msg_result) = stream.next().await {
-        match msg_result {
-            Ok(Message::Assistant { message: assistant_msg }) => {
-                for block in &assistant_msg.content {
-                    if let ContentBlock::Text(text_content) = block {
-                        output_parts.push(text_content.text.clone());
-                    }
-                }
-            }
-            Ok(Message::Result { .. }) => break,
-            Err(e) => return Err(anyhow::anyhow!("cc-sdk stream error: {e}")),
-            _ => {}
-        }
-    }
-
-    let raw = output_parts.join("");
+    let raw = run_codex_text(
+        resolve_codex_model("haiku"),
+        "low",
+        system_prompt,
+        std::path::Path::new("/tmp"),
+        &user_prompt,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("codex exec failed: {e}"))?;
     let text = raw
         .trim()
         .trim_start_matches("```json")
@@ -262,7 +233,7 @@ async fn call_haiku_generate(
         .trim();
 
     let parsed: Vec<GeneratedCard> = serde_json::from_str(text).map_err(|e| {
-        anyhow::anyhow!("failed to parse Haiku JSON: {e}; raw response: {text}")
+        anyhow::anyhow!("failed to parse Codex JSON: {e}; raw response: {text}")
     })?;
 
     let existing_normalized: std::collections::HashSet<String> =

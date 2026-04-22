@@ -1,4 +1,5 @@
 pub mod anthropic_events;
+pub mod codex_exec;
 pub mod executor;
 pub mod oneshot;
 pub mod prompts;

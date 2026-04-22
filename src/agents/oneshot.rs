@@ -5,6 +5,7 @@ use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsCon
 use futures::StreamExt;
 use std::path::Path;
 
+use super::codex_exec::{normalize_reasoning_effort, resolve_codex_model, run_codex_text};
 use super::AgentType;
 
 /// Result of a one-shot agent execution.
@@ -23,6 +24,31 @@ pub async fn run_oneshot(
     working_dir: &Path,
     prompt: impl Into<String>,
 ) -> Result<OneshotResult, String> {
+    let prompt = prompt.into();
+
+    let use_codex_exec = agent_type
+        .as_ref()
+        .map(|at| at.allowed_tools().is_empty())
+        .unwrap_or(true);
+
+    if use_codex_exec {
+        let model = agent_type
+            .as_ref()
+            .map(|at| resolve_codex_model(at.model()))
+            .unwrap_or(resolve_codex_model("haiku"));
+        let reasoning_effort = agent_type
+            .as_ref()
+            .map(|at| normalize_reasoning_effort(at.effort()))
+            .unwrap_or("low");
+        let text = run_codex_text(model, reasoning_effort, system_prompt, working_dir, &prompt)
+            .await?;
+
+        return Ok(OneshotResult {
+            text,
+            tool_call_count: 0,
+        });
+    }
+
     let mut builder = ClaudeCodeOptions::builder()
         .system_prompt(system_prompt)
         .disallowed_tools(crate::safety::disallowed_tools())
@@ -50,7 +76,7 @@ pub async fn run_oneshot(
     sdk_client.connect(None).await
         .map_err(|e| format!("Failed to connect agent: {}", e))?;
 
-    sdk_client.send_user_message(prompt.into()).await
+    sdk_client.send_user_message(prompt).await
         .map_err(|e| format!("Failed to send message: {}", e))?;
 
     let mut response_stream = sdk_client.receive_messages().await;

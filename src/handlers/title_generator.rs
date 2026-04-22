@@ -1,10 +1,9 @@
-//! Generate conversation titles and auto-detect organization using cc-sdk.
-//! Spawns a lightweight Haiku one-shot via the SDK — no API keys needed.
+//! Generate conversation titles and auto-detect organization using Codex.
 
-use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig, PermissionMode};
-use futures::StreamExt;
 use sqlx::SqlitePool;
 use ticketing_system::{conversations, organizations, UpdateConversationRequest};
+
+use crate::agents::codex_exec::{resolve_codex_model, run_codex_text};
 
 /// Result of title + org generation
 pub struct TitleAndOrg {
@@ -76,51 +75,24 @@ pub async fn generate_title_and_org(
         "Classify this conversation based on the user's message:\n\n{user_message}"
     );
 
-    let options = ClaudeCodeOptions::builder()
-        .system_prompt(&system_prompt)
-        .model("haiku")
-        .tools(ToolsConfig::none())
-        .max_turns(1)
-        .permission_mode(PermissionMode::BypassPermissions)
-        .cwd(std::path::Path::new("/tmp"))
-        .build();
-
-    let mut sdk_client = ClaudeSDKClient::new(options);
-
-    if let Err(e) = sdk_client.connect(None).await {
-        tracing::error!("[TITLE] cc-sdk connect failed: {}", e);
-        return None;
-    }
-
-    if let Err(e) = sdk_client.send_user_message(prompt).await {
-        tracing::error!("[TITLE] cc-sdk send failed: {}", e);
-        return None;
-    }
-
-    let mut response_stream = sdk_client.receive_messages().await;
-    let mut output_parts = Vec::new();
-
-    while let Some(msg_result) = response_stream.next().await {
-        match msg_result {
-            Ok(Message::Assistant { message: assistant_msg }) => {
-                for block in &assistant_msg.content {
-                    if let ContentBlock::Text(text_content) = block {
-                        output_parts.push(text_content.text.clone());
-                    }
-                }
-            }
-            Ok(Message::Result { .. }) => break,
-            Err(e) => {
-                tracing::error!("[TITLE] cc-sdk stream error: {}", e);
-                return None;
-            }
-            _ => {}
+    let raw_output = match run_codex_text(
+        resolve_codex_model("haiku"),
+        "low",
+        &system_prompt,
+        std::path::Path::new("/tmp"),
+        &prompt,
+    )
+    .await
+    {
+        Ok(text) => text.trim().to_string(),
+        Err(e) => {
+            tracing::error!("[TITLE] codex exec failed: {}", e);
+            return None;
         }
-    }
+    };
 
-    let raw_output = output_parts.join("").trim().to_string();
     if raw_output.is_empty() {
-        tracing::warn!("[TITLE] Empty response from Haiku");
+        tracing::warn!("[TITLE] Empty response from Codex");
         return None;
     }
 
