@@ -37,6 +37,16 @@ const DB_FLUSH_INTERVAL_MS: u64 = 500;
 /// How long a worker idles before shutting down.
 const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
+fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
+    match agent_type {
+        AgentType::ScopedWorkspace
+        | AgentType::HomePlanner
+        | AgentType::MeetingAgent
+        | AgentType::WorkspaceManager => CodexToolProfile::RestrictedMcpOnly,
+        _ => CodexToolProfile::Default,
+    }
+}
+
 /// Message sent to a ConversationWorker via its mpsc channel.
 pub struct WorkerMessage {
     pub user_id: String,
@@ -1646,11 +1656,7 @@ impl ConversationWorker {
             bypass_approvals_and_sandbox: true,
             resume_session_id: None,
             ephemeral: true,
-            tool_profile: if msg.config.agent_type == AgentType::ScopedWorkspace {
-                CodexToolProfile::RestrictedMcpOnly
-            } else {
-                CodexToolProfile::Default
-            },
+            tool_profile: codex_tool_profile_for_chat_agent(&msg.config.agent_type),
         })
         .await
         {
