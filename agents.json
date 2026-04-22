@@ -307,6 +307,34 @@
         "mcp__agentic-mcp__create_slices",
         "mcp__agentic-mcp__create_slice_tickets"
       ]
+    },
+    "dep-update-reviewer": {
+      "model": "opus",
+      "effort": "xhigh",
+      "prompt_file": "dep-update-reviewer.txt",
+      "tools": [
+        "Task",
+        "mcp__agentic-mcp__list_epics",
+        "mcp__agentic-mcp__list_slices",
+        "mcp__agentic-mcp__list_tickets",
+        "mcp__agentic-mcp__create_slices",
+        "mcp__agentic-mcp__create_slice_tickets",
+        "mcp__agentic-mcp__create_artifact"
+      ]
+    },
+    "dep-update-deep-dive": {
+      "model": "opus",
+      "effort": "xhigh",
+      "prompt_file": "dep-update-deep-dive.txt",
+      "tools": [
+        "Read",
+        "Glob",
+        "Grep",
+        "Bash",
+        "WebFetch",
+        "mcp__agentic-mcp__create_artifact",
+        "mcp__agentic-mcp__update_ticket_documentation"
+      ]
     }
   }
 }
