@@ -50,7 +50,7 @@ pub async fn scoped_workspace_chat(
 
     let config = ChatConfig {
         agent_type: AgentType::ScopedWorkspace,
-        runtime: ChatRuntime::ClaudeSdk,
+        runtime: ChatRuntime::CodexExec,
         prompt_name: "scoped-workspace",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,

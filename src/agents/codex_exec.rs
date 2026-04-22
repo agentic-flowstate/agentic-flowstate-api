@@ -8,6 +8,17 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
+// Scoped workspace and the ticket router are MCP-only surfaces. Disable
+// shell, plugin, and tool-discovery features so Codex cannot widen itself
+// back into desktop or local-file access during those turns.
+const RESTRICTED_MCP_ONLY_DISABLED_FEATURES: &[&str] = &[
+    "plugins",
+    "apps",
+    "tool_search",
+    "shell_tool",
+    "shell_zsh_fork",
+    "shell_snapshot",
+];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CodexSandboxMode {
@@ -24,6 +35,28 @@ impl CodexSandboxMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CodexToolProfile {
+    Default,
+    RestrictedMcpOnly,
+}
+
+impl CodexToolProfile {
+    fn config_overrides(self) -> &'static [&'static str] {
+        match self {
+            Self::Default => &[],
+            Self::RestrictedMcpOnly => &["web_search=\"disabled\""],
+        }
+    }
+
+    fn disabled_features(self) -> &'static [&'static str] {
+        match self {
+            Self::Default => &[],
+            Self::RestrictedMcpOnly => RESTRICTED_MCP_ONLY_DISABLED_FEATURES,
+        }
+    }
+}
+
 pub struct CodexExecOptions<'a> {
     pub model: &'a str,
     pub reasoning_effort: &'a str,
@@ -34,6 +67,7 @@ pub struct CodexExecOptions<'a> {
     pub bypass_approvals_and_sandbox: bool,
     pub resume_session_id: Option<&'a str>,
     pub ephemeral: bool,
+    pub tool_profile: CodexToolProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +159,14 @@ pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCo
         .arg("forced_login_method=\"chatgpt\"")
         .arg("-c")
         .arg(format!("model_reasoning_effort=\"{normalized_effort}\""));
+
+    for config_override in options.tool_profile.config_overrides() {
+        command.arg("-c").arg(config_override);
+    }
+
+    for feature in options.tool_profile.disabled_features() {
+        command.arg("--disable").arg(feature);
+    }
 
     if !options.system_prompt.is_empty() {
         let developer_instructions = serde_json::to_string(options.system_prompt)
@@ -241,6 +283,7 @@ pub async fn run_codex_text(
         bypass_approvals_and_sandbox: false,
         resume_session_id: None,
         ephemeral: true,
+        tool_profile: CodexToolProfile::Default,
     })
     .await?;
     let mut last_agent_message = None;

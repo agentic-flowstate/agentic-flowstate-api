@@ -18,7 +18,7 @@ use super::chat_stream::{
     get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData, ChatRuntime,
 };
 use crate::agents::codex_exec::{
-    spawn_codex_exec, CodexExecEvent, CodexExecOptions, CodexSandboxMode,
+    spawn_codex_exec, CodexExecEvent, CodexExecOptions, CodexSandboxMode, CodexToolProfile,
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
@@ -1459,6 +1459,7 @@ impl ConversationWorker {
             bypass_approvals_and_sandbox: false,
             resume_session_id: None,
             ephemeral: true,
+            tool_profile: CodexToolProfile::RestrictedMcpOnly,
         })
         .await?;
 
@@ -1645,6 +1646,11 @@ impl ConversationWorker {
             bypass_approvals_and_sandbox: true,
             resume_session_id: None,
             ephemeral: true,
+            tool_profile: if msg.config.agent_type == AgentType::ScopedWorkspace {
+                CodexToolProfile::RestrictedMcpOnly
+            } else {
+                CodexToolProfile::Default
+            },
         })
         .await
         {

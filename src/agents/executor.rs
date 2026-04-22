@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
-use super::codex_exec::{spawn_codex_exec, CodexExecEvent, CodexExecOptions, CodexSandboxMode};
+use super::codex_exec::{
+    spawn_codex_exec, CodexExecEvent, CodexExecOptions, CodexSandboxMode, CodexToolProfile,
+};
 use super::prompts::load_prompt;
 use super::{AgentRun, AgentRunStatus, AgentType, EmailOutput, StreamEvent, TicketContext};
 
@@ -108,6 +110,7 @@ pub async fn run_codex_agent_turn(
         bypass_approvals_and_sandbox,
         resume_session_id,
         ephemeral: !persist_session,
+        tool_profile: CodexToolProfile::Default,
     })
     .await
     .map_err(anyhow::Error::msg)?;
