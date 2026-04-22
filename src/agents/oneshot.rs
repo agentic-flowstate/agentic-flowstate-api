@@ -1,13 +1,10 @@
 //! Shared one-shot agent execution: create client, send message, collect text output.
 //! Used by handlers that need a simple "prompt in, text out" pattern.
 
-use cc_sdk::{
-    ClaudeCodeOptions, ClaudeSDKClient, ContentBlock, Message, PermissionMode, ToolsConfig,
-};
+use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig, PermissionMode};
 use futures::StreamExt;
 use std::path::Path;
 
-use super::openai_text::{normalize_reasoning_effort, resolve_openai_model, run_openai_text};
 use super::AgentType;
 
 /// Result of a one-shot agent execution.
@@ -26,31 +23,6 @@ pub async fn run_oneshot(
     working_dir: &Path,
     prompt: impl Into<String>,
 ) -> Result<OneshotResult, String> {
-    let prompt = prompt.into();
-
-    let use_openai = agent_type
-        .as_ref()
-        .map(|at| at.allowed_tools().is_empty())
-        .unwrap_or(true);
-
-    if use_openai {
-        let model = agent_type
-            .as_ref()
-            .map(|at| resolve_openai_model(at.model()))
-            .unwrap_or(resolve_openai_model("haiku"));
-        let reasoning_effort = agent_type
-            .as_ref()
-            .map(|at| normalize_reasoning_effort(at.effort()))
-            .unwrap_or("low");
-
-        let text = run_openai_text(model, reasoning_effort, system_prompt, &prompt).await?;
-
-        return Ok(OneshotResult {
-            text,
-            tool_call_count: 0,
-        });
-    }
-
     let mut builder = ClaudeCodeOptions::builder()
         .system_prompt(system_prompt)
         .disallowed_tools(crate::safety::disallowed_tools())
@@ -75,14 +47,10 @@ pub async fn run_oneshot(
     let options = builder.build();
     let mut sdk_client = ClaudeSDKClient::new(options);
 
-    sdk_client
-        .connect(None)
-        .await
+    sdk_client.connect(None).await
         .map_err(|e| format!("Failed to connect agent: {}", e))?;
 
-    sdk_client
-        .send_user_message(prompt)
-        .await
+    sdk_client.send_user_message(prompt.into()).await
         .map_err(|e| format!("Failed to send message: {}", e))?;
 
     let mut response_stream = sdk_client.receive_messages().await;
@@ -92,10 +60,7 @@ pub async fn run_oneshot(
     while let Some(msg_result) = response_stream.next().await {
         match msg_result {
             Ok(msg) => {
-                if let Message::Assistant {
-                    message: assistant_msg,
-                } = &msg
-                {
+                if let Message::Assistant { message: assistant_msg } = &msg {
                     for block in &assistant_msg.content {
                         match block {
                             ContentBlock::Text(text_content) => {
@@ -103,11 +68,7 @@ pub async fn run_oneshot(
                             }
                             ContentBlock::ToolUse(tool_use) => {
                                 tool_call_count += 1;
-                                tracing::info!(
-                                    "Oneshot tool use: {} [#{}]",
-                                    tool_use.name,
-                                    tool_call_count
-                                );
+                                tracing::info!("Oneshot tool use: {} [#{}]", tool_use.name, tool_call_count);
                             }
                             _ => {}
                         }
