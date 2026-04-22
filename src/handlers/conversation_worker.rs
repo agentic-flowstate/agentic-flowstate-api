@@ -674,6 +674,21 @@ impl ConversationWorker {
                                             pending_tool_ids.retain(|id| id != &tool_result.tool_use_id);
                                         }
                                         ContentBlock::Thinking(thinking) => {
+                                            // T-FEB8E5F8: persist thinking alongside text + tool
+                                            // groups so the ordering survives a page reload. Coalesce
+                                            // consecutive thinking fragments into a single block so
+                                            // the DB doesn't grow a new JSON entry for every token.
+                                            match content_blocks.last_mut() {
+                                                Some(ContentBlockDesc::Thinking { text }) => {
+                                                    text.push_str(&thinking.thinking);
+                                                }
+                                                _ => {
+                                                    content_blocks.push(ContentBlockDesc::Thinking {
+                                                        text: thinking.thinking.clone(),
+                                                    });
+                                                    blocks_dirty = true;
+                                                }
+                                            }
                                             self.emit_event(&StreamEvent::Thinking {
                                                 content: thinking.thinking.clone(),
                                             }).await;
@@ -1236,9 +1251,12 @@ impl ConversationWorker {
                         for block in &assistant_msg.content {
                             match block {
                                 ContentBlock::Text(text_content) => {
-                                    // Collect text for parsing but don't emit RouterText —
-                                    // the output is XML (<router_result>) not human-readable.
-                                    // Router tool calls already show what it's doing.
+                                    // T-B1A8C4D4: don't emit RouterText — the router's
+                                    // text is the XML `<router_result>` blob, which is
+                                    // not useful to show to users. We parse it at the
+                                    // end. RouterToolUse/RouterToolResult below give
+                                    // the iOS app a live signal that routing is
+                                    // in-flight so cold-start doesn't look like a hang.
                                     router_text_parts.push(text_content.text.clone());
                                 }
                                 ContentBlock::ToolUse(tool_use) => {
@@ -1249,9 +1267,34 @@ impl ConversationWorker {
                                         tool_use.name,
                                         tool_use.id
                                     );
+                                    // T-B1A8C4D4: emit so iOS can show a
+                                    // "Routing… N tools" phase pill. Router phase
+                                    // was previously silent to SSE for 3-16s,
+                                    // which read as a hang.
+                                    self.emit_event(&StreamEvent::RouterToolUse {
+                                        id: tool_use.id.clone(),
+                                        name: tool_use.name.clone(),
+                                        input: tool_use.input.clone(),
+                                    })
+                                    .await;
                                 }
-                                ContentBlock::ToolResult(_tool_result) => {
-                                    // Silent — router tool results are not shown to the user.
+                                ContentBlock::ToolResult(tool_result) => {
+                                    // T-B1A8C4D4: emit RouterToolResult so the
+                                    // phase pill can flip each tool call from
+                                    // "running" to "done" as results come back.
+                                    let content = match &tool_result.content {
+                                        Some(cc_sdk::ContentValue::Text(s)) => s.clone(),
+                                        Some(cc_sdk::ContentValue::Structured(vals)) => {
+                                            serde_json::to_string(vals).unwrap_or_default()
+                                        }
+                                        None => String::new(),
+                                    };
+                                    self.emit_event(&StreamEvent::RouterToolResult {
+                                        tool_use_id: tool_result.tool_use_id.clone(),
+                                        content,
+                                        is_error: tool_result.is_error.unwrap_or(false),
+                                    })
+                                    .await;
                                 }
                                 ContentBlock::Thinking(_) => {
                                     // Ignore thinking blocks from router
