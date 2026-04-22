@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::chat_client_manager::ChatClientManager;
-use super::chat_stream::{self, ChatConfig, ChatImageData};
+use super::chat_stream::{self, ChatConfig, ChatImageData, ChatRuntime};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -46,6 +46,7 @@ pub async fn full_access_chat(
 
     let config = ChatConfig {
         agent_type: AgentType::FullAccess,
+        runtime: ChatRuntime::CodexExec,
         prompt_name: "full-access",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,

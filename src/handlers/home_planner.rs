@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::chat_client_manager::ChatClientManager;
-use super::chat_stream::{self, ChatConfig, ChatImageData};
+use super::chat_stream::{self, ChatConfig, ChatImageData, ChatRuntime};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -63,6 +63,7 @@ pub async fn home_planner_chat(
 
     let config = ChatConfig {
         agent_type: AgentType::HomePlanner,
+        runtime: ChatRuntime::ClaudeSdk,
         prompt_name: "home-planner",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,

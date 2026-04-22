@@ -67,10 +67,17 @@ pub async fn remove_broadcast_channel(conversation_id: &str) {
 
 pub type SseStream = Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatRuntime {
+    ClaudeSdk,
+    CodexExec,
+}
+
 /// Configuration for a chat SSE endpoint
 #[derive(Clone)]
 pub struct ChatConfig {
     pub agent_type: AgentType,
+    pub runtime: ChatRuntime,
     pub prompt_name: &'static str,
     pub working_dir: PathBuf,
     pub prompt_vars: HashMap<String, String>,
@@ -296,9 +303,7 @@ pub fn extract_client_id(
     if s.len() > 128 {
         return Err(IdempotencyKeyError::Malformed("exceeds 128 chars"));
     }
-    if s.chars()
-        .any(|c| (c as u32) < 0x20 || (c as u32) == 0x7F)
-    {
+    if s.chars().any(|c| (c as u32) < 0x20 || (c as u32) == 0x7F) {
         return Err(IdempotencyKeyError::Malformed(
             "contains non-printable characters",
         ));

@@ -15,7 +15,10 @@ use tokio::sync::mpsc;
 use super::anthropic_event_encoder::AnthropicEventEncoder;
 use super::chat_client_manager::{ChatClient, ChatClientManager};
 use super::chat_stream::{
-    get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData,
+    get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData, ChatRuntime,
+};
+use crate::agents::codex_exec::{
+    spawn_codex_exec, CodexExecEvent, CodexExecOptions, CodexSandboxMode,
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
@@ -270,8 +273,7 @@ impl ConversationWorker {
         // consumes it on the first `open_message_if_needed` call (i.e.,
         // the next `message_start` frame). When `None`, it stays `None`
         // end-to-end — no synthetic fallbacks.
-        self.encoder
-            .set_pending_client_id(msg.client_id.clone());
+        self.encoder.set_pending_client_id(msg.client_id.clone());
         // Clear stale events from previous message but keep event_index monotonically
         // increasing. Resetting to 0 here was causing the "one turn late" bug: the app's
         // SSE cursor (e.g., lastEventIndex=50) would be higher than all new events (0,1,2...),
@@ -486,6 +488,12 @@ impl ConversationWorker {
             message: Some("Preparing agent...".to_string()),
         })
         .await;
+
+        if msg.config.runtime == ChatRuntime::CodexExec {
+            self.process_codex_message(&msg, &final_message, assistant_message_id.clone())
+                .await;
+            return;
+        }
 
         // Get or create SDK client
         let client_arc = match self.get_or_create_client(&msg.config).await {
@@ -990,7 +998,7 @@ impl ConversationWorker {
     /// 1. Short conversational messages (acknowledgements, confirmations)
     /// 2. Workspace-manager approval flow signals ("approved"/"rejected")
     /// 3. Conversations with an established ticket context from a prior message
-    async fn run_ticket_router(&mut self, user_message: &str, _config: &ChatConfig) -> String {
+    async fn run_ticket_router(&mut self, user_message: &str, config: &ChatConfig) -> String {
         let original = user_message.to_string();
 
         // Truncate preview at a safe UTF-8 char boundary (floor to nearest boundary at or before 60)
@@ -1084,11 +1092,19 @@ impl ConversationWorker {
         });
 
         let start = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_secs(ROUTER_TIMEOUT_SECS),
-            self.run_ticket_router_inner(user_message),
-        )
-        .await;
+        let result = if config.runtime == ChatRuntime::CodexExec {
+            tokio::time::timeout(
+                Duration::from_secs(ROUTER_TIMEOUT_SECS),
+                self.run_ticket_router_inner_codex(user_message),
+            )
+            .await
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(ROUTER_TIMEOUT_SECS),
+                self.run_ticket_router_inner(user_message),
+            )
+            .await
+        };
         let elapsed = start.elapsed();
 
         // Stop heartbeats now that the router is done
@@ -1415,6 +1431,574 @@ impl ConversationWorker {
         }
     }
 
+    async fn run_ticket_router_inner_codex(
+        &mut self,
+        user_message: &str,
+    ) -> Result<String, String> {
+        let router_type = AgentType::TicketRouter;
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("USER_MESSAGE".to_string(), user_message.to_string());
+
+        let orgs = ticketing_system::organizations::list_organizations(&self.db)
+            .await
+            .unwrap_or_default();
+        let org_names: Vec<String> = orgs.iter().map(|o| o.name.clone()).collect();
+        vars.insert("ORGANIZATIONS".to_string(), org_names.join(", "));
+
+        let system_prompt = load_prompt(router_type.as_str(), vars)
+            .map_err(|e| format!("Failed to load router prompt: {}", e))?;
+
+        let mut turn = spawn_codex_exec(CodexExecOptions {
+            model: router_type.model(),
+            reasoning_effort: router_type.effort(),
+            system_prompt: &system_prompt,
+            working_dir: std::path::Path::new("/tmp"),
+            prompt: "Route this message.",
+            sandbox: CodexSandboxMode::ReadOnly,
+            bypass_approvals_and_sandbox: false,
+        })
+        .await?;
+
+        let mut router_text_parts: Vec<String> = Vec::new();
+        let mut tool_call_count = 0u32;
+        let mut thread_id: Option<String> = None;
+
+        while let Some(event) = turn.events.recv().await {
+            match event {
+                CodexExecEvent::ThreadStarted { thread_id: tid } => {
+                    thread_id = Some(tid);
+                }
+                CodexExecEvent::AgentMessage { text } => {
+                    router_text_parts.push(text);
+                }
+                CodexExecEvent::ToolCallStarted { id, name, input } => {
+                    tool_call_count += 1;
+                    tracing::info!(
+                        "[ROUTER] Codex tool #{}: {} ({})",
+                        tool_call_count,
+                        name,
+                        id
+                    );
+                    self.emit_event(&StreamEvent::RouterToolUse { id, name, input })
+                        .await;
+                }
+                CodexExecEvent::ToolCallCompleted {
+                    id,
+                    content,
+                    is_error,
+                } => {
+                    self.emit_event(&StreamEvent::RouterToolResult {
+                        tool_use_id: id,
+                        content,
+                        is_error,
+                    })
+                    .await;
+                }
+                CodexExecEvent::TurnCompleted { .. } => {}
+            }
+        }
+
+        let outcome = turn.wait().await?;
+        if !outcome.exit_status.success() {
+            let stderr = outcome.stderr_text.trim();
+            if stderr.is_empty() {
+                return Err(format!(
+                    "Router codex exec failed with status {}",
+                    outcome.exit_status
+                ));
+            }
+            return Err(format!(
+                "Router codex exec failed with status {}: {}",
+                outcome.exit_status, stderr
+            ));
+        }
+
+        tracing::info!(
+            "[ROUTER] Codex completed — session={:?}, {} tool calls, {} text parts",
+            thread_id,
+            tool_call_count,
+            router_text_parts.len()
+        );
+
+        let full_output = router_text_parts.join("");
+        tracing::info!(
+            "[ROUTER] Full output ({} chars): {}",
+            full_output.len(),
+            if full_output.len() > 200 {
+                &full_output[..(0..=200)
+                    .rev()
+                    .find(|&i| full_output.is_char_boundary(i))
+                    .unwrap_or(0)]
+            } else {
+                &full_output
+            }
+        );
+
+        let parsed = parse_router_result(&full_output);
+
+        match parsed {
+            RouterParsed::Skipped => {
+                tracing::info!("[ROUTER] Skipped — no ticket match needed");
+                let _ = conversations::set_router_result(
+                    &self.db,
+                    &self.conversation_id,
+                    Some("__skipped__"),
+                    None,
+                )
+                .await;
+                self.emit_event(&StreamEvent::RouterResult {
+                    enriched_message: user_message.to_string(),
+                    ticket_id: None,
+                    organization: None,
+                    skipped: true,
+                })
+                .await;
+                Ok(user_message.to_string())
+            }
+            RouterParsed::Enriched {
+                enriched_message,
+                ticket_id,
+                organization,
+            } => {
+                tracing::info!(
+                    "[ROUTER] Matched ticket={:?}, org={:?}",
+                    ticket_id,
+                    organization
+                );
+                self.last_router_ticket_id = ticket_id.clone();
+                self.last_router_organization = organization.clone();
+                if let Err(e) = conversations::set_router_result(
+                    &self.db,
+                    &self.conversation_id,
+                    ticket_id.as_deref(),
+                    organization.as_deref(),
+                )
+                .await
+                {
+                    tracing::warn!("[ROUTER] Failed to persist router result: {}", e);
+                }
+                self.emit_event(&StreamEvent::RouterResult {
+                    enriched_message: enriched_message.clone(),
+                    ticket_id: ticket_id.clone(),
+                    organization: organization.clone(),
+                    skipped: false,
+                })
+                .await;
+                Ok(enriched_message)
+            }
+            RouterParsed::ParseFailed(reason) => {
+                tracing::warn!("[ROUTER] Parse failed: {}", reason);
+                let _ = conversations::set_router_result(
+                    &self.db,
+                    &self.conversation_id,
+                    Some("__failed__"),
+                    None,
+                )
+                .await;
+                self.emit_event(&StreamEvent::RouterResult {
+                    enriched_message: user_message.to_string(),
+                    ticket_id: None,
+                    organization: None,
+                    skipped: true,
+                })
+                .await;
+                Ok(user_message.to_string())
+            }
+        }
+    }
+
+    async fn process_codex_message(
+        &mut self,
+        msg: &WorkerMessage,
+        final_message: &str,
+        assistant_message_id: Option<String>,
+    ) {
+        let system_prompt =
+            match build_codex_system_prompt(&self.db, &self.conversation_id, &msg.config).await {
+                Ok(prompt) => prompt,
+                Err(e) => {
+                    tracing::error!(
+                        "[WORKER] Failed to build Codex prompt for {}: {}",
+                        self.conversation_id,
+                        e
+                    );
+                    let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                    self.emit_event(&StreamEvent::Status {
+                        status: "failed".to_string(),
+                        message: Some(format!("Failed to build Codex prompt: {}", e)),
+                    })
+                    .await;
+                    return;
+                }
+            };
+
+        let mut turn = match spawn_codex_exec(CodexExecOptions {
+            model: msg.config.agent_type.model(),
+            reasoning_effort: msg.config.agent_type.effort(),
+            system_prompt: &system_prompt,
+            working_dir: &msg.config.working_dir,
+            prompt: final_message,
+            sandbox: CodexSandboxMode::DangerFullAccess,
+            bypass_approvals_and_sandbox: true,
+        })
+        .await
+        {
+            Ok(turn) => turn,
+            Err(e) => {
+                tracing::error!(
+                    "[WORKER] Failed to start Codex turn for {}: {}",
+                    self.conversation_id,
+                    e
+                );
+                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.emit_event(&StreamEvent::Status {
+                    status: "failed".to_string(),
+                    message: Some(format!("Failed to start Codex: {}", e)),
+                })
+                .await;
+                return;
+            }
+        };
+
+        self.manager
+            .insert_codex_turn(self.conversation_id.clone(), turn.child())
+            .await;
+
+        let mut accumulated_text = String::new();
+        let mut thread_id: Option<String> = None;
+        let mut last_flush = Instant::now();
+        let flush_interval = Duration::from_millis(DB_FLUSH_INTERVAL_MS);
+        let mut tool_call_count: i32 = 0;
+        let mut content_blocks: Vec<ContentBlockDesc> = Vec::new();
+        let mut blocks_dirty = false;
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+        let mut usage: Option<(i64, i64)> = None;
+        heartbeat.tick().await;
+
+        loop {
+            tokio::select! {
+                maybe_event = turn.events.recv() => {
+                    match maybe_event {
+                        Some(CodexExecEvent::ThreadStarted { thread_id: tid }) => {
+                            thread_id = Some(tid);
+                        }
+                        Some(CodexExecEvent::AgentMessage { text }) => {
+                            if text.is_empty() {
+                                continue;
+                            }
+
+                            let text_chunk = if accumulated_text.is_empty() {
+                                text
+                            } else {
+                                format!("\n\n{}", text)
+                            };
+                            accumulated_text.push_str(&text_chunk);
+
+                            match content_blocks.last_mut() {
+                                Some(ContentBlockDesc::Text { text }) => {
+                                    text.push_str(&text_chunk);
+                                }
+                                _ => {
+                                    content_blocks.push(ContentBlockDesc::Text {
+                                        text: text_chunk.clone(),
+                                    });
+                                    blocks_dirty = true;
+                                }
+                            }
+
+                            self.emit_event(&StreamEvent::Text {
+                                content: text_chunk,
+                            })
+                            .await;
+                        }
+                        Some(CodexExecEvent::ToolCallStarted { id, name, input }) => {
+                            tool_call_count += 1;
+                            tracing::info!("[WORKER] Codex tool use #{}: {} ({})", tool_call_count, name, id);
+
+                            match content_blocks.last_mut() {
+                                Some(ContentBlockDesc::ToolGroup { tool_ids }) => {
+                                    tool_ids.push(id.clone());
+                                }
+                                _ => {
+                                    content_blocks.push(ContentBlockDesc::ToolGroup {
+                                        tool_ids: vec![id.clone()],
+                                    });
+                                    blocks_dirty = true;
+                                }
+                            }
+
+                            if let Some(msg_id) = assistant_message_id.as_deref() {
+                                let now = chrono::Utc::now().timestamp();
+                                if let Err(e) = conversations::insert_tool_call(
+                                    &self.db,
+                                    &id,
+                                    msg_id,
+                                    &self.conversation_id,
+                                    &name,
+                                    Some(&input),
+                                    now,
+                                )
+                                .await {
+                                    tracing::error!("[WORKER] Failed to insert tool call: {}", e);
+                                }
+                            }
+
+                            self.emit_event(&StreamEvent::ToolUse { id, name, input })
+                                .await;
+                        }
+                        Some(CodexExecEvent::ToolCallCompleted {
+                            id,
+                            content,
+                            is_error,
+                        }) => {
+                            if let Err(e) = conversations::update_tool_call_result(
+                                &self.db,
+                                &id,
+                                &content,
+                                is_error,
+                            )
+                            .await {
+                                tracing::error!("[WORKER] Failed to update tool call result: {}", e);
+                            }
+
+                            self.emit_event(&StreamEvent::ToolResult {
+                                tool_use_id: id,
+                                content,
+                                is_error,
+                            })
+                            .await;
+                        }
+                        Some(CodexExecEvent::TurnCompleted {
+                            input_tokens,
+                            output_tokens,
+                        }) => {
+                            usage = Some((input_tokens, output_tokens));
+                        }
+                        None => break,
+                    }
+
+                    if last_flush.elapsed() >= flush_interval {
+                        flush_to_db(&self.db, assistant_message_id.as_deref(), &accumulated_text).await;
+                        last_flush = Instant::now();
+                    }
+
+                    if blocks_dirty {
+                        blocks_dirty = false;
+                        if let Some(msg_id) = &assistant_message_id {
+                            if content_blocks.len() > 1 {
+                                let _ = conversations::update_message_blocks(&self.db, msg_id, &content_blocks).await;
+                            }
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    self.emit_event(&StreamEvent::Status {
+                        status: "heartbeat".to_string(),
+                        message: None,
+                    }).await;
+                    let _ = checkpoints::touch_checkpoint(&self.db, &self.conversation_id).await;
+                }
+            }
+        }
+
+        self.manager.remove_codex_turn(&self.conversation_id).await;
+        let outcome = match turn.wait().await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!(
+                    "[WORKER] Failed waiting for Codex turn for {}: {}",
+                    self.conversation_id,
+                    e
+                );
+                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.emit_event(&StreamEvent::Status {
+                    status: "failed".to_string(),
+                    message: Some(format!("Codex turn failed: {}", e)),
+                })
+                .await;
+                return;
+            }
+        };
+
+        if let Some((input_tok, output_tok)) = usage {
+            if input_tok > 0 || output_tok > 0 {
+                let db_ref = self.db.clone();
+                let conv_id = self.conversation_id.clone();
+                let uid = msg.user_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = token_usage::insert_token_usage(
+                        &db_ref,
+                        "conversation",
+                        &conv_id,
+                        Some(&uid),
+                        None,
+                        input_tok,
+                        output_tok,
+                    )
+                    .await
+                    {
+                        tracing::warn!("[WORKER] Failed to record token usage: {}", e);
+                    }
+                });
+            }
+        }
+
+        enum CodexTurnCompletion {
+            Completed { session_id: String },
+            Cancelled { session_id: String },
+            Failed(String),
+        }
+
+        let cancelled = self
+            .manager
+            .take_cancelled_codex_turn(&self.conversation_id)
+            .await;
+        let completion = if cancelled {
+            CodexTurnCompletion::Cancelled {
+                session_id: thread_id
+                    .clone()
+                    .unwrap_or_else(|| self.conversation_id.clone()),
+            }
+        } else if !outcome.exit_status.success() {
+            let stderr = outcome.stderr_text.trim();
+            if stderr.is_empty() {
+                CodexTurnCompletion::Failed(format!(
+                    "Codex exec failed with status {}",
+                    outcome.exit_status
+                ))
+            } else {
+                CodexTurnCompletion::Failed(format!(
+                    "Codex exec failed with status {}: {}",
+                    outcome.exit_status, stderr
+                ))
+            }
+        } else if let Some(session_id) = thread_id.clone() {
+            CodexTurnCompletion::Completed { session_id }
+        } else {
+            CodexTurnCompletion::Failed(
+                "Codex exec completed without returning a thread id".to_string(),
+            )
+        };
+
+        flush_to_db(&self.db, assistant_message_id.as_deref(), &accumulated_text).await;
+
+        if let Some(msg_id) = &assistant_message_id {
+            if content_blocks.len() > 1 {
+                if let Err(e) =
+                    conversations::update_message_blocks(&self.db, msg_id, &content_blocks).await
+                {
+                    tracing::error!("[WORKER] Failed to store content blocks: {}", e);
+                }
+            }
+        }
+
+        match completion {
+            CodexTurnCompletion::Completed { session_id } => {
+                self.emit_event(&StreamEvent::Result {
+                    session_id: session_id.clone(),
+                    status: "completed".to_string(),
+                    is_error: false,
+                })
+                .await;
+
+                let _ = conversations::update_conversation(
+                    &self.db,
+                    &msg.user_id,
+                    &self.conversation_id,
+                    UpdateConversationRequest {
+                        title: None,
+                        session_id: Some(session_id.clone()),
+                        organization: None,
+                    },
+                )
+                .await;
+
+                if let Err(e) = checkpoints::upsert_checkpoint(
+                    &self.db,
+                    &self.conversation_id,
+                    &session_id,
+                    tool_call_count,
+                )
+                .await
+                {
+                    tracing::warn!("[WORKER] Failed to update checkpoint: {}", e);
+                }
+                if let Err(e) = checkpoints::mark_completed(&self.db, &self.conversation_id).await {
+                    tracing::warn!("[WORKER] Failed to mark checkpoint completed: {}", e);
+                }
+
+                if let Some(apns) = crate::apns::ApnsService::global() {
+                    tracing::info!(
+                        "[WORKER] Sending push notification for user={}, conv={}",
+                        msg.user_id,
+                        self.conversation_id
+                    );
+                    let push_db = (*self.db).clone();
+                    let push_user = msg.user_id.clone();
+                    let push_agent = msg.config.prompt_name.to_string();
+                    let push_conv_id = self.conversation_id.clone();
+                    let apns = apns.clone();
+                    tokio::spawn(async move {
+                        match apns
+                            .send_to_user(
+                                &push_db,
+                                &push_user,
+                                "Agent finished",
+                                &format!("{} has completed processing.", push_agent),
+                                Some(&push_conv_id),
+                                Some(&push_agent),
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "[WORKER] Push notification sent for user={}",
+                                    push_user
+                                )
+                            }
+                            Err(e) => tracing::warn!(
+                                "[WORKER] Push notification failed for user={}: {}",
+                                push_user,
+                                e
+                            ),
+                        }
+                    });
+                } else {
+                    tracing::warn!("[WORKER] APNs not initialized — skipping push notification");
+                }
+
+                self.emit_event(&StreamEvent::Status {
+                    status: "completed".to_string(),
+                    message: None,
+                })
+                .await;
+            }
+            CodexTurnCompletion::Cancelled { session_id } => {
+                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.emit_event(&StreamEvent::Result {
+                    session_id,
+                    status: "cancelled".to_string(),
+                    is_error: false,
+                })
+                .await;
+            }
+            CodexTurnCompletion::Failed(message) => {
+                tracing::error!(
+                    "[WORKER] Codex turn failed for {}: {}",
+                    self.conversation_id,
+                    message
+                );
+                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.emit_event(&StreamEvent::Status {
+                    status: "failed".to_string(),
+                    message: Some(message),
+                })
+                .await;
+            }
+        }
+    }
+
     /// Emit a StreamEvent: encode to Anthropic events, persist, and broadcast.
     ///
     /// Uses the server-side allocator (`insert_conversation_event`) so the
@@ -1474,11 +2058,7 @@ impl ConversationWorker {
                     // worker's expected next index, another writer or a
                     // rollback produced a gap. `record_gap_detected` is
                     // a no-op when the indices match.
-                    record_gap_detected(
-                        &self.conversation_id,
-                        self.event_index,
-                        allocated_index,
-                    );
+                    record_gap_detected(&self.conversation_id, self.event_index, allocated_index);
                     let bytes = ae_json.len();
                     let broadcast_tx = get_broadcast_sender(&self.conversation_id).await;
                     let _ = broadcast_tx.send((allocated_index, ae_json));
@@ -1577,6 +2157,24 @@ impl ConversationWorker {
 
         // Create new client
         create_client(&self.db, &self.conversation_id, config, &self.manager).await
+    }
+}
+
+async fn build_codex_system_prompt(
+    db: &SqlitePool,
+    conv_id: &str,
+    config: &ChatConfig,
+) -> Result<String, String> {
+    let base_prompt = load_prompt(config.prompt_name, config.prompt_vars.clone())
+        .map_err(|e| format!("Failed to load prompt: {}", e))?;
+
+    match conversations::list_messages(db, conv_id, None, None).await {
+        Ok(messages) if !messages.is_empty() => {
+            let history = build_codex_conversation_history(&messages);
+            Ok(format!("{}\n\n{}", base_prompt, history))
+        }
+        Ok(_) => Ok(base_prompt),
+        Err(e) => Err(format!("Failed to load conversation history: {}", e)),
     }
 }
 
@@ -1825,7 +2423,21 @@ fn build_conversation_history(messages: &[ConversationMessage]) -> String {
          Do NOT ask the user to repeat themselves or clarify what they were asking about — \
          the full conversation history is provided here. Pick up exactly where you left off.\n\n",
     );
+    append_conversation_history(&mut history, messages);
+    history
+}
 
+fn build_codex_conversation_history(messages: &[ConversationMessage]) -> String {
+    let mut history = String::from(
+        "## Conversation History\n\n\
+         Use the prior conversation context below to continue seamlessly. \
+         Do not ask the user to repeat information that is already present in the history.\n\n",
+    );
+    append_conversation_history(&mut history, messages);
+    history
+}
+
+fn append_conversation_history(history: &mut String, messages: &[ConversationMessage]) {
     // Take last 30 messages to keep prompt size reasonable
     let recent = if messages.len() > 30 {
         &messages[messages.len() - 30..]
@@ -1886,8 +2498,6 @@ fn build_conversation_history(messages: &[ConversationMessage]) -> String {
             }
         }
     }
-
-    history
 }
 
 // =============================================================================
@@ -2137,7 +2747,7 @@ mod streaming_persistence_tests {
                 "message_start",
                 "content_block_start", // text 0
                 "content_block_delta",
-                "content_block_stop", // text 0 closes before tool_use
+                "content_block_stop",  // text 0 closes before tool_use
                 "content_block_start", // tool_use 1
                 "content_block_delta", // input_json_delta
                 "content_block_stop",
