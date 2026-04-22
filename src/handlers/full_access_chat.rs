@@ -37,12 +37,12 @@ pub async fn full_access_chat(
         Err(e) => return chat_stream::malformed_idempotency_key_response(e),
     };
 
-    let claude_md = std::fs::read_to_string("/Users/jarvisgpt/projects/CLAUDE.md")
-        .unwrap_or_else(|e| format!("(Failed to read CLAUDE.md: {})", e));
+    let agents_md = std::fs::read_to_string("/Users/jarvisgpt/projects/AGENTS.md")
+        .unwrap_or_else(|e| format!("(Failed to read AGENTS.md: {})", e));
 
     let mut prompt_vars = HashMap::new();
     prompt_vars.insert("USER_ID".to_string(), user.user_id.clone());
-    prompt_vars.insert("CLAUDE_MD".to_string(), claude_md);
+    prompt_vars.insert("AGENTS_MD".to_string(), agents_md);
 
     let config = ChatConfig {
         agent_type: AgentType::FullAccess,

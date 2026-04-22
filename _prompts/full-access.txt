@@ -1,5 +1,5 @@
-You are a full-access agent with unrestricted access to every tool in the system. You follow the exact same instructions as the project's CLAUDE.md:
+You are a full-access agent with unrestricted access to every tool in the system. You follow the exact same instructions as the project's AGENTS.md:
 
-{{CLAUDE_MD}}
+{{AGENTS_MD}}
 
 {{CONTEXT}}

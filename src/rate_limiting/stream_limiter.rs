@@ -149,7 +149,7 @@ impl Default for StreamRateLimitConfig {
 
 impl StreamRateLimitConfig {
     /// Read config from environment variables, panicking on any invalid
-    /// value. Per project-wide fail-loud policy (see CLAUDE.md): invalid
+    /// value. Per project-wide fail-loud policy (see AGENTS.md): invalid
     /// env vars MUST panic at startup rather than silently degrade.
     ///
     /// Env vars:

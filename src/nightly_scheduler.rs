@@ -1038,7 +1038,7 @@ async fn run_exa_research(
     run_agent_to_completion("exa-research", &ticket.ticket_id, options).await
 }
 
-/// Agent 3: Full-Access Execution — does the work with all tools and CLAUDE.md context.
+/// Agent 3: Full-Access Execution — does the work with all tools and AGENTS.md context.
 async fn run_full_access_execution(
     ticket: &SchedulerTicket,
     working_dir: &std::path::Path,
@@ -1047,9 +1047,9 @@ async fn run_full_access_execution(
     codebase_output: Option<&str>,
     exa_output: Option<&str>,
 ) -> anyhow::Result<String> {
-    // Load CLAUDE.md
-    let claude_md = std::fs::read_to_string("/Users/jarvisgpt/projects/CLAUDE.md")
-        .unwrap_or_else(|e| format!("(Failed to read CLAUDE.md: {})", e));
+    // Load AGENTS.md
+    let agents_md = std::fs::read_to_string("/Users/jarvisgpt/projects/AGENTS.md")
+        .unwrap_or_else(|e| format!("(Failed to read AGENTS.md: {})", e));
 
     // Build nightly context injection
     let mut context_vars = HashMap::new();
@@ -1080,9 +1080,9 @@ async fn run_full_access_execution(
 
     let nightly_context = load_prompt("nightly-context", context_vars)?;
 
-    // Build the full-access system prompt: CLAUDE.MD + nightly context
+    // Build the full-access system prompt: AGENTS.md + nightly context
     let mut full_access_vars = HashMap::new();
-    full_access_vars.insert("claude_md".to_string(), claude_md);
+    full_access_vars.insert("agents_md".to_string(), agents_md);
     full_access_vars.insert("context".to_string(), nightly_context);
 
     let system_prompt = load_prompt("full-access", full_access_vars)?;
@@ -1204,4 +1204,3 @@ async fn run_agent_to_completion_with_message(
         Ok(output)
     }
 }
-
