@@ -1,10 +1,9 @@
-//! Generate conversation titles and auto-detect organization using cc-sdk.
-//! Spawns a lightweight Haiku one-shot via the SDK — no API keys needed.
+//! Generate conversation titles and auto-detect organization with OpenAI.
 
-use cc_sdk::{ClaudeSDKClient, ClaudeCodeOptions, Message, ContentBlock, ToolsConfig, PermissionMode};
-use futures::StreamExt;
 use sqlx::SqlitePool;
 use ticketing_system::{conversations, organizations, UpdateConversationRequest};
+
+use crate::agents::openai_text::{resolve_openai_model, run_openai_text};
 
 /// Result of title + org generation
 pub struct TitleAndOrg {
@@ -45,7 +44,10 @@ pub async fn generate_title_and_org(
             if let Some(desc) = &org.description {
                 parts.push(format!("### {}\n{}", org.organization, desc));
             } else {
-                parts.push(format!("### {}\n(No description available)", org.organization));
+                parts.push(format!(
+                    "### {}\n(No description available)",
+                    org.organization
+                ));
             }
         }
         parts.push("### general\nUse this ONLY when the conversation genuinely does not belong to any of the organizations above. If the topic is even tangentially related to a specific organization, pick that organization instead. Err on the side of specificity.".to_string());
@@ -72,61 +74,35 @@ pub async fn generate_title_and_org(
         org_list = org_names.join(", "),
     );
 
-    let prompt = format!(
-        "Classify this conversation based on the user's message:\n\n{user_message}"
-    );
+    let prompt =
+        format!("Classify this conversation based on the user's message:\n\n{user_message}");
 
-    let options = ClaudeCodeOptions::builder()
-        .system_prompt(&system_prompt)
-        .model("haiku")
-        .tools(ToolsConfig::none())
-        .max_turns(1)
-        .permission_mode(PermissionMode::BypassPermissions)
-        .cwd(std::path::Path::new("/tmp"))
-        .build();
-
-    let mut sdk_client = ClaudeSDKClient::new(options);
-
-    if let Err(e) = sdk_client.connect(None).await {
-        tracing::error!("[TITLE] cc-sdk connect failed: {}", e);
-        return None;
-    }
-
-    if let Err(e) = sdk_client.send_user_message(prompt).await {
-        tracing::error!("[TITLE] cc-sdk send failed: {}", e);
-        return None;
-    }
-
-    let mut response_stream = sdk_client.receive_messages().await;
-    let mut output_parts = Vec::new();
-
-    while let Some(msg_result) = response_stream.next().await {
-        match msg_result {
-            Ok(Message::Assistant { message: assistant_msg }) => {
-                for block in &assistant_msg.content {
-                    if let ContentBlock::Text(text_content) = block {
-                        output_parts.push(text_content.text.clone());
-                    }
-                }
-            }
-            Ok(Message::Result { .. }) => break,
-            Err(e) => {
-                tracing::error!("[TITLE] cc-sdk stream error: {}", e);
-                return None;
-            }
-            _ => {}
+    let raw_output = match run_openai_text(
+        resolve_openai_model("haiku"),
+        "low",
+        &system_prompt,
+        &prompt,
+    )
+    .await
+    {
+        Ok(text) => text.trim().to_string(),
+        Err(e) => {
+            tracing::error!("[TITLE] OpenAI title generation failed: {}", e);
+            return None;
         }
-    }
+    };
 
-    let raw_output = output_parts.join("").trim().to_string();
     if raw_output.is_empty() {
-        tracing::warn!("[TITLE] Empty response from Haiku");
+        tracing::warn!("[TITLE] Empty response from title model");
         return None;
     }
 
     // Parse two-line response: title on line 1, org on line 2
     let lines: Vec<&str> = raw_output.lines().collect();
-    let title = lines.first().map(|l| l.trim().to_string()).unwrap_or_default();
+    let title = lines
+        .first()
+        .map(|l| l.trim().to_string())
+        .unwrap_or_default();
     let detected_org = lines.get(1).map(|l| l.trim().to_lowercase());
 
     if title.is_empty() {
@@ -142,7 +118,10 @@ pub async fn generate_title_and_org(
             // Return the original-cased name from the org list
             org_names.iter().find(|o| o.to_lowercase() == org).cloned()
         } else {
-            tracing::warn!("[TITLE] Detected org {:?} not in user's orgs, using current", org);
+            tracing::warn!(
+                "[TITLE] Detected org {:?} not in user's orgs, using current",
+                org
+            );
             None
         }
     });
@@ -152,7 +131,10 @@ pub async fn generate_title_and_org(
 
     tracing::info!(
         "[TITLE] Generated for {}: title={:?}, org={:?} (current={:?})",
-        conversation_id, title, final_org, current_org
+        conversation_id,
+        title,
+        final_org,
+        current_org
     );
 
     // Update conversation in DB

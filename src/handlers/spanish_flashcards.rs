@@ -135,7 +135,7 @@ pub struct GenerateCardsResponse {
 
 /// POST /api/spanish/sections/:section_id/generate
 ///
-/// Uses Claude Haiku via cc-sdk to generate new vocabulary for the given
+/// Uses OpenAI to generate new vocabulary for the given
 /// section. Deduplicates against the section's existing words before inserting.
 pub async fn generate_spanish_cards(
     State(db): State<Arc<SqlitePool>>,
@@ -146,14 +146,19 @@ pub async fn generate_spanish_cards(
     let section = spanish_flashcards::get_section(&db, &user.user_id, &section_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("section {section_id} not found")))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("section {section_id} not found"),
+            )
+        })?;
 
     let existing = spanish_flashcards::list_words_in_section(&db, &user.user_id, &section_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let count = body.count.clamp(1, 30);
-    let new_words = call_haiku_generate(&section.title, count, &existing)
+    let new_words = call_openai_generate(&section.title, count, &existing)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("generation failed: {e}")))?;
 
@@ -184,14 +189,13 @@ pub async fn generate_spanish_cards(
     }))
 }
 
-/// Invokes Claude Haiku through cc-sdk to produce N deduped vocabulary entries.
-async fn call_haiku_generate(
+/// Invokes OpenAI Responses to produce N deduped vocabulary entries.
+async fn call_openai_generate(
     section_title: &str,
     count: usize,
     existing: &[String],
 ) -> anyhow::Result<Vec<(String, String, bool)>> {
-    use cc_sdk::{ClaudeCodeOptions, ClaudeSDKClient, ContentBlock, Message, PermissionMode, ToolsConfig};
-    use futures::StreamExt;
+    use crate::agents::openai_text::{resolve_openai_model, run_openai_text};
 
     let existing_list = if existing.is_empty() {
         "(none yet)".to_string()
@@ -199,7 +203,8 @@ async fn call_haiku_generate(
         existing.join(", ")
     };
 
-    let system_prompt = "You are a Spanish-language pedagogy assistant. You generate beginner-friendly \
+    let system_prompt =
+        "You are a Spanish-language pedagogy assistant. You generate beginner-friendly \
                         Spanish vocabulary entries in strict JSON format. You never include prose, \
                         markdown fences, or commentary — only the JSON array requested.";
 
@@ -217,43 +222,15 @@ async fn call_haiku_generate(
          [{{\"spanish\": \"palabra\", \"english\": \"word\", \"is_phrase\": false}}]"
     );
 
-    let options = ClaudeCodeOptions::builder()
-        .system_prompt(system_prompt)
-        .model("haiku")
-        .tools(ToolsConfig::none())
-        .max_turns(1)
-        .permission_mode(PermissionMode::BypassPermissions)
-        .cwd(std::path::Path::new("/tmp"))
-        .build();
+    let raw = run_openai_text(
+        resolve_openai_model("haiku"),
+        "low",
+        system_prompt,
+        &user_prompt,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("OpenAI generation failed: {e}"))?;
 
-    let mut sdk_client = ClaudeSDKClient::new(options);
-    sdk_client
-        .connect(None)
-        .await
-        .map_err(|e| anyhow::anyhow!("cc-sdk connect failed: {e}"))?;
-    sdk_client
-        .send_user_message(user_prompt)
-        .await
-        .map_err(|e| anyhow::anyhow!("cc-sdk send failed: {e}"))?;
-
-    let mut stream = sdk_client.receive_messages().await;
-    let mut output_parts: Vec<String> = Vec::new();
-    while let Some(msg_result) = stream.next().await {
-        match msg_result {
-            Ok(Message::Assistant { message: assistant_msg }) => {
-                for block in &assistant_msg.content {
-                    if let ContentBlock::Text(text_content) = block {
-                        output_parts.push(text_content.text.clone());
-                    }
-                }
-            }
-            Ok(Message::Result { .. }) => break,
-            Err(e) => return Err(anyhow::anyhow!("cc-sdk stream error: {e}")),
-            _ => {}
-        }
-    }
-
-    let raw = output_parts.join("");
     let text = raw
         .trim()
         .trim_start_matches("```json")
@@ -262,7 +239,7 @@ async fn call_haiku_generate(
         .trim();
 
     let parsed: Vec<GeneratedCard> = serde_json::from_str(text).map_err(|e| {
-        anyhow::anyhow!("failed to parse Haiku JSON: {e}; raw response: {text}")
+        anyhow::anyhow!("failed to parse OpenAI JSON payload: {e}; raw response: {text}")
     })?;
 
     let existing_normalized: std::collections::HashSet<String> =

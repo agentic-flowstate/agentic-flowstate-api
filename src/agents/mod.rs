@@ -1,6 +1,7 @@
 pub mod anthropic_events;
 pub mod executor;
 pub mod oneshot;
+pub mod openai_text;
 pub mod prompts;
 pub mod types;
 pub mod working_dir;
