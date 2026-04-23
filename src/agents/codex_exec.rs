@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -65,6 +65,21 @@ impl CodexToolProfile {
             Self::RestrictedMcpOnly => RESTRICTED_MCP_ONLY_DISABLED_FEATURES,
         }
     }
+}
+
+fn agentic_mcp_binary() -> Result<PathBuf, String> {
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../agentic-flowstate-mcp/target/release/agentic_mcp");
+    let binary = binary.canonicalize().unwrap_or(binary);
+
+    if !binary.is_file() {
+        return Err(format!(
+            "Required agentic-mcp binary not found at {}",
+            binary.display()
+        ));
+    }
+
+    Ok(binary)
 }
 
 pub struct CodexExecOptions<'a> {
@@ -158,12 +173,46 @@ fn launchd_safe_path() -> OsString {
     launchd_safe_path_from(std::env::var_os("PATH").as_deref())
 }
 
+fn config_string_literal(value: &str) -> Result<String, String> {
+    serde_json::to_string(value)
+        .map_err(|e| format!("Failed to encode Codex config string value: {e}"))
+}
+
+fn working_dir_trust_overrides(path: &Path) -> Result<Vec<String>, String> {
+    let mut paths = vec![path.to_string_lossy().to_string()];
+
+    if let Ok(canonical) = path.canonicalize() {
+        let canonical = canonical.to_string_lossy().to_string();
+        if !paths.iter().any(|existing| existing == &canonical) {
+            paths.push(canonical);
+        }
+    }
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let quoted_path = config_string_literal(&path)?;
+            Ok(format!("projects.{quoted_path}.trust_level=\"trusted\""))
+        })
+        .collect()
+}
+
+fn mcp_server_command_override(server_name: &str, command: &str) -> Result<String, String> {
+    let quoted_name = config_string_literal(server_name)?;
+    let quoted_command = config_string_literal(command)?;
+    Ok(format!(
+        "mcp_servers.{quoted_name}.command={quoted_command}"
+    ))
+}
+
 pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCodexExec, String> {
     let normalized_effort = normalize_reasoning_effort(options.reasoning_effort);
+    let agentic_mcp_command = agentic_mcp_binary()?;
 
     let mut command = Command::new("codex");
     command.current_dir(options.working_dir);
     command.env("PATH", launchd_safe_path());
+    command.arg("--ignore-user-config");
 
     if let Some(session_id) = options.resume_session_id {
         command
@@ -193,6 +242,15 @@ pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCo
         .arg("-c")
         .arg(format!("model_reasoning_effort=\"{normalized_effort}\""));
 
+    for trust_override in working_dir_trust_overrides(options.working_dir)? {
+        command.arg("-c").arg(trust_override);
+    }
+
+    command.arg("-c").arg(mcp_server_command_override(
+        "agentic-mcp",
+        &agentic_mcp_command.to_string_lossy(),
+    )?);
+
     for config_override in options.tool_profile.config_overrides() {
         command.arg("-c").arg(config_override);
     }
@@ -214,6 +272,18 @@ pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCo
     } else if options.resume_session_id.is_none() {
         command.arg("--sandbox").arg(options.sandbox.as_str());
     }
+
+    tracing::info!(
+        "[CODEX] Launching exec: cwd={}, model={}, effort={}, sandbox={}, profile={:?}, ignore_user_config={}, mcp_servers={:?}, disabled_features={:?}",
+        options.working_dir.display(),
+        resolve_codex_model(options.model),
+        normalized_effort,
+        options.sandbox.as_str(),
+        options.tool_profile,
+        true,
+        ["agentic-mcp"],
+        options.tool_profile.disabled_features(),
+    );
 
     let mut child = command
         .arg(options.prompt)
