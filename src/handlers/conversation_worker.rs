@@ -515,6 +515,13 @@ impl ConversationWorker {
             }
         }
 
+        if self
+            .consume_cancelled_turn_before_agent_start("before_assistant_placeholder")
+            .await
+        {
+            return;
+        }
+
         // Create assistant message placeholder AFTER the forwarded message so it gets
         // a higher message_index. This ensures the chat displays in the correct order:
         // user message → forwarded context → assistant response.
@@ -557,6 +564,13 @@ impl ConversationWorker {
         })
         .await;
 
+        if self
+            .consume_cancelled_turn_before_agent_start("before_runtime_start")
+            .await
+        {
+            return;
+        }
+
         if msg.config.runtime == ChatRuntime::CodexExec {
             self.process_codex_message(&msg, &final_message, assistant_message_id.clone())
                 .await;
@@ -583,6 +597,13 @@ impl ConversationWorker {
                 return;
             }
         };
+
+        if self
+            .consume_cancelled_turn_before_agent_start("after_client_connect")
+            .await
+        {
+            return;
+        }
 
         // Send message to SDK and get response stream.
         // The mutex is released after getting the stream so the cancel handler
@@ -1705,6 +1726,13 @@ impl ConversationWorker {
         final_message: &str,
         assistant_message_id: String,
     ) {
+        if self
+            .consume_cancelled_turn_before_agent_start("before_codex_prompt")
+            .await
+        {
+            return;
+        }
+
         let system_prompt =
             match build_codex_system_prompt(&self.db, &self.conversation_id, &msg.config).await {
                 Ok(prompt) => prompt,
@@ -1729,6 +1757,13 @@ impl ConversationWorker {
                     return;
                 }
             };
+
+        if self
+            .consume_cancelled_turn_before_agent_start("before_codex_spawn")
+            .await
+        {
+            return;
+        }
 
         let mut turn = match spawn_codex_exec(CodexExecOptions {
             model: msg.config.agent_type.model(),
@@ -1782,6 +1817,21 @@ impl ConversationWorker {
         let mut usage: Option<(i64, i64)> = None;
         let mut kill_requested = false;
         heartbeat.tick().await;
+
+        // If Stop lands while Codex is still launching, the cancel endpoint can
+        // only record the marker; there may be no registered child yet. Re-check
+        // immediately after registration so we do not wait for the first event
+        // or the 15s heartbeat before killing the subprocess.
+        if self.manager.is_turn_cancelled(&self.conversation_id).await {
+            kill_requested = true;
+            if let Err(e) = turn.terminate().await {
+                tracing::warn!(
+                    "[WORKER] Failed to terminate newly-started cancelled Codex turn for {}: {}",
+                    self.conversation_id,
+                    e
+                );
+            }
+        }
 
         loop {
             tokio::select! {
