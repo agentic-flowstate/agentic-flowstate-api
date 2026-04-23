@@ -37,6 +37,9 @@ const DB_FLUSH_INTERVAL_MS: u64 = 500;
 /// How long a worker idles before shutting down.
 const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
+/// Maximum number of prior messages to load into prompt context per turn.
+const PROMPT_HISTORY_MESSAGE_LIMIT: usize = 30;
+
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
     match agent_type {
         AgentType::ScopedWorkspace
@@ -1653,16 +1656,22 @@ impl ConversationWorker {
             match build_codex_system_prompt(&self.db, &self.conversation_id, &msg.config).await {
                 Ok(prompt) => prompt,
                 Err(e) => {
+                    let mut accumulated_text = String::new();
+                    let mut content_blocks = Vec::new();
+                    let failure_message = format!("Failed to build Codex prompt: {}", e);
                     tracing::error!(
                         "[WORKER] Failed to build Codex prompt for {}: {}",
                         self.conversation_id,
                         e
                     );
                     let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
-                    self.emit_event(&StreamEvent::Status {
-                        status: "failed".to_string(),
-                        message: Some(format!("Failed to build Codex prompt: {}", e)),
-                    })
+                    persist_failed_codex_message(
+                        self,
+                        &assistant_message_id,
+                        &mut accumulated_text,
+                        &mut content_blocks,
+                        failure_message,
+                    )
                     .await;
                     return;
                 }
@@ -1684,16 +1693,22 @@ impl ConversationWorker {
         {
             Ok(turn) => turn,
             Err(e) => {
+                let mut accumulated_text = String::new();
+                let mut content_blocks = Vec::new();
+                let failure_message = format!("Failed to start Codex: {}", e);
                 tracing::error!(
                     "[WORKER] Failed to start Codex turn for {}: {}",
                     self.conversation_id,
                     e
                 );
                 let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
-                self.emit_event(&StreamEvent::Status {
-                    status: "failed".to_string(),
-                    message: Some(format!("Failed to start Codex: {}", e)),
-                })
+                persist_failed_codex_message(
+                    self,
+                    &assistant_message_id,
+                    &mut accumulated_text,
+                    &mut content_blocks,
+                    failure_message,
+                )
                 .await;
                 return;
             }
@@ -1848,16 +1863,20 @@ impl ConversationWorker {
         let outcome = match turn.wait().await {
             Ok(outcome) => outcome,
             Err(e) => {
+                let failure_message = format!("Codex turn failed: {}", e);
                 tracing::error!(
                     "[WORKER] Failed waiting for Codex turn for {}: {}",
                     self.conversation_id,
                     e
                 );
                 let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
-                self.emit_event(&StreamEvent::Status {
-                    status: "failed".to_string(),
-                    message: Some(format!("Codex turn failed: {}", e)),
-                })
+                persist_failed_codex_message(
+                    self,
+                    &assistant_message_id,
+                    &mut accumulated_text,
+                    &mut content_blocks,
+                    failure_message,
+                )
                 .await;
                 return;
             }
@@ -2034,10 +2053,13 @@ impl ConversationWorker {
                     message
                 );
                 let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
-                self.emit_event(&StreamEvent::Status {
-                    status: "failed".to_string(),
-                    message: Some(message),
-                })
+                persist_failed_codex_message(
+                    self,
+                    &assistant_message_id,
+                    &mut accumulated_text,
+                    &mut content_blocks,
+                    message,
+                )
                 .await;
             }
         }
@@ -2212,14 +2234,40 @@ async fn build_codex_system_prompt(
     let base_prompt = load_prompt(config.prompt_name, config.prompt_vars.clone())
         .map_err(|e| format!("Failed to load prompt: {}", e))?;
 
-    match conversations::list_messages(db, conv_id, None, None).await {
+    match load_recent_prompt_history(db, conv_id, "codex-prompt").await {
         Ok(messages) if !messages.is_empty() => {
             let history = build_codex_conversation_history(&messages);
             Ok(format!("{}\n\n{}", base_prompt, history))
         }
         Ok(_) => Ok(base_prompt),
-        Err(e) => Err(format!("Failed to load conversation history: {}", e)),
+        Err(e) => Err(e),
     }
+}
+
+async fn load_recent_prompt_history(
+    db: &SqlitePool,
+    conv_id: &str,
+    source: &str,
+) -> Result<Vec<ConversationMessage>, String> {
+    let started = Instant::now();
+    let messages = conversations::list_messages(
+        db,
+        conv_id,
+        Some(PROMPT_HISTORY_MESSAGE_LIMIT as i64),
+        None,
+    )
+    .await
+    .map_err(|e| format!("Failed to load conversation history: {}", e))?;
+
+    tracing::info!(
+        "[WORKER] Loaded {} prompt-history messages for {} via {} in {}ms",
+        messages.len(),
+        conv_id,
+        source,
+        started.elapsed().as_millis()
+    );
+
+    Ok(messages)
 }
 
 /// Create a new ClaudeSDKClient, optionally resuming from a saved session.
@@ -2258,7 +2306,7 @@ pub(crate) async fn create_client(
     // For resumed sessions: safety net if --resume fails silently.
     // For new sessions on existing conversations (e.g., nightly scheduler stubs):
     // provides the only context the agent will have.
-    let system_prompt = match conversations::list_messages(db, conv_id, None, None).await {
+    let system_prompt = match load_recent_prompt_history(db, conv_id, "claude-resume").await {
         Ok(messages) if !messages.is_empty() => {
             tracing::info!(
                 "[WORKER] Injecting {} messages as resume context for {}",
@@ -2360,6 +2408,15 @@ async fn flush_to_db(db: &SqlitePool, assistant_message_id: &str, accumulated_te
     }
 }
 
+fn codex_failure_text_chunk(accumulated_text: &str, message: &str) -> String {
+    let failure_notice = format!("Codex error: {message}");
+    if accumulated_text.is_empty() {
+        failure_notice
+    } else {
+        format!("\n\n{failure_notice}")
+    }
+}
+
 /// Scope per-turn tool ids by assistant message id before they hit durable
 /// storage or the SSE/UI layer. Codex emits short ids like `item_2`, which
 /// are only unique inside one turn.
@@ -2384,6 +2441,51 @@ fn append_tool_group_id(content_blocks: &mut Vec<ContentBlockDesc>, tool_id: Str
         }
     }
     true
+}
+
+fn append_text_block(content_blocks: &mut Vec<ContentBlockDesc>, text_chunk: &str) {
+    match content_blocks.last_mut() {
+        Some(ContentBlockDesc::Text { text }) => {
+            text.push_str(text_chunk);
+        }
+        _ => {
+            content_blocks.push(ContentBlockDesc::Text {
+                text: text_chunk.to_string(),
+            });
+        }
+    }
+}
+
+async fn persist_failed_codex_message(
+    worker: &mut ConversationWorker,
+    assistant_message_id: &str,
+    accumulated_text: &mut String,
+    content_blocks: &mut Vec<ContentBlockDesc>,
+    message: String,
+) {
+    let text_chunk = codex_failure_text_chunk(accumulated_text, &message);
+    accumulated_text.push_str(&text_chunk);
+    append_text_block(content_blocks, &text_chunk);
+
+    worker
+        .emit_event(&StreamEvent::Text {
+            content: text_chunk.clone(),
+        })
+        .await;
+    flush_to_db(&worker.db, assistant_message_id, accumulated_text).await;
+
+    if let Err(e) =
+        conversations::update_message_blocks(&worker.db, assistant_message_id, content_blocks).await
+    {
+        tracing::error!("[WORKER] Failed to store failure content blocks: {}", e);
+    }
+
+    worker
+        .emit_event(&StreamEvent::Status {
+            status: "failed".to_string(),
+            message: Some(message),
+        })
+        .await;
 }
 
 /// Parsed result from the ticket-router's `<router_result>` XML output.
@@ -2507,9 +2609,8 @@ fn build_codex_conversation_history(messages: &[ConversationMessage]) -> String 
 }
 
 fn append_conversation_history(history: &mut String, messages: &[ConversationMessage]) {
-    // Take last 30 messages to keep prompt size reasonable
-    let recent = if messages.len() > 30 {
-        &messages[messages.len() - 30..]
+    let recent = if messages.len() > PROMPT_HISTORY_MESSAGE_LIMIT {
+        &messages[messages.len() - PROMPT_HISTORY_MESSAGE_LIMIT..]
     } else {
         messages
     };
@@ -2982,6 +3083,53 @@ mod streaming_persistence_tests {
                 );
             }
             other => panic!("expected tool_group, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn codex_failure_text_chunk_is_full_message_when_empty() {
+        assert_eq!(codex_failure_text_chunk("", "boom"), "Codex error: boom");
+    }
+
+    #[test]
+    fn codex_failure_text_chunk_appends_after_existing_text() {
+        assert_eq!(
+            codex_failure_text_chunk("Partial answer", "boom"),
+            "\n\nCodex error: boom"
+        );
+    }
+
+    #[test]
+    fn append_text_block_updates_existing_text_block() {
+        let mut blocks = vec![ContentBlockDesc::Text {
+            text: "Hello".to_string(),
+        }];
+
+        append_text_block(&mut blocks, "\n\nCodex error: boom");
+
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlockDesc::Text { text } => {
+                assert_eq!(text, "Hello\n\nCodex error: boom");
+            }
+            other => panic!("expected text block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn append_text_block_starts_new_text_block_after_tool_group() {
+        let mut blocks = vec![ContentBlockDesc::ToolGroup {
+            tool_ids: vec!["msg-1::item_1".to_string()],
+        }];
+
+        append_text_block(&mut blocks, "Codex error: boom");
+
+        assert_eq!(blocks.len(), 2);
+        match &blocks[1] {
+            ContentBlockDesc::Text { text } => {
+                assert_eq!(text, "Codex error: boom");
+            }
+            other => panic!("expected trailing text block, got {:?}", other),
         }
     }
 }
