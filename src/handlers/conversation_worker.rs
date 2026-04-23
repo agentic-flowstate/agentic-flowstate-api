@@ -475,8 +475,7 @@ impl ConversationWorker {
         // Create assistant message placeholder AFTER the forwarded message so it gets
         // a higher message_index. This ensures the chat displays in the correct order:
         // user message → forwarded context → assistant response.
-        let mut assistant_message_id: Option<String> = None;
-        match conversations::add_message(
+        let assistant_message_id = match conversations::add_message(
             &self.db,
             &self.conversation_id,
             AddMessageRequest {
@@ -487,9 +486,25 @@ impl ConversationWorker {
         )
         .await
         {
-            Ok(m) => assistant_message_id = Some(m.id),
-            Err(e) => tracing::error!("[WORKER] Failed to create assistant message: {}", e),
-        }
+            Ok(message) => {
+                tracing::debug!(
+                    "[WORKER] Created assistant placeholder: conv={} msg={}",
+                    self.conversation_id,
+                    message.id
+                );
+                message.id
+            }
+            Err(e) => {
+                tracing::error!("[WORKER] Failed to create assistant message: {}", e);
+                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.emit_event(&StreamEvent::Status {
+                    status: "failed".to_string(),
+                    message: Some(format!("Failed to create assistant message: {}", e)),
+                })
+                .await;
+                return;
+            }
+        };
 
         // Bridge the gap between router completion and main agent streaming.
         // Without this, the UI shows no activity during client creation + connection.
@@ -628,10 +643,8 @@ impl ConversationWorker {
                                         }
                                         ContentBlock::ToolUse(tool_use) => {
                                             tool_call_count += 1;
-                                            let scoped_tool_id = scoped_tool_call_id(
-                                                assistant_message_id.as_deref(),
-                                                &tool_use.id,
-                                            );
+                                            let scoped_tool_id =
+                                                scoped_tool_call_id(&assistant_message_id, &tool_use.id);
                                             tracing::info!(
                                                 "[WORKER] Tool use #{}: {} ({})",
                                                 tool_call_count,
@@ -643,19 +656,17 @@ impl ConversationWorker {
                                                 scoped_tool_id.clone(),
                                             );
 
-                                            if let Some(msg_id) = &assistant_message_id {
-                                                let now = chrono::Utc::now().timestamp();
-                                                if let Err(e) = conversations::insert_tool_call(
-                                                    &self.db,
-                                                    &scoped_tool_id,
-                                                    msg_id,
-                                                    &self.conversation_id,
-                                                    &tool_use.name,
-                                                    Some(&tool_use.input),
-                                                    now,
-                                                ).await {
-                                                    tracing::error!("[WORKER] Failed to insert tool call: {}", e);
-                                                }
+                                            let now = chrono::Utc::now().timestamp();
+                                            if let Err(e) = conversations::insert_tool_call(
+                                                &self.db,
+                                                &scoped_tool_id,
+                                                &assistant_message_id,
+                                                &self.conversation_id,
+                                                &tool_use.name,
+                                                Some(&tool_use.input),
+                                                now,
+                                            ).await {
+                                                tracing::error!("[WORKER] Failed to insert tool call: {}", e);
                                             }
 
                                             self.emit_event(&StreamEvent::ToolUse {
@@ -668,7 +679,7 @@ impl ConversationWorker {
                                         }
                                         ContentBlock::ToolResult(tool_result) => {
                                             let scoped_tool_id = scoped_tool_call_id(
-                                                assistant_message_id.as_deref(),
+                                                &assistant_message_id,
                                                 &tool_result.tool_use_id,
                                             );
                                             let content = match &tool_result.content {
@@ -723,17 +734,20 @@ impl ConversationWorker {
 
                             // Periodically flush accumulated text to DB
                             if last_flush.elapsed() >= flush_interval {
-                                flush_to_db(&self.db, assistant_message_id.as_deref(), &accumulated_text).await;
+                                flush_to_db(&self.db, &assistant_message_id, &accumulated_text).await;
                                 last_flush = Instant::now();
                             }
 
                             // Flush content blocks when structure changes
                             if blocks_dirty {
                                 blocks_dirty = false;
-                                if let Some(msg_id) = &assistant_message_id {
-                                    if content_blocks.len() > 1 {
-                                        let _ = conversations::update_message_blocks(&self.db, msg_id, &content_blocks).await;
-                                    }
+                                if !content_blocks.is_empty() {
+                                    let _ = conversations::update_message_blocks(
+                                        &self.db,
+                                        &assistant_message_id,
+                                        &content_blocks,
+                                    )
+                                    .await;
                                 }
                             }
 
@@ -984,16 +998,18 @@ impl ConversationWorker {
         }
 
         // Final flush of accumulated text to DB
-        flush_to_db(&self.db, assistant_message_id.as_deref(), &accumulated_text).await;
+        flush_to_db(&self.db, &assistant_message_id, &accumulated_text).await;
 
         // Store content block ordering
-        if let Some(msg_id) = &assistant_message_id {
-            if content_blocks.len() > 1 {
-                if let Err(e) =
-                    conversations::update_message_blocks(&self.db, msg_id, &content_blocks).await
-                {
-                    tracing::error!("[WORKER] Failed to store content blocks: {}", e);
-                }
+        if !content_blocks.is_empty() {
+            if let Err(e) = conversations::update_message_blocks(
+                &self.db,
+                &assistant_message_id,
+                &content_blocks,
+            )
+            .await
+            {
+                tracing::error!("[WORKER] Failed to store content blocks: {}", e);
             }
         }
 
@@ -1631,7 +1647,7 @@ impl ConversationWorker {
         &mut self,
         msg: &WorkerMessage,
         final_message: &str,
-        assistant_message_id: Option<String>,
+        assistant_message_id: String,
     ) {
         let system_prompt =
             match build_codex_system_prompt(&self.db, &self.conversation_id, &msg.config).await {
@@ -1736,8 +1752,7 @@ impl ConversationWorker {
                         }
                         Some(CodexExecEvent::ToolCallStarted { id, name, input }) => {
                             tool_call_count += 1;
-                            let scoped_tool_id =
-                                scoped_tool_call_id(assistant_message_id.as_deref(), &id);
+                            let scoped_tool_id = scoped_tool_call_id(&assistant_message_id, &id);
                             tracing::info!(
                                 "[WORKER] Codex tool use #{}: {} ({})",
                                 tool_call_count,
@@ -1748,20 +1763,19 @@ impl ConversationWorker {
                             blocks_dirty |=
                                 append_tool_group_id(&mut content_blocks, scoped_tool_id.clone());
 
-                            if let Some(msg_id) = assistant_message_id.as_deref() {
-                                let now = chrono::Utc::now().timestamp();
-                                if let Err(e) = conversations::insert_tool_call(
-                                    &self.db,
-                                    &scoped_tool_id,
-                                    msg_id,
-                                    &self.conversation_id,
-                                    &name,
-                                    Some(&input),
-                                    now,
-                                )
-                                .await {
-                                    tracing::error!("[WORKER] Failed to insert tool call: {}", e);
-                                }
+                            let now = chrono::Utc::now().timestamp();
+                            if let Err(e) = conversations::insert_tool_call(
+                                &self.db,
+                                &scoped_tool_id,
+                                &assistant_message_id,
+                                &self.conversation_id,
+                                &name,
+                                Some(&input),
+                                now,
+                            )
+                            .await
+                            {
+                                tracing::error!("[WORKER] Failed to insert tool call: {}", e);
                             }
 
                             self.emit_event(&StreamEvent::ToolUse {
@@ -1776,8 +1790,7 @@ impl ConversationWorker {
                             content,
                             is_error,
                         }) => {
-                            let scoped_tool_id =
-                                scoped_tool_call_id(assistant_message_id.as_deref(), &id);
+                            let scoped_tool_id = scoped_tool_call_id(&assistant_message_id, &id);
                             if let Err(e) = conversations::update_tool_call_result(
                                 &self.db,
                                 &scoped_tool_id,
@@ -1805,16 +1818,19 @@ impl ConversationWorker {
                     }
 
                     if last_flush.elapsed() >= flush_interval {
-                        flush_to_db(&self.db, assistant_message_id.as_deref(), &accumulated_text).await;
+                        flush_to_db(&self.db, &assistant_message_id, &accumulated_text).await;
                         last_flush = Instant::now();
                     }
 
                     if blocks_dirty {
                         blocks_dirty = false;
-                        if let Some(msg_id) = &assistant_message_id {
-                            if content_blocks.len() > 1 {
-                                let _ = conversations::update_message_blocks(&self.db, msg_id, &content_blocks).await;
-                            }
+                        if !content_blocks.is_empty() {
+                            let _ = conversations::update_message_blocks(
+                                &self.db,
+                                &assistant_message_id,
+                                &content_blocks,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -1907,15 +1923,17 @@ impl ConversationWorker {
             )
         };
 
-        flush_to_db(&self.db, assistant_message_id.as_deref(), &accumulated_text).await;
+        flush_to_db(&self.db, &assistant_message_id, &accumulated_text).await;
 
-        if let Some(msg_id) = &assistant_message_id {
-            if content_blocks.len() > 1 {
-                if let Err(e) =
-                    conversations::update_message_blocks(&self.db, msg_id, &content_blocks).await
-                {
-                    tracing::error!("[WORKER] Failed to store content blocks: {}", e);
-                }
+        if !content_blocks.is_empty() {
+            if let Err(e) = conversations::update_message_blocks(
+                &self.db,
+                &assistant_message_id,
+                &content_blocks,
+            )
+            .await
+            {
+                tracing::error!("[WORKER] Failed to store content blocks: {}", e);
             }
         }
 
@@ -2335,22 +2353,18 @@ pub(crate) async fn create_client(
 }
 
 /// Flush accumulated text content to the database.
-async fn flush_to_db(db: &SqlitePool, assistant_message_id: Option<&str>, accumulated_text: &str) {
-    if let Some(msg_id) = assistant_message_id {
-        if let Err(e) = conversations::update_message(db, msg_id, accumulated_text).await {
-            tracing::error!("[WORKER] Failed to flush message to DB: {}", e);
-        }
+async fn flush_to_db(db: &SqlitePool, assistant_message_id: &str, accumulated_text: &str) {
+    if let Err(e) = conversations::update_message(db, assistant_message_id, accumulated_text).await
+    {
+        tracing::error!("[WORKER] Failed to flush message to DB: {}", e);
     }
 }
 
 /// Scope per-turn tool ids by assistant message id before they hit durable
 /// storage or the SSE/UI layer. Codex emits short ids like `item_2`, which
 /// are only unique inside one turn.
-fn scoped_tool_call_id(assistant_message_id: Option<&str>, raw_tool_id: &str) -> String {
-    match assistant_message_id {
-        Some(message_id) => format!("{message_id}::{raw_tool_id}"),
-        None => raw_tool_id.to_string(),
-    }
+fn scoped_tool_call_id(assistant_message_id: &str, raw_tool_id: &str) -> String {
+    format!("{assistant_message_id}::{raw_tool_id}")
 }
 
 /// Append a tool id to the trailing tool-group block, or start a new tool
@@ -2407,14 +2421,14 @@ fn parse_router_result(output: &str) -> RouterParsed {
     let tag_start = match output.find("<router_result>") {
         Some(idx) => idx,
         None => {
-            return RouterParsed::ParseFailed("No <router_result> tag found in output".to_string())
+            return RouterParsed::ParseFailed("No <router_result> tag found in output".to_string());
         }
     };
 
     let tag_end = match output.find("</router_result>") {
         Some(idx) => idx,
         None => {
-            return RouterParsed::ParseFailed("No </router_result> closing tag found".to_string())
+            return RouterParsed::ParseFailed("No </router_result> closing tag found".to_string());
         }
     };
 
@@ -2942,8 +2956,8 @@ mod streaming_persistence_tests {
 
     #[test]
     fn scoped_tool_call_id_is_unique_per_assistant_message() {
-        let first = scoped_tool_call_id(Some("msg-1"), "item_2");
-        let second = scoped_tool_call_id(Some("msg-2"), "item_2");
+        let first = scoped_tool_call_id("msg-1", "item_2");
+        let second = scoped_tool_call_id("msg-2", "item_2");
 
         assert_eq!(first, "msg-1::item_2");
         assert_eq!(second, "msg-2::item_2");
@@ -2964,10 +2978,7 @@ mod streaming_persistence_tests {
             ContentBlockDesc::ToolGroup { tool_ids } => {
                 assert_eq!(
                     tool_ids,
-                    &vec![
-                        "msg-1::item_1".to_string(),
-                        "msg-1::item_2".to_string()
-                    ]
+                    &vec!["msg-1::item_1".to_string(), "msg-1::item_2".to_string()]
                 );
             }
             other => panic!("expected tool_group, got {:?}", other),
