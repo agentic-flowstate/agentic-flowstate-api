@@ -83,6 +83,73 @@ pub struct ChatConfig {
     pub prompt_vars: HashMap<String, String>,
 }
 
+/// Forward worker/broadcast events into the per-request SSE channel.
+///
+/// The returned future owns the generate-stream permit indirectly via the
+/// surrounding task in [`chat`]. It therefore MUST exit as soon as the HTTP
+/// client disconnects; otherwise the rate limiter keeps the old POST /chat
+/// slot occupied and the next send on the same conversation gets a bogus 429.
+async fn forward_worker_events_to_http(
+    tx: mpsc::Sender<(i32, String)>,
+    mut broadcast_rx: broadcast::Receiver<(i32, String)>,
+    mut completion_rx: tokio::sync::oneshot::Receiver<()>,
+    conv_id: String,
+) {
+    let timeout = tokio::time::sleep(Duration::from_secs(600));
+    tokio::pin!(timeout);
+
+    loop {
+        tokio::select! {
+            _ = tx.closed() => {
+                tracing::info!(
+                    "[CHAT] SSE receiver dropped for {}, closing forwarder",
+                    conv_id
+                );
+                break;
+            }
+            result = broadcast_rx.recv() => {
+                match result {
+                    Ok((index, json)) => {
+                        timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(600));
+                        if tx.send((index, json)).await.is_err() {
+                            tracing::info!(
+                                "[CHAT] SSE send failed for {}, closing forwarder",
+                                conv_id
+                            );
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Worker ended — broadcast channel dropped
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("[CHAT] SSE lagged by {} events for {}, catching up", n, conv_id);
+                        // Continue — broadcast will deliver the next available event
+                    }
+                }
+            }
+            _ = &mut completion_rx => {
+                // Worker signaled THIS message is done — drain remaining events
+                while let Ok((index, json)) = broadcast_rx.try_recv() {
+                    if tx.send((index, json)).await.is_err() {
+                        tracing::info!(
+                            "[CHAT] SSE send failed while draining {}, closing forwarder",
+                            conv_id
+                        );
+                        break;
+                    }
+                }
+                break;
+            }
+            _ = &mut timeout => {
+                tracing::warn!("[CHAT] SSE forwarding timed out for {}", conv_id);
+                break;
+            }
+        }
+    }
+}
+
 /// Start or continue a chat session via SSE.
 ///
 /// Pushes the message to a ConversationWorker (one per conversation) which
@@ -185,12 +252,12 @@ pub fn chat(
         // Subscribe to broadcast BEFORE pushing message to worker
         // so we don't miss any events the worker emits
         let broadcast_tx = get_broadcast_sender(&conv_id).await;
-        let mut broadcast_rx = broadcast_tx.subscribe();
+        let broadcast_rx = broadcast_tx.subscribe();
         drop(broadcast_tx);
 
         // Per-request completion channel: worker signals when THIS message
         // is done, preventing us from exiting on a prior message's terminal event
-        let (completion_tx, mut completion_rx) = tokio::sync::oneshot::channel::<()>();
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Get or create worker, push message to its queue
         let worker_tx = WORKER_MANAGER
@@ -219,42 +286,7 @@ pub fn chat(
             return;
         }
 
-        // Forward broadcast events until worker signals THIS message is complete
-        let timeout = tokio::time::sleep(Duration::from_secs(600));
-        tokio::pin!(timeout);
-
-        loop {
-            tokio::select! {
-                result = broadcast_rx.recv() => {
-                    match result {
-                        Ok((index, json)) => {
-                            // Reset inactivity timeout
-                            timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(600));
-                            let _ = tx.send((index, json)).await;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            // Worker ended — broadcast channel dropped
-                            break;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!("[CHAT] SSE lagged by {} events for {}, catching up", n, conv_id);
-                            // Continue — broadcast will deliver the next available event
-                        }
-                    }
-                }
-                _ = &mut completion_rx => {
-                    // Worker signaled THIS message is done — drain remaining events
-                    while let Ok((index, json)) = broadcast_rx.try_recv() {
-                        let _ = tx.send((index, json)).await;
-                    }
-                    break;
-                }
-                _ = &mut timeout => {
-                    tracing::warn!("[CHAT] SSE forwarding timed out for {}", conv_id);
-                    break;
-                }
-            }
-        }
+        forward_worker_events_to_http(tx, broadcast_rx, completion_rx, conv_id).await;
     });
 
     create_sse_stream_raw(rx, wrapper_conv_id).into_response()
@@ -405,6 +437,34 @@ fn create_sse_stream_raw(rx: mpsc::Receiver<(i32, String)>, conversation_id: Str
     // comments.
     Sse::new(Box::pin(wrapped) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(3600)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forward_worker_events_to_http;
+    use tokio::sync::{broadcast, mpsc, oneshot};
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn forwarder_exits_when_http_client_disconnects() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let (_broadcast_tx, broadcast_rx) = broadcast::channel(8);
+        let (_completion_tx, completion_rx) = oneshot::channel();
+
+        let task = tokio::spawn(forward_worker_events_to_http(
+            tx,
+            broadcast_rx,
+            completion_rx,
+            "conv-stop-429".to_string(),
+        ));
+
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("forwarder should exit promptly once the SSE receiver drops")
+            .expect("forwarder task should not panic");
+    }
 }
 
 /// Create an SSE stream that replays stored events for a conversation, then
