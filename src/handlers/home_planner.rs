@@ -103,4 +103,5 @@ pub async fn home_planner_chat(
         req.images,
         client_id,
     )
+    .await
 }

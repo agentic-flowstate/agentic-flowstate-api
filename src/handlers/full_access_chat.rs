@@ -62,4 +62,5 @@ pub async fn full_access_chat(
         req.images,
         client_id,
     )
+    .await
 }

@@ -171,7 +171,7 @@ async fn forward_worker_events_to_http(
 /// When no `conversation_id` is supplied the rate check is skipped too:
 /// the underlying handler will emit a `status: failed` frame in that case
 /// and the stream closes immediately.
-pub fn chat(
+pub async fn chat(
     db: Arc<SqlitePool>,
     manager: Arc<ChatClientManager>,
     message: String,
@@ -217,75 +217,65 @@ pub fn chat(
 
     let (tx, rx) = mpsc::channel::<(i32, String)>(100);
 
-    // Capture the conversation_id early so the outer SSE wrapper (keepalive
-    // + idle timeout + shutdown) can attribute pings/closes to the right
-    // conversation in logs and metrics. The task-local copy inside the
-    // spawn handles the request-is-missing path by emitting a failed
-    // status; the wrapper here uses a safe placeholder for that case.
+    // Capture the conversation id early so the SSE wrapper can attribute
+    // keepalives/closes even on the malformed-request path below.
     let wrapper_conv_id = conversation_id
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
 
-    tokio::spawn(async move {
-        // Take the permit by move so rustc drops it at the end of the
-        // spawned task — whether the task exits via the normal break,
-        // the completion signal, the idle timeout, or a panic. DO NOT
-        // drop earlier than that: dropping before the broadcast-forward
-        // loop exits would re-open the slot while the stream is still
-        // live and let the same bucket admit a second concurrent
-        // connection.
-        let _rate_limit_permit = permit;
-        let conv_id = match conversation_id {
-            Some(id) => id,
-            None => {
-                tracing::error!("[CHAT] No conversation_id provided");
-                if let Ok(json) = serde_json::to_string(&StreamEvent::Status {
-                    status: "failed".to_string(),
-                    message: Some("No conversation_id".to_string()),
-                }) {
-                    let _ = tx.send((0, json)).await;
-                }
-                return;
-            }
-        };
-
-        // Subscribe to broadcast BEFORE pushing message to worker
-        // so we don't miss any events the worker emits
-        let broadcast_tx = get_broadcast_sender(&conv_id).await;
-        let broadcast_rx = broadcast_tx.subscribe();
-        drop(broadcast_tx);
-
-        // Per-request completion channel: worker signals when THIS message
-        // is done, preventing us from exiting on a prior message's terminal event
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
-
-        // Get or create worker, push message to its queue
-        let worker_tx = WORKER_MANAGER
-            .get_or_create(conv_id.clone(), db, manager)
-            .await;
-
-        if worker_tx
-            .send(WorkerMessage {
-                user_id,
-                message,
-                config,
-                images,
-                completion_tx: Some(completion_tx),
-                client_id,
-            })
-            .await
-            .is_err()
-        {
-            tracing::error!("[CHAT] Worker channel closed for {}", conv_id);
+    let conv_id = match conversation_id {
+        Some(id) => id,
+        None => {
+            tracing::error!("[CHAT] No conversation_id provided");
             if let Ok(json) = serde_json::to_string(&StreamEvent::Status {
                 status: "failed".to_string(),
-                message: Some("Worker unavailable".to_string()),
+                message: Some("No conversation_id".to_string()),
             }) {
                 let _ = tx.send((0, json)).await;
             }
-            return;
+            return create_sse_stream_raw(rx, wrapper_conv_id).into_response();
         }
+    };
 
+    // Subscribe before enqueue so we do not miss the worker's first frames.
+    let broadcast_tx = get_broadcast_sender(&conv_id).await;
+    let broadcast_rx = broadcast_tx.subscribe();
+    drop(broadcast_tx);
+
+    // T-2AE66881/T-DCA37215: enqueue the worker turn before returning the
+    // HTTP response so an immediate Stop can already see a live worker
+    // instead of racing the detached setup task.
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
+    let worker_tx = WORKER_MANAGER
+        .get_or_create(conv_id.clone(), db, manager)
+        .await;
+
+    if worker_tx
+        .send(WorkerMessage {
+            user_id,
+            message,
+            config,
+            images,
+            completion_tx: Some(completion_tx),
+            client_id,
+        })
+        .await
+        .is_err()
+    {
+        tracing::error!("[CHAT] Worker channel closed for {}", conv_id);
+        if let Ok(json) = serde_json::to_string(&StreamEvent::Status {
+            status: "failed".to_string(),
+            message: Some("Worker unavailable".to_string()),
+        }) {
+            let _ = tx.send((0, json)).await;
+        }
+        return create_sse_stream_raw(rx, wrapper_conv_id).into_response();
+    }
+
+    tokio::spawn(async move {
+        // Hold the generate-stream permit until the forwarder exits. Dropping
+        // it earlier would reopen the bucket while this SSE is still live.
+        let _rate_limit_permit = permit;
         forward_worker_events_to_http(tx, broadcast_rx, completion_rx, conv_id).await;
     });
 

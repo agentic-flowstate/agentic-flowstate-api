@@ -139,4 +139,5 @@ pub async fn meeting_agent_chat(
         req.images,
         client_id,
     )
+    .await
 }

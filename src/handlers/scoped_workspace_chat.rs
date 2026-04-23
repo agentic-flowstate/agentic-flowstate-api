@@ -66,6 +66,7 @@ pub async fn scoped_workspace_chat(
         req.images,
         client_id,
     )
+    .await
 }
 
 async fn lookup_display_name(db: &SqlitePool, user_id: &str) -> String {

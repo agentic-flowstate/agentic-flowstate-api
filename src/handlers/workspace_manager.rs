@@ -58,4 +58,5 @@ pub async fn workspace_manager_chat(
         req.images,
         client_id,
     )
+    .await
 }
