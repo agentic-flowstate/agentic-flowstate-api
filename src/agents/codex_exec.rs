@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -205,29 +205,24 @@ fn mcp_server_command_override(server_name: &str, command: &str) -> Result<Strin
     ))
 }
 
-pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCodexExec, String> {
-    let normalized_effort = normalize_reasoning_effort(options.reasoning_effort);
-    let agentic_mcp_command = agentic_mcp_binary()?;
-
-    let mut command = Command::new("codex");
+fn build_codex_command(
+    options: &CodexExecOptions<'_>,
+    normalized_effort: &str,
+    agentic_mcp_command: &Path,
+) -> Result<StdCommand, String> {
+    let mut command = StdCommand::new("codex");
     command.current_dir(options.working_dir);
     command.env("PATH", launchd_safe_path());
-    command.arg("--ignore-user-config");
+    command.arg("exec").arg("--ignore-user-config");
 
-    if let Some(session_id) = options.resume_session_id {
-        command
-            .arg("exec")
-            .arg("resume")
-            .arg("--json")
-            .arg("--skip-git-repo-check")
-            .arg(session_id);
-    } else {
-        command
-            .arg("exec")
-            .arg("--json")
-            .arg("--skip-git-repo-check")
-            .arg("-C")
-            .arg(options.working_dir);
+    if options.resume_session_id.is_some() {
+        command.arg("resume");
+    }
+
+    command.arg("--json").arg("--skip-git-repo-check");
+
+    if options.resume_session_id.is_none() {
+        command.arg("-C").arg(options.working_dir);
 
         if options.ephemeral {
             command.arg("--ephemeral");
@@ -273,6 +268,24 @@ pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCo
         command.arg("--sandbox").arg(options.sandbox.as_str());
     }
 
+    if let Some(session_id) = options.resume_session_id {
+        command.arg(session_id);
+    }
+
+    command.arg(options.prompt);
+
+    Ok(command)
+}
+
+pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCodexExec, String> {
+    let normalized_effort = normalize_reasoning_effort(options.reasoning_effort);
+    let agentic_mcp_command = agentic_mcp_binary()?;
+    let mut command = Command::from(build_codex_command(
+        &options,
+        normalized_effort,
+        &agentic_mcp_command,
+    )?);
+
     tracing::info!(
         "[CODEX] Launching exec: cwd={}, model={}, effort={}, sandbox={}, profile={:?}, ignore_user_config={}, mcp_servers={:?}, disabled_features={:?}",
         options.working_dir.display(),
@@ -286,7 +299,6 @@ pub async fn spawn_codex_exec(options: CodexExecOptions<'_>) -> Result<RunningCo
     );
 
     let mut child = command
-        .arg(options.prompt)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -540,6 +552,29 @@ fn extract_mcp_result_text(item: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn sample_codex_exec_options<'a>(resume_session_id: Option<&'a str>) -> CodexExecOptions<'a> {
+        CodexExecOptions {
+            model: "haiku",
+            reasoning_effort: "medium",
+            system_prompt: "",
+            working_dir: Path::new("/tmp/codex-workspace"),
+            prompt: "test prompt",
+            sandbox: CodexSandboxMode::ReadOnly,
+            bypass_approvals_and_sandbox: false,
+            resume_session_id,
+            ephemeral: true,
+            tool_profile: CodexToolProfile::Default,
+        }
+    }
+
+    fn command_args(command: &StdCommand) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
 
     #[test]
     fn resolves_legacy_models_to_gpt_5_4() {
@@ -572,6 +607,52 @@ mod tests {
             path.to_string_lossy(),
             "/opt/homebrew/opt/node@20/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         );
+    }
+
+    #[test]
+    fn build_codex_command_places_ignore_user_config_on_exec_subcommand() {
+        let command = build_codex_command(
+            &sample_codex_exec_options(None),
+            "medium",
+            Path::new("/tmp/agentic_mcp"),
+        )
+        .expect("build command");
+        let args = command_args(&command);
+
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+        assert_eq!(
+            args.get(1).map(String::as_str),
+            Some("--ignore-user-config")
+        );
+        assert_eq!(args.last().map(String::as_str), Some("test prompt"));
+    }
+
+    #[test]
+    fn build_codex_command_keeps_resume_options_before_session_id() {
+        let session_id = "session-123";
+        let command = build_codex_command(
+            &sample_codex_exec_options(Some(session_id)),
+            "medium",
+            Path::new("/tmp/agentic_mcp"),
+        )
+        .expect("build command");
+        let args = command_args(&command);
+
+        let ignore_index = args
+            .iter()
+            .position(|arg| arg == "--ignore-user-config")
+            .expect("ignore-user-config flag");
+        let resume_index = args.iter().position(|arg| arg == "resume").expect("resume");
+        let model_index = args.iter().position(|arg| arg == "-m").expect("model");
+        let session_index = args
+            .iter()
+            .position(|arg| arg == session_id)
+            .expect("session id");
+
+        assert!(ignore_index < resume_index);
+        assert!(resume_index < model_index);
+        assert!(model_index < session_index);
+        assert_eq!(args.last().map(String::as_str), Some("test prompt"));
     }
 
     #[test]
