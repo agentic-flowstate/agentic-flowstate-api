@@ -20,6 +20,7 @@ use ticketing_system::{
 
 use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::get_broadcast_sender;
+use super::conversation_worker_manager::WORKER_MANAGER;
 use crate::auth_middleware::AuthenticatedUser;
 use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_opened, DisconnectReason,
@@ -169,6 +170,9 @@ pub async fn cancel_conversation(
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
 
+    manager.mark_cancelled_turn(&id).await;
+    let worker_exists = WORKER_MANAGER.has_worker(&id).await;
+
     // Try to interrupt the running agent
     match manager.interrupt(&id).await {
         Ok(true) => {
@@ -184,10 +188,18 @@ pub async fn cancel_conversation(
             }
         }
         Ok(false) => {
-            tracing::info!(
-                "[CANCEL] No active client for conversation {}, nothing to cancel",
-                id
-            );
+            if worker_exists {
+                tracing::info!(
+                    "[CANCEL] Marked queued turn cancelled for conversation {}",
+                    id
+                );
+            } else {
+                tracing::info!(
+                    "[CANCEL] No active or queued turn for conversation {}, nothing to cancel",
+                    id
+                );
+                let _ = manager.consume_cancelled_turn(&id).await;
+            }
         }
         Err(e) => {
             tracing::warn!("[CANCEL] Interrupt failed for {}: {}", id, e);

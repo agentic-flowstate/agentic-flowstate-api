@@ -1,20 +1,24 @@
 //! Per-(user_id, conversation_id, kind) SSE stream rate limiter (T-C410DD96).
 //!
-//! Two independent checks per admission:
+//! Admission checks depend on [`StreamKind`]:
 //!
-//! 1. **Reconnect-rate limit** — sliding window of the last N reconnect
-//!    attempts, where "attempt" means "admitted into the stream handler".
-//!    Defaults to 10 reconnects per 60 seconds per bucket. When exceeded
-//!    the client gets a 429 with `Retry-After: <oldest_entry + window - now>`.
-//! 2. **Concurrent-stream cap** — hard limit on the number of SSE streams
-//!    currently open for a given bucket. Defaults to 1. When exceeded the
-//!    client gets a 429 with a short `Retry-After: 1` so a just-closed
-//!    stream has time to release the slot.
+//! 1. **Reconnect-rate limit** — applies only to durable `Resume` streams.
+//!    Sliding window of the last N reconnect attempts, where "attempt"
+//!    means "admitted into the stream handler". Defaults to 10 reconnects
+//!    per 60 seconds per bucket. When exceeded the client gets a 429 with
+//!    `Retry-After: <oldest_entry + window - now>`.
+//! 2. **Concurrent-stream cap** — applies to both `Generate` and `Resume`.
+//!    Hard limit on the number of SSE streams currently open for a given
+//!    bucket. Defaults to 1. When exceeded the client gets a 429 with a
+//!    short `Retry-After: 1` so a just-closed stream has time to release
+//!    the slot.
 //!
-//! The reconnect-rate check runs FIRST so that a client stuck in a
-//! reconnect loop is told loudly ("too many reconnects, come back in N
-//! seconds") instead of getting a series of "slot full" 429s that hide
-//! the underlying bug.
+//! For `Resume`, the reconnect-rate check runs FIRST so that a client
+//! stuck in a reconnect loop is told loudly ("too many reconnects, come
+//! back in N seconds") instead of getting a series of "slot full" 429s
+//! that hide the underlying bug. `Generate` skips that window entirely:
+//! rapid legitimate sends on one conversation must not be misclassified
+//! as reconnect spam.
 //!
 //! ## Bucket key dimensionality (T-1BEAA41E)
 //!
@@ -108,9 +112,9 @@ pub struct RateLimitState {
     /// Number of SSE streams currently open for this bucket. Bumped on
     /// `Allow` and decremented on [`StreamPermit::drop`].
     pub active_streams: u32,
-    /// Timestamps of the most recent reconnect *admissions* (NOT denials).
-    /// Denied attempts do not enter the log — otherwise a client in a
-    /// reconnect loop would keep its own denial count high forever.
+    /// Timestamps of the most recent reconnect *admissions* (NOT denials)
+    /// for [`StreamKind::Resume`] buckets only. Generate buckets leave this
+    /// empty because normal chat sends are not reconnects.
     pub reconnect_log: VecDeque<Instant>,
 }
 
@@ -400,6 +404,7 @@ impl StreamRateLimiter {
         let key: BucketKey = (user_id.to_string(), conversation_id.to_string(), kind);
         let now = self.inner.clock.now();
         let config = self.inner.config;
+        let tracks_reconnect_window = kind == StreamKind::Resume;
 
         let mut entry = self
             .inner
@@ -407,50 +412,54 @@ impl StreamRateLimiter {
             .entry(key.clone())
             .or_insert_with(RateLimitState::new);
 
-        // --- 1. Prune expired reconnect log entries. ---
-        while let Some(&front) = entry.reconnect_log.front() {
-            if now.duration_since(front) >= config.window_duration {
-                entry.reconnect_log.pop_front();
-            } else {
-                break;
+        // --- 1. Prune expired reconnect log entries (Resume only). ---
+        if tracks_reconnect_window {
+            while let Some(&front) = entry.reconnect_log.front() {
+                if now.duration_since(front) >= config.window_duration {
+                    entry.reconnect_log.pop_front();
+                } else {
+                    break;
+                }
             }
         }
 
-        // --- 2. Reconnect-rate check. ---
-        //
-        // The list is kept to the most recent `max_reconnects_per_window`
-        // admissions; once it fills up, a new admission must wait until
-        // the oldest entry ages out of the window.
-        if entry.reconnect_log.len() >= config.max_reconnects_per_window as usize {
-            // Safe unwrap: non-empty by the `>= N` check above (N >= 1
-            // enforced at startup).
-            let oldest = *entry.reconnect_log.front().unwrap();
-            let window_end = oldest + config.window_duration;
-            let retry_after = window_end.saturating_duration_since(now);
-            let retry_after = retry_after.max(Duration::from_secs(1));
+        // --- 2. Reconnect-rate check (Resume only). ---
+        if tracks_reconnect_window {
+            // The list is kept to the most recent
+            // `max_reconnects_per_window` admissions; once it fills up, a
+            // new admission must wait until the oldest entry ages out of the
+            // window.
+            if entry.reconnect_log.len() >= config.max_reconnects_per_window as usize {
+                // Safe unwrap: non-empty by the `>= N` check above (N >= 1
+                // enforced at startup).
+                let oldest = *entry.reconnect_log.front().unwrap();
+                let window_end = oldest + config.window_duration;
+                let retry_after = window_end.saturating_duration_since(now);
+                let retry_after = retry_after.max(Duration::from_secs(1));
 
-            drop(entry); // release shard lock before metric emission
+                drop(entry); // release shard lock before metric emission
 
-            record_stream_rate_limited(
-                user_id,
-                conversation_id,
-                kind,
-                DenyReason::ReconnectRateLimit,
-            );
-            tracing::warn!(
-                target: "rate_limiting.stream",
-                user_id = %user_id,
-                conversation_id = %conversation_id,
-                kind = %kind,
-                reason = %DenyReason::ReconnectRateLimit,
-                retry_after_secs = retry_after.as_secs(),
-                "stream rate-limited: reconnect window full"
-            );
+                record_stream_rate_limited(
+                    user_id,
+                    conversation_id,
+                    kind,
+                    DenyReason::ReconnectRateLimit,
+                );
+                tracing::warn!(
+                    target: "rate_limiting.stream",
+                    user_id = %user_id,
+                    conversation_id = %conversation_id,
+                    kind = %kind,
+                    reason = %DenyReason::ReconnectRateLimit,
+                    retry_after_secs = retry_after.as_secs(),
+                    "stream rate-limited: reconnect window full"
+                );
 
-            return RateLimitDecision::Deny {
-                retry_after,
-                reason: DenyReason::ReconnectRateLimit,
-            };
+                return RateLimitDecision::Deny {
+                    retry_after,
+                    reason: DenyReason::ReconnectRateLimit,
+                };
+            }
         }
 
         // --- 3. Concurrent-stream check. ---
@@ -479,7 +488,9 @@ impl StreamRateLimiter {
         }
 
         // --- 4. Admit: log + bump + return permit. ---
-        entry.reconnect_log.push_back(now);
+        if tracks_reconnect_window {
+            entry.reconnect_log.push_back(now);
+        }
         entry.active_streams += 1;
 
         // Explicitly drop the guard so the shard lock is released before
@@ -587,7 +598,7 @@ mod tests {
         *g += by;
     }
 
-    /// 1. First stream per (user, conv) is admitted; active_streams=1.
+    /// 1. First generate stream per (user, conv) is admitted; active_streams=1.
     #[test]
     fn first_stream_allowed() {
         let limiter = StreamRateLimiter::new(test_config());
@@ -612,7 +623,7 @@ mod tests {
                     ))
                     .unwrap();
                 assert_eq!(entry.active_streams, 1);
-                assert_eq!(entry.reconnect_log.len(), 1);
+                assert_eq!(entry.reconnect_log.len(), 0);
             }
             other => panic!("expected Allow, got {:?}", other),
         }
@@ -660,9 +671,9 @@ mod tests {
         }
     }
 
-    /// 4. 10 reconnects inside the window are all admitted; the 11th is
-    ///    denied with ReconnectRateLimit. Uses a mock clock so we do not
-    ///    race a real wall clock.
+    /// 4. 10 resume reconnects inside the window are all admitted; the
+    ///    11th is denied with ReconnectRateLimit. Uses a mock clock so we
+    ///    do not race a real wall clock.
     #[test]
     fn eleventh_reconnect_denied() {
         let clock = mock_clock(Instant::now());
@@ -671,7 +682,7 @@ mod tests {
         // Burn 10 admissions by admitting + dropping each permit so the
         // concurrent-stream check doesn't fire first.
         for _ in 0..10 {
-            match limiter.check("alex", "conv-1", StreamKind::Generate) {
+            match limiter.check("alex", "conv-1", StreamKind::Resume) {
                 RateLimitDecision::Allow(p) => drop(p),
                 other => panic!("expected Allow, got {:?}", other),
             }
@@ -679,7 +690,7 @@ mod tests {
         }
 
         // 11th inside the same window → denied with ReconnectRateLimit.
-        match limiter.check("alex", "conv-1", StreamKind::Generate) {
+        match limiter.check("alex", "conv-1", StreamKind::Resume) {
             RateLimitDecision::Deny {
                 reason,
                 retry_after,
@@ -693,7 +704,7 @@ mod tests {
         }
     }
 
-    /// 5. Once the window passes, the log is pruned and admissions
+    /// 5. Once the resume window passes, the log is pruned and admissions
     ///    resume.
     #[test]
     fn window_expiration_resets_reconnect_log() {
@@ -701,7 +712,7 @@ mod tests {
         let limiter = StreamRateLimiter::with_mock_clock(test_config(), clock.clone());
 
         for _ in 0..10 {
-            match limiter.check("alex", "conv-1", StreamKind::Generate) {
+            match limiter.check("alex", "conv-1", StreamKind::Resume) {
                 RateLimitDecision::Allow(p) => drop(p),
                 other => panic!("expected Allow, got {:?}", other),
             }
@@ -709,7 +720,7 @@ mod tests {
 
         // 11th denied
         matches!(
-            limiter.check("alex", "conv-1", StreamKind::Generate),
+            limiter.check("alex", "conv-1", StreamKind::Resume),
             RateLimitDecision::Deny {
                 reason: DenyReason::ReconnectRateLimit,
                 ..
@@ -718,10 +729,38 @@ mod tests {
 
         // Advance past the window. Pruning happens lazily on next check.
         advance(&clock, Duration::from_secs(61));
-        match limiter.check("alex", "conv-1", StreamKind::Generate) {
+        match limiter.check("alex", "conv-1", StreamKind::Resume) {
             RateLimitDecision::Allow(_) => {}
             other => panic!("expected Allow after window, got {:?}", other),
         }
+    }
+
+    /// 5b. Generate streams are normal chat sends, not reconnect attempts.
+    ///     Repeated sequential sends on one conversation must not trip the
+    ///     reconnect window.
+    #[test]
+    fn generate_streams_are_not_reconnect_limited() {
+        let clock = mock_clock(Instant::now());
+        let limiter = StreamRateLimiter::with_mock_clock(test_config(), clock.clone());
+
+        for _ in 0..25 {
+            match limiter.check("alex", "conv-1", StreamKind::Generate) {
+                RateLimitDecision::Allow(p) => drop(p),
+                other => panic!("expected Allow, got {:?}", other),
+            }
+            advance(&clock, Duration::from_millis(100));
+        }
+
+        let entry = limiter
+            .inner
+            .state
+            .get(&(
+                "alex".to_string(),
+                "conv-1".to_string(),
+                StreamKind::Generate,
+            ))
+            .unwrap();
+        assert_eq!(entry.reconnect_log.len(), 0);
     }
 
     /// 6. Different users on the same conversation have independent

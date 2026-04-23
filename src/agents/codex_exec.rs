@@ -1,5 +1,7 @@
 use serde_json::{json, Value};
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -274,6 +276,18 @@ fn build_codex_command(
 
     command.arg(options.prompt);
 
+    #[cfg(unix)]
+    unsafe {
+        // Give each Codex turn its own process group so Stop can terminate the
+        // whole turn tree, not just the direct `codex exec` parent.
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
     Ok(command)
 }
 
@@ -353,6 +367,10 @@ impl RunningCodexExec {
         self.child.clone()
     }
 
+    pub async fn terminate(&self) -> Result<(), String> {
+        terminate_child_process(&self.child).await
+    }
+
     pub async fn wait(self) -> Result<CodexExecOutcome, String> {
         let stdout_result = self
             .stdout_task
@@ -379,6 +397,37 @@ impl RunningCodexExec {
             stderr_text,
         })
     }
+}
+
+pub async fn terminate_child_process(child: &Arc<Mutex<Child>>) -> Result<(), String> {
+    let mut child = child.lock().await;
+    terminate_child_process_locked(&mut child)
+}
+
+fn terminate_child_process_locked(child: &mut Child) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            let rc = unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+            if rc == 0 {
+                return Ok(());
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+
+            return Err(format!(
+                "Interrupt failed: killpg({}, SIGKILL) returned {}",
+                pid, err
+            ));
+        }
+    }
+
+    child
+        .start_kill()
+        .map_err(|e| format!("Interrupt failed: {}", e))
 }
 
 pub async fn run_codex_text(

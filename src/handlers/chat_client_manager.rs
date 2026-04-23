@@ -5,6 +5,8 @@ use std::time::Instant;
 use tokio::process::Child;
 use tokio::sync::Mutex;
 
+use crate::agents::codex_exec::terminate_child_process;
+
 pub struct ChatClient {
     pub sdk_client: ClaudeSDKClient,
     pub session_id: Option<String>,
@@ -17,7 +19,7 @@ pub struct ChatClient {
 pub struct ChatClientManager {
     clients: Mutex<HashMap<String, Arc<Mutex<ChatClient>>>>,
     codex_turns: Mutex<HashMap<String, Arc<Mutex<Child>>>>,
-    cancelled_codex_turns: Mutex<HashSet<String>>,
+    cancelled_turns: Mutex<HashSet<String>>,
 }
 
 impl ChatClientManager {
@@ -25,7 +27,7 @@ impl ChatClientManager {
         Self {
             clients: Mutex::new(HashMap::new()),
             codex_turns: Mutex::new(HashMap::new()),
-            cancelled_codex_turns: Mutex::new(HashSet::new()),
+            cancelled_turns: Mutex::new(HashSet::new()),
         }
     }
 
@@ -57,11 +59,7 @@ impl ChatClientManager {
     /// cancel endpoint can kill it.
     pub async fn insert_codex_turn(&self, conversation_id: String, child: Arc<Mutex<Child>>) {
         let mut turns = self.codex_turns.lock().await;
-        turns.insert(conversation_id.clone(), child);
-        drop(turns);
-
-        let mut cancelled = self.cancelled_codex_turns.lock().await;
-        cancelled.remove(&conversation_id);
+        turns.insert(conversation_id, child);
     }
 
     /// Remove a live Codex CLI subprocess handle after the turn ends.
@@ -70,9 +68,22 @@ impl ChatClientManager {
         turns.remove(conversation_id);
     }
 
-    /// Consume the "user cancelled this Codex turn" marker.
-    pub async fn take_cancelled_codex_turn(&self, conversation_id: &str) -> bool {
-        let mut cancelled = self.cancelled_codex_turns.lock().await;
+    /// Mark the current turn as cancelled. The worker consumes this marker
+    /// either before the queued turn starts or when an in-flight turn exits.
+    pub async fn mark_cancelled_turn(&self, conversation_id: &str) {
+        let mut cancelled = self.cancelled_turns.lock().await;
+        cancelled.insert(conversation_id.to_string());
+    }
+
+    /// Check whether the current turn has been cancelled without consuming it.
+    pub async fn is_turn_cancelled(&self, conversation_id: &str) -> bool {
+        let cancelled = self.cancelled_turns.lock().await;
+        cancelled.contains(conversation_id)
+    }
+
+    /// Consume the "user cancelled this turn" marker.
+    pub async fn consume_cancelled_turn(&self, conversation_id: &str) -> bool {
+        let mut cancelled = self.cancelled_turns.lock().await;
         cancelled.remove(conversation_id)
     }
 
@@ -98,18 +109,29 @@ impl ChatClientManager {
             };
 
             if let Some(child_arc) = child_arc {
-                let mut cancelled = self.cancelled_codex_turns.lock().await;
-                cancelled.insert(conversation_id.to_string());
-                drop(cancelled);
-
-                let mut child = child_arc.lock().await;
-                child
-                    .start_kill()
-                    .map_err(|e| format!("Interrupt failed: {}", e))?;
+                terminate_child_process(&child_arc).await?;
                 Ok(true)
             } else {
                 Ok(false)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatClientManager;
+
+    #[tokio::test]
+    async fn cancelled_turn_marker_round_trips() {
+        let manager = ChatClientManager::new();
+
+        assert!(!manager.is_turn_cancelled("conv-1").await);
+
+        manager.mark_cancelled_turn("conv-1").await;
+        assert!(manager.is_turn_cancelled("conv-1").await);
+        assert!(manager.consume_cancelled_turn("conv-1").await);
+        assert!(!manager.is_turn_cancelled("conv-1").await);
+        assert!(!manager.consume_cancelled_turn("conv-1").await);
     }
 }

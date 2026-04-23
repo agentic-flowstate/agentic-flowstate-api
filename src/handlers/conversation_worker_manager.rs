@@ -1,9 +1,9 @@
+use once_cell::sync::Lazy;
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
-use sqlx::SqlitePool;
-use once_cell::sync::Lazy;
 
 use super::chat_client_manager::ChatClientManager;
 use super::conversation_worker::{ConversationWorker, WorkerMessage};
@@ -37,6 +37,15 @@ impl ConversationWorkerManager {
         }
     }
 
+    /// Whether a live worker currently exists for the conversation.
+    pub async fn has_worker(&self, conversation_id: &str) -> bool {
+        let workers = self.workers.lock().await;
+        workers
+            .get(conversation_id)
+            .map(|handle| !handle.message_tx.is_closed())
+            .unwrap_or(false)
+    }
+
     /// Get or create a worker for the given conversation.
     /// Returns a sender to push messages to the worker's queue.
     pub async fn get_or_create(
@@ -59,12 +68,7 @@ impl ConversationWorkerManager {
         // Spawn new worker
         let (message_tx, message_rx) = mpsc::channel::<WorkerMessage>(WORKER_CHANNEL_SIZE);
 
-        let worker = ConversationWorker::new(
-            db,
-            conversation_id.clone(),
-            chat_manager,
-            message_rx,
-        );
+        let worker = ConversationWorker::new(db, conversation_id.clone(), chat_manager, message_rx);
 
         let conv_id_for_cleanup = conversation_id.clone();
         tokio::spawn(async move {
@@ -73,10 +77,13 @@ impl ConversationWorkerManager {
             tracing::info!("[WORKER-MGR] Worker task ended for {}", conv_id_for_cleanup);
         });
 
-        workers.insert(conversation_id, WorkerHandle {
-            message_tx: message_tx.clone(),
-            created_at: Instant::now(),
-        });
+        workers.insert(
+            conversation_id,
+            WorkerHandle {
+                message_tx: message_tx.clone(),
+                created_at: Instant::now(),
+            },
+        );
 
         message_tx
     }

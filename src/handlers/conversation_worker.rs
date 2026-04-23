@@ -273,6 +273,32 @@ impl ConversationWorker {
         self.manager.remove(&self.conversation_id).await;
     }
 
+    async fn consume_cancelled_turn_before_agent_start(&mut self, stage: &str) -> bool {
+        if !self.manager.is_turn_cancelled(&self.conversation_id).await {
+            return false;
+        }
+        if !self
+            .manager
+            .consume_cancelled_turn(&self.conversation_id)
+            .await
+        {
+            return false;
+        }
+
+        tracing::info!(
+            "[WORKER] Cancelled queued/starting turn for {} at {}",
+            self.conversation_id,
+            stage
+        );
+        let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+        self.emit_event(&StreamEvent::Status {
+            status: "cancelled".to_string(),
+            message: Some("Cancelled by user".to_string()),
+        })
+        .await;
+        true
+    }
+
     /// Process a single user message: store in DB, send to SDK, consume entire response.
     async fn process_message(&mut self, mut msg: WorkerMessage) {
         // RAII guard: fires completion signal when this function exits (normal or early return)
@@ -448,11 +474,25 @@ impl ConversationWorker {
             tracing::warn!("[WORKER] Failed to create checkpoint: {}", e);
         }
 
+        if self
+            .consume_cancelled_turn_before_agent_start("before_router")
+            .await
+        {
+            return;
+        }
+
         // === TICKET ROUTER PRE-PROCESSING ===
         // Run a lightweight router agent to match the user's message to a ticket.
         // The router is ephemeral (no session persistence) and has a strict timeout.
         // On any failure, we fall back to the original enhanced_message.
         let final_message = self.run_ticket_router(&enhanced_message, &msg.config).await;
+
+        if self
+            .consume_cancelled_turn_before_agent_start("after_router")
+            .await
+        {
+            return;
+        }
 
         // If the router enriched the message (added ticket context), save it as a
         // "forwarded" message in the conversation DB so it persists across fetchMessages calls.
@@ -1017,11 +1057,24 @@ impl ConversationWorker {
         }
 
         tracing::info!("[WORKER] Stream ended after {} messages", message_count);
-        self.emit_event(&StreamEvent::Status {
-            status: "completed".to_string(),
-            message: None,
-        })
-        .await;
+        if self
+            .manager
+            .consume_cancelled_turn(&self.conversation_id)
+            .await
+        {
+            let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+            self.emit_event(&StreamEvent::Status {
+                status: "cancelled".to_string(),
+                message: Some("Cancelled by user".to_string()),
+            })
+            .await;
+        } else {
+            self.emit_event(&StreamEvent::Status {
+                status: "completed".to_string(),
+                message: None,
+            })
+            .await;
+        }
     }
 
     /// Run the ticket-router agent as a pre-processing step.
@@ -1727,6 +1780,7 @@ impl ConversationWorker {
         let mut blocks_dirty = false;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         let mut usage: Option<(i64, i64)> = None;
+        let mut kill_requested = false;
         heartbeat.tick().await;
 
         loop {
@@ -1848,6 +1902,19 @@ impl ConversationWorker {
                             .await;
                         }
                     }
+
+                    if !kill_requested
+                        && self.manager.is_turn_cancelled(&self.conversation_id).await
+                    {
+                        kill_requested = true;
+                        if let Err(e) = turn.terminate().await {
+                            tracing::warn!(
+                                "[WORKER] Failed to terminate cancelled Codex turn for {}: {}",
+                                self.conversation_id,
+                                e
+                            );
+                        }
+                    }
                 }
                 _ = heartbeat.tick() => {
                     self.emit_event(&StreamEvent::Status {
@@ -1855,6 +1922,19 @@ impl ConversationWorker {
                         message: None,
                     }).await;
                     let _ = checkpoints::touch_checkpoint(&self.db, &self.conversation_id).await;
+
+                    if !kill_requested
+                        && self.manager.is_turn_cancelled(&self.conversation_id).await
+                    {
+                        kill_requested = true;
+                        if let Err(e) = turn.terminate().await {
+                            tracing::warn!(
+                                "[WORKER] Failed to terminate cancelled Codex turn for {}: {}",
+                                self.conversation_id,
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1913,7 +1993,7 @@ impl ConversationWorker {
 
         let cancelled = self
             .manager
-            .take_cancelled_codex_turn(&self.conversation_id)
+            .consume_cancelled_turn(&self.conversation_id)
             .await;
         let completion = if cancelled {
             CodexTurnCompletion::Cancelled {
@@ -2250,14 +2330,10 @@ async fn load_recent_prompt_history(
     source: &str,
 ) -> Result<Vec<ConversationMessage>, String> {
     let started = Instant::now();
-    let messages = conversations::list_messages(
-        db,
-        conv_id,
-        Some(PROMPT_HISTORY_MESSAGE_LIMIT as i64),
-        None,
-    )
-    .await
-    .map_err(|e| format!("Failed to load conversation history: {}", e))?;
+    let messages =
+        conversations::list_messages(db, conv_id, Some(PROMPT_HISTORY_MESSAGE_LIMIT as i64), None)
+            .await
+            .map_err(|e| format!("Failed to load conversation history: {}", e))?;
 
     tracing::info!(
         "[WORKER] Loaded {} prompt-history messages for {} via {} in {}ms",
