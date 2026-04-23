@@ -628,24 +628,26 @@ impl ConversationWorker {
                                         }
                                         ContentBlock::ToolUse(tool_use) => {
                                             tool_call_count += 1;
-                                            tracing::info!("[WORKER] Tool use #{}: {} ({})", tool_call_count, tool_use.name, tool_use.id);
-                                            match content_blocks.last_mut() {
-                                                Some(ContentBlockDesc::ToolGroup { tool_ids }) => {
-                                                    tool_ids.push(tool_use.id.clone());
-                                                }
-                                                _ => {
-                                                    content_blocks.push(ContentBlockDesc::ToolGroup {
-                                                        tool_ids: vec![tool_use.id.clone()],
-                                                    });
-                                                    blocks_dirty = true;
-                                                }
-                                            }
+                                            let scoped_tool_id = scoped_tool_call_id(
+                                                assistant_message_id.as_deref(),
+                                                &tool_use.id,
+                                            );
+                                            tracing::info!(
+                                                "[WORKER] Tool use #{}: {} ({})",
+                                                tool_call_count,
+                                                tool_use.name,
+                                                scoped_tool_id
+                                            );
+                                            blocks_dirty |= append_tool_group_id(
+                                                &mut content_blocks,
+                                                scoped_tool_id.clone(),
+                                            );
 
                                             if let Some(msg_id) = &assistant_message_id {
                                                 let now = chrono::Utc::now().timestamp();
                                                 if let Err(e) = conversations::insert_tool_call(
                                                     &self.db,
-                                                    &tool_use.id,
+                                                    &scoped_tool_id,
                                                     msg_id,
                                                     &self.conversation_id,
                                                     &tool_use.name,
@@ -657,14 +659,18 @@ impl ConversationWorker {
                                             }
 
                                             self.emit_event(&StreamEvent::ToolUse {
-                                                id: tool_use.id.clone(),
+                                                id: scoped_tool_id.clone(),
                                                 name: tool_use.name.clone(),
                                                 input: tool_use.input.clone(),
                                             }).await;
                                             // Track for synthetic ToolResult on next Assistant / Result
-                                            pending_tool_ids.push(tool_use.id.clone());
+                                            pending_tool_ids.push(scoped_tool_id);
                                         }
                                         ContentBlock::ToolResult(tool_result) => {
+                                            let scoped_tool_id = scoped_tool_call_id(
+                                                assistant_message_id.as_deref(),
+                                                &tool_result.tool_use_id,
+                                            );
                                             let content = match &tool_result.content {
                                                 Some(cc_sdk::ContentValue::Text(s)) => s.clone(),
                                                 Some(cc_sdk::ContentValue::Structured(vals)) => {
@@ -675,7 +681,7 @@ impl ConversationWorker {
 
                                             if let Err(e) = conversations::update_tool_call_result(
                                                 &self.db,
-                                                &tool_result.tool_use_id,
+                                                &scoped_tool_id,
                                                 &content,
                                                 tool_result.is_error.unwrap_or(false),
                                             ).await {
@@ -683,13 +689,13 @@ impl ConversationWorker {
                                             }
 
                                             self.emit_event(&StreamEvent::ToolResult {
-                                                tool_use_id: tool_result.tool_use_id.clone(),
+                                                tool_use_id: scoped_tool_id.clone(),
                                                 content,
                                                 is_error: tool_result.is_error.unwrap_or(false),
                                             }).await;
                                             // Remove from pending so we don't synthesize a
                                             // second event when cc-sdk eventually ships the fix.
-                                            pending_tool_ids.retain(|id| id != &tool_result.tool_use_id);
+                                            pending_tool_ids.retain(|id| id != &scoped_tool_id);
                                         }
                                         ContentBlock::Thinking(thinking) => {
                                             // T-FEB8E5F8: persist thinking alongside text + tool
@@ -1730,25 +1736,23 @@ impl ConversationWorker {
                         }
                         Some(CodexExecEvent::ToolCallStarted { id, name, input }) => {
                             tool_call_count += 1;
-                            tracing::info!("[WORKER] Codex tool use #{}: {} ({})", tool_call_count, name, id);
+                            let scoped_tool_id =
+                                scoped_tool_call_id(assistant_message_id.as_deref(), &id);
+                            tracing::info!(
+                                "[WORKER] Codex tool use #{}: {} ({})",
+                                tool_call_count,
+                                name,
+                                scoped_tool_id
+                            );
 
-                            match content_blocks.last_mut() {
-                                Some(ContentBlockDesc::ToolGroup { tool_ids }) => {
-                                    tool_ids.push(id.clone());
-                                }
-                                _ => {
-                                    content_blocks.push(ContentBlockDesc::ToolGroup {
-                                        tool_ids: vec![id.clone()],
-                                    });
-                                    blocks_dirty = true;
-                                }
-                            }
+                            blocks_dirty |=
+                                append_tool_group_id(&mut content_blocks, scoped_tool_id.clone());
 
                             if let Some(msg_id) = assistant_message_id.as_deref() {
                                 let now = chrono::Utc::now().timestamp();
                                 if let Err(e) = conversations::insert_tool_call(
                                     &self.db,
-                                    &id,
+                                    &scoped_tool_id,
                                     msg_id,
                                     &self.conversation_id,
                                     &name,
@@ -1760,7 +1764,11 @@ impl ConversationWorker {
                                 }
                             }
 
-                            self.emit_event(&StreamEvent::ToolUse { id, name, input })
+                            self.emit_event(&StreamEvent::ToolUse {
+                                id: scoped_tool_id,
+                                name,
+                                input,
+                            })
                                 .await;
                         }
                         Some(CodexExecEvent::ToolCallCompleted {
@@ -1768,9 +1776,11 @@ impl ConversationWorker {
                             content,
                             is_error,
                         }) => {
+                            let scoped_tool_id =
+                                scoped_tool_call_id(assistant_message_id.as_deref(), &id);
                             if let Err(e) = conversations::update_tool_call_result(
                                 &self.db,
-                                &id,
+                                &scoped_tool_id,
                                 &content,
                                 is_error,
                             )
@@ -1779,7 +1789,7 @@ impl ConversationWorker {
                             }
 
                             self.emit_event(&StreamEvent::ToolResult {
-                                tool_use_id: id,
+                                tool_use_id: scoped_tool_id,
                                 content,
                                 is_error,
                             })
@@ -2331,6 +2341,35 @@ async fn flush_to_db(db: &SqlitePool, assistant_message_id: Option<&str>, accumu
             tracing::error!("[WORKER] Failed to flush message to DB: {}", e);
         }
     }
+}
+
+/// Scope per-turn tool ids by assistant message id before they hit durable
+/// storage or the SSE/UI layer. Codex emits short ids like `item_2`, which
+/// are only unique inside one turn.
+fn scoped_tool_call_id(assistant_message_id: Option<&str>, raw_tool_id: &str) -> String {
+    match assistant_message_id {
+        Some(message_id) => format!("{message_id}::{raw_tool_id}"),
+        None => raw_tool_id.to_string(),
+    }
+}
+
+/// Append a tool id to the trailing tool-group block, or start a new tool
+/// group when the previous block was text/thinking.
+///
+/// Returns `true` because any appended tool id changes the durable
+/// interleaving snapshot, including the "same group, one more tool" case.
+fn append_tool_group_id(content_blocks: &mut Vec<ContentBlockDesc>, tool_id: String) -> bool {
+    match content_blocks.last_mut() {
+        Some(ContentBlockDesc::ToolGroup { tool_ids }) => {
+            tool_ids.push(tool_id);
+        }
+        _ => {
+            content_blocks.push(ContentBlockDesc::ToolGroup {
+                tool_ids: vec![tool_id],
+            });
+        }
+    }
+    true
 }
 
 /// Parsed result from the ticket-router's `<router_result>` XML output.
@@ -2899,5 +2938,39 @@ mod streaming_persistence_tests {
             ALLOWED_EVENT_TYPES, ALL_EVENT_TYPES,
             "scope-cut allow-list drifted from canonical AnthropicEvent surface"
         );
+    }
+
+    #[test]
+    fn scoped_tool_call_id_is_unique_per_assistant_message() {
+        let first = scoped_tool_call_id(Some("msg-1"), "item_2");
+        let second = scoped_tool_call_id(Some("msg-2"), "item_2");
+
+        assert_eq!(first, "msg-1::item_2");
+        assert_eq!(second, "msg-2::item_2");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn append_tool_group_id_updates_existing_group() {
+        let mut blocks = vec![ContentBlockDesc::ToolGroup {
+            tool_ids: vec!["msg-1::item_1".to_string()],
+        }];
+
+        let changed = append_tool_group_id(&mut blocks, "msg-1::item_2".to_string());
+
+        assert!(changed);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ContentBlockDesc::ToolGroup { tool_ids } => {
+                assert_eq!(
+                    tool_ids,
+                    &vec![
+                        "msg-1::item_1".to_string(),
+                        "msg-1::item_2".to_string()
+                    ]
+                );
+            }
+            other => panic!("expected tool_group, got {:?}", other),
+        }
     }
 }
