@@ -10,7 +10,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
-const DEFAULT_CODEX_MODEL: &str = "gpt-5.4";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 const REQUIRED_CODEX_PATH_ENTRIES: &[&str] = &[
     "/opt/homebrew/opt/node@20/bin",
     "/opt/homebrew/bin",
@@ -626,10 +626,10 @@ mod tests {
     }
 
     #[test]
-    fn resolves_legacy_models_to_gpt_5_4() {
-        assert_eq!(resolve_codex_model("haiku"), "gpt-5.4");
-        assert_eq!(resolve_codex_model("claude-opus-4-7"), "gpt-5.4");
-        assert_eq!(resolve_codex_model("gpt-5.4"), "gpt-5.4");
+    fn resolves_legacy_models_to_gpt_5_5() {
+        assert_eq!(resolve_codex_model("haiku"), "gpt-5.5");
+        assert_eq!(resolve_codex_model("claude-opus-4-7"), "gpt-5.5");
+        assert_eq!(resolve_codex_model("gpt-5.5"), "gpt-5.5");
     }
 
     #[test]
