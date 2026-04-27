@@ -603,6 +603,10 @@ async fn main() -> anyhow::Result<()> {
         )
         // Ticket routes
         .route("/api/tickets", get(handlers::list_all_tickets))
+        .route(
+            "/api/tickets/ensure-work-ticket",
+            post(handlers::ensure_work_ticket),
+        )
         .route("/api/tickets/:ticket_id", get(handlers::get_ticket_by_id))
         .route(
             "/api/tickets/:ticket_id/guidance",

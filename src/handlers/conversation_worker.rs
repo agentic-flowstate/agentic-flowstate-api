@@ -22,14 +22,14 @@ use crate::agents::codex_exec::{
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
-use crate::observability::streaming::{record_gap_detected, record_stream_event_emitted};
+use crate::observability::streaming::{
+    record_gap_detected, record_stream_event_emitted, record_ticket_preflight,
+    record_ticket_preflight_error,
+};
 use ticketing_system::{
     checkpoints, conversations, token_usage, AddMessageRequest, ContentBlockDesc,
     ConversationMessage, UpdateConversationRequest,
 };
-
-/// Timeout for the ticket-router pre-processing phase.
-const ROUTER_TIMEOUT_SECS: u64 = 60;
 
 /// How often to flush accumulated content to the database (ms).
 const DB_FLUSH_INTERVAL_MS: u64 = 500;
@@ -481,10 +481,10 @@ impl ConversationWorker {
             return;
         }
 
-        // === TICKET ROUTER PRE-PROCESSING ===
-        // Run a lightweight router agent to match the user's message to a ticket.
-        // The router is ephemeral (no session persistence) and has a strict timeout.
-        // On any failure, we fall back to the original enhanced_message.
+        // === TICKET PREFLIGHT ===
+        // Use deterministic ticket lookup before agent start. It cannot invoke
+        // an LLM and does not create tickets from chat startup, so first useful
+        // work is not blocked on router-agent tool loops.
         let final_message = self.run_ticket_router(&enhanced_message, &msg.config).await;
 
         if self
@@ -1098,16 +1098,11 @@ impl ConversationWorker {
         }
     }
 
-    /// Run the ticket-router agent as a pre-processing step.
-    /// Returns the enriched message if the router matched a ticket,
-    /// or the original message on skip/failure/timeout.
-    ///
-    /// Applies three early-exit conditions to bypass the router entirely
-    /// (no cc-sdk call, no latency penalty):
-    /// 1. Short conversational messages (acknowledgements, confirmations)
-    /// 2. Workspace-manager approval flow signals ("approved"/"rejected")
-    /// 3. Conversations with an established ticket context from a prior message
-    async fn run_ticket_router(&mut self, user_message: &str, config: &ChatConfig) -> String {
+    /// Run deterministic ticket preflight before the main agent starts.
+    /// Returns an enriched message only when an explicit or clear ticket match
+    /// is found. No LLM router is invoked and chat startup never creates
+    /// tickets, epics, slices, or milestones.
+    async fn run_ticket_router(&mut self, user_message: &str, _config: &ChatConfig) -> String {
         let original = user_message.to_string();
 
         // Truncate preview at a safe UTF-8 char boundary (floor to nearest boundary at or before 60)
@@ -1176,78 +1171,85 @@ impl ConversationWorker {
         }
 
         tracing::info!(
-            "[ROUTER] === RUNNING FULL ROUTER === conv={}",
+            "[ROUTER] === RUNNING DETERMINISTIC PREFLIGHT === conv={}",
             self.conversation_id
         );
 
-        // Emit heartbeats on the SSE connection while the router is running.
-        // The router can take 10-30+ seconds — without heartbeats the iOS watchdog
-        // (45s no-byte timeout) could kill the connection.
-        let heartbeat_conv_id = self.conversation_id.clone();
-        let heartbeat_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            interval.tick().await; // consume immediate first tick
-            loop {
-                interval.tick().await;
-                let tx = get_broadcast_sender(&heartbeat_conv_id).await;
-                let heartbeat = StreamEvent::Status {
-                    status: "heartbeat".to_string(),
-                    message: None,
-                };
-                if let Ok(json) = serde_json::to_string(&heartbeat) {
-                    let _ = tx.send((-1, json));
-                }
-            }
-        });
+        let started = Instant::now();
+        let result = ticketing_system::work_ticket::ensure_work_ticket(
+            &self.db,
+            ticketing_system::work_ticket::EnsureWorkTicketRequest {
+                request: Some(user_message.to_string()),
+                create_if_missing: false,
+                mark_in_progress: false,
+                ..Default::default()
+            },
+        )
+        .await;
 
-        let start = std::time::Instant::now();
-        let result = if config.runtime == ChatRuntime::CodexExec {
-            tokio::time::timeout(
-                Duration::from_secs(ROUTER_TIMEOUT_SECS),
-                self.run_ticket_router_inner_codex(user_message),
-            )
-            .await
-        } else {
-            tokio::time::timeout(
-                Duration::from_secs(ROUTER_TIMEOUT_SECS),
-                self.run_ticket_router_inner(user_message),
-            )
-            .await
-        };
-        let elapsed = start.elapsed();
-
-        // Stop heartbeats now that the router is done
-        heartbeat_handle.abort();
-
-        // Mark as routed regardless of outcome — never route twice
         self.has_routed = true;
 
         match result {
-            Ok(Ok(ref enriched)) => {
-                let enriched_preview = if enriched.len() > 100 {
-                    &enriched[..(0..=100)
-                        .rev()
-                        .find(|&i| enriched.is_char_boundary(i))
-                        .unwrap_or(0)]
-                } else {
-                    enriched
-                };
+            Ok(response) => {
+                record_ticket_preflight(&response.status, &response.action, response.elapsed_ms);
                 tracing::info!(
-                    "[ROUTER] === DONE ({:.1}s) === conv={} result={:?}",
-                    elapsed.as_secs_f64(),
+                    "[ROUTER] === PREFLIGHT DONE ({}ms) === conv={} status={} action={} candidates={}",
+                    response.elapsed_ms,
                     self.conversation_id,
-                    enriched_preview
+                    response.status,
+                    response.action,
+                    response.candidate_count
                 );
-                enriched.clone()
+
+                if let Some(ticket) = response.ticket {
+                    let enriched_message = Self::enrich_message_with_ticket(user_message, &ticket);
+                    self.last_router_ticket_id = Some(ticket.ticket_id.clone());
+                    self.last_router_organization = Some(ticket.organization.clone());
+                    if let Err(e) = conversations::set_router_result(
+                        &self.db,
+                        &self.conversation_id,
+                        Some(&ticket.ticket_id),
+                        Some(&ticket.organization),
+                    )
+                    .await
+                    {
+                        tracing::warn!("[ROUTER] Failed to persist preflight result: {}", e);
+                    }
+                    self.emit_event(&StreamEvent::RouterResult {
+                        enriched_message: enriched_message.clone(),
+                        ticket_id: Some(ticket.ticket_id),
+                        organization: Some(ticket.organization),
+                        skipped: false,
+                    })
+                    .await;
+                    enriched_message
+                } else {
+                    let _ = conversations::set_router_result(
+                        &self.db,
+                        &self.conversation_id,
+                        Some("__skipped__"),
+                        None,
+                    )
+                    .await;
+                    self.emit_event(&StreamEvent::RouterResult {
+                        enriched_message: user_message.to_string(),
+                        ticket_id: None,
+                        organization: None,
+                        skipped: true,
+                    })
+                    .await;
+                    original
+                }
             }
-            Ok(Err(e)) => {
+            Err(e) => {
+                let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                record_ticket_preflight_error("failed", elapsed_ms);
                 tracing::warn!(
-                    "[ROUTER] === FAILED ({:.1}s) === conv={} error={}",
-                    elapsed.as_secs_f64(),
+                    "[ROUTER] === PREFLIGHT FAILED ({}ms) === conv={} error={}",
+                    elapsed_ms,
                     self.conversation_id,
                     e
                 );
-                // Persist so router doesn't retry on next message or after restart
                 let _ = conversations::set_router_result(
                     &self.db,
                     &self.conversation_id,
@@ -1257,467 +1259,20 @@ impl ConversationWorker {
                 .await;
                 original
             }
-            Err(_) => {
-                tracing::warn!(
-                    "[ROUTER] === TIMEOUT ({}s) === conv={}",
-                    ROUTER_TIMEOUT_SECS,
-                    self.conversation_id
-                );
-                let _ = conversations::set_router_result(
-                    &self.db,
-                    &self.conversation_id,
-                    Some("__timeout__"),
-                    None,
-                )
-                .await;
-                original
-            }
         }
     }
 
-    /// Inner router logic, separated so the caller can wrap it in a timeout.
-    async fn run_ticket_router_inner(&mut self, user_message: &str) -> Result<String, String> {
-        let router_type = AgentType::TicketRouter;
-
-        // Build prompt variables
-        let mut vars = std::collections::HashMap::new();
-        vars.insert("USER_MESSAGE".to_string(), user_message.to_string());
-
-        // Fetch organizations from DB for the prompt
-        let orgs = ticketing_system::organizations::list_organizations(&self.db)
-            .await
-            .unwrap_or_default();
-        let org_names: Vec<String> = orgs.iter().map(|o| o.name.clone()).collect();
-        vars.insert("ORGANIZATIONS".to_string(), org_names.join(", "));
-
-        // Load the router prompt with variable substitution
-        let system_prompt = load_prompt(router_type.as_str(), vars)
-            .map_err(|e| format!("Failed to load router prompt: {}", e))?;
-
-        // Build tools list
-        let tools_list: Vec<String> = router_type
-            .allowed_tools()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        let has_mcp_tools = tools_list.iter().any(|t| t.starts_with("mcp__"));
-
-        // Build cc-sdk client options for the router
-        let mut builder = ClaudeCodeOptions::builder()
-            .system_prompt(&system_prompt)
-            .model(router_type.model())
-            .tools(ToolsConfig::list(tools_list.clone()))
-            .allowed_tools(tools_list)
-            .disallowed_tools(crate::safety::disallowed_tools())
-            .permission_mode(PermissionMode::BypassPermissions)
-            .cwd(std::path::Path::new("/tmp"));
-
-        // Register MCP server (router uses mcp__agentic-mcp__* tools)
-        if has_mcp_tools {
-            let mcp_binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../agentic-flowstate-mcp/target/release/agentic_mcp");
-            let mcp_binary = mcp_binary.canonicalize().unwrap_or(mcp_binary);
-            builder = builder.add_mcp_server(
-                "agentic-mcp",
-                McpServerConfig::Stdio {
-                    command: mcp_binary.to_string_lossy().to_string(),
-                    args: None,
-                    env: None,
-                },
-            );
-        }
-
-        // Set max turns (1 for router — single turn)
-        if let Some(turns) = router_type.max_turns() {
-            builder = builder.max_turns(turns);
-        }
-
-        // Set effort level (low for router)
-        builder = builder.add_extra_arg("effort", Some(router_type.effort().to_string()));
-
-        // No session resumption — router is ephemeral
-        let options = builder.build();
-        let mut sdk_client = ClaudeSDKClient::new(options);
-
-        // Connect with a 30s timeout
-        match tokio::time::timeout(Duration::from_secs(30), sdk_client.connect(None)).await {
-            Ok(Ok(())) => {
-                tracing::info!("[ROUTER] Client connected");
-            }
-            Ok(Err(e)) => {
-                return Err(format!("Router connect failed: {}", e));
-            }
-            Err(_) => {
-                return Err("Router connect timed out after 30s".to_string());
-            }
-        }
-
-        // Send the user's message (the prompt already has it embedded, so send a short trigger)
-        if let Err(e) = sdk_client
-            .send_user_message("Route this message.".to_string())
-            .await
-        {
-            return Err(format!("Router send failed: {}", e));
-        }
-
-        // Stream the response — router is silent (no SSE events), only logging
-        let mut response_stream = sdk_client.receive_messages().await;
-        let mut router_text_parts: Vec<String> = Vec::new();
-        let mut tool_call_count = 0u32;
-
-        loop {
-            match response_stream.next().await {
-                Some(Ok(sdk_msg)) => {
-                    if let Message::Assistant {
-                        message: assistant_msg,
-                    } = &sdk_msg
-                    {
-                        for block in &assistant_msg.content {
-                            match block {
-                                ContentBlock::Text(text_content) => {
-                                    // T-B1A8C4D4: don't emit RouterText — the router's
-                                    // text is the XML `<router_result>` blob, which is
-                                    // not useful to show to users. We parse it at the
-                                    // end. RouterToolUse/RouterToolResult below give
-                                    // the iOS app a live signal that routing is
-                                    // in-flight so cold-start doesn't look like a hang.
-                                    router_text_parts.push(text_content.text.clone());
-                                }
-                                ContentBlock::ToolUse(tool_use) => {
-                                    tool_call_count += 1;
-                                    tracing::info!(
-                                        "[ROUTER] Tool #{}: {} ({})",
-                                        tool_call_count,
-                                        tool_use.name,
-                                        tool_use.id
-                                    );
-                                    // T-B1A8C4D4: emit so iOS can show a
-                                    // "Routing… N tools" phase pill. Router phase
-                                    // was previously silent to SSE for 3-16s,
-                                    // which read as a hang.
-                                    self.emit_event(&StreamEvent::RouterToolUse {
-                                        id: tool_use.id.clone(),
-                                        name: tool_use.name.clone(),
-                                        input: tool_use.input.clone(),
-                                    })
-                                    .await;
-                                }
-                                ContentBlock::ToolResult(tool_result) => {
-                                    // T-B1A8C4D4: emit RouterToolResult so the
-                                    // phase pill can flip each tool call from
-                                    // "running" to "done" as results come back.
-                                    let content = match &tool_result.content {
-                                        Some(cc_sdk::ContentValue::Text(s)) => s.clone(),
-                                        Some(cc_sdk::ContentValue::Structured(vals)) => {
-                                            serde_json::to_string(vals).unwrap_or_default()
-                                        }
-                                        None => String::new(),
-                                    };
-                                    self.emit_event(&StreamEvent::RouterToolResult {
-                                        tool_use_id: tool_result.tool_use_id.clone(),
-                                        content,
-                                        is_error: tool_result.is_error.unwrap_or(false),
-                                    })
-                                    .await;
-                                }
-                                ContentBlock::Thinking(_) => {
-                                    // Ignore thinking blocks from router
-                                }
-                            }
-                        }
-                    }
-
-                    // Check for result message — router is done
-                    if let Message::Result { .. } = &sdk_msg {
-                        tracing::info!(
-                            "[ROUTER] Completed — {} tool calls, {} text parts",
-                            tool_call_count,
-                            router_text_parts.len()
-                        );
-                        break;
-                    }
-                }
-                Some(Err(e)) => {
-                    return Err(format!("Router stream error: {}", e));
-                }
-                None => {
-                    tracing::warn!("[ROUTER] Stream ended without Result");
-                    break;
-                }
-            }
-        }
-
-        // Parse the router output
-        let full_output = router_text_parts.join("");
-        tracing::info!(
-            "[ROUTER] Full output ({} chars): {}",
-            full_output.len(),
-            if full_output.len() > 200 {
-                &full_output[..(0..=200)
-                    .rev()
-                    .find(|&i| full_output.is_char_boundary(i))
-                    .unwrap_or(0)]
-            } else {
-                &full_output
-            }
-        );
-
-        let parsed = parse_router_result(&full_output);
-
-        match parsed {
-            RouterParsed::Skipped => {
-                tracing::info!("[ROUTER] Skipped — no ticket match needed");
-                // Persist sentinel so has_router_run() returns true even for skipped
-                let _ = conversations::set_router_result(
-                    &self.db,
-                    &self.conversation_id,
-                    Some("__skipped__"),
-                    None,
-                )
-                .await;
-                self.emit_event(&StreamEvent::RouterResult {
-                    enriched_message: user_message.to_string(),
-                    ticket_id: None,
-                    organization: None,
-                    skipped: true,
-                })
-                .await;
-                Ok(user_message.to_string())
-            }
-            RouterParsed::Enriched {
-                enriched_message,
-                ticket_id,
-                organization,
-            } => {
-                tracing::info!(
-                    "[ROUTER] Matched ticket={:?}, org={:?}",
-                    ticket_id,
-                    organization
-                );
-                // Persist router result to DB — survives server restarts
-                self.last_router_ticket_id = ticket_id.clone();
-                self.last_router_organization = organization.clone();
-                if let Err(e) = conversations::set_router_result(
-                    &self.db,
-                    &self.conversation_id,
-                    ticket_id.as_deref(),
-                    organization.as_deref(),
-                )
-                .await
-                {
-                    tracing::warn!("[ROUTER] Failed to persist router result: {}", e);
-                }
-                self.emit_event(&StreamEvent::RouterResult {
-                    enriched_message: enriched_message.clone(),
-                    ticket_id: ticket_id.clone(),
-                    organization: organization.clone(),
-                    skipped: false,
-                })
-                .await;
-                Ok(enriched_message)
-            }
-            RouterParsed::ParseFailed(reason) => {
-                tracing::warn!("[ROUTER] Parse failed: {}", reason);
-                // Persist sentinel so router doesn't re-run on next message
-                let _ = conversations::set_router_result(
-                    &self.db,
-                    &self.conversation_id,
-                    Some("__failed__"),
-                    None,
-                )
-                .await;
-                // Fall back to original message
-                self.emit_event(&StreamEvent::RouterResult {
-                    enriched_message: user_message.to_string(),
-                    ticket_id: None,
-                    organization: None,
-                    skipped: true,
-                })
-                .await;
-                Ok(user_message.to_string())
-            }
-        }
-    }
-
-    async fn run_ticket_router_inner_codex(
-        &mut self,
-        user_message: &str,
-    ) -> Result<String, String> {
-        let router_type = AgentType::TicketRouter;
-
-        let mut vars = std::collections::HashMap::new();
-        vars.insert("USER_MESSAGE".to_string(), user_message.to_string());
-
-        let orgs = ticketing_system::organizations::list_organizations(&self.db)
-            .await
-            .unwrap_or_default();
-        let org_names: Vec<String> = orgs.iter().map(|o| o.name.clone()).collect();
-        vars.insert("ORGANIZATIONS".to_string(), org_names.join(", "));
-
-        let system_prompt = load_prompt(router_type.as_str(), vars)
-            .map_err(|e| format!("Failed to load router prompt: {}", e))?;
-
-        let mut turn = spawn_codex_exec(CodexExecOptions {
-            model: router_type.model(),
-            reasoning_effort: router_type.effort(),
-            system_prompt: &system_prompt,
-            working_dir: std::path::Path::new("/tmp"),
-            prompt: "Route this message.",
-            sandbox: CodexSandboxMode::ReadOnly,
-            bypass_approvals_and_sandbox: false,
-            resume_session_id: None,
-            ephemeral: true,
-            tool_profile: CodexToolProfile::RestrictedMcpOnly,
-        })
-        .await?;
-
-        let mut router_text_parts: Vec<String> = Vec::new();
-        let mut tool_call_count = 0u32;
-        let mut thread_id: Option<String> = None;
-
-        while let Some(event) = turn.events.recv().await {
-            match event {
-                CodexExecEvent::ThreadStarted { thread_id: tid } => {
-                    thread_id = Some(tid);
-                }
-                CodexExecEvent::AgentMessage { text } => {
-                    router_text_parts.push(text);
-                }
-                CodexExecEvent::ToolCallStarted { id, name, input } => {
-                    tool_call_count += 1;
-                    tracing::info!(
-                        "[ROUTER] Codex tool #{}: {} ({})",
-                        tool_call_count,
-                        name,
-                        id
-                    );
-                    self.emit_event(&StreamEvent::RouterToolUse { id, name, input })
-                        .await;
-                }
-                CodexExecEvent::ToolCallCompleted {
-                    id,
-                    content,
-                    is_error,
-                } => {
-                    self.emit_event(&StreamEvent::RouterToolResult {
-                        tool_use_id: id,
-                        content,
-                        is_error,
-                    })
-                    .await;
-                }
-                CodexExecEvent::TurnCompleted { .. } => {}
-            }
-        }
-
-        let outcome = turn.wait().await?;
-        if !outcome.exit_status.success() {
-            let stderr = outcome.stderr_text.trim();
-            if stderr.is_empty() {
-                return Err(format!(
-                    "Router codex exec failed with status {}",
-                    outcome.exit_status
-                ));
-            }
-            return Err(format!(
-                "Router codex exec failed with status {}: {}",
-                outcome.exit_status, stderr
-            ));
-        }
-
-        tracing::info!(
-            "[ROUTER] Codex completed — session={:?}, {} tool calls, {} text parts",
-            thread_id,
-            tool_call_count,
-            router_text_parts.len()
-        );
-
-        let full_output = router_text_parts.join("");
-        tracing::info!(
-            "[ROUTER] Full output ({} chars): {}",
-            full_output.len(),
-            if full_output.len() > 200 {
-                &full_output[..(0..=200)
-                    .rev()
-                    .find(|&i| full_output.is_char_boundary(i))
-                    .unwrap_or(0)]
-            } else {
-                &full_output
-            }
-        );
-
-        let parsed = parse_router_result(&full_output);
-
-        match parsed {
-            RouterParsed::Skipped => {
-                tracing::info!("[ROUTER] Skipped — no ticket match needed");
-                let _ = conversations::set_router_result(
-                    &self.db,
-                    &self.conversation_id,
-                    Some("__skipped__"),
-                    None,
-                )
-                .await;
-                self.emit_event(&StreamEvent::RouterResult {
-                    enriched_message: user_message.to_string(),
-                    ticket_id: None,
-                    organization: None,
-                    skipped: true,
-                })
-                .await;
-                Ok(user_message.to_string())
-            }
-            RouterParsed::Enriched {
-                enriched_message,
-                ticket_id,
-                organization,
-            } => {
-                tracing::info!(
-                    "[ROUTER] Matched ticket={:?}, org={:?}",
-                    ticket_id,
-                    organization
-                );
-                self.last_router_ticket_id = ticket_id.clone();
-                self.last_router_organization = organization.clone();
-                if let Err(e) = conversations::set_router_result(
-                    &self.db,
-                    &self.conversation_id,
-                    ticket_id.as_deref(),
-                    organization.as_deref(),
-                )
-                .await
-                {
-                    tracing::warn!("[ROUTER] Failed to persist router result: {}", e);
-                }
-                self.emit_event(&StreamEvent::RouterResult {
-                    enriched_message: enriched_message.clone(),
-                    ticket_id: ticket_id.clone(),
-                    organization: organization.clone(),
-                    skipped: false,
-                })
-                .await;
-                Ok(enriched_message)
-            }
-            RouterParsed::ParseFailed(reason) => {
-                tracing::warn!("[ROUTER] Parse failed: {}", reason);
-                let _ = conversations::set_router_result(
-                    &self.db,
-                    &self.conversation_id,
-                    Some("__failed__"),
-                    None,
-                )
-                .await;
-                self.emit_event(&StreamEvent::RouterResult {
-                    enriched_message: user_message.to_string(),
-                    ticket_id: None,
-                    organization: None,
-                    skipped: true,
-                })
-                .await;
-                Ok(user_message.to_string())
-            }
-        }
+    fn enrich_message_with_ticket(user_message: &str, ticket: &ticketing_system::Ticket) -> String {
+        format!(
+            "{}\n\n---\nTicket: {} | Organization: {} | Status: {}\nEpic: {}\nSlice: {}\nTitle: {}\n---",
+            user_message,
+            ticket.ticket_id,
+            ticket.organization,
+            ticket.status,
+            ticket.epic_id,
+            ticket.slice_id,
+            ticket.title
+        )
     }
 
     async fn process_codex_message(
@@ -2614,101 +2169,6 @@ async fn persist_failed_codex_message(
         .await;
 }
 
-/// Parsed result from the ticket-router's `<router_result>` XML output.
-enum RouterParsed {
-    /// Router decided no ticket is needed (skipped="true")
-    Skipped,
-    /// Router matched or created a ticket
-    Enriched {
-        enriched_message: String,
-        ticket_id: Option<String>,
-        organization: Option<String>,
-    },
-    /// Could not parse the router output
-    ParseFailed(String),
-}
-
-/// Parse the `<router_result>` XML block from the router agent's text output.
-///
-/// Expected formats:
-///   `<router_result skipped="true">...original message...</router_result>`
-///   `<router_result>...enriched message with --- metadata block ---...</router_result>`
-fn parse_router_result(output: &str) -> RouterParsed {
-    // Check for skipped result first
-    if let Some(start) = output.find("<router_result skipped=\"true\">") {
-        if let Some(end) = output.find("</router_result>") {
-            let inner = output[start + "<router_result skipped=\"true\">".len()..end].trim();
-            if !inner.is_empty() {
-                return RouterParsed::Skipped;
-            }
-        }
-        return RouterParsed::Skipped;
-    }
-
-    // Check for enriched result
-    let tag_start = match output.find("<router_result>") {
-        Some(idx) => idx,
-        None => {
-            return RouterParsed::ParseFailed("No <router_result> tag found in output".to_string());
-        }
-    };
-
-    let tag_end = match output.find("</router_result>") {
-        Some(idx) => idx,
-        None => {
-            return RouterParsed::ParseFailed("No </router_result> closing tag found".to_string());
-        }
-    };
-
-    let inner = output[tag_start + "<router_result>".len()..tag_end]
-        .trim()
-        .to_string();
-    if inner.is_empty() {
-        return RouterParsed::ParseFailed("Empty <router_result> block".to_string());
-    }
-
-    // Parse the metadata block between --- markers
-    let mut ticket_id: Option<String> = None;
-    let mut organization: Option<String> = None;
-
-    // Look for the --- delimited metadata section
-    let parts: Vec<&str> = inner.splitn(2, "\n---\n").collect();
-    if parts.len() == 2 {
-        // There's a metadata block after the first ---
-        let metadata_section = parts[1];
-        // The metadata block ends at the second ---
-        let metadata = if let Some(end_idx) = metadata_section.find("\n---") {
-            &metadata_section[..end_idx]
-        } else {
-            metadata_section
-        };
-
-        for line in metadata.lines() {
-            let line = line.trim();
-            // Parse "Ticket: T-XXXXXXXX | Organization: org-name | Status: open"
-            if line.starts_with("Ticket:") {
-                for part in line.split('|') {
-                    let part = part.trim();
-                    if let Some(tid) = part.strip_prefix("Ticket:") {
-                        let tid = tid.trim();
-                        if tid.starts_with("T-") {
-                            ticket_id = Some(tid.to_string());
-                        }
-                    } else if let Some(org) = part.strip_prefix("Organization:") {
-                        organization = Some(org.trim().to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    RouterParsed::Enriched {
-        enriched_message: inner,
-        ticket_id,
-        organization,
-    }
-}
-
 /// Build a condensed conversation history for system prompt injection.
 /// Used as a safety net when resuming sessions — if --resume works, this is
 /// redundant; if it fails silently, Claude still has context.
@@ -3130,8 +2590,11 @@ mod streaming_persistence_tests {
             &pool,
             "c-t49352bf5",
             &[
-                StreamEvent::RouterText {
-                    content: "internal routing note".into(),
+                StreamEvent::RouterResult {
+                    enriched_message: "internal routing note".into(),
+                    ticket_id: None,
+                    organization: None,
+                    skipped: true,
                 },
                 StreamEvent::TitleUpdate {
                     title: "ignored".into(),

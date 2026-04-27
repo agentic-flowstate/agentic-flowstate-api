@@ -292,22 +292,6 @@
         "mcp__agentic-mcp__exa_get_contents"
       ]
     },
-    "ticket-router": {
-      "model": "opus",
-      "effort": "xhigh",
-      "max_turns": 5,
-      "prompt_file": "ticket-router.txt",
-      "tools": [
-        "mcp__agentic-mcp__search_tickets",
-        "mcp__agentic-mcp__list_tickets",
-        "mcp__agentic-mcp__get_ticket",
-        "mcp__agentic-mcp__list_organizations",
-        "mcp__agentic-mcp__list_epics",
-        "mcp__agentic-mcp__list_slices",
-        "mcp__agentic-mcp__create_slices",
-        "mcp__agentic-mcp__create_slice_tickets"
-      ]
-    },
     "dep-update-reviewer": {
       "model": "opus",
       "effort": "xhigh",

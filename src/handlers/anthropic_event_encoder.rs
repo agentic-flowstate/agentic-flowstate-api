@@ -48,11 +48,9 @@
 //! Status("failed" | error case)  → error  (followed by message_stop if open)
 //! ```
 //!
-//! Router events (`RouterText`, `RouterToolUse`, `RouterToolResult`,
-//! `RouterResult`), title/org updates, user messages, and
-//! `ReplayComplete` have no Anthropic equivalent. The encoder returns an
-//! empty frame list for them — they are simply not persisted and not
-//! broadcast on the wire.
+//! Router result, title/org updates, user messages, and `ReplayComplete`
+//! have no Anthropic equivalent. The encoder returns an empty frame list
+//! for them — they are simply not persisted and not broadcast on the wire.
 
 use crate::agents::anthropic_events::{
     AnthropicEvent, ApiError, ContentBlockDelta, ContentBlockStub, MessageDeltaBody, MessageStub,
@@ -106,10 +104,7 @@ pub struct AnthropicEventEncoder {
 
 impl AnthropicEventEncoder {
     pub fn new(conversation_id: &str) -> Self {
-        let conv_short = conversation_id
-            .chars()
-            .take(8)
-            .collect::<String>();
+        let conv_short = conversation_id.chars().take(8).collect::<String>();
         Self {
             message_open: false,
             next_block_index: 0,
@@ -170,10 +165,7 @@ impl AnthropicEventEncoder {
             StreamEvent::Status { status, message } => self.on_status(status, message.as_deref()),
             // Router + metadata events have no Anthropic equivalent —
             // they are not persisted and not broadcast on the wire.
-            StreamEvent::RouterText { .. }
-            | StreamEvent::RouterToolUse { .. }
-            | StreamEvent::RouterToolResult { .. }
-            | StreamEvent::RouterResult { .. }
+            StreamEvent::RouterResult { .. }
             | StreamEvent::UserMessage { .. }
             | StreamEvent::ReplayComplete { .. }
             | StreamEvent::TitleUpdate { .. }
@@ -571,21 +563,15 @@ mod tests {
     fn router_events_are_not_emitted_on_wire() {
         let mut tx = AnthropicEventEncoder::new("c");
         assert!(tx
-            .encode(&StreamEvent::RouterText {
-                content: "x".into(),
+            .encode(&StreamEvent::RouterResult {
+                enriched_message: "x".into(),
+                ticket_id: None,
+                organization: None,
+                skipped: true,
             })
             .is_empty());
         assert!(tx
-            .encode(&StreamEvent::RouterToolUse {
-                id: "a".into(),
-                name: "b".into(),
-                input: json!({}),
-            })
-            .is_empty());
-        assert!(tx
-            .encode(&StreamEvent::TitleUpdate {
-                title: "t".into(),
-            })
+            .encode(&StreamEvent::TitleUpdate { title: "t".into() })
             .is_empty());
         assert!(tx
             .encode(&StreamEvent::ReplayComplete {
@@ -665,7 +651,9 @@ mod tests {
         tx.set_pending_client_id(Some("key-1".to_string()));
 
         let turn1: Vec<_> = [
-            StreamEvent::Text { content: "a".into() },
+            StreamEvent::Text {
+                content: "a".into(),
+            },
             StreamEvent::Result {
                 session_id: "s".into(),
                 status: "success".into(),

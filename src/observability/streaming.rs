@@ -22,6 +22,8 @@
 //! | `push_sent_total`                      | counter    | APNs silent-push attempts, labeled by `result` + `apns_status`. |
 //! | `events_gap_detected_total`            | counter    | event_index allocator saw a skip (missing index), by size.      |
 //! | `clients_session_start_total`          | counter    | Client session_start events, labeled by platform+version.       |
+//! | `ticket_preflight_total`               | counter    | Deterministic ticket preflight decisions by status/action.      |
+//! | `ticket_preflight_duration_ms`         | histogram  | Wall-clock duration of deterministic ticket preflight.          |
 
 use std::borrow::Cow;
 use std::fmt;
@@ -57,6 +59,8 @@ pub const METRIC_STREAM_KEEPALIVE_SENT: &str = "stream_keepalive_sent_total";
 pub const METRIC_PUSH_SENT: &str = "push_sent_total";
 pub const METRIC_EVENTS_GAP_DETECTED: &str = "events_gap_detected_total";
 pub const METRIC_CLIENTS_SESSION_START: &str = "clients_session_start_total";
+pub const METRIC_TICKET_PREFLIGHT_TOTAL: &str = "ticket_preflight_total";
+pub const METRIC_TICKET_PREFLIGHT_DURATION_MS: &str = "ticket_preflight_duration_ms";
 
 // Retention prune metrics (T-65DA4D32). Emitted by `src/retention/prune.rs`
 // after every scheduled sweep so operators can confirm (a) the prune is
@@ -410,16 +414,47 @@ pub fn record_gap_detected(conversation_id: &str, expected: i32, actual: i32) {
 }
 
 // ---------------------------------------------------------------------------
+// Deterministic ticket preflight metrics.
+// ---------------------------------------------------------------------------
+
+pub fn record_ticket_preflight(status: &str, action: &str, duration_ms: u64) {
+    let status_label: Cow<'static, str> = status.to_string().into();
+    let action_label: Cow<'static, str> = action.to_string().into();
+
+    counter!(
+        METRIC_TICKET_PREFLIGHT_TOTAL,
+        "status" => status_label.clone(),
+        "action" => action_label.clone(),
+    )
+    .increment(1);
+    histogram!(
+        METRIC_TICKET_PREFLIGHT_DURATION_MS,
+        "status" => status_label.clone(),
+        "action" => action_label.clone(),
+    )
+    .record(duration_ms as f64);
+
+    tracing::info!(
+        target: "observability.streaming",
+        event = "ticket_preflight.completed",
+        status,
+        action,
+        duration_ms,
+        "deterministic ticket preflight completed"
+    );
+}
+
+pub fn record_ticket_preflight_error(error_kind: &str, duration_ms: u64) {
+    record_ticket_preflight("error", error_kind, duration_ms);
+}
+
+// ---------------------------------------------------------------------------
 // Client session-start counter.
 // ---------------------------------------------------------------------------
 
 /// Observed a client session_start. Updates:
 ///   * `clients_session_start_total{platform, client_version}` counter +1
-pub fn record_session_start(
-    user_id: &str,
-    platform: ClientPlatform,
-    client_version: &str,
-) {
+pub fn record_session_start(user_id: &str, platform: ClientPlatform, client_version: &str) {
     let platform_label: Cow<'static, str> = platform.to_string().into();
     let version_label: Cow<'static, str> = client_version.to_string().into();
 

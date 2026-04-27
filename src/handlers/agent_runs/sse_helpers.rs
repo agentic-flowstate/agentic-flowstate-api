@@ -1,10 +1,10 @@
+use async_stream::stream;
 use axum::response::sse::Event;
 use futures::stream::Stream;
-use std::convert::Infallible;
 use sqlx::SqlitePool;
+use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use async_stream::stream;
 
 use crate::agents::StreamEvent;
 
@@ -33,7 +33,9 @@ pub fn spawn_event_persister(
                     event_index,
                     event_type,
                     &json,
-                ).await {
+                )
+                .await
+                {
                     tracing::warn!("[PERSIST] Failed to store event #{}: {}", event_index, e);
                 }
                 event_index += 1;
@@ -43,7 +45,11 @@ pub fn spawn_event_persister(
             let _ = sse_tx.send(event).await;
         }
 
-        tracing::info!("[PERSIST] Event persister ended after {} events for session {}", event_index, session_id);
+        tracing::info!(
+            "[PERSIST] Event persister ended after {} events for session {}",
+            event_index,
+            session_id
+        );
     });
 
     sse_rx
@@ -154,9 +160,6 @@ pub fn get_event_type(event: &StreamEvent) -> &'static str {
         StreamEvent::ReplayComplete { .. } => "replay_complete",
         StreamEvent::TitleUpdate { .. } => "title_update",
         StreamEvent::OrgUpdate { .. } => "org_update",
-        StreamEvent::RouterText { .. } => "router_text",
-        StreamEvent::RouterToolUse { .. } => "router_tool_use",
-        StreamEvent::RouterToolResult { .. } => "router_tool_result",
         StreamEvent::RouterResult { .. } => "router_result",
     }
 }

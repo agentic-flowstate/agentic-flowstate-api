@@ -1,18 +1,20 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{StatusCode, HeaderMap},
-    Json,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
+use ticketing_system::work_ticket::EnsureWorkTicketRequest;
 use tracing::{error, info};
 
 use crate::{
-    models::{CreateTicketHttpBody, UpdateTicketRequest},
     mcp_wrapper::call_mcp_tool,
+    models::{CreateTicketHttpBody, UpdateTicketRequest},
+    observability::streaming::{record_ticket_preflight, record_ticket_preflight_error},
 };
 
 use super::get_organization;
@@ -25,6 +27,35 @@ pub struct TicketQuery {
 #[derive(Debug, Deserialize)]
 pub struct AllTicketsQuery {
     pub assignee: Option<String>,
+}
+
+pub async fn ensure_work_ticket(
+    State(pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
+    Json(mut request): Json<EnsureWorkTicketRequest>,
+) -> Response {
+    let header_org = get_organization(&headers);
+    if request.organization.is_none() && !header_org.is_empty() {
+        request.organization = Some(header_org);
+    }
+
+    let started = Instant::now();
+    match ticketing_system::work_ticket::ensure_work_ticket(&pool, request).await {
+        Ok(response) => {
+            record_ticket_preflight(&response.status, &response.action, response.elapsed_ms);
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => {
+            let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            record_ticket_preflight_error("failed", duration_ms);
+            error!("Failed to ensure work ticket: {:?}", e);
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Failed to ensure work ticket: {}", e) })),
+            )
+                .into_response()
+        }
+    }
 }
 
 // List all tickets for an organization, optionally filtered by assignee
@@ -42,7 +73,11 @@ pub async fn list_all_tickets(
             Ok(result) => (StatusCode::OK, Json(result)).into_response(),
             Err(e) => {
                 error!("Failed to list tickets by assignee: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to list tickets" }))).into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Failed to list tickets" })),
+                )
+                    .into_response()
             }
         }
     } else {
@@ -51,7 +86,11 @@ pub async fn list_all_tickets(
             Ok(tickets) => (StatusCode::OK, Json(tickets)).into_response(),
             Err(e) => {
                 error!("Failed to list all tickets: {:?}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to list tickets" }))).into_response()
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Failed to list tickets" })),
+                )
+                    .into_response()
             }
         }
     }
@@ -76,15 +115,14 @@ pub async fn list_tickets(
     };
 
     match call_mcp_tool("list_tickets", Some(args)).await {
-        Ok(result) => {
-            (StatusCode::OK, Json(result)).into_response()
-        }
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => {
             error!("Failed to list tickets: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to list tickets: {}", e) }))
-            ).into_response()
+                Json(json!({ "error": format!("Failed to list tickets: {}", e) })),
+            )
+                .into_response()
         }
     }
 }
@@ -99,8 +137,11 @@ pub async fn list_slice_tickets(
         State(pool),
         headers,
         Path(epic_id),
-        Query(TicketQuery { slice_id: Some(slice_id) })
-    ).await
+        Query(TicketQuery {
+            slice_id: Some(slice_id),
+        }),
+    )
+    .await
 }
 
 // Get ticket with full path (epic_id, slice_id, ticket_id)
@@ -118,21 +159,21 @@ pub async fn get_ticket_nested(
     });
 
     match call_mcp_tool("get_ticket", Some(args)).await {
-        Ok(result) => {
-            (StatusCode::OK, Json(result)).into_response()
-        }
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => {
             error!("Failed to get ticket: {:?}", e);
             if e.to_string().contains("not found") {
                 (
                     StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "Ticket not found" }))
-                ).into_response()
+                    Json(json!({ "error": "Ticket not found" })),
+                )
+                    .into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to get ticket: {}", e) }))
-                ).into_response()
+                    Json(json!({ "error": format!("Failed to get ticket: {}", e) })),
+                )
+                    .into_response()
             }
         }
     }
@@ -145,7 +186,14 @@ pub async fn create_ticket(
     Json(request): Json<CreateTicketHttpBody>,
 ) -> Response {
     let organization = get_organization(&headers);
-    let ref_handle = format!("api-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+    let ref_handle = format!(
+        "api-{}",
+        uuid::Uuid::new_v4()
+            .to_string()
+            .split('-')
+            .next()
+            .unwrap_or("0")
+    );
     let args = json!({
         "organization": organization,
         "epic_id": epic_id,
@@ -160,7 +208,8 @@ pub async fn create_ticket(
     match call_mcp_tool("create_slice_tickets", Some(args)).await {
         Ok(result) => {
             // Extract first ticket from batch result for single-item response
-            let ticket = result.get("tickets")
+            let ticket = result
+                .get("tickets")
                 .and_then(|t| t.get(0))
                 .and_then(|t| t.get("ticket"))
                 .cloned()
@@ -172,8 +221,9 @@ pub async fn create_ticket(
             error!("Failed to create ticket: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to create ticket: {}", e) }))
-            ).into_response()
+                Json(json!({ "error": format!("Failed to create ticket: {}", e) })),
+            )
+                .into_response()
         }
     }
 }
@@ -206,8 +256,9 @@ pub async fn update_ticket_nested(
                 error!("Failed to update ticket: {:?}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to update ticket: {}", e) }))
-                ).into_response()
+                    Json(json!({ "error": format!("Failed to update ticket: {}", e) })),
+                )
+                    .into_response()
             }
         }
     } else if request.notes.is_some() {
@@ -228,15 +279,17 @@ pub async fn update_ticket_nested(
                 error!("Failed to update ticket: {:?}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to update ticket: {}", e) }))
-                ).into_response()
+                    Json(json!({ "error": format!("Failed to update ticket: {}", e) })),
+                )
+                    .into_response()
             }
         }
     } else {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "No fields to update" }))
-        ).into_response()
+            Json(json!({ "error": "No fields to update" })),
+        )
+            .into_response()
     }
 }
 
@@ -264,13 +317,15 @@ pub async fn delete_ticket_nested(
             if e.to_string().contains("not found") {
                 (
                     StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "Ticket not found" }))
-                ).into_response()
+                    Json(json!({ "error": "Ticket not found" })),
+                )
+                    .into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to delete ticket: {}", e) }))
-                ).into_response()
+                    Json(json!({ "error": format!("Failed to delete ticket: {}", e) })),
+                )
+                    .into_response()
             }
         }
     }
@@ -302,8 +357,9 @@ pub async fn add_relationship_nested(
             error!("Failed to add relationship: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to add relationship: {}", e) }))
-            ).into_response()
+                Json(json!({ "error": format!("Failed to add relationship: {}", e) })),
+            )
+                .into_response()
         }
     }
 }
@@ -334,8 +390,9 @@ pub async fn remove_relationship_nested(
             error!("Failed to remove relationship: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to remove relationship: {}", e) }))
-            ).into_response()
+                Json(json!({ "error": format!("Failed to remove relationship: {}", e) })),
+            )
+                .into_response()
         }
     }
 }
@@ -351,21 +408,21 @@ pub async fn get_ticket_by_id(
     });
 
     match call_mcp_tool("get_ticket", Some(args)).await {
-        Ok(result) => {
-            (StatusCode::OK, Json(result)).into_response()
-        }
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => {
             error!("Failed to get ticket by id: {:?}", e);
             if e.to_string().contains("not found") {
                 (
                     StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "Ticket not found" }))
-                ).into_response()
+                    Json(json!({ "error": "Ticket not found" })),
+                )
+                    .into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to get ticket: {}", e) }))
-                ).into_response()
+                    Json(json!({ "error": format!("Failed to get ticket: {}", e) })),
+                )
+                    .into_response()
             }
         }
     }
@@ -386,7 +443,9 @@ pub async fn update_ticket_guidance(
         &pool,
         &ticket_id,
         request.guidance.as_deref(),
-    ).await {
+    )
+    .await
+    {
         Ok(()) => {
             // Fetch and return the updated ticket
             match ticketing_system::tickets::get_ticket_by_id(&pool, &ticket_id).await {
@@ -394,18 +453,18 @@ pub async fn update_ticket_guidance(
                     info!("Updated ticket guidance for: {}", ticket_id);
                     (StatusCode::OK, Json(ticket)).into_response()
                 }
-                Ok(None) => {
-                    (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({ "error": "Ticket not found" }))
-                    ).into_response()
-                }
+                Ok(None) => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "Ticket not found" })),
+                )
+                    .into_response(),
                 Err(e) => {
                     error!("Failed to fetch updated ticket: {:?}", e);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": format!("Failed to fetch ticket: {}", e) }))
-                    ).into_response()
+                        Json(json!({ "error": format!("Failed to fetch ticket: {}", e) })),
+                    )
+                        .into_response()
                 }
             }
         }
@@ -414,13 +473,15 @@ pub async fn update_ticket_guidance(
             if e.to_string().contains("not found") {
                 (
                     StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "Ticket not found" }))
-                ).into_response()
+                    Json(json!({ "error": "Ticket not found" })),
+                )
+                    .into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to update guidance: {}", e) }))
-                ).into_response()
+                    Json(json!({ "error": format!("Failed to update guidance: {}", e) })),
+                )
+                    .into_response()
             }
         }
     }

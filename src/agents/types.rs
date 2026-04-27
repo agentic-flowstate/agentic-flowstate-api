@@ -86,8 +86,6 @@ pub enum AgentType {
     FullAccess,
     /// Scoped workspace manager — restricted tool set for external users (no home/daily plan/focus/code)
     ScopedWorkspace,
-    /// Pre-processing router — matches user messages to tickets before the main agent runs
-    TicketRouter,
 }
 
 impl AgentType {
@@ -112,7 +110,6 @@ impl AgentType {
             AgentType::MeetingAgent => "meeting-agent",
             AgentType::FullAccess => "full-access",
             AgentType::ScopedWorkspace => "scoped-workspace",
-            AgentType::TicketRouter => "ticket-router",
         }
     }
 

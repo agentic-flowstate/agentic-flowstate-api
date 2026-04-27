@@ -52,21 +52,7 @@ pub enum StreamEvent {
     TitleUpdate { title: String },
     /// Auto-detected organization for the conversation (sent after first message)
     OrgUpdate { organization: String },
-    /// Text content from the router agent (reasoning, search output)
-    RouterText { content: String },
-    /// Tool use by the router agent
-    RouterToolUse {
-        id: String,
-        name: String,
-        input: serde_json::Value,
-    },
-    /// Tool result for the router agent
-    RouterToolResult {
-        tool_use_id: String,
-        content: String,
-        is_error: bool,
-    },
-    /// Final router decision: enriched message + ticket info
+    /// Final deterministic ticket-preflight decision.
     RouterResult {
         enriched_message: String,
         ticket_id: Option<String>,
