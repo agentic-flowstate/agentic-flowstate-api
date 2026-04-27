@@ -2782,6 +2782,7 @@ dependencies = [
  "dirs",
  "futures",
  "futures-util",
+ "jsonwebtoken",
  "libc",
  "md5",
  "once_cell",
