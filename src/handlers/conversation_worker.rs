@@ -555,6 +555,8 @@ impl ConversationWorker {
                 return;
             }
         };
+        self.encoder
+            .set_pending_message_id(assistant_message_id.clone());
 
         // Bridge the gap between router completion and main agent streaming.
         // Without this, the UI shows no activity during client creation + connection.
@@ -2374,6 +2376,7 @@ mod streaming_persistence_tests {
         events: &[StreamEvent],
     ) -> (Vec<String>, Vec<serde_json::Value>) {
         let mut encoder = AnthropicEventEncoder::new(conversation_id);
+        encoder.set_pending_message_id("assistant-test-message");
         for ev in events {
             for ae in encoder.encode(ev) {
                 let ae_type = ae.event_type();
@@ -2460,6 +2463,7 @@ mod streaming_persistence_tests {
             ]
         );
         assert_payload_type_matches_column(&types, &values);
+        assert_eq!(values[0]["message"]["id"], "assistant-test-message");
 
         // Sanity: the text delta actually carries the text payload.
         let delta = &values[2];

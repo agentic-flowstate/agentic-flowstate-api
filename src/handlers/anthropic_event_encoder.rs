@@ -80,18 +80,17 @@ pub struct AnthropicEventEncoder {
     /// Index of the currently-open block — only meaningful when
     /// `open_kind != None`.
     current_block_index: u32,
-    /// Per-conversation monotonic message counter, used to fabricate a
-    /// stable `message_id` when cc-sdk doesn't give us one. Format
-    /// `msg_<conv_short>_<n>`.
-    message_counter: u32,
-    /// Short prefix of the conversation id, cached for message_id
-    /// construction.
-    conv_short: String,
     /// The `message_id` attached to the most recent `message_start`.
     /// Retained across `message_stop` so callers that observe the stop
     /// frame (e.g. the silent-push fan-out) can tag it. Cleared only
     /// when the next `message_start` overwrites it.
     current_message_id: Option<String>,
+    /// Canonical `conversation_messages.id` to attach to the next
+    /// `message_start`. The worker must stage this after it creates the
+    /// assistant placeholder row and before any content can open the
+    /// stream. Keeping the SSE id equal to the DB id is load-bearing for
+    /// iOS checkpoint rehydration and GRDB reconciliation.
+    pending_message_id: Option<String>,
     /// Pending `client_id` (the client-supplied `Idempotency-Key` from
     /// T-A819D36B) to stamp onto the next `message_start` stub this
     /// encoder emits. Consumed on `open_message_if_needed`. The
@@ -103,18 +102,25 @@ pub struct AnthropicEventEncoder {
 }
 
 impl AnthropicEventEncoder {
-    pub fn new(conversation_id: &str) -> Self {
-        let conv_short = conversation_id.chars().take(8).collect::<String>();
+    pub fn new(_conversation_id: &str) -> Self {
         Self {
             message_open: false,
             next_block_index: 0,
             open_kind: OpenBlock::None,
             current_block_index: 0,
-            message_counter: 0,
-            conv_short,
             current_message_id: None,
+            pending_message_id: None,
             pending_client_id: None,
         }
+    }
+
+    /// Stage the canonical assistant `conversation_messages.id` that must
+    /// appear on the next `message_start` frame. This is intentionally
+    /// required: emitting a synthetic stream id creates a second assistant
+    /// identity on iOS when `/messages` and `/checkpoint.recent_events`
+    /// are merged during an active reconnect.
+    pub fn set_pending_message_id(&mut self, message_id: impl Into<String>) {
+        self.pending_message_id = Some(message_id.into());
     }
 
     /// Stage the `client_id` (Idempotency-Key) that should be echoed on
@@ -175,8 +181,10 @@ impl AnthropicEventEncoder {
 
     fn open_message_if_needed(&mut self, out: &mut Vec<AnthropicEvent>) {
         if !self.message_open {
-            self.message_counter += 1;
-            let id = format!("msg_{}_{}", self.conv_short, self.message_counter);
+            let id = self
+                .pending_message_id
+                .take()
+                .expect("pending assistant message id must be staged before message_start");
             self.current_message_id = Some(id.clone());
             // Consume the pending Idempotency-Key (T-A819D36B). `.take()`
             // leaves `None` behind so a second message within the same
@@ -434,9 +442,15 @@ mod tests {
         events.iter().map(|e| e.event_type()).collect()
     }
 
+    fn encoder_with_message_id(message_id: &str) -> AnthropicEventEncoder {
+        let mut tx = AnthropicEventEncoder::new("conv-test");
+        tx.set_pending_message_id(message_id.to_string());
+        tx
+    }
+
     #[test]
     fn text_only_turn_produces_canonical_sequence() {
-        let mut tx = AnthropicEventEncoder::new("conv-abcdef1234");
+        let mut tx = encoder_with_message_id("asst-text");
         let mut all = Vec::new();
         all.extend(tx.encode(&StreamEvent::Text {
             content: "Hello".into(),
@@ -466,7 +480,7 @@ mod tests {
 
     #[test]
     fn tool_use_turn_produces_input_json_delta() {
-        let mut tx = AnthropicEventEncoder::new("conv-abcd1234");
+        let mut tx = encoder_with_message_id("asst-tool");
         let mut all = Vec::new();
         all.extend(tx.encode(&StreamEvent::ToolUse {
             id: "toolu_1".into(),
@@ -508,7 +522,7 @@ mod tests {
 
     #[test]
     fn thinking_block_uses_thinking_delta() {
-        let mut tx = AnthropicEventEncoder::new("conv-9999");
+        let mut tx = encoder_with_message_id("asst-thinking");
         let all: Vec<_> = [
             StreamEvent::Thinking {
                 content: "Let me see...".into(),
@@ -583,7 +597,7 @@ mod tests {
 
     #[test]
     fn failed_status_produces_error_and_message_stop() {
-        let mut tx = AnthropicEventEncoder::new("c");
+        let mut tx = encoder_with_message_id("asst-failed");
         // Open a text block first
         let _ = tx.encode(&StreamEvent::Text {
             content: "hi".into(),
@@ -599,13 +613,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn message_start_uses_pending_message_id() {
+        let mut tx = encoder_with_message_id("assistant-db-id");
+        let all: Vec<_> = tx.encode(&StreamEvent::Text {
+            content: "hi".into(),
+        });
+        let ms = &all[0];
+        assert_eq!(ms.event_type(), "message_start");
+        let v = serde_json::to_value(ms).unwrap();
+        assert_eq!(v["message"]["id"], "assistant-db-id");
+    }
+
     /// T-A819D36B: the Idempotency-Key staged via
     /// `set_pending_client_id` must appear on the `message_start` frame's
     /// `client_id` field, which serializes as snake_case `client_id` in
     /// the wire JSON (iOS's `MessageEchoService` decodes this exact key).
     #[test]
     fn message_start_echoes_pending_client_id() {
-        let mut tx = AnthropicEventEncoder::new("conv-idempo");
+        let mut tx = encoder_with_message_id("asst-idempo");
         tx.set_pending_client_id(Some("test-abc-123".to_string()));
         let all: Vec<_> = tx.encode(&StreamEvent::Text {
             content: "hi".into(),
@@ -624,7 +650,7 @@ mod tests {
     /// documents is "absent".
     #[test]
     fn message_start_omits_client_id_when_none() {
-        let mut tx = AnthropicEventEncoder::new("conv-no-idempo");
+        let mut tx = encoder_with_message_id("asst-no-idempo");
         // No call to set_pending_client_id — default is None.
         let all: Vec<_> = tx.encode(&StreamEvent::Text {
             content: "hi".into(),
@@ -647,7 +673,7 @@ mod tests {
     /// NOT echo the first turn's key.
     #[test]
     fn pending_client_id_is_consumed_once() {
-        let mut tx = AnthropicEventEncoder::new("conv-once");
+        let mut tx = encoder_with_message_id("asst-once-1");
         tx.set_pending_client_id(Some("key-1".to_string()));
 
         let turn1: Vec<_> = [
@@ -664,8 +690,8 @@ mod tests {
         .flat_map(|e| tx.encode(e))
         .collect();
         // The `Result` event already closes the message via on_result;
-        // no explicit reset needed — a subsequent Text on the same
-        // encoder opens a fresh message_start.
+        // the worker stages a fresh assistant row id before the next turn.
+        tx.set_pending_message_id("asst-once-2");
 
         // Second turn — NO set_pending_client_id, so client_id must be absent.
         let turn2: Vec<_> = tx.encode(&StreamEvent::Text {
@@ -685,7 +711,7 @@ mod tests {
 
     #[test]
     fn tool_use_after_text_closes_text_block() {
-        let mut tx = AnthropicEventEncoder::new("c");
+        let mut tx = encoder_with_message_id("asst-mixed");
         let all: Vec<_> = [
             StreamEvent::Text {
                 content: "I'll search.".into(),
