@@ -80,6 +80,81 @@ impl FromRef<AppState> for Arc<rate_limiting::StreamRateLimiter> {
     }
 }
 
+fn spawn_direct_restart_or_setup(service: &str, action: &str) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
+    let log = "/tmp/agentic-restart-watcher.log";
+    let script = if action == "setup" {
+        format!(
+            r#"exec > '{log}' 2>&1
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: setup started"
+exec bash -l '{home}/projects/agentic-flowstate/agentic-flowstate-setup/setup.sh'
+"#,
+            home = home,
+            log = log
+        )
+    } else {
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "501".to_string());
+        let mut commands = Vec::new();
+        if matches!(service, "api-server" | "all") {
+            commands.push(format!(
+                "launchctl kickstart -k gui/{}/com.agentic.api 2>&1 || true",
+                uid
+            ));
+        }
+        if matches!(service, "frontend" | "all") {
+            commands.push(format!(
+                "launchctl kickstart -k gui/{}/com.agentic.frontend 2>&1 || true",
+                uid
+            ));
+        }
+        if matches!(service, "mcp-server" | "all") {
+            commands.push(format!(
+                "launchctl kickstart -k gui/{}/com.agentic.mcp 2>&1 || true",
+                uid
+            ));
+        }
+
+        if commands.is_empty() {
+            tracing::error!(
+                "[RESTART_WATCHER] Refusing direct restart for unknown service '{}'",
+                service
+            );
+            return;
+        }
+
+        format!(
+            r#"exec > '{log}' 2>&1
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: direct restart started for {service}"
+{commands}
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: direct restart complete"
+"#,
+            log = log,
+            service = service,
+            commands = commands.join("\n")
+        )
+    };
+
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("bash");
+    cmd.args(["-c", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    if let Err(e) = cmd.spawn() {
+        tracing::error!("[RESTART_WATCHER] Failed to spawn direct restart: {}", e);
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -462,64 +537,26 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
 
-                // All agents finished — write pending_restart.json flag file.
-                // The iOS app polls for this and shows the approval UI.
-                // We do NOT restart directly — the user must approve first.
                 tracing::info!(
-                    "[RESTART_WATCHER] Agents finished. Writing pending_restart.json for deferred {} of '{}' (requested by {:?})",
+                    "[RESTART_WATCHER] Agents finished. Executing deferred {} of '{}' directly (requested by {:?})",
                     pending.action, pending.service, pending.requested_by
                 );
 
-                // Mark as executed in the DB queue
                 let _ =
                     ticketing_system::restart_queue::mark_executed(&restart_pool, pending.id).await;
 
-                // Log to system_logs
                 system_log_helper::log_info(
                     &restart_pool,
                     "restart_watcher",
                     &format!(
-                        "Agents finished — queuing {} for '{}' for user approval",
+                        "Agents finished — executing {} for '{}' directly",
                         pending.action, pending.service
                     ),
                     None,
                 )
                 .await;
 
-                // Write the flag file for the iOS app to detect
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
-                let data_dir = format!("{}/.agentic-flowstate", home);
-                let _ = std::fs::create_dir_all(&data_dir);
-                let pending_path = format!("{}/pending_restart.json", data_dir);
-
-                let restart_type = if pending.action == "setup" {
-                    "setup"
-                } else {
-                    "restart"
-                };
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                let flag = serde_json::json!({
-                    "type": restart_type,
-                    "service": pending.service,
-                    "requested_at": ts,
-                    "requested_by": pending.requested_by
-                });
-
-                if let Err(e) = std::fs::write(
-                    &pending_path,
-                    serde_json::to_string_pretty(&flag).unwrap_or_default(),
-                ) {
-                    tracing::error!(
-                        "[RESTART_WATCHER] Failed to write pending_restart.json: {}",
-                        e
-                    );
-                } else {
-                    tracing::info!("[RESTART_WATCHER] pending_restart.json written — waiting for user approval via iOS app");
-                }
+                spawn_direct_restart_or_setup(&pending.service, &pending.action);
 
                 break;
             }
