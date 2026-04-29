@@ -1,24 +1,21 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use cc_sdk::{
-    ClaudeCodeOptions, ClaudeSDKClient, ContentBlock, McpServerConfig, Message, PermissionMode,
-    ToolsConfig,
-};
-use futures::StreamExt;
+use anyhow::Result;
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use sqlx::SqlitePool;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::anthropic_event_encoder::AnthropicEventEncoder;
-use super::chat_client_manager::{ChatClient, ChatClientManager};
+use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::{
-    get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData, ChatRuntime,
+    get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData,
 };
-use crate::agents::codex_exec::{
-    spawn_codex_exec, CodexExecEvent, CodexExecOptions, CodexSandboxMode, CodexToolProfile,
+use crate::agents::codex_app_server::{
+    spawn_codex_app_server, CodexAppServerEvent, CodexAppServerOptions, CodexSandboxMode,
+    CodexToolProfile,
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
@@ -135,10 +132,10 @@ pub struct ConversationWorker {
     last_router_ticket_id: Option<String>,
     /// Cached organization from the last successful router match (from DB).
     last_router_organization: Option<String>,
-    /// Stateful encoder from internal `StreamEvent` → Anthropic events.
+    /// Stateful encoder from internal `StreamEvent` to chat-stream events.
     /// Maintains message / content-block lifecycle across emit_event calls.
     /// One encoder instance per worker — it survives the entire
-    /// conversation and is reset between turns by cc-sdk's `Result` event.
+    /// conversation and is reset between turns by the runtime result event.
     encoder: AnthropicEventEncoder,
     /// User id for the turn currently being processed. Populated at the
     /// top of `process_message` from the inbound `WorkerMessage.user_id`
@@ -247,30 +244,13 @@ impl ConversationWorker {
         tracing::info!("[WORKER] Ended for conversation {}", self.conversation_id);
     }
 
-    /// Save session_id from the current client and remove it from the manager.
+    /// Codex app-server turns are per-turn subprocesses. Durable session ids
+    /// are written when a turn completes, so idle shutdown has no client state
+    /// to persist.
     async fn save_session_and_disconnect(&self) {
-        if let Some(client_arc) = self.manager.get(&self.conversation_id).await {
-            let client = client_arc.lock().await;
-            if let Some(ref session_id) = client.session_id {
-                tracing::info!(
-                    "[WORKER] Saving session_id {} before disconnect",
-                    session_id
-                );
-                let _ = conversations::update_conversation(
-                    &self.db,
-                    "", // user_id not needed for session_id update (WHERE already has id)
-                    &self.conversation_id,
-                    UpdateConversationRequest {
-                        title: None,
-                        session_id: Some(session_id.clone()),
-                        organization: None,
-                    },
-                )
-                .await;
-            }
-            drop(client);
-        }
-        self.manager.remove(&self.conversation_id).await;
+        self.manager
+            .remove_app_server_turn(&self.conversation_id)
+            .await;
     }
 
     async fn consume_cancelled_turn_before_agent_start(&mut self, stage: &str) -> bool {
@@ -390,7 +370,7 @@ impl ConversationWorker {
             }
         }
 
-        // Build enhanced message for SDK (with image paths for Claude to read)
+        // Build enhanced message for SDK (with image paths for the active runtime to read)
         let enhanced_message = if !image_paths.is_empty() {
             let paths_list = image_paths
                 .iter()
@@ -573,531 +553,8 @@ impl ConversationWorker {
             return;
         }
 
-        if msg.config.runtime == ChatRuntime::CodexExec {
-            self.process_codex_message(&msg, &final_message, assistant_message_id.clone())
-                .await;
-            return;
-        }
-
-        // Get or create SDK client
-        let client_arc = match self.get_or_create_client(&msg.config).await {
-            Ok(arc) => arc,
-            Err(e) => {
-                tracing::error!(
-                    "[WORKER] Failed to get client for {}: {}",
-                    self.conversation_id,
-                    e
-                );
-                // Mark checkpoint as interrupted so the iOS app doesn't think the agent is still running.
-                // (upsert_checkpoint always writes status='running', so we use mark_interrupted instead.)
-                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
-                self.emit_event(&StreamEvent::Status {
-                    status: "failed".to_string(),
-                    message: Some(format!("Failed to start agent: {}", e)),
-                })
-                .await;
-                return;
-            }
-        };
-
-        if self
-            .consume_cancelled_turn_before_agent_start("after_client_connect")
-            .await
-        {
-            return;
-        }
-
-        // Send message to SDK and get response stream.
-        // The mutex is released after getting the stream so the cancel handler
-        // can acquire it to call interrupt().
-        let (mut response_stream, resume_session_id) = {
-            let mut client = client_arc.lock().await;
-            client.last_used = Instant::now();
-
-            // Capture the session_id we're trying to resume from (if any)
-            let resume_sid = client.session_id.clone();
-
-            if let Err(e) = client.sdk_client.send_user_message(final_message).await {
-                tracing::error!("[WORKER] Failed to send message: {}", e);
-                self.emit_event(&StreamEvent::Status {
-                    status: "failed".to_string(),
-                    message: Some(format!("Failed to send: {}", e)),
-                })
-                .await;
-                return;
-            }
-
-            (client.sdk_client.receive_messages().await, resume_sid)
-            // MutexGuard dropped here — allows cancel handler to call interrupt()
-        };
-        let mut accumulated_text = String::new();
-        let mut result_session_id: Option<String> = None;
-        let mut last_flush = Instant::now();
-        let flush_interval = Duration::from_millis(DB_FLUSH_INTERVAL_MS);
-        let mut tool_call_count: i32 = 0;
-        let mut message_count = 0u32;
-        let mut content_blocks: Vec<ContentBlockDesc> = Vec::new();
-        let mut blocks_dirty = false;
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
-        heartbeat.tick().await; // consume immediate first tick
-        let mut last_message_time = Instant::now();
-        // WORKAROUND for cc-sdk 0.6.0: parse_user_message drops User messages with array
-        // content (i.e., all tool_result messages from Claude CLI), so ContentBlock::ToolResult
-        // never reaches us via the SDK stream. We synthesize completion events by tracking
-        // in-flight tool_use IDs and flushing them when the next Assistant message arrives
-        // (Claude CLI runs tools synchronously between messages, so by the next Assistant
-        // message the tool is definitely done) or on Result. Without this the client never
-        // receives toolUseEnd, so the interrupt sweep in ChatLabViewModel marks tool cards
-        // as `⚠︎ interrupted` and the UI shows them in the error state.
-        let mut pending_tool_ids: Vec<String> = Vec::new();
-
-        loop {
-            tokio::select! {
-                msg_opt = response_stream.next() => {
-                    match msg_opt {
-                        Some(Ok(sdk_msg)) => {
-                            message_count += 1;
-                            last_message_time = Instant::now();
-
-                            if let Message::Assistant { message: assistant_msg } = &sdk_msg {
-                                // Before processing this assistant turn's blocks, flush any
-                                // tool_uses from the PREVIOUS assistant turn as synthetic
-                                // ToolResults — they're guaranteed to have completed because
-                                // Claude CLI runs tools synchronously between Assistant
-                                // messages but cc-sdk drops the intervening tool_result User
-                                // message (see note at loop init).
-                                if !pending_tool_ids.is_empty() {
-                                    for tool_id in pending_tool_ids.drain(..) {
-                                        tracing::debug!(
-                                            "[WORKER] Synthesizing ToolResult for pending tool_use_id={} (cc-sdk dropped the actual result message)",
-                                            tool_id
-                                        );
-                                        if let Err(e) = conversations::update_tool_call_result(
-                                            &self.db,
-                                            &tool_id,
-                                            "",
-                                            false,
-                                        ).await {
-                                            tracing::error!("[WORKER] Failed to update synth tool result: {}", e);
-                                        }
-                                        self.emit_event(&StreamEvent::ToolResult {
-                                            tool_use_id: tool_id,
-                                            content: String::new(),
-                                            is_error: false,
-                                        }).await;
-                                    }
-                                }
-
-                                for block in &assistant_msg.content {
-                                    match block {
-                                        ContentBlock::Text(text_content) => {
-                                            accumulated_text.push_str(&text_content.text);
-                                            match content_blocks.last_mut() {
-                                                Some(ContentBlockDesc::Text { text }) => {
-                                                    text.push_str(&text_content.text);
-                                                }
-                                                _ => {
-                                                    content_blocks.push(ContentBlockDesc::Text {
-                                                        text: text_content.text.clone(),
-                                                    });
-                                                    blocks_dirty = true;
-                                                }
-                                            }
-                                            self.emit_event(&StreamEvent::Text {
-                                                content: text_content.text.clone(),
-                                            }).await;
-                                        }
-                                        ContentBlock::ToolUse(tool_use) => {
-                                            tool_call_count += 1;
-                                            let scoped_tool_id =
-                                                scoped_tool_call_id(&assistant_message_id, &tool_use.id);
-                                            tracing::info!(
-                                                "[WORKER] Tool use #{}: {} ({})",
-                                                tool_call_count,
-                                                tool_use.name,
-                                                scoped_tool_id
-                                            );
-                                            blocks_dirty |= append_tool_group_id(
-                                                &mut content_blocks,
-                                                scoped_tool_id.clone(),
-                                            );
-
-                                            let now = chrono::Utc::now().timestamp();
-                                            if let Err(e) = conversations::insert_tool_call(
-                                                &self.db,
-                                                &scoped_tool_id,
-                                                &assistant_message_id,
-                                                &self.conversation_id,
-                                                &tool_use.name,
-                                                Some(&tool_use.input),
-                                                now,
-                                            ).await {
-                                                tracing::error!("[WORKER] Failed to insert tool call: {}", e);
-                                            }
-
-                                            self.emit_event(&StreamEvent::ToolUse {
-                                                id: scoped_tool_id.clone(),
-                                                name: tool_use.name.clone(),
-                                                input: tool_use.input.clone(),
-                                            }).await;
-                                            // Track for synthetic ToolResult on next Assistant / Result
-                                            pending_tool_ids.push(scoped_tool_id);
-                                        }
-                                        ContentBlock::ToolResult(tool_result) => {
-                                            let scoped_tool_id = scoped_tool_call_id(
-                                                &assistant_message_id,
-                                                &tool_result.tool_use_id,
-                                            );
-                                            let content = match &tool_result.content {
-                                                Some(cc_sdk::ContentValue::Text(s)) => s.clone(),
-                                                Some(cc_sdk::ContentValue::Structured(vals)) => {
-                                                    serde_json::to_string(vals).unwrap_or_default()
-                                                }
-                                                None => String::new(),
-                                            };
-
-                                            if let Err(e) = conversations::update_tool_call_result(
-                                                &self.db,
-                                                &scoped_tool_id,
-                                                &content,
-                                                tool_result.is_error.unwrap_or(false),
-                                            ).await {
-                                                tracing::error!("[WORKER] Failed to update tool call result: {}", e);
-                                            }
-
-                                            self.emit_event(&StreamEvent::ToolResult {
-                                                tool_use_id: scoped_tool_id.clone(),
-                                                content,
-                                                is_error: tool_result.is_error.unwrap_or(false),
-                                            }).await;
-                                            // Remove from pending so we don't synthesize a
-                                            // second event when cc-sdk eventually ships the fix.
-                                            pending_tool_ids.retain(|id| id != &scoped_tool_id);
-                                        }
-                                        ContentBlock::Thinking(thinking) => {
-                                            // T-FEB8E5F8: persist thinking alongside text + tool
-                                            // groups so the ordering survives a page reload. Coalesce
-                                            // consecutive thinking fragments into a single block so
-                                            // the DB doesn't grow a new JSON entry for every token.
-                                            match content_blocks.last_mut() {
-                                                Some(ContentBlockDesc::Thinking { text }) => {
-                                                    text.push_str(&thinking.thinking);
-                                                }
-                                                _ => {
-                                                    content_blocks.push(ContentBlockDesc::Thinking {
-                                                        text: thinking.thinking.clone(),
-                                                    });
-                                                    blocks_dirty = true;
-                                                }
-                                            }
-                                            self.emit_event(&StreamEvent::Thinking {
-                                                content: thinking.thinking.clone(),
-                                            }).await;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Periodically flush accumulated text to DB
-                            if last_flush.elapsed() >= flush_interval {
-                                flush_to_db(&self.db, &assistant_message_id, &accumulated_text).await;
-                                last_flush = Instant::now();
-                            }
-
-                            // Flush content blocks when structure changes
-                            if blocks_dirty {
-                                blocks_dirty = false;
-                                if !content_blocks.is_empty() {
-                                    let _ = conversations::update_message_blocks(
-                                        &self.db,
-                                        &assistant_message_id,
-                                        &content_blocks,
-                                    )
-                                    .await;
-                                }
-                            }
-
-                            // Check for result message
-                            if let Message::Result { session_id: sess_id, is_error, subtype, usage, .. } = &sdk_msg {
-                                tracing::info!("[WORKER] Result: subtype={}, is_error={}", subtype, is_error);
-
-                                // Flush any still-pending tool_uses as synthetic ToolResults.
-                                // On the is_error=true path these were likely killed by the
-                                // SDK/CLI and didn't actually finish; mark them as errors so
-                                // the UI shows the correct state.
-                                if !pending_tool_ids.is_empty() {
-                                    for tool_id in pending_tool_ids.drain(..) {
-                                        tracing::debug!(
-                                            "[WORKER] Synthesizing final ToolResult for tool_use_id={} at Result (is_error={})",
-                                            tool_id, is_error
-                                        );
-                                        if let Err(e) = conversations::update_tool_call_result(
-                                            &self.db,
-                                            &tool_id,
-                                            "",
-                                            *is_error,
-                                        ).await {
-                                            tracing::error!("[WORKER] Failed to update synth tool result at Result: {}", e);
-                                        }
-                                        self.emit_event(&StreamEvent::ToolResult {
-                                            tool_use_id: tool_id,
-                                            content: String::new(),
-                                            is_error: *is_error,
-                                        }).await;
-                                    }
-                                }
-
-                                // Track token usage
-                                if let Some(usage_json) = usage {
-                                    let input_tok = usage_json.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                                    let output_tok = usage_json.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                                    if input_tok > 0 || output_tok > 0 {
-                                        let db_ref = self.db.clone();
-                                        let conv_id = self.conversation_id.clone();
-                                        let uid = msg.user_id.clone();
-                                        tokio::spawn(async move {
-                                            if let Err(e) = token_usage::insert_token_usage(
-                                                &db_ref, "conversation", &conv_id,
-                                                Some(&uid), None, input_tok, output_tok,
-                                            ).await {
-                                                tracing::warn!("[WORKER] Failed to record token usage: {}", e);
-                                            }
-                                        });
-                                    }
-                                }
-
-                                // Detect silent --resume failure: if the Result session_id
-                                // differs from what we passed to --resume, the CLI silently
-                                // started a fresh session. DO NOT overwrite the original
-                                // session_id — it may still be resumable later.
-                                let resume_failed = if let Some(ref original_sid) = resume_session_id {
-                                    if sess_id != original_sid {
-                                        tracing::warn!(
-                                            "[WORKER] RESUME FAILURE DETECTED for {}: \
-                                            requested --resume {} but CLI returned session {}. \
-                                            Original session_id preserved — NOT overwriting.",
-                                            self.conversation_id, original_sid, sess_id
-                                        );
-                                        // Emit a visible status event so the user/app knows
-                                        // context was degraded. The conversation history was
-                                        // injected into the system prompt as a safety net.
-                                        self.emit_event(&StreamEvent::Status {
-                                            status: "resume_failed".to_string(),
-                                            message: Some(
-                                                "Session was interrupted and could not be fully restored. \
-                                                The agent is continuing with conversation history context."
-                                                .to_string()
-                                            ),
-                                        }).await;
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    false
-                                };
-
-                                result_session_id = Some(sess_id.clone());
-
-                                self.emit_event(&StreamEvent::Result {
-                                    session_id: sess_id.clone(),
-                                    status: subtype.clone(),
-                                    is_error: *is_error,
-                                }).await;
-
-                                // Only update the conversation's session_id if resume
-                                // succeeded (or this is a fresh conversation with no prior
-                                // session). When resume fails, preserving the original
-                                // session_id allows future resume attempts.
-                                if !resume_failed {
-                                    let _ = conversations::update_conversation(
-                                        &self.db,
-                                        &msg.user_id,
-                                        &self.conversation_id,
-                                        UpdateConversationRequest {
-                                            title: None,
-                                            session_id: Some(sess_id.clone()),
-                                            organization: None,
-                                        },
-                                    ).await;
-                                }
-
-                                if let Err(e) = checkpoints::upsert_checkpoint(&self.db, &self.conversation_id, sess_id, tool_call_count).await {
-                                    tracing::warn!("[WORKER] Failed to update checkpoint: {}", e);
-                                }
-                                if let Err(e) = checkpoints::mark_completed(&self.db, &self.conversation_id).await {
-                                    tracing::warn!("[WORKER] Failed to mark checkpoint completed: {}", e);
-                                }
-
-                                // Send push notification
-                                if let Some(apns) = crate::apns::ApnsService::global() {
-                                    tracing::info!("[WORKER] Sending push notification for user={}, conv={}", msg.user_id, self.conversation_id);
-                                    let push_db = (*self.db).clone();
-                                    let push_user = msg.user_id.clone();
-                                    let push_agent = msg.config.prompt_name.to_string();
-                                    let push_conv_id = self.conversation_id.clone();
-                                    let apns = apns.clone();
-                                    tokio::spawn(async move {
-                                        match apns.send_to_user(
-                                            &push_db,
-                                            &push_user,
-                                            "Agent finished",
-                                            &format!("{} has completed processing.", push_agent),
-                                            Some(&push_conv_id),
-                                            Some(&push_agent),
-                                        ).await {
-                                            Ok(()) => tracing::info!("[WORKER] Push notification sent for user={}", push_user),
-                                            Err(e) => tracing::warn!("[WORKER] Push notification failed for user={}: {}", push_user, e),
-                                        }
-                                    });
-                                } else {
-                                    tracing::warn!("[WORKER] APNs not initialized — skipping push notification");
-                                }
-
-                                break;
-                            }
-                        }
-                        Some(Err(e)) => {
-                            tracing::error!("[WORKER] Error receiving message #{}: {}", message_count, e);
-                            // Flush pending tool_uses as errored — we don't know if they
-                            // finished, but the stream is dying; better to mark them error
-                            // than leave the UI stuck in Running.
-                            for tool_id in pending_tool_ids.drain(..) {
-                                let _ = conversations::update_tool_call_result(&self.db, &tool_id, "", true).await;
-                                self.emit_event(&StreamEvent::ToolResult {
-                                    tool_use_id: tool_id,
-                                    content: String::new(),
-                                    is_error: true,
-                                }).await;
-                            }
-                            // Mark checkpoint as interrupted so it doesn't block restarts
-                            let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
-                            self.emit_event(&StreamEvent::Status {
-                                status: "failed".to_string(),
-                                message: Some(format!("Error: {}", e)),
-                            }).await;
-                            break;
-                        }
-                        None => {
-                            tracing::error!(
-                                "[WORKER] INCOMPLETE SESSION: Stream ended without Result \
-                                for conversation {} (session: {:?}). The session file will \
-                                have no result entry — future --resume may fail silently. \
-                                Tool calls processed: {}",
-                                self.conversation_id,
-                                resume_session_id,
-                                tool_call_count
-                            );
-                            // Flush pending tool_uses as errored on stream-ended-without-Result.
-                            for tool_id in pending_tool_ids.drain(..) {
-                                let _ = conversations::update_tool_call_result(&self.db, &tool_id, "", true).await;
-                                self.emit_event(&StreamEvent::ToolResult {
-                                    tool_use_id: tool_id,
-                                    content: String::new(),
-                                    is_error: true,
-                                }).await;
-                            }
-                            // Mark checkpoint as interrupted — stream ended unexpectedly
-                            let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
-                            // Emit visible status so the user knows the agent stopped
-                            self.emit_event(&StreamEvent::Status {
-                                status: "failed".to_string(),
-                                message: Some(
-                                    "Agent session ended unexpectedly. Your conversation history \
-                                    is preserved — send another message to continue."
-                                    .to_string()
-                                ),
-                            }).await;
-                            break;
-                        }
-                    }
-                }
-                _ = heartbeat.tick() => {
-                    self.emit_event(&StreamEvent::Status {
-                        status: "heartbeat".to_string(),
-                        message: None,
-                    }).await;
-                    // Touch checkpoint updated_at so staleness detection knows we're alive.
-                    // Without this, a long-running agent (e.g., 10-minute tool call) would
-                    // look stale and get auto-cleaned by the restart watcher.
-                    let _ = checkpoints::touch_checkpoint(&self.db, &self.conversation_id).await;
-
-                    // Watchdog: check if the subprocess is still alive.
-                    // If the SDK client is disconnected (subprocess died), there's no point
-                    // waiting for more messages — the stream will never produce them.
-                    let subprocess_alive = if let Some(client_arc) = self.manager.get(&self.conversation_id).await {
-                        let guard = client_arc.lock().await;
-                        guard.sdk_client.is_connected().await
-                    } else {
-                        false
-                    };
-
-                    if !subprocess_alive {
-                        tracing::error!(
-                            "[WORKER] WATCHDOG: Subprocess is no longer connected for {} \
-                            (last message {}s ago, tool_calls: {}). Breaking out of stream loop.",
-                            self.conversation_id,
-                            last_message_time.elapsed().as_secs(),
-                            tool_call_count
-                        );
-                        let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
-                        self.emit_event(&StreamEvent::Status {
-                            status: "failed".to_string(),
-                            message: Some(
-                                "Agent subprocess stopped unexpectedly. Your conversation history \
-                                is preserved — send another message to continue."
-                                .to_string()
-                            ),
-                        }).await;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Write session_id back to client (needed for resume on next message)
-        if let Some(ref sid) = result_session_id {
-            if let Some(client_arc) = self.manager.get(&self.conversation_id).await {
-                let mut client = client_arc.lock().await;
-                client.session_id = Some(sid.clone());
-            }
-        }
-
-        // Final flush of accumulated text to DB
-        flush_to_db(&self.db, &assistant_message_id, &accumulated_text).await;
-
-        // Store content block ordering
-        if !content_blocks.is_empty() {
-            if let Err(e) = conversations::update_message_blocks(
-                &self.db,
-                &assistant_message_id,
-                &content_blocks,
-            )
-            .await
-            {
-                tracing::error!("[WORKER] Failed to store content blocks: {}", e);
-            }
-        }
-
-        tracing::info!("[WORKER] Stream ended after {} messages", message_count);
-        if self
-            .manager
-            .consume_cancelled_turn(&self.conversation_id)
-            .await
-        {
-            let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
-            self.emit_event(&StreamEvent::Status {
-                status: "cancelled".to_string(),
-                message: Some("Cancelled by user".to_string()),
-            })
+        self.process_codex_message(&msg, &final_message, assistant_message_id.clone())
             .await;
-        } else {
-            self.emit_event(&StreamEvent::Status {
-                status: "completed".to_string(),
-                message: None,
-            })
-            .await;
-        }
     }
 
     /// Run deterministic ticket preflight before the main agent starts.
@@ -1322,7 +779,7 @@ impl ConversationWorker {
             return;
         }
 
-        let mut turn = match spawn_codex_exec(CodexExecOptions {
+        let mut turn = match spawn_codex_app_server(CodexAppServerOptions {
             model: msg.config.agent_type.model(),
             reasoning_effort: msg.config.agent_type.effort(),
             system_prompt: &system_prompt,
@@ -1360,7 +817,7 @@ impl ConversationWorker {
         };
 
         self.manager
-            .insert_codex_turn(self.conversation_id.clone(), turn.child())
+            .insert_app_server_turn(self.conversation_id.clone(), turn.child())
             .await;
 
         let mut accumulated_text = String::new();
@@ -1373,6 +830,7 @@ impl ConversationWorker {
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         let mut usage: Option<(i64, i64)> = None;
         let mut kill_requested = false;
+        let mut streamed_agent_message_items: HashSet<String> = HashSet::new();
         heartbeat.tick().await;
 
         // If Stop lands while Codex is still launching, the cancel endpoint can
@@ -1394,11 +852,36 @@ impl ConversationWorker {
             tokio::select! {
                 maybe_event = turn.events.recv() => {
                     match maybe_event {
-                        Some(CodexExecEvent::ThreadStarted { thread_id: tid }) => {
+                        Some(CodexAppServerEvent::ThreadStarted { thread_id: tid }) => {
                             thread_id = Some(tid);
                         }
-                        Some(CodexExecEvent::AgentMessage { text }) => {
+                        Some(CodexAppServerEvent::AgentMessageDelta { id, text }) => {
                             if text.is_empty() {
+                                continue;
+                            }
+                            streamed_agent_message_items.insert(id);
+
+                            accumulated_text.push_str(&text);
+
+                            match content_blocks.last_mut() {
+                                Some(ContentBlockDesc::Text { text: existing }) => {
+                                    existing.push_str(&text);
+                                }
+                                _ => {
+                                    content_blocks.push(ContentBlockDesc::Text {
+                                        text: text.clone(),
+                                    });
+                                    blocks_dirty = true;
+                                }
+                            }
+
+                            self.emit_event(&StreamEvent::Text {
+                                content: text,
+                            })
+                            .await;
+                        }
+                        Some(CodexAppServerEvent::AgentMessageCompleted { id, text }) => {
+                            if text.is_empty() || streamed_agent_message_items.contains(&id) {
                                 continue;
                             }
 
@@ -1426,7 +909,24 @@ impl ConversationWorker {
                             })
                             .await;
                         }
-                        Some(CodexExecEvent::ToolCallStarted { id, name, input }) => {
+                        Some(CodexAppServerEvent::ReasoningDelta { text }) => {
+                            if text.trim().is_empty() {
+                                continue;
+                            }
+                            match content_blocks.last_mut() {
+                                Some(ContentBlockDesc::Thinking { text: existing }) => {
+                                    existing.push_str(&text);
+                                }
+                                _ => {
+                                    content_blocks.push(ContentBlockDesc::Thinking {
+                                        text: text.clone(),
+                                    });
+                                    blocks_dirty = true;
+                                }
+                            }
+                            self.emit_event(&StreamEvent::Thinking { content: text }).await;
+                        }
+                        Some(CodexAppServerEvent::ToolCallStarted { id, name, input }) => {
                             tool_call_count += 1;
                             let scoped_tool_id = scoped_tool_call_id(&assistant_message_id, &id);
                             tracing::info!(
@@ -1461,7 +961,7 @@ impl ConversationWorker {
                             })
                                 .await;
                         }
-                        Some(CodexExecEvent::ToolCallCompleted {
+                        Some(CodexAppServerEvent::ToolCallCompleted {
                             id,
                             content,
                             is_error,
@@ -1484,7 +984,7 @@ impl ConversationWorker {
                             })
                             .await;
                         }
-                        Some(CodexExecEvent::TurnCompleted {
+                        Some(CodexAppServerEvent::TurnCompleted {
                             input_tokens,
                             output_tokens,
                         }) => {
@@ -1546,7 +1046,9 @@ impl ConversationWorker {
             }
         }
 
-        self.manager.remove_codex_turn(&self.conversation_id).await;
+        self.manager
+            .remove_app_server_turn(&self.conversation_id)
+            .await;
         let outcome = match turn.wait().await {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -1608,24 +1110,13 @@ impl ConversationWorker {
                     .clone()
                     .unwrap_or_else(|| self.conversation_id.clone()),
             }
-        } else if !outcome.exit_status.success() {
-            let stderr = outcome.stderr_text.trim();
-            if stderr.is_empty() {
-                CodexTurnCompletion::Failed(format!(
-                    "Codex exec failed with status {}",
-                    outcome.exit_status
-                ))
-            } else {
-                CodexTurnCompletion::Failed(format!(
-                    "Codex exec failed with status {}: {}",
-                    outcome.exit_status, stderr
-                ))
-            }
+        } else if !outcome.success() {
+            CodexTurnCompletion::Failed(outcome.failure_summary("Codex app-server"))
         } else if let Some(session_id) = thread_id.clone() {
             CodexTurnCompletion::Completed { session_id }
         } else {
             CodexTurnCompletion::Failed(
-                "Codex exec completed without returning a thread id".to_string(),
+                "Codex app-server completed without returning a thread id".to_string(),
             )
         };
 
@@ -1888,199 +1379,6 @@ impl ConversationWorker {
         }
     }
 
-    /// Get an existing connected client or create a new one.
-    async fn get_or_create_client(
-        &self,
-        config: &ChatConfig,
-    ) -> Result<Arc<tokio::sync::Mutex<ChatClient>>, String> {
-        // Try existing client
-        if let Some(existing) = self.manager.get(&self.conversation_id).await {
-            let guard = existing.lock().await;
-            if guard.sdk_client.is_connected().await {
-                drop(guard);
-                return Ok(existing);
-            }
-            drop(guard);
-            tracing::info!(
-                "[WORKER] Client for {} disconnected, will recreate",
-                self.conversation_id
-            );
-            self.manager.remove(&self.conversation_id).await;
-        }
-
-        // Create new client
-        create_client(&self.db, &self.conversation_id, config, &self.manager).await
-    }
-}
-
-async fn build_codex_system_prompt(
-    db: &SqlitePool,
-    conv_id: &str,
-    config: &ChatConfig,
-) -> Result<String, String> {
-    let base_prompt = load_prompt(config.prompt_name, config.prompt_vars.clone())
-        .map_err(|e| format!("Failed to load prompt: {}", e))?;
-
-    match load_recent_prompt_history(db, conv_id, "codex-prompt").await {
-        Ok(messages) if !messages.is_empty() => {
-            let history = build_codex_conversation_history(&messages);
-            Ok(format!("{}\n\n{}", base_prompt, history))
-        }
-        Ok(_) => Ok(base_prompt),
-        Err(e) => Err(e),
-    }
-}
-
-async fn load_recent_prompt_history(
-    db: &SqlitePool,
-    conv_id: &str,
-    source: &str,
-) -> Result<Vec<ConversationMessage>, String> {
-    let started = Instant::now();
-    let messages =
-        conversations::list_messages(db, conv_id, Some(PROMPT_HISTORY_MESSAGE_LIMIT as i64), None)
-            .await
-            .map_err(|e| format!("Failed to load conversation history: {}", e))?;
-
-    tracing::info!(
-        "[WORKER] Loaded {} prompt-history messages for {} via {} in {}ms",
-        messages.len(),
-        conv_id,
-        source,
-        started.elapsed().as_millis()
-    );
-
-    Ok(messages)
-}
-
-/// Create a new ClaudeSDKClient, optionally resuming from a saved session.
-pub(crate) async fn create_client(
-    db: &SqlitePool,
-    conv_id: &str,
-    config: &ChatConfig,
-    manager: &ChatClientManager,
-) -> Result<Arc<tokio::sync::Mutex<ChatClient>>, String> {
-    let system_prompt = load_prompt(config.prompt_name, config.prompt_vars.clone())
-        .map_err(|e| format!("Failed to load prompt: {}", e))?;
-
-    let tools_list: Vec<String> = config
-        .agent_type
-        .allowed_tools()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    let has_mcp_tools = tools_list.iter().any(|t| t.starts_with("mcp__"));
-    tracing::info!(
-        "[WORKER] Configuring {} tools for {}: {:?}",
-        tools_list.len(),
-        config.prompt_name,
-        tools_list
-    );
-
-    // Check if conversation has a saved session_id for resume
-    let saved_session_id = conversations::get_conversation(db, conv_id, false)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|c| c.session_id);
-
-    // Always inject conversation history as context when messages exist.
-    // For resumed sessions: safety net if --resume fails silently.
-    // For new sessions on existing conversations (e.g., nightly scheduler stubs):
-    // provides the only context the agent will have.
-    let system_prompt = match load_recent_prompt_history(db, conv_id, "claude-resume").await {
-        Ok(messages) if !messages.is_empty() => {
-            tracing::info!(
-                "[WORKER] Injecting {} messages as resume context for {}",
-                messages.len(),
-                conv_id
-            );
-            let history = build_conversation_history(&messages);
-            format!("{}\n\n{}", system_prompt, history)
-        }
-        _ => system_prompt,
-    };
-
-    let mut builder = ClaudeCodeOptions::builder()
-        .system_prompt(&system_prompt)
-        .model(config.agent_type.model())
-        .tools(ToolsConfig::list(tools_list.clone()))
-        .allowed_tools(tools_list)
-        .disallowed_tools(crate::safety::disallowed_tools())
-        .permission_mode(PermissionMode::BypassPermissions)
-        .cwd(&config.working_dir);
-
-    // Register MCP server so Claude CLI can resolve mcp__agentic-mcp__* tools
-    if has_mcp_tools {
-        let mcp_binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../agentic-flowstate-mcp/target/release/agentic_mcp");
-        let mcp_binary = mcp_binary.canonicalize().unwrap_or(mcp_binary);
-        tracing::info!("[WORKER] Registering MCP server: {}", mcp_binary.display());
-        builder = builder.add_mcp_server(
-            "agentic-mcp",
-            McpServerConfig::Stdio {
-                command: mcp_binary.to_string_lossy().to_string(),
-                args: None,
-                env: None,
-            },
-        );
-    }
-
-    // Increase channel buffer size to handle bursts of simultaneous Agent task
-    // results without backpressure. Default is 100, which was insufficient when
-    // 4+ Agent tasks completed at the same millisecond (see incident A-EB7EE722).
-    builder = builder.cli_channel_buffer_size(500);
-
-    // Enable adaptive thinking via --effort flag
-    builder = builder.add_extra_arg("effort", Some(config.agent_type.effort().to_string()));
-
-    if let Some(ref sid) = saved_session_id {
-        tracing::info!(
-            "[WORKER] Resuming conversation {} from session {}",
-            conv_id,
-            sid
-        );
-        builder = builder.resume(sid.clone());
-    } else {
-        tracing::info!(
-            "[WORKER] Creating fresh client for conversation {}",
-            conv_id
-        );
-    }
-
-    let options = builder.build();
-    let mut sdk_client = ClaudeSDKClient::new(options);
-
-    tracing::info!(
-        "[WORKER] Connecting client for {} (30s timeout)...",
-        conv_id
-    );
-    match tokio::time::timeout(Duration::from_secs(30), sdk_client.connect(None)).await {
-        Ok(Ok(())) => {
-            tracing::info!("[WORKER] Client connected for {}", conv_id);
-        }
-        Ok(Err(e)) => {
-            tracing::error!("[WORKER] Client connect error for {}: {}", conv_id, e);
-            return Err(format!("Failed to connect: {}", e));
-        }
-        Err(_) => {
-            tracing::error!(
-                "[WORKER] Client connect timed out after 30s for {}",
-                conv_id
-            );
-            drop(sdk_client);
-            return Err("Connection timed out — the agent failed to start within 30 seconds. Please try again.".to_string());
-        }
-    }
-
-    let client = ChatClient {
-        sdk_client,
-        session_id: saved_session_id,
-        last_used: Instant::now(),
-    };
-
-    Ok(manager.insert(conv_id.to_string(), client).await)
 }
 
 /// Flush accumulated text content to the database.
@@ -2171,19 +1469,21 @@ async fn persist_failed_codex_message(
         .await;
 }
 
-/// Build a condensed conversation history for system prompt injection.
-/// Used as a safety net when resuming sessions — if --resume works, this is
-/// redundant; if it fails silently, Claude still has context.
-fn build_conversation_history(messages: &[ConversationMessage]) -> String {
-    let mut history = String::from(
-        "## Previous Conversation Context\n\n\
-         IMPORTANT: This conversation was resumed but the previous session could not be fully \
-         restored. You MUST use the context below to continue the conversation seamlessly. \
-         Do NOT ask the user to repeat themselves or clarify what they were asking about — \
-         the full conversation history is provided here. Pick up exactly where you left off.\n\n",
-    );
-    append_conversation_history(&mut history, messages);
-    history
+async fn build_codex_system_prompt(
+    db: &SqlitePool,
+    conversation_id: &str,
+    config: &ChatConfig,
+) -> Result<String> {
+    let prompt_vars: HashMap<String, String> = config.prompt_vars.clone();
+    let mut system_prompt = load_prompt(config.prompt_name, prompt_vars)?;
+    let messages = conversations::list_messages(db, conversation_id, None, None).await?;
+
+    if !messages.is_empty() {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&build_codex_conversation_history(&messages));
+    }
+
+    Ok(system_prompt)
 }
 
 fn build_codex_conversation_history(messages: &[ConversationMessage]) -> String {
@@ -2266,7 +1566,7 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
 // confirm:
 //
 //   1. Encoder → `insert_conversation_event` → `get_events` round-trips
-//      produce ONLY Anthropic vocabulary event_types — no cc-sdk
+//      produce ONLY Anthropic vocabulary event_types — no the previous SDK
 //      discriminants (`text`, `tool_use`, `thinking`) ever land in the row.
 //   2. A text-only turn, a tool-use turn, and a thinking turn each produce
 //      the canonical Anthropic frame ordering when replayed off the DB.
@@ -2288,7 +1588,7 @@ mod streaming_persistence_tests {
 
     /// Allow-list of event_type strings any persisted row may carry.
     /// These are the canonical 8 Anthropic streaming event type tags, as
-    /// exported by [`ALL_EVENT_TYPES`]. If a cc-sdk discriminant ever
+    /// exported by [`ALL_EVENT_TYPES`]. If a the previous SDK discriminant ever
     /// sneaks through the persistence path, this allow-list is what
     /// trips first.
     const ALLOWED_EVENT_TYPES: &[&str] = ALL_EVENT_TYPES;
@@ -2367,7 +1667,7 @@ mod streaming_persistence_tests {
         pool
     }
 
-    /// Drive a sequence of cc-sdk StreamEvents through the encoder, persist
+    /// Drive a sequence of the previous SDK StreamEvents through the encoder, persist
     /// every emitted Anthropic event via `insert_conversation_event`, then
     /// replay from the DB and return (event_types, parsed_json_values).
     async fn run_turn_and_replay(
@@ -2584,7 +1884,7 @@ mod streaming_persistence_tests {
         assert_eq!(thinking_delta["delta"]["thinking"], "Reasoning step...");
     }
 
-    /// Silencer: confirm that cc-sdk router/replay tags are NOT
+    /// Silencer: confirm that the previous SDK router/replay tags are NOT
     /// emitted onto the wire. If they ever regressed into the pipeline,
     /// this test would see extra rows with event_type outside the allow-list.
     #[tokio::test]

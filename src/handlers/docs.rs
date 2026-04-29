@@ -130,7 +130,10 @@ pub async fn list_ticket_docs(
                 // Artifact was deleted but ID still in documentation list — skip it
             }
             Err(e) => {
-                error!("Failed to fetch artifact {} for ticket {}: {:?}", id, ticket_id, e);
+                error!(
+                    "Failed to fetch artifact {} for ticket {}: {:?}",
+                    id, ticket_id, e
+                );
             }
         }
     }

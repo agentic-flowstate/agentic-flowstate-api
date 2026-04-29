@@ -89,7 +89,7 @@ use crate::agents::anthropic_events::{AnthropicEvent, ContentBlockStub};
 /// handler. Labeled by `block_kind` so operators can chart whether
 /// clients are predominantly resuming mid-text (common — streaming
 /// assistant reply) vs mid-tool_use (rarer — tool_use arguments are
-/// atomic in cc-sdk, but the Anthropic vocabulary still streams
+/// atomic in the previous SDK, but the Anthropic vocabulary still streams
 /// `input_json_delta`s).
 pub const METRIC_STREAM_SNAPSHOT_EMITTED: &str = "stream_snapshot_emitted_total";
 
@@ -429,11 +429,11 @@ fn new_state_from_start(parsed: StoredBlockStart) -> ContentBlockState {
             stopped: false,
         },
         StoredBlockStub::ToolUse { id, name, input } => {
-            // cc-sdk fires `content_block_start` with `input: {}` and
+            // the previous SDK fires `content_block_start` with `input: {}` and
             // streams the payload via `input_json_delta`. We still seed
             // `accumulated_input_json` from any non-empty `input` we see
             // on start — defensive against events that emit a non-empty
-            // input eagerly on start (some cc-sdk versions do this).
+            // input eagerly on start (some the previous SDK versions do this).
             let seed = if matches!(input, serde_json::Value::Object(ref m) if m.is_empty()) {
                 String::new()
             } else {

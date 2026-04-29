@@ -5,7 +5,9 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use ticketing_system::{email_thread_tickets, EmailThreadTicket, LinkThreadTicketRequest, SqlitePool};
+use ticketing_system::{
+    email_thread_tickets, EmailThreadTicket, LinkThreadTicketRequest, SqlitePool,
+};
 
 #[derive(Debug, Serialize)]
 pub struct ThreadTicketsResponse {
@@ -22,10 +24,7 @@ pub async fn get_tickets_for_thread(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(ThreadTicketsResponse {
-        thread_id,
-        tickets,
-    }))
+    Ok(Json(ThreadTicketsResponse { thread_id, tickets }))
 }
 
 /// Link a thread to a ticket (POST /api/email-threads/:thread_id/tickets)
@@ -82,8 +81,5 @@ pub async fn get_threads_for_ticket(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(TicketThreadsResponse {
-        ticket_id,
-        threads,
-    }))
+    Ok(Json(TicketThreadsResponse { ticket_id, threads }))
 }

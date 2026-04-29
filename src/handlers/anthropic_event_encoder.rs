@@ -3,7 +3,7 @@
 //!
 //! ## Why this module exists
 //!
-//! cc-sdk (the Claude Agent SDK we consume) does NOT expose the raw
+//! the previous SDK (the runtime SDK we consume) does NOT expose the raw
 //! Anthropic SSE wire — it hands the application a `Message` enum
 //! (`User` / `Assistant` / `System` / `Result`) whose `Assistant` variant
 //! carries already-materialized `ContentBlock`s. Our `AgentExecutor`
@@ -15,14 +15,14 @@
 //! vocabulary (`message_start` / `content_block_start` /
 //! `content_block_delta` / `content_block_stop` / `message_delta` /
 //! `message_stop` / `ping` / `error`). This module is the single bridge
-//! that reconstructs that vocabulary from cc-sdk's shape. It is NOT a
+//! that reconstructs that vocabulary from the previous SDK's shape. It is NOT a
 //! legacy compatibility layer — there is no other vocabulary on the wire,
 //! no feature flag, no alternate writer. The encoder is a structural
-//! consequence of cc-sdk's API shape.
+//! consequence of the previous SDK's API shape.
 //!
 //! ## Mapping rules
 //!
-//! cc-sdk reports text/thinking/tool_use/tool_result content blocks on an
+//! the previous SDK reports text/thinking/tool_use/tool_result content blocks on an
 //! assistant turn, terminated by a `Result`. We model the turn as a single
 //! Anthropic message:
 //!
@@ -284,7 +284,7 @@ impl AnthropicEventEncoder {
                 input: serde_json::json!({}),
             },
         });
-        // Serialize the input as a single input_json_delta — cc-sdk
+        // Serialize the input as a single input_json_delta — the previous SDK
         // gives us the complete input atomically, so one frame is enough.
         let partial_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
         out.push(AnthropicEvent::ContentBlockDelta {
@@ -330,7 +330,7 @@ impl AnthropicEventEncoder {
         let mut out = Vec::with_capacity(3);
         self.close_open_block(&mut out);
         if !self.message_open {
-            // cc-sdk can fire Result without any preceding content (e.g.,
+            // the previous SDK can fire Result without any preceding content (e.g.,
             // an empty error turn). Open+close the message anyway so the
             // Anthropic stream remains well-formed.
             self.open_message_if_needed(&mut out);
@@ -383,7 +383,7 @@ impl AnthropicEventEncoder {
             }
             // "running" / "completed" are worker-lifecycle markers, not
             // Anthropic events. Completion maps to the on_result path
-            // when cc-sdk sends a proper Result — if we see a bare
+            // when the previous SDK sends a proper Result — if we see a bare
             // Status("completed") without a Result (e.g., the trailing
             // status after the stream ends cleanly), synthesize a
             // message_stop if a message is still open.
@@ -421,7 +421,7 @@ impl AnthropicEventEncoder {
     }
 
     /// Attach a final usage snapshot to a just-emitted `message_delta`.
-    /// The worker computes token usage from cc-sdk's `Result` metadata;
+    /// The worker computes token usage from the previous SDK's `Result` metadata;
     /// this is a small helper so callers can override the `usage: None`
     /// we emit from `on_result`.
     #[allow(dead_code)]

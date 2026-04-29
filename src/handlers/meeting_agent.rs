@@ -100,7 +100,7 @@ pub async fn meeting_agent_chat(
 
     let config = ChatConfig {
         agent_type: AgentType::MeetingAgent,
-        runtime: ChatRuntime::CodexExec,
+        runtime: ChatRuntime::CodexAppServer,
         prompt_name: "meeting-agent",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,

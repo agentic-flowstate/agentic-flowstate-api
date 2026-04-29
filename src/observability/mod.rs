@@ -206,12 +206,11 @@ mod tests {
         use crate::observability::streaming::{
             record_cursor_expired, record_gap_detected, record_push_sent, record_session_start,
             record_stream_closed, record_stream_event_emitted, record_stream_opened,
-            ClientPlatform, DisconnectReason, PushResult,
-            METRIC_CLIENTS_SESSION_START, METRIC_EVENTS_GAP_DETECTED,
-            METRIC_PUSH_SENT, METRIC_STREAM_BYTES_EMITTED, METRIC_STREAM_CLOSED,
-            METRIC_STREAM_COLD_START, METRIC_STREAM_CONCURRENT, METRIC_STREAM_CURSOR_EXPIRED,
-            METRIC_STREAM_DURATION_MS, METRIC_STREAM_EVENTS_EMITTED, METRIC_STREAM_OPENED,
-            METRIC_STREAM_RESUME, METRIC_STREAM_RESUME_RATIO,
+            ClientPlatform, DisconnectReason, PushResult, METRIC_CLIENTS_SESSION_START,
+            METRIC_EVENTS_GAP_DETECTED, METRIC_PUSH_SENT, METRIC_STREAM_BYTES_EMITTED,
+            METRIC_STREAM_CLOSED, METRIC_STREAM_COLD_START, METRIC_STREAM_CONCURRENT,
+            METRIC_STREAM_CURSOR_EXPIRED, METRIC_STREAM_DURATION_MS, METRIC_STREAM_EVENTS_EMITTED,
+            METRIC_STREAM_OPENED, METRIC_STREAM_RESUME, METRIC_STREAM_RESUME_RATIO,
         };
 
         install_for_test();

@@ -5,7 +5,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use ticketing_system::{drafts, email_accounts, email_thread_tickets, CreateDraftRequest, EmailDraft, LinkThreadTicketRequest, SqlitePool, UpdateDraftRequest};
+use ticketing_system::{
+    drafts, email_accounts, email_thread_tickets, CreateDraftRequest, EmailDraft,
+    LinkThreadTicketRequest, SqlitePool, UpdateDraftRequest,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct ListDraftsQuery {
@@ -66,7 +69,9 @@ pub async fn create_draft(
             draft.id,
             &draft.to_address,
             &draft.subject,
-        ).await {
+        )
+        .await
+        {
             tracing::warn!("Failed to log draft creation to ticket history: {}", e);
         }
     }
@@ -135,13 +140,21 @@ pub async fn send_draft(
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
     if draft.status != "draft" {
-        return Err((StatusCode::BAD_REQUEST, "Draft has already been sent or discarded".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Draft has already been sent or discarded".to_string(),
+        ));
     }
 
     // Look up sender's email account for AWS credentials
     let account = email_accounts::get_email_account(&pool, &draft.from_address)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Unknown sender email '{}': {}", draft.from_address, e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Unknown sender email '{}': {}", draft.from_address, e),
+            )
+        })?;
 
     let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(account.aws_region.clone()));
@@ -155,7 +168,12 @@ pub async fn send_draft(
     // Build destination
     let mut destination_builder = Destination::builder();
     // Parse to addresses (comma-separated)
-    for to in draft.to_address.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+    for to in draft
+        .to_address
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
         destination_builder = destination_builder.to_addresses(to);
     }
     // Parse cc addresses if present
@@ -173,14 +191,17 @@ pub async fn send_draft(
                 .data(&draft.body)
                 .charset("UTF-8")
                 .build()
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
         )
         .html(
             Content::builder()
-                .data(&format!("<pre style=\"font-family: sans-serif; white-space: pre-wrap;\">{}</pre>", draft.body))
+                .data(&format!(
+                    "<pre style=\"font-family: sans-serif; white-space: pre-wrap;\">{}</pre>",
+                    draft.body
+                ))
                 .charset("UTF-8")
                 .build()
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
         )
         .build();
 
@@ -190,14 +211,9 @@ pub async fn send_draft(
         .build()
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let message = Message::builder()
-        .subject(subject)
-        .body(body)
-        .build();
+    let message = Message::builder().subject(subject).body(body).build();
 
-    let email_content = EmailContent::builder()
-        .simple(message)
-        .build();
+    let email_content = EmailContent::builder().simple(message).build();
 
     let result = ses_client
         .send_email()
@@ -208,7 +224,10 @@ pub async fn send_draft(
         .await
         .map_err(|e| {
             tracing::error!("SES send failed: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send email: {}", e))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to send email: {}", e),
+            )
         })?;
 
     let message_id = result.message_id().unwrap_or("unknown").to_string();
@@ -221,7 +240,8 @@ pub async fn send_draft(
 
     // Store in Sent folder
     let now = chrono::Utc::now().timestamp();
-    let to_addresses: Vec<String> = draft.to_address
+    let to_addresses: Vec<String> = draft
+        .to_address
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -282,7 +302,9 @@ pub async fn send_draft(
             &history_to_address,
             &history_subject,
             &message_id,
-        ).await {
+        )
+        .await
+        {
             tracing::warn!("Failed to log email sent to ticket history: {}", e);
         }
     }

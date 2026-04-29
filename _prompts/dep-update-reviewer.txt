@@ -28,9 +28,9 @@ Brew/rustup snapshots carry actual version strings. Cargo/npm carry Cargo.lock /
    - **patch** — patch-only bump. Skip unless the package is on the security watchlist.
    - **cosmetic** — transitive-looking system libs (libheif, libpng, libomp, libuv, openssl patches, nss, harfbuzz, libxml2, etc.). Skip — too noisy.
 3. **Load-bearing packages** (always file a ticket + always spawn deep-dive on any change):
-   - `claude-code` cask, `gh`, `node@20`, `awscli`, `terraform`, `rustup` toolchain
-   - Any crate named `cc-sdk`, `axum`, `sqlx`, `tokio`, `reqwest`, `serde`, `aws-sdk-*`
-   - Any npm package named `next`, `react`, `react-dom`, `typescript`, `tailwindcss`, `@anthropic-ai/*`, `@modelcontextprotocol/*`
+   - `codex` CLI, `gh`, `node@20`, `awscli`, `terraform`, `rustup` toolchain
+   - Any crate named `axum`, `sqlx`, `tokio`, `reqwest`, `serde`, `aws-sdk-*`
+   - Any npm package named `next`, `react`, `react-dom`, `typescript`, `tailwindcss`, `@modelcontextprotocol/*`
 4. **For cargo/npm lock-hash deltas**, spawn one deep-dive per repo whose hash changed. The sub-agent will diff the actual lock file and determine which crates/packages moved.
 5. **File tickets** in the `backend` epic, new slice `package-updates` (create if missing). One ticket per significant package update. Title format: `Update review: <package> <old> → <new>`. Assignee: `alex`. Classification: `automated`. Due date: 7 days out.
 
@@ -40,10 +40,10 @@ For each update that qualifies for deep-dive, emit a Task tool call to `dep-upda
 
 ```json
 {
-  "package": "cc-sdk",
+  "package": "axum",
   "ecosystem": "cargo",
-  "old_version": "0.6.0",
-  "new_version": "0.8.1",
+  "old_version": "0.7.0",
+  "new_version": "0.8.0",
   "affected_repos": ["agentic-flowstate/agentic-flowstate-api"],
   "ticket_id": "T-<freshly-created>"
 }

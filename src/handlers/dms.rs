@@ -69,7 +69,10 @@ pub async fn create_dm(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if recipient.is_none() {
-        return Err((StatusCode::NOT_FOUND, format!("User '{}' not found", body.recipient_id)));
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("User '{}' not found", body.recipient_id),
+        ));
     }
 
     let dm = ticketing_system::dms::create_or_get_dm(&pool, &user.user_id, &body.recipient_id)
@@ -91,7 +94,10 @@ pub async fn get_dm_messages(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
-        return Err((StatusCode::FORBIDDEN, "Not a participant in this DM".to_string()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Not a participant in this DM".to_string(),
+        ));
     }
 
     let limit = params.limit.unwrap_or(50);
@@ -114,7 +120,10 @@ pub async fn send_dm_message(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
-        return Err((StatusCode::FORBIDDEN, "Not a participant in this DM".to_string()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Not a participant in this DM".to_string(),
+        ));
     }
 
     let mut content = String::new();
@@ -128,9 +137,15 @@ pub async fn send_dm_message(
             }
             "files" => {
                 let filename = field.file_name().unwrap_or("file").to_string();
-                let content_type = field.content_type().unwrap_or("application/octet-stream").to_string();
+                let content_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
                 let bytes = field.bytes().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, format!("Failed to read file: {}", e))
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read file: {}", e),
+                    )
                 })?;
                 files.push((filename, content_type, bytes.to_vec()));
             }
@@ -139,7 +154,10 @@ pub async fn send_dm_message(
     }
 
     if content.trim().is_empty() && files.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Message must have content or attachments".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Message must have content or attachments".to_string(),
+        ));
     }
 
     // If content is empty but files exist, use a placeholder
@@ -161,22 +179,35 @@ pub async fn send_dm_message(
             .join("dm_attachments")
             .join(&dm_id);
         tokio::fs::create_dir_all(&base_dir).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create attachment dir: {}", e))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create attachment dir: {}", e),
+            )
         })?;
 
         for (filename, content_type, bytes) in files {
             let att_id = format!("att-{}", uuid::Uuid::new_v4());
             // Sanitize filename: remove path separators, null bytes, CRLF, quotes
-            let safe_filename: String = filename.chars()
-                .filter(|c| *c != '/' && *c != '\\' && *c != '\0' && *c != '\r' && *c != '\n' && *c != '"')
+            let safe_filename: String = filename
+                .chars()
+                .filter(|c| {
+                    *c != '/' && *c != '\\' && *c != '\0' && *c != '\r' && *c != '\n' && *c != '"'
+                })
                 .take(255)
                 .collect();
-            let safe_filename = if safe_filename.is_empty() { "file".to_string() } else { safe_filename };
+            let safe_filename = if safe_filename.is_empty() {
+                "file".to_string()
+            } else {
+                safe_filename
+            };
             let stored_name = format!("{}_{}", att_id, safe_filename);
             let stored_path = base_dir.join(&stored_name);
 
             tokio::fs::write(&stored_path, &bytes).await.map_err(|e| {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write attachment: {}", e))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to write attachment: {}", e),
+                )
             })?;
 
             let att = ticketing_system::dms::save_attachment(
@@ -211,7 +242,10 @@ pub async fn send_dm_message_json(
     Json(body): Json<SendMessageBody>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     if body.content.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "Message content cannot be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Message content cannot be empty".to_string(),
+        ));
     }
 
     // Verify participant
@@ -219,14 +253,20 @@ pub async fn send_dm_message_json(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
-        return Err((StatusCode::FORBIDDEN, "Not a participant in this DM".to_string()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Not a participant in this DM".to_string(),
+        ));
     }
 
     let msg = ticketing_system::dms::send_message(&pool, &dm_id, &user.user_id, &body.content)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok((StatusCode::CREATED, Json(serde_json::to_value(msg).unwrap())))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::to_value(msg).unwrap()),
+    ))
 }
 
 /// GET /api/dms/:dm_id/attachments/:attachment_id — download an attachment
@@ -240,7 +280,10 @@ pub async fn download_dm_attachment(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
-        return Err((StatusCode::FORBIDDEN, "Not a participant in this DM".to_string()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Not a participant in this DM".to_string(),
+        ));
     }
 
     let (att, stored_path) = ticketing_system::dms::get_attachment(&pool, &attachment_id)
@@ -252,17 +295,30 @@ pub async fn download_dm_attachment(
     let att_dm_id = ticketing_system::dms::get_dm_id_for_message(&pool, &att.message_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Attachment message not found".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Attachment message not found".to_string(),
+            )
+        })?;
     if att_dm_id != dm_id {
-        return Err((StatusCode::FORBIDDEN, "Attachment does not belong to this DM".to_string()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Attachment does not belong to this DM".to_string(),
+        ));
     }
 
     let file_bytes = tokio::fs::read(&stored_path).await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read file: {}", e))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read file: {}", e),
+        )
     })?;
 
     // Sanitize filename for Content-Disposition header (prevent CRLF injection)
-    let safe_name: String = att.filename.chars()
+    let safe_name: String = att
+        .filename
+        .chars()
         .filter(|c| *c != '\r' && *c != '\n' && *c != '"')
         .collect();
 
@@ -289,7 +345,10 @@ pub async fn mark_dm_read(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     {
-        return Err((StatusCode::FORBIDDEN, "Not a participant in this DM".to_string()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Not a participant in this DM".to_string(),
+        ));
     }
 
     ticketing_system::dms::mark_read(&pool, &dm_id, &user.user_id)

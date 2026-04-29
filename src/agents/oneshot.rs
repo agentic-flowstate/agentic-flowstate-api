@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use super::codex_exec::{resolve_codex_model, run_codex_text};
+use super::codex_app_server::{resolve_codex_model, run_codex_text};
 use super::executor::run_codex_agent_turn;
 use super::AgentType;
 
@@ -47,7 +47,7 @@ pub async fn run_oneshot(
     }
 
     let text = run_codex_text(
-        resolve_codex_model("haiku"),
+        resolve_codex_model(""),
         "low",
         system_prompt,
         working_dir,

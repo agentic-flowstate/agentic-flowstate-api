@@ -1,5 +1,5 @@
-use sqlx::SqlitePool;
 use crate::agents::{AgentRun, AgentRunStatus};
+use sqlx::SqlitePool;
 
 /// Store an agent run to the database
 pub async fn store_agent_run(db: &SqlitePool, run: &AgentRun) -> anyhow::Result<()> {
@@ -25,7 +25,10 @@ pub async fn store_agent_run(db: &SqlitePool, run: &AgentRun) -> anyhow::Result<
 /// Convert a database agent run to API agent run
 pub fn db_run_to_api_run(db_run: ticketing_system::AgentRun) -> AgentRun {
     let email_output = if db_run.agent_type == "email" {
-        db_run.output_summary.as_ref().and_then(|s| crate::agents::EmailOutput::parse(s))
+        db_run
+            .output_summary
+            .as_ref()
+            .and_then(|s| crate::agents::EmailOutput::parse(s))
     } else {
         None
     };

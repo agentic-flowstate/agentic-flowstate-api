@@ -42,13 +42,22 @@ pub async fn create_email_account(
         if let Ok(internal) = email_accounts::get_account_internal(&sync_pool, &sync_email).await {
             match crate::email_fetcher::fetch_emails_for_account(&sync_pool, &internal).await {
                 Ok(()) => {
-                    email_accounts::update_fetch_status(&sync_pool, &sync_email, "ok", None).await.ok();
+                    email_accounts::update_fetch_status(&sync_pool, &sync_email, "ok", None)
+                        .await
+                        .ok();
                     tracing::info!("Force sync completed for new account {}", sync_email);
                 }
                 Err(e) => {
                     let err_msg = format!("{:?}", e);
                     tracing::error!("Force sync failed for {}: {}", sync_email, err_msg);
-                    email_accounts::update_fetch_status(&sync_pool, &sync_email, "error", Some(&err_msg)).await.ok();
+                    email_accounts::update_fetch_status(
+                        &sync_pool,
+                        &sync_email,
+                        "error",
+                        Some(&err_msg),
+                    )
+                    .await
+                    .ok();
                 }
             }
         }
@@ -107,7 +116,10 @@ pub async fn sync_email_account(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !has_access {
-        return Err((StatusCode::FORBIDDEN, "No access to this email account".to_string()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "No access to this email account".to_string(),
+        ));
     }
 
     let internal = email_accounts::get_account_internal(&pool, &path.email)
@@ -116,7 +128,9 @@ pub async fn sync_email_account(
 
     match crate::email_fetcher::fetch_emails_for_account(&pool, &internal).await {
         Ok(()) => {
-            email_accounts::update_fetch_status(&pool, &path.email, "ok", None).await.ok();
+            email_accounts::update_fetch_status(&pool, &path.email, "ok", None)
+                .await
+                .ok();
             Ok(Json(SyncResponse {
                 status: "ok".to_string(),
                 message: format!("Sync completed for {}", path.email),
@@ -124,8 +138,13 @@ pub async fn sync_email_account(
         }
         Err(e) => {
             let err_msg = format!("{:?}", e);
-            email_accounts::update_fetch_status(&pool, &path.email, "error", Some(&err_msg)).await.ok();
-            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Sync failed: {}", err_msg)))
+            email_accounts::update_fetch_status(&pool, &path.email, "error", Some(&err_msg))
+                .await
+                .ok();
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Sync failed: {}", err_msg),
+            ))
         }
     }
 }

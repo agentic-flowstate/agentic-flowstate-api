@@ -3,7 +3,7 @@
 use sqlx::SqlitePool;
 use ticketing_system::{conversations, organizations, UpdateConversationRequest};
 
-use crate::agents::codex_exec::{resolve_codex_model, run_codex_text};
+use crate::agents::codex_app_server::{resolve_codex_model, run_codex_text};
 
 /// Result of title + org generation
 pub struct TitleAndOrg {
@@ -44,7 +44,10 @@ pub async fn generate_title_and_org(
             if let Some(desc) = &org.description {
                 parts.push(format!("### {}\n{}", org.organization, desc));
             } else {
-                parts.push(format!("### {}\n(No description available)", org.organization));
+                parts.push(format!(
+                    "### {}\n(No description available)",
+                    org.organization
+                ));
             }
         }
         parts.push("### general\nUse this ONLY when the conversation genuinely does not belong to any of the organizations above. If the topic is even tangentially related to a specific organization, pick that organization instead. Err on the side of specificity.".to_string());
@@ -71,12 +74,11 @@ pub async fn generate_title_and_org(
         org_list = org_names.join(", "),
     );
 
-    let prompt = format!(
-        "Classify this conversation based on the user's message:\n\n{user_message}"
-    );
+    let prompt =
+        format!("Classify this conversation based on the user's message:\n\n{user_message}");
 
     let raw_output = match run_codex_text(
-        resolve_codex_model("haiku"),
+        resolve_codex_model(""),
         "low",
         &system_prompt,
         std::path::Path::new("/tmp"),
@@ -86,7 +88,7 @@ pub async fn generate_title_and_org(
     {
         Ok(text) => text.trim().to_string(),
         Err(e) => {
-            tracing::error!("[TITLE] codex exec failed: {}", e);
+            tracing::error!("[TITLE] codex app-server failed: {}", e);
             return None;
         }
     };
@@ -98,7 +100,10 @@ pub async fn generate_title_and_org(
 
     // Parse two-line response: title on line 1, org on line 2
     let lines: Vec<&str> = raw_output.lines().collect();
-    let title = lines.first().map(|l| l.trim().to_string()).unwrap_or_default();
+    let title = lines
+        .first()
+        .map(|l| l.trim().to_string())
+        .unwrap_or_default();
     let detected_org = lines.get(1).map(|l| l.trim().to_lowercase());
 
     if title.is_empty() {
@@ -114,7 +119,10 @@ pub async fn generate_title_and_org(
             // Return the original-cased name from the org list
             org_names.iter().find(|o| o.to_lowercase() == org).cloned()
         } else {
-            tracing::warn!("[TITLE] Detected org {:?} not in user's orgs, using current", org);
+            tracing::warn!(
+                "[TITLE] Detected org {:?} not in user's orgs, using current",
+                org
+            );
             None
         }
     });
@@ -124,7 +132,10 @@ pub async fn generate_title_and_org(
 
     tracing::info!(
         "[TITLE] Generated for {}: title={:?}, org={:?} (current={:?})",
-        conversation_id, title, final_org, current_org
+        conversation_id,
+        title,
+        final_org,
+        current_org
     );
 
     // Update conversation in DB

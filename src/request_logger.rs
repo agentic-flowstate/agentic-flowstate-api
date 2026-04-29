@@ -5,11 +5,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::{
-    extract::Request,
-    middleware::Next,
-    response::Response,
-};
+use axum::{extract::Request, middleware::Next, response::Response};
 use sqlx::SqlitePool;
 
 /// Paths that are too noisy to log (SSE streams, health checks, polling endpoints).
@@ -41,13 +37,21 @@ fn detect_component(path: &str) -> &'static str {
         "chat"
     } else if path.starts_with("/api/meetings") || path.starts_with("/api/tts") {
         "meetings"
-    } else if path.starts_with("/api/daily-plan") || path.starts_with("/api/focus") || path.starts_with("/api/home-planner") {
+    } else if path.starts_with("/api/daily-plan")
+        || path.starts_with("/api/focus")
+        || path.starts_with("/api/home-planner")
+    {
         "planner"
-    } else if path.starts_with("/api/library") || path.starts_with("/api/tickets") && path.contains("/docs") {
+    } else if path.starts_with("/api/library")
+        || path.starts_with("/api/tickets") && path.contains("/docs")
+    {
         "library"
     } else if path.starts_with("/api/admin") {
         "admin"
-    } else if path.starts_with("/api/epics") || path.starts_with("/api/tickets") || path.starts_with("/api/workspace") {
+    } else if path.starts_with("/api/epics")
+        || path.starts_with("/api/tickets")
+        || path.starts_with("/api/workspace")
+    {
         "workspace"
     } else if path.starts_with("/api/memberships") {
         "auth"
@@ -67,10 +71,7 @@ fn level_from_status(status: u16) -> &'static str {
 
 /// Request logging middleware. Applied as an outermost layer so it captures all requests
 /// including auth failures. Writes to system_logs in a background task (non-blocking).
-pub async fn request_logger(
-    request: Request,
-    next: Next,
-) -> Response {
+pub async fn request_logger(request: Request, next: Next) -> Response {
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
 
@@ -112,10 +113,7 @@ pub async fn request_logger(
         let level = level_from_status(status).to_string();
         let duration_ms = duration.as_millis();
 
-        let message = format!(
-            "{} {} → {} ({}ms)",
-            method, path, status, duration_ms
-        );
+        let message = format!("{} {} → {} ({}ms)", method, path, status, duration_ms);
 
         // Extract user_id from response extensions (set by require_auth middleware)
         // We can't easily get it here since AuthenticatedUser is set on the request.

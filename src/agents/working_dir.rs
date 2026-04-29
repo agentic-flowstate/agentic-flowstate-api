@@ -53,7 +53,10 @@ pub async fn resolve_working_dir(
 
     // Treat as literal path — verify it's not empty
     if template.is_empty() {
-        bail!("Agent '{}' has empty working_dir configured", agent_type.as_str());
+        bail!(
+            "Agent '{}' has empty working_dir configured",
+            agent_type.as_str()
+        );
     }
 
     Ok(PathBuf::from(template))

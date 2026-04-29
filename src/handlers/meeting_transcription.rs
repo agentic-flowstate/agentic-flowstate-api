@@ -4,9 +4,9 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use sqlx::SqlitePool;
 
 use ticketing_system::{
     CreateTranscriptEntryRequest, CreateTranscriptSessionRequest, TranscribeAudioRequest,
@@ -14,7 +14,7 @@ use ticketing_system::{
 };
 
 use crate::agents::prompts::load_prompt;
-use crate::agents::{AgentType, run_oneshot};
+use crate::agents::{run_oneshot, AgentType};
 
 // ============================================================================
 // Transcription Handler (OpenAI Whisper)
@@ -31,8 +31,12 @@ pub async fn transcribe_meeting(
         .decode(&req.audio_data)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid base64: {}", e)))?;
 
-    let api_key = std::env::var("OPENAI_KEY")
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "OPENAI_KEY not set".to_string()))?;
+    let api_key = std::env::var("OPENAI_KEY").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OPENAI_KEY not set".to_string(),
+        )
+    })?;
 
     let file_name = format!("audio.{}", req.format);
     let mime_type = match req.format.as_str() {
@@ -64,7 +68,12 @@ pub async fn transcribe_meeting(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("API request failed: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("API request failed: {}", e),
+            )
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
@@ -79,10 +88,12 @@ pub async fn transcribe_meeting(
         text: String,
     }
 
-    let whisper_response: WhisperResponse = response
-        .json()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse response: {}", e)))?;
+    let whisper_response: WhisperResponse = response.json().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to parse response: {}", e),
+        )
+    })?;
 
     let session_id = format!("mtg-{}", room_id);
 
@@ -155,14 +166,27 @@ pub async fn upload_meeting_audio(
         .join("meeting-audio")
         .join(&room_id);
 
-    std::fs::create_dir_all(&audio_dir)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create audio dir: {}", e)))?;
+    std::fs::create_dir_all(&audio_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create audio dir: {}", e),
+        )
+    })?;
 
-    let filename = format!("{}_{}.{}", req.username.replace(' ', "_"), req.start_time, req.format);
+    let filename = format!(
+        "{}_{}.{}",
+        req.username.replace(' ', "_"),
+        req.start_time,
+        req.format
+    );
     let filepath = audio_dir.join(&filename);
 
-    std::fs::write(&filepath, &audio_bytes)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write audio: {}", e)))?;
+    std::fs::write(&filepath, &audio_bytes).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write audio: {}", e),
+        )
+    })?;
 
     let metadata = serde_json::json!({
         "username": req.username,
@@ -171,9 +195,21 @@ pub async fn upload_meeting_audio(
         "filename": filename,
     });
 
-    let meta_path = audio_dir.join(format!("{}_{}.json", req.username.replace(' ', "_"), req.start_time));
-    std::fs::write(&meta_path, serde_json::to_string_pretty(&metadata).unwrap_or_default())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write metadata: {}", e)))?;
+    let meta_path = audio_dir.join(format!(
+        "{}_{}.json",
+        req.username.replace(' ', "_"),
+        req.start_time
+    ));
+    std::fs::write(
+        &meta_path,
+        serde_json::to_string_pretty(&metadata).unwrap_or_default(),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write metadata: {}", e),
+        )
+    })?;
 
     tracing::info!("Uploaded audio for {} in meeting {}", req.username, room_id);
 
@@ -204,8 +240,12 @@ pub async fn finalize_meeting_transcript(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let api_key = std::env::var("OPENAI_KEY")
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "OPENAI_KEY not set".to_string()))?;
+    let api_key = std::env::var("OPENAI_KEY").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OPENAI_KEY not set".to_string(),
+        )
+    })?;
 
     let audio_dir = dirs::home_dir()
         .unwrap_or_default()
@@ -229,8 +269,9 @@ pub async fn finalize_meeting_transcript(
         if path.extension().map(|e| e == "json").unwrap_or(false) {
             let meta: serde_json::Value = serde_json::from_str(
                 &std::fs::read_to_string(&path)
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            )
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             let username = meta["username"].as_str().unwrap_or("Unknown").to_string();
             let start_time = meta["start_time"].as_i64().unwrap_or(0);
@@ -247,17 +288,28 @@ pub async fn finalize_meeting_transcript(
         return Err((StatusCode::NOT_FOUND, "No audio segments found".to_string()));
     }
 
-    tracing::info!("Processing {} audio segments for meeting {}", segments.len(), room_id);
+    tracing::info!(
+        "Processing {} audio segments for meeting {}",
+        segments.len(),
+        room_id
+    );
 
     // Transcribe each segment with timestamps
     let client = reqwest::Client::new();
     let mut all_entries: Vec<(i64, String, String)> = Vec::new();
 
     for (username, start_time_ms, audio_path) in segments {
-        let audio_bytes = std::fs::read(&audio_path)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read audio: {}", e)))?;
+        let audio_bytes = std::fs::read(&audio_path).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to read audio: {}", e),
+            )
+        })?;
 
-        let ext = audio_path.extension().and_then(|e| e.to_str()).unwrap_or("webm");
+        let ext = audio_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("webm");
         let mime_type = match ext {
             "webm" => "audio/webm",
             "mp3" => "audio/mpeg",
@@ -283,7 +335,12 @@ pub async fn finalize_meeting_transcript(
             .multipart(form)
             .send()
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("API request failed: {}", e)))?;
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("API request failed: {}", e),
+                )
+            })?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
@@ -291,25 +348,37 @@ pub async fn finalize_meeting_transcript(
             continue;
         }
 
-        let whisper_response: WhisperVerboseResponse = response
-            .json()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse response: {}", e)))?;
+        let whisper_response: WhisperVerboseResponse = response.json().await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to parse response: {}", e),
+            )
+        })?;
 
         for seg in whisper_response.segments {
             let absolute_start = start_time_ms + (seg.start * 1000.0) as i64;
-            all_entries.push((absolute_start, username.clone(), seg.text.trim().to_string()));
+            all_entries.push((
+                absolute_start,
+                username.clone(),
+                seg.text.trim().to_string(),
+            ));
         }
     }
 
     if all_entries.is_empty() {
-        tracing::error!("All audio segments failed to transcribe for meeting {}", room_id);
+        tracing::error!(
+            "All audio segments failed to transcribe for meeting {}",
+            room_id
+        );
         // Cleanup audio files even on failure
         let _ = std::fs::remove_dir_all(&audio_dir);
         ticketing_system::meetings::update_processing_status(&db, &room_id, "failed")
             .await
             .ok();
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Transcription failed for all audio segments".to_string()));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Transcription failed for all audio segments".to_string(),
+        ));
     }
 
     all_entries.sort_by_key(|(ts, _, _)| *ts);
@@ -376,7 +445,7 @@ pub async fn finalize_meeting_transcript(
 
     tracing::info!("Finalized transcript for meeting {}", room_id);
 
-    // Extract meeting notes using Claude
+    // Extract meeting notes using the configured Codex runtime.
     ticketing_system::meetings::update_processing_status(&db, &room_id, "extracting_notes")
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -409,16 +478,19 @@ pub async fn finalize_meeting_transcript(
     }))
 }
 
-/// Extract structured meeting notes from a transcript using Claude
+/// Extract structured meeting notes from a transcript.
 async fn extract_meeting_notes(transcript: &str) -> Result<String, String> {
-    tracing::info!("Starting meeting notes extraction, transcript length: {} chars", transcript.len());
+    tracing::info!(
+        "Starting meeting notes extraction, transcript length: {} chars",
+        transcript.len()
+    );
 
     let system_prompt = load_prompt("meeting-notes", HashMap::new())
         .map_err(|e| format!("Failed to load meeting-notes prompt: {}", e))?;
 
     let working_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
-    // Transcript goes in user message, not system prompt (per Anthropic best practices)
+    // Transcript goes in the user message, not the system prompt.
     let prompt = format!(
         "<transcript>\n{}\n</transcript>\n\nExtract structured notes from the transcript above.",
         transcript
@@ -429,7 +501,8 @@ async fn extract_meeting_notes(transcript: &str) -> Result<String, String> {
         &system_prompt,
         &working_dir,
         prompt,
-    ).await?;
+    )
+    .await?;
 
     Ok(result.text)
 }

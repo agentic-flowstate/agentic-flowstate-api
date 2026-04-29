@@ -69,8 +69,7 @@ pub type SseStream = Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatRuntime {
-    ClaudeSdk,
-    CodexExec,
+    CodexAppServer,
 }
 
 /// Configuration for a chat SSE endpoint

@@ -10,9 +10,6 @@ mcp-handlers = { path = "../agentic-flowstate-mcp/mcp-handlers" }
 # Ticketing system (SQLite data layer)
 ticketing-system = { path = "../agentic-flowstate-ticketing-system" }
 
-# Claude Agent SDK
-cc-sdk = "0.6"
-
 # Process detachment (setsid for restart scripts)
 libc = "0.2"
 
@@ -31,6 +28,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.9"
 
 # Error handling
 anyhow = "1.0"

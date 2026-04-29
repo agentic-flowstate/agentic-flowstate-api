@@ -160,8 +160,7 @@ pub async fn prune_conversation_events(
     let mut report = PruneReport::default();
 
     for (conversation_id,) in &candidate_rows {
-        let summary =
-            prune_one_conversation(pool, conversation_id, cutoff_ts, config).await?;
+        let summary = prune_one_conversation(pool, conversation_id, cutoff_ts, config).await?;
         report.rows_scanned += summary.rows_scanned;
         report.rows_deleted += summary.rows_deleted;
         if summary.rows_deleted > 0 {
@@ -265,8 +264,8 @@ async fn prune_one_conversation(
     // (high_watermark+1) is less than min_keep — then cutoff_idx becomes
     // 0 or negative, meaning NO event is eligible and the hot-tail rule
     // fully protects the conversation.
-    let cutoff_idx: i64 = (high_watermark + 1)
-        .saturating_sub(config.min_keep_per_conversation as i64);
+    let cutoff_idx: i64 =
+        (high_watermark + 1).saturating_sub(config.min_keep_per_conversation as i64);
 
     if cutoff_idx <= 0 {
         // Entire conversation fits within the hot-tail window. Nothing to
@@ -386,10 +385,8 @@ async fn delete_one_batch(
 /// [`crate::observability::streaming`] as consts so dashboards and call
 /// sites stay in sync.
 async fn emit_run_metrics(report: &PruneReport, now_ts: i64, pool: &SqlitePool) {
-    metrics::counter!(obs::METRIC_RETENTION_ROWS_DELETED)
-        .increment(report.rows_deleted);
-    metrics::histogram!(obs::METRIC_RETENTION_PRUNE_DURATION_MS)
-        .record(report.duration_ms as f64);
+    metrics::counter!(obs::METRIC_RETENTION_ROWS_DELETED).increment(report.rows_deleted);
+    metrics::histogram!(obs::METRIC_RETENTION_PRUNE_DURATION_MS).record(report.duration_ms as f64);
     metrics::gauge!(obs::METRIC_RETENTION_CONVERSATIONS_TOUCHED)
         .set(report.conversations_touched as f64);
 
@@ -399,13 +396,12 @@ async fn emit_run_metrics(report: &PruneReport, now_ts: i64, pool: &SqlitePool) 
     // only holds conversations that were pruned this run — stable
     // conversations that never had rows to delete would drop off, and the
     // gauge would misrepresent the fleet floor.
-    let fleet_min: Option<i64> = sqlx::query_scalar(
-        "SELECT MIN(created_at) FROM conversation_events",
-    )
-    .fetch_one(pool)
-    .await
-    .ok()
-    .flatten();
+    let fleet_min: Option<i64> =
+        sqlx::query_scalar("SELECT MIN(created_at) FROM conversation_events")
+            .fetch_one(pool)
+            .await
+            .ok()
+            .flatten();
     if let Some(oldest) = fleet_min {
         let age_secs = (now_ts - oldest).max(0) as f64;
         metrics::gauge!(obs::METRIC_RETENTION_EARLIEST_AGE_SECS).set(age_secs);
@@ -523,13 +519,11 @@ mod tests {
     }
 
     async fn seed_conversation(pool: &SqlitePool, id: &str) {
-        sqlx::query(
-            "INSERT INTO conversations (id, status) VALUES (?, 'open')",
-        )
-        .bind(id)
-        .execute(pool)
-        .await
-        .expect("insert conversation");
+        sqlx::query("INSERT INTO conversations (id, status) VALUES (?, 'open')")
+            .bind(id)
+            .execute(pool)
+            .await
+            .expect("insert conversation");
     }
 
     /// Seed a range of events for a conversation with explicit per-event
@@ -557,13 +551,11 @@ mod tests {
     }
 
     async fn count_events(pool: &SqlitePool, conversation_id: &str) -> i64 {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM conversation_events WHERE conversation_id = ?",
-        )
-        .bind(conversation_id)
-        .fetch_one(pool)
-        .await
-        .expect("count")
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_events WHERE conversation_id = ?")
+            .bind(conversation_id)
+            .fetch_one(pool)
+            .await
+            .expect("count")
     }
 
     async fn min_event_index(pool: &SqlitePool, conversation_id: &str) -> Option<i64> {
@@ -723,7 +715,9 @@ mod tests {
 
         // Before prune: minimum index is 0.
         assert_eq!(
-            earliest_retained_event_index(&pool, "conv-min").await.unwrap(),
+            earliest_retained_event_index(&pool, "conv-min")
+                .await
+                .unwrap(),
             Some(0)
         );
 
@@ -733,13 +727,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            earliest_retained_event_index(&pool, "conv-min").await.unwrap(),
+            earliest_retained_event_index(&pool, "conv-min")
+                .await
+                .unwrap(),
             Some(1_000),
             "earliest index should advance to the first retained row"
         );
 
         assert_eq!(
-            earliest_retained_event_index(&pool, "conv-empty").await.unwrap(),
+            earliest_retained_event_index(&pool, "conv-empty")
+                .await
+                .unwrap(),
             None,
             "empty conversation returns None"
         );
@@ -784,22 +782,20 @@ mod tests {
             .unwrap();
         }
 
-        let blobs_before: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM event_blobs")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let blobs_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(blobs_before, blob_parent_ids.len() as i64);
 
         prune_conversation_events(&pool, &RetentionConfig::default())
             .await
             .unwrap();
 
-        let blobs_after: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM event_blobs")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let blobs_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_blobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(
             blobs_after, 0,
             "FK cascade should have reaped every blob whose parent was pruned"

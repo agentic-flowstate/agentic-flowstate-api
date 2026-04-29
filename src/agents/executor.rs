@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
-use super::codex_exec::{
-    spawn_codex_exec, CodexExecEvent, CodexExecOptions, CodexSandboxMode, CodexToolProfile,
+use super::codex_app_server::{
+    spawn_codex_app_server, CodexAppServerEvent, CodexAppServerOptions, CodexSandboxMode,
+    CodexToolProfile,
 };
 use super::prompts::load_prompt;
 use super::{AgentRun, AgentRunStatus, AgentType, EmailOutput, StreamEvent, TicketContext};
@@ -100,7 +101,7 @@ pub async fn run_codex_agent_turn(
     result_session_id: &str,
 ) -> Result<CodexAgentTurnResult> {
     let (sandbox, bypass_approvals_and_sandbox) = codex_policy_for_agent_type(agent_type);
-    let mut turn = spawn_codex_exec(CodexExecOptions {
+    let mut turn = spawn_codex_app_server(CodexAppServerOptions {
         model: agent_type.model(),
         reasoning_effort: agent_type.effort(),
         system_prompt,
@@ -119,14 +120,25 @@ pub async fn run_codex_agent_turn(
     let mut tool_call_count = 0;
     let mut runtime_session_id = resume_session_id.map(str::to_string);
     let mut usage = (0_i64, 0_i64);
+    let mut streamed_agent_message_items: HashSet<String> = HashSet::new();
 
     while let Some(event) = turn.events.recv().await {
         match event {
-            CodexExecEvent::ThreadStarted { thread_id } => {
+            CodexAppServerEvent::ThreadStarted { thread_id } => {
                 runtime_session_id = Some(thread_id);
             }
-            CodexExecEvent::AgentMessage { text } => {
+            CodexAppServerEvent::AgentMessageDelta { id, text } => {
                 if text.is_empty() {
+                    continue;
+                }
+                streamed_agent_message_items.insert(id);
+                output_parts.push(text.clone());
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(StreamEvent::Text { content: text }).await;
+                }
+            }
+            CodexAppServerEvent::AgentMessageCompleted { id, text } => {
+                if text.is_empty() || streamed_agent_message_items.contains(&id) {
                     continue;
                 }
                 output_parts.push(text.clone());
@@ -134,13 +146,18 @@ pub async fn run_codex_agent_turn(
                     let _ = tx.send(StreamEvent::Text { content: text }).await;
                 }
             }
-            CodexExecEvent::ToolCallStarted { id, name, input } => {
+            CodexAppServerEvent::ReasoningDelta { text, .. } => {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(StreamEvent::Thinking { content: text }).await;
+                }
+            }
+            CodexAppServerEvent::ToolCallStarted { id, name, input } => {
                 tool_call_count += 1;
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(StreamEvent::ToolUse { id, name, input }).await;
                 }
             }
-            CodexExecEvent::ToolCallCompleted {
+            CodexAppServerEvent::ToolCallCompleted {
                 id,
                 content,
                 is_error,
@@ -155,7 +172,7 @@ pub async fn run_codex_agent_turn(
                         .await;
                 }
             }
-            CodexExecEvent::TurnCompleted {
+            CodexAppServerEvent::TurnCompleted {
                 input_tokens,
                 output_tokens,
             } => {
@@ -165,17 +182,8 @@ pub async fn run_codex_agent_turn(
     }
 
     let outcome = turn.wait().await.map_err(anyhow::Error::msg)?;
-    let stderr_text = outcome.stderr_text.trim();
-
-    if !outcome.exit_status.success() {
-        if stderr_text.is_empty() {
-            anyhow::bail!("codex exec failed with status {}", outcome.exit_status);
-        }
-        anyhow::bail!(
-            "codex exec failed with status {}: {}",
-            outcome.exit_status,
-            stderr_text
-        );
+    if !outcome.success() {
+        anyhow::bail!("{}", outcome.failure_summary("codex app-server"));
     }
 
     let output_summary =
@@ -242,7 +250,7 @@ impl AgentExecutor {
         );
 
         tracing::info!(
-            "Starting agent execution via codex exec: type={}, ticket={}, model={}",
+            "Starting agent execution via codex app-server: type={}, ticket={}, model={}",
             agent_type.as_str(),
             ticket_context.ticket_id,
             agent_type.model()

@@ -27,7 +27,11 @@ pub async fn list_library_artifacts(
         Ok(artifacts) => (StatusCode::OK, Json(json!(artifacts))).into_response(),
         Err(e) => {
             error!("Failed to list artifacts for org {}: {:?}", org, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to list artifacts" }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to list artifacts" })),
+            )
+                .into_response()
         }
     }
 }
@@ -41,13 +45,23 @@ pub async fn search_library_artifacts(
     let org = get_organization(&headers);
     let q = match query.q {
         Some(q) if !q.trim().is_empty() => q,
-        _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Missing search query 'q'" }))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing search query 'q'" })),
+            )
+                .into_response()
+        }
     };
     match ticketing_system::artifacts::search(&pool, &q, Some(&org)).await {
         Ok(artifacts) => (StatusCode::OK, Json(json!(artifacts))).into_response(),
         Err(e) => {
             error!("Failed to search artifacts: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to search artifacts" }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to search artifacts" })),
+            )
+                .into_response()
         }
     }
 }
@@ -59,10 +73,18 @@ pub async fn get_library_artifact(
 ) -> Response {
     match ticketing_system::artifacts::get_artifact(&pool, &artifact_id).await {
         Ok(Some(artifact)) => (StatusCode::OK, Json(json!(artifact))).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({ "error": "Artifact not found" }))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Artifact not found" })),
+        )
+            .into_response(),
         Err(e) => {
             error!("Failed to get artifact {}: {:?}", artifact_id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to get artifact" }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to get artifact" })),
+            )
+                .into_response()
         }
     }
 }
@@ -77,7 +99,11 @@ pub async fn list_library_documents(
         Ok(documents) => (StatusCode::OK, Json(json!(documents))).into_response(),
         Err(e) => {
             error!("Failed to list documents for org {}: {:?}", org, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to list documents" }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to list documents" })),
+            )
+                .into_response()
         }
     }
 }
@@ -91,13 +117,23 @@ pub async fn search_library_documents(
     let org = get_organization(&headers);
     let q = match query.q {
         Some(q) if !q.trim().is_empty() => q,
-        _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "Missing search query 'q'" }))).into_response(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing search query 'q'" })),
+            )
+                .into_response()
+        }
     };
     match ticketing_system::documents::search_documents(&pool, &q, Some(&org)).await {
         Ok(documents) => (StatusCode::OK, Json(json!(documents))).into_response(),
         Err(e) => {
             error!("Failed to search documents: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to search documents" }))).into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to search documents" })),
+            )
+                .into_response()
         }
     }
 }
@@ -117,34 +153,61 @@ pub async fn download_library_document(
     // Get metadata for Content-Type and filename
     let doc = match ticketing_system::documents::get_document(&pool, &document_id).await {
         Ok(Some(d)) => d,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "Document not found" }))).into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Document not found" })),
+            )
+                .into_response()
+        }
         Err(e) => {
             error!("Failed to get document metadata {}: {:?}", document_id, e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to get document" }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to get document" })),
+            )
+                .into_response();
         }
     };
 
     // Get binary content
-    let content = match ticketing_system::documents::get_document_content(&pool, &document_id).await {
+    let content = match ticketing_system::documents::get_document_content(&pool, &document_id).await
+    {
         Ok(Some(c)) => c,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "Document content not found" }))).into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Document content not found" })),
+            )
+                .into_response()
+        }
         Err(e) => {
             error!("Failed to get document content {}: {:?}", document_id, e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "Failed to get document content" }))).into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to get document content" })),
+            )
+                .into_response();
         }
     };
 
     let disposition = if query.inline.unwrap_or(false) {
         format!("inline; filename=\"{}\"", doc.filename.replace('"', "\\\""))
     } else {
-        format!("attachment; filename=\"{}\"", doc.filename.replace('"', "\\\""))
+        format!(
+            "attachment; filename=\"{}\"",
+            doc.filename.replace('"', "\\\"")
+        )
     };
 
     (
         StatusCode::OK,
         [
             (axum::http::header::CONTENT_TYPE, doc.mime_type.as_str()),
-            (axum::http::header::CONTENT_DISPOSITION, disposition.as_str()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                disposition.as_str(),
+            ),
         ],
         content,
     )

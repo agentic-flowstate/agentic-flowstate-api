@@ -28,7 +28,7 @@ pub struct WorkspaceManagerRequest {
 fn config() -> ChatConfig {
     ChatConfig {
         agent_type: AgentType::WorkspaceManager,
-        runtime: ChatRuntime::CodexExec,
+        runtime: ChatRuntime::CodexAppServer,
         prompt_name: "workspace-manager",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars: HashMap::new(),

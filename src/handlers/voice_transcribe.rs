@@ -1,7 +1,4 @@
-use axum::{
-    http::StatusCode,
-    Json,
-};
+use axum::{http::StatusCode, Json};
 use serde::Deserialize;
 
 use ticketing_system::TranscriptionResponse;
@@ -33,8 +30,12 @@ pub async fn voice_transcribe(
         .decode(&req.audio_data)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid base64: {}", e)))?;
 
-    let api_key = std::env::var("OPENAI_KEY")
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "OPENAI_KEY not set".to_string()))?;
+    let api_key = std::env::var("OPENAI_KEY").map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OPENAI_KEY not set".to_string(),
+        )
+    })?;
 
     let file_name = format!("audio.{}", req.format);
     let mime_type = match req.format.as_str() {
@@ -66,7 +67,12 @@ pub async fn voice_transcribe(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Whisper API request failed: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Whisper API request failed: {}", e),
+            )
+        })?;
 
     if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
@@ -81,10 +87,12 @@ pub async fn voice_transcribe(
         text: String,
     }
 
-    let whisper: WhisperResponse = response
-        .json()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to parse Whisper response: {}", e)))?;
+    let whisper: WhisperResponse = response.json().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to parse Whisper response: {}", e),
+        )
+    })?;
 
     Ok(Json(TranscriptionResponse {
         text: whisper.text,

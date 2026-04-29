@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use ticketing_system::{emails, email_accounts, Email, EmailAttachment, EmailThread, SqlitePool};
+use ticketing_system::{email_accounts, emails, Email, EmailAttachment, EmailThread, SqlitePool};
 
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -13,25 +13,76 @@ use crate::auth_middleware::AuthenticatedUser;
 fn sanitize_email_html(html: &str) -> String {
     ammonia::Builder::default()
         .add_tags(&[
-            "div", "span", "p", "br", "a", "b", "i", "u", "strong", "em",
-            "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li",
-            "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup", "col",
-            "blockquote", "pre", "code", "img", "hr", "sup", "sub", "small",
-            "dl", "dt", "dd", "figure", "figcaption", "abbr", "cite",
-            "center", "font",
+            "div",
+            "span",
+            "p",
+            "br",
+            "a",
+            "b",
+            "i",
+            "u",
+            "strong",
+            "em",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "ul",
+            "ol",
+            "li",
+            "table",
+            "thead",
+            "tbody",
+            "tfoot",
+            "tr",
+            "td",
+            "th",
+            "caption",
+            "colgroup",
+            "col",
+            "blockquote",
+            "pre",
+            "code",
+            "img",
+            "hr",
+            "sup",
+            "sub",
+            "small",
+            "dl",
+            "dt",
+            "dd",
+            "figure",
+            "figcaption",
+            "abbr",
+            "cite",
+            "center",
+            "font",
         ])
         .add_tag_attributes("a", &["href", "title", "target"])
         .add_tag_attributes("img", &["src", "alt", "width", "height", "style"])
-        .add_tag_attributes("td", &["colspan", "rowspan", "style", "align", "valign", "width"])
-        .add_tag_attributes("th", &["colspan", "rowspan", "style", "align", "valign", "width"])
-        .add_tag_attributes("table", &["style", "width", "cellpadding", "cellspacing", "border"])
+        .add_tag_attributes(
+            "td",
+            &["colspan", "rowspan", "style", "align", "valign", "width"],
+        )
+        .add_tag_attributes(
+            "th",
+            &["colspan", "rowspan", "style", "align", "valign", "width"],
+        )
+        .add_tag_attributes(
+            "table",
+            &["style", "width", "cellpadding", "cellspacing", "border"],
+        )
         .add_tag_attributes("tr", &["style"])
         .add_tag_attributes("div", &["style", "class"])
         .add_tag_attributes("span", &["style", "class"])
         .add_tag_attributes("p", &["style"])
         .add_tag_attributes("font", &["color", "size", "face"])
         .add_tag_attributes("col", &["width", "style"])
-        .url_schemes(std::collections::HashSet::from(["http", "https", "mailto", "cid"]))
+        .url_schemes(std::collections::HashSet::from([
+            "http", "https", "mailto", "cid",
+        ]))
         .link_rel(Some("noopener noreferrer"))
         .clean(html)
         .to_string()
@@ -74,7 +125,10 @@ async fn verify_mailbox_access(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     if !has_access {
-        return Err((StatusCode::FORBIDDEN, format!("No access to mailbox: {}", mailbox)));
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("No access to mailbox: {}", mailbox),
+        ));
     }
     Ok(())
 }
@@ -293,7 +347,12 @@ pub async fn send_email(
     // Look up sender's email account for AWS credentials
     let account = email_accounts::get_email_account(&pool, &req.from)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Unknown sender email '{}': {}", req.from, e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Unknown sender email '{}': {}", req.from, e),
+            )
+        })?;
 
     let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(account.aws_region.clone()));
@@ -324,7 +383,11 @@ pub async fn send_email(
         from_address: req.from.clone(),
         from_name: None,
         to_addresses: req.to.clone(),
-        cc_addresses: if req.cc.is_empty() { None } else { Some(req.cc.clone()) },
+        cc_addresses: if req.cc.is_empty() {
+            None
+        } else {
+            Some(req.cc.clone())
+        },
         subject: Some(req.subject.clone()),
         body_text: req.body_text.clone(),
         body_html: req.body_html.clone(),
@@ -364,20 +427,31 @@ async fn send_simple_email(
     let mut body_builder = Body::builder();
     if let Some(text) = &req.body_text {
         body_builder = body_builder.text(
-            Content::builder().data(text).charset("UTF-8").build()
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+            Content::builder()
+                .data(text)
+                .charset("UTF-8")
+                .build()
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
         );
     }
     if let Some(html) = &req.body_html {
         body_builder = body_builder.html(
-            Content::builder().data(html).charset("UTF-8").build()
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+            Content::builder()
+                .data(html)
+                .charset("UTF-8")
+                .build()
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
         );
     }
 
     let message = Message::builder()
-        .subject(Content::builder().data(&req.subject).charset("UTF-8").build()
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?)
+        .subject(
+            Content::builder()
+                .data(&req.subject)
+                .charset("UTF-8")
+                .build()
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
+        )
         .body(body_builder.build())
         .build();
 
@@ -395,7 +469,10 @@ async fn send_simple_email(
 
     let result = send_request.send().await.map_err(|e| {
         tracing::error!("SES send failed: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send email: {}", e))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to send email: {}", e),
+        )
     })?;
 
     Ok(result.message_id().unwrap_or("unknown").to_string())
@@ -406,8 +483,8 @@ async fn send_raw_email(
     ses_client: &aws_sdk_sesv2::Client,
     req: &SendEmailRequest,
 ) -> Result<String, (StatusCode, String)> {
-    use aws_sdk_sesv2::types::{EmailContent, RawMessage};
     use aws_sdk_sesv2::primitives::Blob;
+    use aws_sdk_sesv2::types::{EmailContent, RawMessage};
     use mail_builder::MessageBuilder;
 
     let mut builder = MessageBuilder::new();
@@ -428,7 +505,10 @@ async fn send_raw_email(
     if let Some(in_reply_to) = &req.in_reply_to {
         builder = builder.in_reply_to(in_reply_to.as_str());
         // References = In-Reply-To for single-level threading
-        builder = builder.header("References", mail_builder::headers::raw::Raw::new(in_reply_to.as_str()));
+        builder = builder.header(
+            "References",
+            mail_builder::headers::raw::Raw::new(in_reply_to.as_str()),
+        );
     }
 
     // Build body: multipart/alternative if both text and html, otherwise single part
@@ -448,17 +528,19 @@ async fn send_raw_email(
         }
     }
 
-    let raw_bytes = builder.write_to_vec()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to build MIME: {}", e)))?;
+    let raw_bytes = builder.write_to_vec().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to build MIME: {}", e),
+        )
+    })?;
 
     let raw_message = RawMessage::builder()
         .data(Blob::new(raw_bytes))
         .build()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let email_content = EmailContent::builder()
-        .raw(raw_message)
-        .build();
+    let email_content = EmailContent::builder().raw(raw_message).build();
 
     let result = ses_client
         .send_email()
@@ -467,7 +549,10 @@ async fn send_raw_email(
         .await
         .map_err(|e| {
             tracing::error!("SES raw send failed: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to send email: {}", e))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to send email: {}", e),
+            )
         })?;
 
     Ok(result.message_id().unwrap_or("unknown").to_string())
@@ -502,21 +587,37 @@ pub async fn search_emails(
 
     let limit = params.limit.unwrap_or(50);
     let offset = params.offset.unwrap_or(0);
-    let mailbox = params.mailbox.as_deref()
+    let mailbox = params
+        .mailbox
+        .as_deref()
         .and_then(|m| if m == "all" { None } else { Some(m) });
 
     let results = if let Some(mb) = mailbox {
         // Specific mailbox — verify access
         verify_mailbox_access(&pool, &user.user_id, mb).await?;
-        emails::search_emails(&pool, &params.q, Some(mb), params.folder.as_deref(), limit, offset)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        emails::search_emails(
+            &pool,
+            &params.q,
+            Some(mb),
+            params.folder.as_deref(),
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
         // All mailboxes — filter to accessible ones
         let accessible = get_user_mailboxes(&pool, &user.user_id).await?;
-        emails::search_emails_for_mailboxes(&pool, &params.q, &accessible, params.folder.as_deref(), limit, offset)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        emails::search_emails_for_mailboxes(
+            &pool,
+            &params.q,
+            &accessible,
+            params.folder.as_deref(),
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     };
 
     let total = results.len() as i64;
@@ -553,7 +654,9 @@ pub async fn list_threads(
 ) -> Result<Json<ThreadListResponse>, (StatusCode, String)> {
     let limit = params.limit.unwrap_or(50);
     let offset = params.offset.unwrap_or(0);
-    let mailbox = params.mailbox.as_deref()
+    let mailbox = params
+        .mailbox
+        .as_deref()
         .and_then(|m| if m == "all" { None } else { Some(m) });
 
     let threads = if let Some(mb) = mailbox {
@@ -589,7 +692,10 @@ pub async fn get_thread(
         .collect();
 
     if filtered.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "Thread not found or no access".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "Thread not found or no access".to_string(),
+        ));
     }
 
     Ok(Json(sanitize_emails(filtered)))
@@ -631,8 +737,10 @@ pub async fn download_attachment(
     // Verify access to the parent email
     get_email_with_access_check(&pool, &user.user_id, attachment.email_id).await?;
 
-    let stored_path = attachment.stored_path
-        .ok_or((StatusCode::NOT_FOUND, "Attachment file not stored".to_string()))?;
+    let stored_path = attachment.stored_path.ok_or((
+        StatusCode::NOT_FOUND,
+        "Attachment file not stored".to_string(),
+    ))?;
 
     let file_bytes = tokio::fs::read(&stored_path)
         .await
@@ -640,7 +748,10 @@ pub async fn download_attachment(
 
     let response = Response::builder()
         .header("Content-Type", &attachment.content_type)
-        .header("Content-Disposition", format!("attachment; filename=\"{}\"", attachment.filename))
+        .header(
+            "Content-Disposition",
+            format!("attachment; filename=\"{}\"", attachment.filename),
+        )
         .header("Content-Length", file_bytes.len().to_string())
         .body(Body::from(file_bytes))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

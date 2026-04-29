@@ -155,6 +155,6 @@ curl -X POST http://localhost:8001/api/epics \
 
 ## Related Projects
 
-- `agentic-flowstate-mcp`: MCP server for Claude integration
+- `agentic-flowstate-mcp`: MCP server for agent tooling
 - `agentic-flowstate-frontend`: Next.js web interface
 - `agentic-flowstate-ticketing-system`: DynamoDB infrastructure

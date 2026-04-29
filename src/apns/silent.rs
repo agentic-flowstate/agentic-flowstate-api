@@ -39,12 +39,11 @@
 use std::sync::Arc;
 
 use apns_h2::{
-    Client, ClientConfig, CollapseId, Endpoint, ErrorReason, NotificationOptions, Priority,
-    PushType,
-    request::payload::PayloadLike,
+    request::payload::PayloadLike, Client, ClientConfig, CollapseId, Endpoint, ErrorReason,
+    NotificationOptions, Priority, PushType,
 };
 use once_cell::sync::OnceCell;
-use serde::{Serialize, ser::SerializeStruct};
+use serde::{ser::SerializeStruct, Serialize};
 
 /// Errors returned by [`ApnsClient`].
 ///
@@ -313,11 +312,10 @@ impl ApnsClient {
 
         // Collapse id cap: APNs enforces a 64-byte ceiling. apns_h2's
         // CollapseId constructor checks this for us.
-        let collapse = CollapseId::new(conversation_id)
-            .map_err(|e| ApnsSilentError::Rejected {
-                code: 0,
-                reason: format!("invalid collapse-id: {}", e),
-            })?;
+        let collapse = CollapseId::new(conversation_id).map_err(|e| ApnsSilentError::Rejected {
+            code: 0,
+            reason: format!("invalid collapse-id: {}", e),
+        })?;
 
         let options = NotificationOptions {
             apns_push_type: Some(PushType::Background),
@@ -373,7 +371,7 @@ impl ApnsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
+    use jsonwebtoken::{decode_header, Algorithm, DecodingKey, Validation};
 
     /// A throwaway ES256 key in PKCS8 PEM format, generated specifically
     /// for the unit test suite. NOT a real APNs key — it is embedded
@@ -495,7 +493,11 @@ l7266ve46Rqa6TsuX86Nd3Rtw7q8DABfg0rwX3G3B0jZ0kHe6+4F3f6phQ==
             "TESTTEAMID".to_string(),
             ClientConfig::default(),
         );
-        assert!(build.is_ok(), "apns-h2 Client::token failed to parse .p8: {:?}", build.err());
+        assert!(
+            build.is_ok(),
+            "apns-h2 Client::token failed to parse .p8: {:?}",
+            build.err()
+        );
     }
 
     #[test]

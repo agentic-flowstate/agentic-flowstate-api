@@ -5,8 +5,8 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Global readiness flag. Set to `true` after full initialization
 /// (DB pool, listeners, background tasks). Set to `false` immediately
@@ -41,13 +41,21 @@ pub fn is_ready() -> bool {
 ///   Poll GET /health/ready every 500ms, max 30 retries (15s).
 pub async fn ready() -> Response {
     if is_ready() {
-        (StatusCode::OK, Json(json!({
-            "status": "ready"
-        }))).into_response()
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ready"
+            })),
+        )
+            .into_response()
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
-            "status": "starting"
-        }))).into_response()
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "starting"
+            })),
+        )
+            .into_response()
     }
 }
 
@@ -60,11 +68,19 @@ pub async fn ready_with_agents(State(db): State<Arc<sqlx::SqlitePool>>) -> Respo
         .map(|w| w.agent_run_count)
         .unwrap_or(0);
 
-    let status_code = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let status_code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     let status_str = if ready { "ready" } else { "starting" };
 
-    (status_code, Json(json!({
-        "status": status_str,
-        "active_agent_runs": active_agents
-    }))).into_response()
+    (
+        status_code,
+        Json(json!({
+            "status": status_str,
+            "active_agent_runs": active_agents
+        })),
+    )
+        .into_response()
 }

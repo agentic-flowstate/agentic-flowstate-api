@@ -16,7 +16,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub working_dir: Option<String>,
     /// Effort level for adaptive thinking: "low", "medium", "high", "xhigh", "max".
-    /// Defaults to "xhigh" if not set (Opus 4.7 recommended).
+    /// Defaults to "xhigh" if not set.
     #[serde(default = "default_effort")]
     pub effort: String,
 }
@@ -62,7 +62,7 @@ pub enum AgentType {
     WorkspaceManager,
     MeetingNotes,
     TicketAssistant,
-    /// EXA-powered deep research agent - uses EXA API for web search/content + Anthropic for analysis
+    /// EXA-powered deep research agent - uses EXA API for web search/content and model analysis
     ExaResearch,
     /// Critically evaluates and synthesizes research findings into structured, actionable output
     ResearchSynthesis,
@@ -82,7 +82,7 @@ pub enum AgentType {
     DocManager,
     /// Post-meeting agent — processes transcript, takes action (create tickets, send emails, etc.)
     MeetingAgent,
-    /// Full-access agent — every MCP tool + all built-in tools, uses CLAUDE.md as system prompt
+    /// Full-access agent — every MCP tool + all built-in tools
     FullAccess,
     /// Scoped workspace manager — restricted tool set for external users (no home/daily plan/focus/code)
     ScopedWorkspace,
@@ -243,7 +243,7 @@ pub struct AgentRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub email_output: Option<EmailOutput>,
     pub tool_call_count: i32,
-    /// Claude Code SDK session ID for resuming after API restart
+    /// Runtime session ID for resuming after API restart
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cc_session_id: Option<String>,
 }

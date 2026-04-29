@@ -1,5 +1,5 @@
-use sqlx::SqlitePool;
 use crate::agents::{AgentType, TicketContext};
+use sqlx::SqlitePool;
 
 /// Build ticket context for agent execution
 pub fn build_ticket_context(
@@ -68,12 +68,17 @@ pub async fn build_blocked_by_context(db: &SqlitePool, ticket_id: &str) -> Optio
     let mut context_sections = Vec::new();
 
     for blocker_id in blocked_by {
-        if let Ok(Some(blocker_ticket)) = ticketing_system::tickets::get_ticket_by_id(db, blocker_id).await {
+        if let Ok(Some(blocker_ticket)) =
+            ticketing_system::tickets::get_ticket_by_id(db, blocker_id).await
+        {
             // Fetch all artifacts for this blocker ticket
-            if let Ok(summaries) = ticketing_system::artifacts::list_by_ticket(db, blocker_id).await {
+            if let Ok(summaries) = ticketing_system::artifacts::list_by_ticket(db, blocker_id).await
+            {
                 for summary in &summaries {
                     // Fetch full content for each artifact
-                    if let Ok(Some(artifact)) = ticketing_system::artifacts::get_artifact(db, &summary.artifact_id).await {
+                    if let Ok(Some(artifact)) =
+                        ticketing_system::artifacts::get_artifact(db, &summary.artifact_id).await
+                    {
                         context_sections.push(format!(
                             "## {} ({}: \"{}\")\n\n{}",
                             artifact.title,
@@ -135,7 +140,12 @@ pub async fn gather_agent_context(
     previous_session_id: Option<&str>,
     selected_session_ids: &[String],
     assignee: Option<&str>,
-) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     let previous_output = if let Some(prev_id) = previous_session_id {
         get_previous_output(db, prev_id).await
     } else {
@@ -153,5 +163,10 @@ pub async fn gather_agent_context(
     // Auto-fetch context from blocked_by tickets
     let blocked_by_context = build_blocked_by_context(db, ticket_id).await;
 
-    (previous_output, selected_context, sender_info, blocked_by_context)
+    (
+        previous_output,
+        selected_context,
+        sender_info,
+        blocked_by_context,
+    )
 }

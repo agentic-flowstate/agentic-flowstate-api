@@ -3,8 +3,8 @@
 use axum::{
     extract::{Extension, Path, Query, State},
     http::StatusCode,
-    Json,
     response::sse::{Event, KeepAlive, Sse},
+    Json,
 };
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
@@ -15,9 +15,8 @@ use std::time::Duration;
 
 use crate::auth_middleware::AuthenticatedUser;
 use ticketing_system::{
-    CreateDailyPlanDateItemRequest, CreateDailyPlanItemRequest, DailyPlanItem,
-    DailyPlanDateItem, DailyPlanView, ToggleDailyPlanItemRequest,
-    UpdateDailyPlanItemRequest,
+    CreateDailyPlanDateItemRequest, CreateDailyPlanItemRequest, DailyPlanDateItem, DailyPlanItem,
+    DailyPlanView, ToggleDailyPlanItemRequest, UpdateDailyPlanItemRequest,
 };
 
 #[derive(Deserialize)]
@@ -31,7 +30,9 @@ pub async fn get_daily_plan(
     Extension(user): Extension<AuthenticatedUser>,
     Query(query): Query<DateQuery>,
 ) -> Result<Json<DailyPlanView>, (StatusCode, String)> {
-    let date = query.date.unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+    let date = query
+        .date
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
 
     let plan = ticketing_system::daily_plan::get_plan_for_date(&db, &user.user_id, &date)
         .await
@@ -215,6 +216,6 @@ pub async fn subscribe_daily_plan(
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(30))
-            .text("ping")
+            .text("ping"),
     )
 }

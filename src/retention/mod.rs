@@ -134,11 +134,7 @@ impl RetentionConfig {
         fn parse<T: std::str::FromStr>(key: &str, default: T) -> T {
             match std::env::var(key) {
                 Ok(raw) => raw.trim().parse::<T>().unwrap_or_else(|_| {
-                    tracing::warn!(
-                        "[retention] invalid {}={:?}, using default",
-                        key,
-                        raw
-                    );
+                    tracing::warn!("[retention] invalid {}={:?}, using default", key, raw);
                     default
                 }),
                 Err(_) => default,
@@ -181,6 +177,9 @@ mod tests {
             age_days: 90,
             ..RetentionConfig::default()
         };
-        assert_eq!(cfg.cutoff_timestamp(1_000_000_000), 1_000_000_000 - 90 * 86_400);
+        assert_eq!(
+            cfg.cutoff_timestamp(1_000_000_000),
+            1_000_000_000 - 90 * 86_400
+        );
     }
 }

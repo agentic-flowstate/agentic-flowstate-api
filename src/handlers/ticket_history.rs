@@ -28,11 +28,21 @@ pub async fn get_ticket_history(
     let events = if let Some(limit) = params.limit {
         ticketing_system::ticket_history::get_ticket_history_limited(&db, &ticket_id, limit)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to fetch history: {}", e)))?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to fetch history: {}", e),
+                )
+            })?
     } else {
         ticketing_system::ticket_history::get_ticket_history(&db, &ticket_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to fetch history: {}", e)))?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to fetch history: {}", e),
+                )
+            })?
     };
 
     Ok(Json(TicketHistoryResponse { events }))
@@ -49,11 +59,21 @@ pub async fn get_ticket_history_by_id(
     let events = if let Some(limit) = params.limit {
         ticketing_system::ticket_history::get_ticket_history_limited(&db, &ticket_id, limit)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to fetch history: {}", e)))?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to fetch history: {}", e),
+                )
+            })?
     } else {
         ticketing_system::ticket_history::get_ticket_history(&db, &ticket_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to fetch history: {}", e)))?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to fetch history: {}", e),
+                )
+            })?
     };
 
     Ok(Json(TicketHistoryResponse { events }))

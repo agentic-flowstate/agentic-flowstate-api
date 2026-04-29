@@ -1,8 +1,8 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{StatusCode, HeaderMap},
-    Json,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -10,10 +10,7 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::{
-    models::CreateEpicRequest,
-    mcp_wrapper::call_mcp_tool,
-};
+use crate::{mcp_wrapper::call_mcp_tool, models::CreateEpicRequest};
 
 use super::get_organization;
 
@@ -29,22 +26,22 @@ pub async fn list_epics(
 ) -> Response {
     // Use query param if provided, otherwise check header, otherwise list ALL
     let org = query.organization.or_else(|| {
-        headers.get("X-Organization")
+        headers
+            .get("X-Organization")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
     });
     let args = org.map(|o| json!({ "organization": o }));
 
     match call_mcp_tool("list_epics", args).await {
-        Ok(result) => {
-            (StatusCode::OK, Json(result)).into_response()
-        }
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => {
             error!("Failed to list epics: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to list epics: {}", e) }))
-            ).into_response()
+                Json(json!({ "error": format!("Failed to list epics: {}", e) })),
+            )
+                .into_response()
         }
     }
 }
@@ -58,21 +55,21 @@ pub async fn get_epic(
     let args = json!({ "organization": organization, "epic_id": epic_id });
 
     match call_mcp_tool("get_epic", Some(args)).await {
-        Ok(result) => {
-            (StatusCode::OK, Json(result)).into_response()
-        }
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(e) => {
             error!("Failed to get epic: {:?}", e);
             if e.to_string().contains("not found") {
                 (
                     StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "Epic not found" }))
-                ).into_response()
+                    Json(json!({ "error": "Epic not found" })),
+                )
+                    .into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to get epic: {}", e) }))
-                ).into_response()
+                    Json(json!({ "error": format!("Failed to get epic: {}", e) })),
+                )
+                    .into_response()
             }
         }
     }
@@ -95,7 +92,8 @@ pub async fn create_epic(
     match call_mcp_tool("create_epics", Some(args)).await {
         Ok(result) => {
             // Extract first epic from batch result for single-item response
-            let epic = result.get("epics")
+            let epic = result
+                .get("epics")
                 .and_then(|e| e.get(0))
                 .cloned()
                 .unwrap_or(result);
@@ -106,8 +104,9 @@ pub async fn create_epic(
             error!("Failed to create epic: {:?}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to create epic: {}", e) }))
-            ).into_response()
+                Json(json!({ "error": format!("Failed to create epic: {}", e) })),
+            )
+                .into_response()
         }
     }
 }
@@ -130,13 +129,15 @@ pub async fn delete_epic(
             if e.to_string().contains("not found") {
                 (
                     StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "Epic not found" }))
-                ).into_response()
+                    Json(json!({ "error": "Epic not found" })),
+                )
+                    .into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to delete epic: {}", e) }))
-                ).into_response()
+                    Json(json!({ "error": format!("Failed to delete epic: {}", e) })),
+                )
+                    .into_response()
             }
         }
     }

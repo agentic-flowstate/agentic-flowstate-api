@@ -1,7 +1,7 @@
 use axum::{extract::Json, http::StatusCode};
 use serde::Deserialize;
-use std::sync::OnceLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 static DEBUG_LOG: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
@@ -15,9 +15,7 @@ pub struct DebugLogRequest {
 }
 
 /// POST /api/debug-log — Store a debug log entry from the iOS app
-pub async fn post_debug_log(
-    Json(req): Json<DebugLogRequest>,
-) -> StatusCode {
+pub async fn post_debug_log(Json(req): Json<DebugLogRequest>) -> StatusCode {
     let timestamp = chrono::Utc::now().format("%H:%M:%S%.3f").to_string();
     let entry = format!("[{}] {}", timestamp, req.log);
     if let Ok(mut logs) = log_store().lock() {

@@ -1,6 +1,5 @@
 //! Authentication middleware - validates session cookie on protected routes
 
-use std::sync::Arc;
 use axum::{
     extract::{Request, State},
     http::StatusCode,
@@ -9,6 +8,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::sync::Arc;
 use tower_cookies::Cookies;
 
 use ticketing_system::SqlitePool;

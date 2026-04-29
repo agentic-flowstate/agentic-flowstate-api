@@ -6,7 +6,6 @@ mod handlers;
 mod health_monitor;
 mod mcp_wrapper;
 mod models;
-mod nightly_scheduler;
 mod observability;
 mod rate_limiting;
 mod request_logger;
@@ -201,7 +200,6 @@ async fn main() -> anyhow::Result<()> {
     email_fetcher::start_email_fetcher(db_pool.clone(), shutdown_token.child_token());
 
     // Nightly scheduler DISABLED — do not re-enable until conversation integration is validated.
-    // nightly_scheduler::start_nightly_scheduler(db_pool.clone(), shutdown_token.child_token());
     tracing::info!("Nightly scheduler is DISABLED");
 
     // Conversation-events retention prune (T-65DA4D32). Fires once per
@@ -224,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Create chat client manager for persistent ClaudeSDKClient instances
+    // Create chat client manager for live Codex app-server turns.
     let chat_manager = Arc::new(ChatClientManager::new());
     tracing::info!("Chat client manager initialized");
 
@@ -846,31 +844,6 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/daily-plan/date-items",
             post(handlers::create_daily_plan_date_item),
-        )
-        // Spanish flashcards (personal language-learning feature)
-        .route(
-            "/api/spanish/sections",
-            get(handlers::spanish_flashcards::list_spanish_sections),
-        )
-        .route(
-            "/api/spanish/sections/:section_id/cards",
-            get(handlers::spanish_flashcards::list_spanish_cards),
-        )
-        .route(
-            "/api/spanish/sections/:section_id/generate",
-            post(handlers::spanish_flashcards::generate_spanish_cards),
-        )
-        .route(
-            "/api/spanish/cards",
-            post(handlers::spanish_flashcards::create_spanish_card),
-        )
-        .route(
-            "/api/spanish/cards/:card_id/review",
-            post(handlers::spanish_flashcards::review_spanish_card),
-        )
-        .route(
-            "/api/spanish/cards/:card_id",
-            delete(handlers::spanish_flashcards::delete_spanish_card),
         )
         // Quick commands (dynamic presets above keyboard)
         .route(

@@ -1,7 +1,7 @@
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use anyhow::{Result, Context};
 
 /// Load a prompt template from the _prompts directory and substitute variables.
 ///
@@ -33,17 +33,23 @@ fn process_conditionals(template: &str, vars: &HashMap<String, String>) -> Strin
     let if_pattern = regex::Regex::new(r"\{\{#if\s+(\w+)\}\}([\s\S]*?)\{\{/if\}\}").ok();
 
     if let Some(re) = if_pattern {
-        result = re.replace_all(&result, |caps: &regex::Captures| {
-            let var_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let content = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        result = re
+            .replace_all(&result, |caps: &regex::Captures| {
+                let var_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                let content = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 
-            // Check if variable exists and is non-empty
-            if vars.get(&var_name.to_uppercase()).map(|v| !v.is_empty()).unwrap_or(false) {
-                content.to_string()
-            } else {
-                String::new()
-            }
-        }).to_string();
+                // Check if variable exists and is non-empty
+                if vars
+                    .get(&var_name.to_uppercase())
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(false)
+                {
+                    content.to_string()
+                } else {
+                    String::new()
+                }
+            })
+            .to_string();
     }
 
     result

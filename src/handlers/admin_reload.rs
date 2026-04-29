@@ -297,7 +297,11 @@ fi
     {
         Ok(_) => {
             tracing::info!("iOS install spawned (lightweight, no full rebuild)");
-            (StatusCode::OK, Json(json!({"status": "ios_install_started"}))).into_response()
+            (
+                StatusCode::OK,
+                Json(json!({"status": "ios_install_started"})),
+            )
+                .into_response()
         }
         Err(e) => {
             tracing::error!("Failed to spawn iOS install: {:?}", e);
@@ -335,30 +339,42 @@ pub async fn get_pending_restart() -> Response {
     // Check for pending restart flag
     if let Ok(content) = fs::read_to_string(&pending_path) {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
-            return (StatusCode::OK, Json(json!({
-                "pending": true,
-                "type": data.get("type").and_then(|v| v.as_str()).unwrap_or("restart"),
-                "requested_at": data.get("requested_at"),
-                "requested_by": data.get("requested_by"),
-                "service": data.get("service")
-            }))).into_response();
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "pending": true,
+                    "type": data.get("type").and_then(|v| v.as_str()).unwrap_or("restart"),
+                    "requested_at": data.get("requested_at"),
+                    "requested_by": data.get("requested_by"),
+                    "service": data.get("service")
+                })),
+            )
+                .into_response();
         }
     }
 
     // Check for pending iOS install flag
     if let Ok(content) = fs::read_to_string(&ios_pending_path) {
         if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
-            return (StatusCode::OK, Json(json!({
-                "pending": true,
-                "type": "ios_install",
-                "requested_at": data.get("requested_at"),
-            }))).into_response();
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "pending": true,
+                    "type": "ios_install",
+                    "requested_at": data.get("requested_at"),
+                })),
+            )
+                .into_response();
         }
     }
 
-    (StatusCode::OK, Json(json!({
-        "pending": false
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(json!({
+            "pending": false
+        })),
+    )
+        .into_response()
 }
 
 /// DELETE /api/admin/pending-restart — clear ALL pending flag files.
@@ -397,7 +413,7 @@ pub async fn restart_api() -> Response {
         .unwrap_or_else(|_| "501".to_string());
     let log = "/tmp/agentic-restart-debug.log";
     let binary = format!(
-        "{}/projects/agentic-flowstate/agentic-flowstate-api/target/release/agentic_api",
+        "{}/.agentic-flowstate/bin/agentic_api",
         std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string())
     );
     let script = format!(
@@ -431,7 +447,10 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_api: script complete""#,
         binary = binary,
         log = log,
     );
-    tracing::info!("Executing approved restart via atomic-replace + kickstart (debug logging to {})", log);
+    tracing::info!(
+        "Executing approved restart via atomic-replace + kickstart (debug logging to {})",
+        log
+    );
     // Use pre_exec(setsid) to create a new session so this script survives
     // kickstart killing our process group.
     {

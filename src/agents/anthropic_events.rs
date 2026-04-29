@@ -44,9 +44,7 @@ use serde::{Deserialize, Serialize};
 pub enum AnthropicEvent {
     /// First frame of a message. Payload is a skeleton `Message` with empty
     /// `content` array.
-    MessageStart {
-        message: MessageStub,
-    },
+    MessageStart { message: MessageStub },
     /// A new content block has opened at `index`.
     ContentBlockStart {
         index: u32,
@@ -58,9 +56,7 @@ pub enum AnthropicEvent {
         delta: ContentBlockDelta,
     },
     /// The block at `index` is finalized.
-    ContentBlockStop {
-        index: u32,
-    },
+    ContentBlockStop { index: u32 },
     /// Top-level message fields changed (stop_reason, usage, ...).
     MessageDelta {
         delta: MessageDeltaBody,
@@ -74,9 +70,7 @@ pub enum AnthropicEvent {
     /// Transport keepalive.
     Ping,
     /// Terminal error. Body is the Anthropic `{type, message}` error shape.
-    Error {
-        error: ApiError,
-    },
+    Error { error: ApiError },
     /// Synthetic resumption snapshot for a mid-stream content block
     /// (T-F8F986A9). Emitted by the resume stream replay path BEFORE
     /// forward-emission continues, ONLY for blocks whose stored log
@@ -98,10 +92,7 @@ pub enum AnthropicEvent {
     /// re-emit an equivalent snapshot derived fresh from the DB —
     /// clients must treat snapshots as idempotent replacements, not
     /// cumulative deltas.
-    ContentBlockSnapshot {
-        index: u32,
-        block: ContentBlockStub,
-    },
+    ContentBlockSnapshot { index: u32, block: ContentBlockStub },
 }
 
 impl AnthropicEvent {
@@ -143,7 +134,7 @@ pub struct MessageStub {
     /// Always `"assistant"` — server-to-client stream only carries assistant
     /// messages.
     pub role: String,
-    /// Model identifier (e.g., `"claude-opus-4-7"`). Optional because cc-sdk
+    /// Model identifier (e.g., `"gpt-5.5"`). Optional because the previous SDK
     /// doesn't always surface it; we pass `None` when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -166,7 +157,7 @@ pub struct MessageStub {
 
 impl MessageStub {
     /// Build a fresh `message_start` stub for an assistant message.
-    /// `model` can be `None` when cc-sdk doesn't surface the model id.
+    /// `model` can be `None` when the previous SDK doesn't surface the model id.
     /// `client_id` defaults to `None`; use [`Self::with_client_id`] to
     /// attach the optimistic-echo reconciliation key (T-A819D36B).
     pub fn new_assistant(id: impl Into<String>, model: Option<String>) -> Self {
@@ -221,13 +212,13 @@ pub enum ContentBlockStub {
         signature: String,
     },
     /// Tool-result block. In Anthropic's REST API this appears on USER
-    /// messages (the reply sent after a tool_use). cc-sdk surfaces the
+    /// messages (the reply sent after a tool_use). the previous SDK surfaces the
     /// result inline on the assistant stream as a separate Message with
     /// `role: "user"` content. We emit it as a `content_block_start`
     /// with the full result as initial content — no delta follow-ups.
     ToolResult {
         tool_use_id: String,
-        /// Inline text form of the result — cc-sdk flattens structured
+        /// Inline text form of the result — the previous SDK flattens structured
         /// results into a JSON string before we see them.
         #[serde(default)]
         content: String,
@@ -319,7 +310,7 @@ mod tests {
     #[test]
     fn message_start_wire_shape() {
         let ev = AnthropicEvent::MessageStart {
-            message: MessageStub::new_assistant("msg_abc123", Some("claude-opus-4-7".to_string())),
+            message: MessageStub::new_assistant("msg_abc123", Some("gpt-5.5".to_string())),
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(
@@ -330,7 +321,7 @@ mod tests {
                     "id": "msg_abc123",
                     "type": "message",
                     "role": "assistant",
-                    "model": "claude-opus-4-7",
+                    "model": "gpt-5.5",
                     "content": []
                 }
             })
@@ -345,7 +336,7 @@ mod tests {
     #[test]
     fn message_start_with_client_id_wire_shape() {
         let ev = AnthropicEvent::MessageStart {
-            message: MessageStub::new_assistant("msg_abc123", Some("claude-opus-4-7".to_string()))
+            message: MessageStub::new_assistant("msg_abc123", Some("gpt-5.5".to_string()))
                 .with_client_id(Some("test-abc-123".to_string())),
         };
         let v = serde_json::to_value(&ev).unwrap();
@@ -357,7 +348,7 @@ mod tests {
                     "id": "msg_abc123",
                     "type": "message",
                     "role": "assistant",
-                    "model": "claude-opus-4-7",
+                    "model": "gpt-5.5",
                     "content": [],
                     "client_id": "test-abc-123"
                 }
@@ -376,9 +367,7 @@ mod tests {
         let v = serde_json::to_value(&ev).unwrap();
         // The `client_id` key MUST NOT appear when value is None.
         assert!(
-            v.get("message")
-                .and_then(|m| m.get("client_id"))
-                .is_none(),
+            v.get("message").and_then(|m| m.get("client_id")).is_none(),
             "client_id must be skipped when None, got: {}",
             v
         );
@@ -654,7 +643,11 @@ mod tests {
         let all: std::collections::HashSet<&str> = ALL_EVENT_TYPES.iter().copied().collect();
         for (ev, expected) in cases {
             assert_eq!(ev.event_type(), *expected);
-            assert!(all.contains(expected), "{} not in ALL_EVENT_TYPES", expected);
+            assert!(
+                all.contains(expected),
+                "{} not in ALL_EVENT_TYPES",
+                expected
+            );
         }
     }
 }

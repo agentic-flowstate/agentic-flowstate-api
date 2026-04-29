@@ -1,10 +1,8 @@
 /// Commands that agents must never execute.
 ///
-/// These patterns use Claude Code's deny-rule glob syntax and are enforced at
-/// the framework level via `disallowed_tools` on `ClaudeCodeOptions`. They
-/// block *before* the LLM sees the tool result, even in `BypassPermissions`
-/// mode. The agent receives feedback explaining the denial so it can use the
-/// proper MCP tools instead.
+/// These patterns use the runtime's deny-rule glob syntax. They block before
+/// the agent sees a tool result. The agent receives feedback explaining the
+/// denial so it can use the proper MCP tools instead.
 ///
 /// Context: in-app agents previously killed the API server by running
 /// `launchctl bootout` on `com.agentic.api`, which is the very process

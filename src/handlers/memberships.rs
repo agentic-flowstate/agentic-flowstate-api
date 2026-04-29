@@ -1,6 +1,5 @@
 //! Organization membership API handlers
 
-use std::sync::Arc;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -8,6 +7,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use ticketing_system::SqlitePool;
 
 use crate::auth_middleware::AuthenticatedUser;
@@ -28,7 +28,10 @@ pub async fn list_my_organizations(
         .await
         .map_err(|e| {
             tracing::error!("Failed to list user organizations: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to list organizations"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to list organizations"})),
+            )
         })?;
 
     Ok(Json(json!(orgs)))
@@ -44,18 +47,27 @@ pub async fn list_members(
         .await
         .map_err(|e| {
             tracing::error!("Failed to check ownership: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to check ownership"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to check ownership"})),
+            )
         })?;
 
     if !is_owner {
-        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Only organization owners can list members"}))));
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Only organization owners can list members"})),
+        ));
     }
 
     let members = ticketing_system::memberships::list_members(&pool, &org)
         .await
         .map_err(|e| {
             tracing::error!("Failed to list members: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to list members"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to list members"})),
+            )
         })?;
 
     Ok(Json(json!(members)))
@@ -70,26 +82,39 @@ pub async fn add_member(
     let role = req.role.as_deref().unwrap_or("member");
 
     if role != "owner" && role != "member" {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "role must be 'owner' or 'member'"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "role must be 'owner' or 'member'"})),
+        ));
     }
 
     let is_owner = ticketing_system::memberships::is_owner(&pool, &user.user_id, &req.organization)
         .await
         .map_err(|e| {
             tracing::error!("Failed to check ownership: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to check ownership"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to check ownership"})),
+            )
         })?;
 
     if !is_owner {
-        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Only organization owners can add members"}))));
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Only organization owners can add members"})),
+        ));
     }
 
-    let membership = ticketing_system::memberships::add_member(&pool, &req.user_id, &req.organization, role)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to add member: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to add member"})))
-        })?;
+    let membership =
+        ticketing_system::memberships::add_member(&pool, &req.user_id, &req.organization, role)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to add member: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Failed to add member"})),
+                )
+            })?;
 
     Ok((StatusCode::CREATED, Json(json!(membership))))
 }
@@ -104,23 +129,35 @@ pub async fn remove_member(
         .await
         .map_err(|e| {
             tracing::error!("Failed to check ownership: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to check ownership"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to check ownership"})),
+            )
         })?;
 
     if !is_owner {
-        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "Only organization owners can remove members"}))));
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Only organization owners can remove members"})),
+        ));
     }
 
     let removed = ticketing_system::memberships::remove_member(&pool, &target_user_id, &org)
         .await
         .map_err(|e| {
             tracing::error!("Failed to remove member: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to remove member"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to remove member"})),
+            )
         })?;
 
     if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, Json(json!({"error": "Membership not found"}))))
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Membership not found"})),
+        ))
     }
 }

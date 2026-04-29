@@ -1,8 +1,8 @@
 //! Authentication handlers - register, login, logout, session check
 
-use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tower_cookies::{Cookie, Cookies};
 
 use ticketing_system::{LoginRequest, RegisterUserRequest, SqlitePool};
@@ -34,8 +34,12 @@ pub async fn register(
     cookies: Cookies,
     Json(req): Json<RegisterUserRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
-    if req.user_id.trim().is_empty() || req.password.trim().is_empty() || req.name.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "user_id, name, and password are required"}))));
+    if req.user_id.trim().is_empty() || req.password.trim().is_empty() || req.name.trim().is_empty()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "user_id, name, and password are required"})),
+        ));
     }
 
     let user = ticketing_system::auth::register_user(
@@ -52,7 +56,10 @@ pub async fn register(
             (StatusCode::CONFLICT, Json(json!({"error": msg})))
         } else {
             tracing::error!("Registration error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Registration failed"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Registration failed"})),
+            )
         }
     })?;
 
@@ -60,22 +67,33 @@ pub async fn register(
         .await
         .map_err(|e| {
             tracing::error!("Session creation error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to create session"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to create session"})),
+            )
         })?;
 
     cookies.add(make_session_cookie(&session_id));
 
     crate::system_log_helper::log_event(
-        &pool, "info", "auth",
+        &pool,
+        "info",
+        "auth",
         &format!("New user registered: {}", user.user_id),
-        None, Some(&user.user_id), Some(&session_id),
-    ).await;
+        None,
+        Some(&user.user_id),
+        Some(&session_id),
+    )
+    .await;
 
-    Ok((StatusCode::CREATED, Json(json!({
-        "user_id": user.user_id,
-        "name": user.name,
-        "email": user.email,
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "user_id": user.user_id,
+            "name": user.name,
+            "email": user.email,
+        })),
+    ))
 }
 
 /// POST /api/auth/login
@@ -89,33 +107,52 @@ pub async fn login(
         .await
         .map_err(|e| {
             tracing::error!("Authentication error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Authentication failed"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Authentication failed"})),
+            )
         })?;
 
     let Some(user) = user else {
         tracing::warn!("Login rejected (401) for user: {}", req.user_id);
         crate::system_log_helper::log_event(
-            &pool, "warn", "auth",
+            &pool,
+            "warn",
+            "auth",
             &format!("Failed login attempt for user: {}", req.user_id),
-            None, Some(&req.user_id), None,
-        ).await;
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid user_id or password"}))));
+            None,
+            Some(&req.user_id),
+            None,
+        )
+        .await;
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Invalid user_id or password"})),
+        ));
     };
 
     let session_id = ticketing_system::auth::create_session(&pool, &user.user_id)
         .await
         .map_err(|e| {
             tracing::error!("Session creation error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to create session"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to create session"})),
+            )
         })?;
 
     cookies.add(make_session_cookie(&session_id));
 
     crate::system_log_helper::log_event(
-        &pool, "info", "auth",
+        &pool,
+        "info",
+        "auth",
         &format!("User logged in: {}", user.user_id),
-        None, Some(&user.user_id), Some(&session_id),
-    ).await;
+        None,
+        Some(&user.user_id),
+        Some(&session_id),
+    )
+    .await;
 
     Ok(Json(json!({
         "user_id": user.user_id,
@@ -125,10 +162,7 @@ pub async fn login(
 }
 
 /// POST /api/auth/logout
-pub async fn logout(
-    State(pool): State<Arc<SqlitePool>>,
-    cookies: Cookies,
-) -> StatusCode {
+pub async fn logout(State(pool): State<Arc<SqlitePool>>, cookies: Cookies) -> StatusCode {
     if let Some(cookie) = cookies.get(SESSION_COOKIE) {
         let session_id = cookie.value().to_string();
         let _ = ticketing_system::auth::delete_session(&pool, &session_id).await;
@@ -150,7 +184,10 @@ pub async fn list_public_users(
         .await
         .map_err(|e| {
             tracing::error!("Failed to list users for public dropdown: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to list users"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to list users"})),
+            )
         })?;
 
     let payload: Vec<Value> = users
@@ -281,22 +318,34 @@ pub async fn me(
     let session_id = cookies
         .get(SESSION_COOKIE)
         .map(|c| c.value().to_string())
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, Json(json!({"error": "Not authenticated"}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Not authenticated"})),
+            )
+        })?;
 
     let user = ticketing_system::auth::validate_session(&pool, &session_id)
         .await
         .map_err(|e| {
             tracing::error!("Session validation error: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Session validation failed"})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Session validation failed"})),
+            )
         })?;
 
     let Some(user) = user else {
-        return Err((StatusCode::UNAUTHORIZED, Json(json!({"error": "Session expired or invalid"}))));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Session expired or invalid"})),
+        ));
     };
 
-    let organizations = ticketing_system::memberships::list_user_organizations(&pool, &user.user_id)
-        .await
-        .unwrap_or_default();
+    let organizations =
+        ticketing_system::memberships::list_user_organizations(&pool, &user.user_id)
+            .await
+            .unwrap_or_default();
 
     let is_admin = ticketing_system::system_logs::is_admin(&pool, &user.user_id)
         .await

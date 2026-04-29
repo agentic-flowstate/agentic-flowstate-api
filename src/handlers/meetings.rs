@@ -152,7 +152,10 @@ impl SignalingState {
 
     pub async fn get_screen_sharers(&self, room_id: &str) -> Vec<String> {
         let rooms = self.rooms.read().await;
-        rooms.get(room_id).map(|r| r.screen_sharers.clone()).unwrap_or_default()
+        rooms
+            .get(room_id)
+            .map(|r| r.screen_sharers.clone())
+            .unwrap_or_default()
     }
 
     pub async fn add_transcriber(&self, room_id: &str, user_id: &str) {
@@ -173,7 +176,10 @@ impl SignalingState {
 
     pub async fn get_transcribers(&self, room_id: &str) -> Vec<String> {
         let rooms = self.rooms.read().await;
-        rooms.get(room_id).map(|r| r.transcribers.clone()).unwrap_or_default()
+        rooms
+            .get(room_id)
+            .map(|r| r.transcribers.clone())
+            .unwrap_or_default()
     }
 
     #[allow(dead_code)]
@@ -211,9 +217,10 @@ pub async fn list_meetings(
     Query(query): Query<ListMeetingsQuery>,
 ) -> Result<Json<MeetingsResponse>, (StatusCode, String)> {
     let active_only = query.active_only.unwrap_or(false);
-    let meetings = ticketing_system::meetings::list_meetings_for_user(&db, active_only, Some(&user.user_id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let meetings =
+        ticketing_system::meetings::list_meetings_for_user(&db, active_only, Some(&user.user_id))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(MeetingsResponse { meetings }))
 }
@@ -459,17 +466,24 @@ async fn handle_signaling(socket: WebSocket) {
                     tokio::spawn(async move {
                         while let Ok(msg) = rx.recv().await {
                             let should_forward = match &msg {
-                                SignalingMessage::Offer { from_user, to_user, .. } |
-                                SignalingMessage::Answer { from_user, to_user, .. } |
-                                SignalingMessage::IceCandidate { from_user, to_user, .. } => {
-                                    from_user != &user_clone && (to_user == &user_clone || to_user == "*")
+                                SignalingMessage::Offer {
+                                    from_user, to_user, ..
                                 }
-                                SignalingMessage::UserJoined { user_id, .. } |
-                                SignalingMessage::UserLeft { user_id, .. } |
-                                SignalingMessage::ScreenShareStarted { user_id, .. } |
-                                SignalingMessage::ScreenShareStopped { user_id, .. } |
-                                SignalingMessage::TranscriptionStarted { user_id, .. } |
-                                SignalingMessage::TranscriptionStopped { user_id, .. } => {
+                                | SignalingMessage::Answer {
+                                    from_user, to_user, ..
+                                }
+                                | SignalingMessage::IceCandidate {
+                                    from_user, to_user, ..
+                                } => {
+                                    from_user != &user_clone
+                                        && (to_user == &user_clone || to_user == "*")
+                                }
+                                SignalingMessage::UserJoined { user_id, .. }
+                                | SignalingMessage::UserLeft { user_id, .. }
+                                | SignalingMessage::ScreenShareStarted { user_id, .. }
+                                | SignalingMessage::ScreenShareStopped { user_id, .. }
+                                | SignalingMessage::TranscriptionStarted { user_id, .. }
+                                | SignalingMessage::TranscriptionStopped { user_id, .. } => {
                                     user_id != &user_clone
                                 }
                                 _ => true,
@@ -520,25 +534,37 @@ async fn handle_signaling(socket: WebSocket) {
                 let _ = channel.send(signal);
             }
 
-            SignalingMessage::ScreenShareStarted { ref room_id, ref user_id } => {
+            SignalingMessage::ScreenShareStarted {
+                ref room_id,
+                ref user_id,
+            } => {
                 SIGNALING.add_screen_sharer(room_id, user_id).await;
                 let channel = SIGNALING.get_or_create_channel(room_id).await;
                 let _ = channel.send(signal);
             }
 
-            SignalingMessage::ScreenShareStopped { ref room_id, ref user_id } => {
+            SignalingMessage::ScreenShareStopped {
+                ref room_id,
+                ref user_id,
+            } => {
                 SIGNALING.remove_screen_sharer(room_id, user_id).await;
                 let channel = SIGNALING.get_or_create_channel(room_id).await;
                 let _ = channel.send(signal);
             }
 
-            SignalingMessage::TranscriptionStarted { ref room_id, ref user_id } => {
+            SignalingMessage::TranscriptionStarted {
+                ref room_id,
+                ref user_id,
+            } => {
                 SIGNALING.add_transcriber(room_id, user_id).await;
                 let channel = SIGNALING.get_or_create_channel(room_id).await;
                 let _ = channel.send(signal);
             }
 
-            SignalingMessage::TranscriptionStopped { ref room_id, ref user_id } => {
+            SignalingMessage::TranscriptionStopped {
+                ref room_id,
+                ref user_id,
+            } => {
                 SIGNALING.remove_transcriber(room_id, user_id).await;
                 let channel = SIGNALING.get_or_create_channel(room_id).await;
                 let _ = channel.send(signal);

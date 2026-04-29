@@ -63,7 +63,7 @@ pub async fn home_planner_chat(
 
     let config = ChatConfig {
         agent_type: AgentType::HomePlanner,
-        runtime: ChatRuntime::CodexExec,
+        runtime: ChatRuntime::CodexAppServer,
         prompt_name: "home-planner",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,

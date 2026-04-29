@@ -7,7 +7,9 @@ use mail_parser::{MessageParser, MimeHeaders};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use ticketing_system::{email_accounts, emails, CreateEmailRequest, EmailAccountInternal, SqlitePool};
+use ticketing_system::{
+    email_accounts, emails, CreateEmailRequest, EmailAccountInternal, SqlitePool,
+};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -41,16 +43,24 @@ async fn account_manager(db_pool: Arc<SqlitePool>, shutdown: CancellationToken) 
             Ok(accounts) => accounts,
             Err(e) => {
                 tracing::error!("Failed to load email accounts: {:?}", e);
-                crate::system_log_helper::log_error(&db_pool, "email", &format!("Failed to load email accounts: {}", e), None).await;
+                crate::system_log_helper::log_error(
+                    &db_pool,
+                    "email",
+                    &format!("Failed to load email accounts: {}", e),
+                    None,
+                )
+                .await;
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 continue;
             }
         };
 
-        let active_emails: HashSet<String> = active_accounts.iter().map(|a| a.email.clone()).collect();
+        let active_emails: HashSet<String> =
+            active_accounts.iter().map(|a| a.email.clone()).collect();
 
         // Stop watchers for removed accounts
-        let removed: Vec<String> = watchers.keys()
+        let removed: Vec<String> = watchers
+            .keys()
             .filter(|email| !active_emails.contains(*email))
             .cloned()
             .collect();
@@ -73,7 +83,10 @@ async fn account_manager(db_pool: Arc<SqlitePool>, shutdown: CancellationToken) 
                     continue; // All watchers still running
                 }
                 // Some watcher died, kill all and restart
-                tracing::warn!("[IDLE] Restarting watchers for {}: some tasks died", account.email);
+                tracing::warn!(
+                    "[IDLE] Restarting watchers for {}: some tasks died",
+                    account.email
+                );
                 if let Some(old_handles) = watchers.remove(&account.email) {
                     for h in old_handles {
                         h.abort();
@@ -83,10 +96,7 @@ async fn account_manager(db_pool: Arc<SqlitePool>, shutdown: CancellationToken) 
 
             tracing::info!("[IDLE] Starting watchers for account: {}", account.email);
 
-            let folders = vec![
-                ("INBOX", "INBOX"),
-                ("Sent Items", "Sent"),
-            ];
+            let folders = vec![("INBOX", "INBOX"), ("Sent Items", "Sent")];
 
             let mut handles = Vec::new();
             for (imap_folder, db_folder) in folders {
@@ -144,18 +154,29 @@ async fn idle_watcher(
         match idle_loop(&db_pool, &account, &imap_folder, &db_folder, idle_timeout).await {
             Ok(()) => {
                 // Clean exit (shouldn't happen in normal operation)
-                tracing::info!("[IDLE] {} {} watcher exited cleanly", account.email, db_folder);
+                tracing::info!(
+                    "[IDLE] {} {} watcher exited cleanly",
+                    account.email,
+                    db_folder
+                );
                 backoff = Duration::from_secs(1);
             }
             Err(e) => {
                 tracing::warn!(
                     "[IDLE] {} {} error: {:?} — reconnecting in {:?}",
-                    account.email, db_folder, e, backoff
+                    account.email,
+                    db_folder,
+                    e,
+                    backoff
                 );
                 email_accounts::update_fetch_status(
-                    &db_pool, &account.email, "error",
+                    &db_pool,
+                    &account.email,
+                    "error",
                     Some(&format!("IDLE {}: {:?}", db_folder, e)),
-                ).await.ok();
+                )
+                .await
+                .ok();
             }
         }
 
@@ -195,7 +216,12 @@ async fn idle_loop(
     let _mailbox = match session.select(imap_folder).await {
         Ok(m) => m,
         Err(e) => {
-            tracing::debug!("[IDLE] Could not select {} for {}: {:?}", imap_folder, account.email, e);
+            tracing::debug!(
+                "[IDLE] Could not select {} for {}: {:?}",
+                imap_folder,
+                account.email,
+                e
+            );
             session.logout().await.ok();
             // Folder doesn't exist — sleep long and retry (maybe it gets created later)
             tokio::time::sleep(Duration::from_secs(300)).await;
@@ -205,9 +231,16 @@ async fn idle_loop(
 
     // Initial full fetch to sync any missed messages
     if let Err(e) = fetch_folder(&mut session, db_pool, account, imap_folder, db_folder).await {
-        tracing::warn!("[IDLE] Initial fetch failed for {} {}: {:?}", account.email, db_folder, e);
+        tracing::warn!(
+            "[IDLE] Initial fetch failed for {} {}: {:?}",
+            account.email,
+            db_folder,
+            e
+        );
     }
-    email_accounts::update_fetch_status(db_pool, &account.email, "ok", None).await.ok();
+    email_accounts::update_fetch_status(db_pool, &account.email, "ok", None)
+        .await
+        .ok();
 
     tracing::info!("[IDLE] {} {} entering IDLE loop", account.email, db_folder);
 
@@ -226,21 +259,39 @@ async fn idle_loop(
             IdleResponse::NewData(data) => {
                 tracing::debug!(
                     "[IDLE] {} {} got event: {:?}",
-                    account.email, db_folder,
+                    account.email,
+                    db_folder,
                     data.parsed()
                 );
                 // Fetch new messages
-                if let Err(e) = fetch_folder(&mut session, db_pool, account, imap_folder, db_folder).await {
-                    tracing::warn!("[IDLE] Fetch after event failed for {} {}: {:?}", account.email, db_folder, e);
+                if let Err(e) =
+                    fetch_folder(&mut session, db_pool, account, imap_folder, db_folder).await
+                {
+                    tracing::warn!(
+                        "[IDLE] Fetch after event failed for {} {}: {:?}",
+                        account.email,
+                        db_folder,
+                        e
+                    );
                 }
-                email_accounts::update_fetch_status(db_pool, &account.email, "ok", None).await.ok();
+                email_accounts::update_fetch_status(db_pool, &account.email, "ok", None)
+                    .await
+                    .ok();
             }
             IdleResponse::Timeout => {
                 // Normal — re-issue IDLE to keep connection alive
-                tracing::debug!("[IDLE] {} {} timeout, re-issuing IDLE", account.email, db_folder);
+                tracing::debug!(
+                    "[IDLE] {} {} timeout, re-issuing IDLE",
+                    account.email,
+                    db_folder
+                );
             }
             IdleResponse::ManualInterrupt => {
-                tracing::debug!("[IDLE] {} {} manually interrupted", account.email, db_folder);
+                tracing::debug!(
+                    "[IDLE] {} {} manually interrupted",
+                    account.email,
+                    db_folder
+                );
                 break;
             }
         }
@@ -252,7 +303,10 @@ async fn idle_loop(
 
 /// Connect and fetch emails for a single account (both INBOX and Sent).
 /// Used by the force sync endpoint — independent of the IDLE system.
-pub async fn fetch_emails_for_account(db_pool: &SqlitePool, account: &EmailAccountInternal) -> Result<()> {
+pub async fn fetch_emails_for_account(
+    db_pool: &SqlitePool,
+    account: &EmailAccountInternal,
+) -> Result<()> {
     tracing::debug!("Force-syncing emails for {}", account.email);
 
     let tcp_stream = TcpStream::connect(format!("{}:{}", account.imap_host, account.imap_port))
@@ -272,14 +326,16 @@ pub async fn fetch_emails_for_account(db_pool: &SqlitePool, account: &EmailAccou
         .await
         .map_err(|e| anyhow::anyhow!("IMAP login failed: {:?}", e.0))?;
 
-    let folders = vec![
-        ("INBOX", "INBOX"),
-        ("Sent Items", "Sent"),
-    ];
+    let folders = vec![("INBOX", "INBOX"), ("Sent Items", "Sent")];
 
     for (imap_folder, db_folder) in folders {
         if let Err(e) = fetch_folder(&mut session, db_pool, account, imap_folder, db_folder).await {
-            tracing::warn!("Failed to fetch {} for {}: {:?}", imap_folder, account.email, e);
+            tracing::warn!(
+                "Failed to fetch {} for {}: {:?}",
+                imap_folder,
+                account.email,
+                e
+            );
         }
     }
 
@@ -307,7 +363,9 @@ async fn fetch_folder(
 
     tracing::debug!(
         "{} has {} messages for {}",
-        imap_folder, mailbox.exists, account.email
+        imap_folder,
+        mailbox.exists,
+        account.email
     );
 
     // Get all UIDs on server via UID SEARCH ALL (lightweight — no bodies)
@@ -321,7 +379,8 @@ async fn fetch_folder(
 
     // Sync deletions: remove local emails whose UIDs are no longer on server
     if !server_uids.is_empty() {
-        let local_emails = emails::get_local_message_ids(db_pool, &account.email, db_folder).await?;
+        let local_emails =
+            emails::get_local_message_ids(db_pool, &account.email, db_folder).await?;
         let mut stale_ids = Vec::new();
         for (db_id, message_id) in &local_emails {
             if let Some(uid_str) = message_id.rsplit(':').next() {
@@ -334,7 +393,12 @@ async fn fetch_folder(
         }
         if !stale_ids.is_empty() {
             let count = emails::delete_emails_by_ids(db_pool, &stale_ids).await?;
-            tracing::info!("Deleted {} stale emails from {} {}", count, account.email, db_folder);
+            tracing::info!(
+                "Deleted {} stale emails from {} {}",
+                count,
+                account.email,
+                db_folder
+            );
         }
     }
 
@@ -436,7 +500,11 @@ async fn fetch_folder(
 
                 match emails::create_email(db_pool, &req).await {
                     Ok(stored_email) => {
-                        tracing::info!("Stored new email in {} from {}", db_folder, req.from_address);
+                        tracing::info!(
+                            "Stored new email in {} from {}",
+                            db_folder,
+                            req.from_address
+                        );
 
                         let attachment_count = parsed.attachment_count();
                         if attachment_count > 0 {
@@ -450,10 +518,12 @@ async fn fetch_folder(
                                 tracing::warn!("Failed to create attachments dir: {:?}", e);
                             } else {
                                 for attachment in parsed.attachments() {
-                                    let filename = attachment.attachment_name()
+                                    let filename = attachment
+                                        .attachment_name()
                                         .unwrap_or("unnamed")
                                         .to_string();
-                                    let content_type = attachment.content_type()
+                                    let content_type = attachment
+                                        .content_type()
                                         .map(|ct: &mail_parser::ContentType| ct.ctype().to_string())
                                         .unwrap_or_else(|| "application/octet-stream".to_string());
                                     let contents = attachment.contents();
@@ -461,7 +531,11 @@ async fn fetch_folder(
                                     let file_path = attachments_dir.join(&filename);
 
                                     if let Err(e) = std::fs::write(&file_path, contents) {
-                                        tracing::warn!("Failed to write attachment {}: {:?}", filename, e);
+                                        tracing::warn!(
+                                            "Failed to write attachment {}: {:?}",
+                                            filename,
+                                            e
+                                        );
                                         continue;
                                     }
 
@@ -473,8 +547,14 @@ async fn fetch_folder(
                                         &content_type,
                                         size_bytes,
                                         Some(&stored_path),
-                                    ).await {
-                                        tracing::warn!("Failed to store attachment record for {}: {:?}", filename, e);
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to store attachment record for {}: {:?}",
+                                            filename,
+                                            e
+                                        );
                                     }
                                 }
                             }

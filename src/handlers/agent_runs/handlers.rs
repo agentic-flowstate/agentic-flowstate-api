@@ -465,7 +465,7 @@ pub async fn reconnect_agent_stream(
 
 /// POST /api/agent-runs/:session_id/message
 ///
-/// Sends a follow-up message by resuming the persisted Codex exec session for
+/// Sends a follow-up message by resuming the persisted Codex app-server thread for
 /// the agent run.
 pub async fn send_message_to_agent(
     Path(session_id): Path<String>,

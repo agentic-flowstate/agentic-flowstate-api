@@ -1,19 +1,19 @@
 use axum::{
     extract::{Path, Query, State},
-    response::sse::{Event, KeepAlive, Sse},
     http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
 use futures::stream::Stream;
+use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
-use sqlx::SqlitePool;
-use serde::{Deserialize, Serialize};
 
 use ticketing_system::{
-    TranscriptSession, TranscriptEntry,
-    CreateTranscriptSessionRequest, CreateTranscriptEntryRequest,
+    CreateTranscriptEntryRequest, CreateTranscriptSessionRequest, TranscriptEntry,
+    TranscriptSession,
 };
 
 #[derive(Debug, Serialize)]
@@ -52,7 +52,12 @@ pub async fn list_sessions(
 
     let sessions = ticketing_system::transcripts::list_sessions(&db, active_only)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+        })?;
 
     Ok(Json(TranscriptSessionsResponse { sessions }))
 }
@@ -65,12 +70,22 @@ pub async fn get_session(
 ) -> Result<Json<TranscriptEntriesResponse>, (StatusCode, String)> {
     let session = ticketing_system::transcripts::get_session(&db, &session_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Session not found".to_string()))?;
 
     let entries = ticketing_system::transcripts::get_entries(&db, &session_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+        })?;
 
     Ok(Json(TranscriptEntriesResponse { entries, session }))
 }
@@ -83,7 +98,12 @@ pub async fn create_session(
 ) -> Result<Json<TranscriptSession>, (StatusCode, String)> {
     let session = ticketing_system::transcripts::create_session(&db, req)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+        })?;
 
     Ok(Json(session))
 }
@@ -96,7 +116,12 @@ pub async fn end_session(
 ) -> Result<StatusCode, (StatusCode, String)> {
     ticketing_system::transcripts::end_session(&db, &session_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -113,7 +138,12 @@ pub async fn add_entry(
 
     let entry = ticketing_system::transcripts::add_entry(&db, req)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {}", e),
+            )
+        })?;
 
     Ok(Json(entry))
 }

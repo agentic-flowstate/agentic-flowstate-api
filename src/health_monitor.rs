@@ -9,7 +9,7 @@
 
 use sqlx::SqlitePool;
 use std::time::Duration;
-use ticketing_system::models::{CreateTicketRequest, TicketType, TicketStatus};
+use ticketing_system::models::{CreateTicketRequest, TicketStatus, TicketType};
 use ticketing_system::tickets;
 
 /// Check a single endpoint. Returns Ok(()) or Err with a description of what failed.
@@ -28,7 +28,10 @@ async fn check_endpoint(client: &reqwest::Client, url: &str) -> Result<(), Strin
     }
 
     // Read body for content validation
-    let body = resp.text().await.map_err(|e| format!("failed to read body: {}", e))?;
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("failed to read body: {}", e))?;
 
     if body.is_empty() {
         return Err("empty response body".to_string());
@@ -37,7 +40,10 @@ async fn check_endpoint(client: &reqwest::Client, url: &str) -> Result<(), Strin
     // For health API endpoints, validate the JSON body actually says "ok"
     if url.contains("/api/health") {
         if !body.contains("\"status\"") || !body.contains("\"ok\"") {
-            return Err(format!("health endpoint returned unexpected body: {}", &body[..body.len().min(200)]));
+            return Err(format!(
+                "health endpoint returned unexpected body: {}",
+                &body[..body.len().min(200)]
+            ));
         }
     }
 
@@ -46,12 +52,21 @@ async fn check_endpoint(client: &reqwest::Client, url: &str) -> Result<(), Strin
 
 /// Check if there's already an open/in_progress bug ticket for this endpoint.
 /// Searches by exact title prefix match to avoid duplicates.
-async fn has_existing_bug(pool: &SqlitePool, organization: &str, epic_id: &str, slice_id: &str, endpoint_name: &str) -> bool {
+async fn has_existing_bug(
+    pool: &SqlitePool,
+    organization: &str,
+    epic_id: &str,
+    slice_id: &str,
+    endpoint_name: &str,
+) -> bool {
     let title_prefix = format!("[DOWN] {}", endpoint_name);
     match tickets::list_tickets(pool, organization, epic_id, slice_id).await {
         Ok(existing) => existing.iter().any(|t| {
             t.ticket_type == TicketType::Bug
-                && matches!(t.status, TicketStatus::Open | TicketStatus::InProgress | TicketStatus::Blocked)
+                && matches!(
+                    t.status,
+                    TicketStatus::Open | TicketStatus::InProgress | TicketStatus::Blocked
+                )
                 && t.title.starts_with(&title_prefix)
         }),
         Err(e) => {
@@ -69,7 +84,10 @@ pub async fn run_checks(pool: &SqlitePool) {
     let endpoints = match ticketing_system::health_endpoints::list_endpoints(pool, true).await {
         Ok(eps) => eps,
         Err(e) => {
-            tracing::error!("[HEALTH_MONITOR] Failed to load endpoints from database: {}", e);
+            tracing::error!(
+                "[HEALTH_MONITOR] Failed to load endpoints from database: {}",
+                e
+            );
             return;
         }
     };
@@ -99,8 +117,13 @@ pub async fn run_checks(pool: &SqlitePool) {
                 tracing::warn!("[HEALTH_MONITOR] {} — DOWN ({})", ep.name, error);
 
                 // Check for existing open bug before creating a new one
-                if has_existing_bug(pool, &ep.organization, &ep.epic_id, &ep.slice_id, &ep.name).await {
-                    tracing::info!("[HEALTH_MONITOR] Bug ticket already exists for {}, skipping", ep.name);
+                if has_existing_bug(pool, &ep.organization, &ep.epic_id, &ep.slice_id, &ep.name)
+                    .await
+                {
+                    tracing::info!(
+                        "[HEALTH_MONITOR] Bug ticket already exists for {}, skipping",
+                        ep.name
+                    );
                     continue;
                 }
 

@@ -1,10 +1,10 @@
 {
   "models": {
-    "opus": "claude-opus-4-7"
+    "codex": "gpt-5.5"
   },
   "agents": {
     "exa-research": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "exa-research.txt",
       "tools": [
@@ -21,13 +21,13 @@
       ]
     },
     "research-synthesis": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "research-synthesis.txt",
       "tools": []
     },
     "ticket-planner": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "ticket-planner.txt",
       "tools": [
@@ -40,7 +40,7 @@
       ]
     },
     "ticket-creator": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "ticket-creator.txt",
       "tools": [
@@ -58,7 +58,7 @@
       ]
     },
     "planning": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "planning.txt",
       "tools": [
@@ -71,7 +71,7 @@
       ]
     },
     "execution": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "execution.txt",
       "tools": [
@@ -86,7 +86,7 @@
       ]
     },
     "evaluation": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "evaluation.txt",
       "tools": [
@@ -98,13 +98,13 @@
       ]
     },
     "email": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "email.txt",
       "tools": []
     },
     "workspace-manager": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "workspace-manager.txt",
       "tools": [
@@ -126,13 +126,13 @@
       ]
     },
     "meeting-notes": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "meeting-notes.txt",
       "tools": []
     },
     "ticket-assistant": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "ticket-assistant.txt",
       "tools": [
@@ -144,19 +144,19 @@
       ]
     },
     "doc-drafter": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "doc-drafter.txt",
       "tools": []
     },
     "pull-ticket": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "pull-ticket.txt",
       "tools": []
     },
     "codebase-research": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "codebase-research.txt",
       "tools": [
@@ -167,7 +167,7 @@
       ]
     },
     "home-planner": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "home-planner.txt",
       "tools": [
@@ -215,7 +215,7 @@
       ]
     },
     "doc-manager": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "doc-manager.txt",
       "tools": [
@@ -227,7 +227,7 @@
       ]
     },
     "meeting-agent": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "meeting-agent.txt",
       "tools": [
@@ -242,7 +242,7 @@
       ]
     },
     "full-access": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "full-access.txt",
       "tools": [
@@ -257,7 +257,7 @@
       ]
     },
     "scoped-workspace": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "scoped-workspace.txt",
       "tools": [
@@ -293,7 +293,7 @@
       ]
     },
     "dep-update-reviewer": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "dep-update-reviewer.txt",
       "tools": [
@@ -307,7 +307,7 @@
       ]
     },
     "dep-update-deep-dive": {
-      "model": "opus",
+      "model": "codex",
       "effort": "xhigh",
       "prompt_file": "dep-update-deep-dive.txt",
       "tools": [

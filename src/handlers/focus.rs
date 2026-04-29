@@ -13,9 +13,9 @@ use std::sync::Arc;
 
 use ticketing_system::FocusItem;
 
-use crate::agents::AgentType;
 use crate::agents::prompts::load_prompt;
 use crate::agents::run_oneshot;
+use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 
 /// GET /api/focus
@@ -69,8 +69,12 @@ pub async fn pull_focus_ticket(
     let mut vars = HashMap::new();
     vars.insert("organization".to_string(), org.clone());
 
-    let system_prompt = load_prompt("pull-ticket", vars)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to load prompt: {}", e)))?;
+    let system_prompt = load_prompt("pull-ticket", vars).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load prompt: {}", e),
+        )
+    })?;
 
     let working_dir = PathBuf::from("/Users/jarvisgpt/projects");
 
@@ -95,14 +99,19 @@ pub async fn pull_focus_ticket(
         tracing::error!("[PULL-TICKET] Failed to create agent run record: {}", e);
     }
 
-    tracing::info!("[PULL-TICKET] Starting agent for org={} session={}", org, session_id);
+    tracing::info!(
+        "[PULL-TICKET] Starting agent for org={} session={}",
+        org,
+        session_id
+    );
 
     let result = run_oneshot(
         Some(AgentType::PullTicket),
         &system_prompt,
         &working_dir,
         prompt,
-    ).await;
+    )
+    .await;
 
     let (result_text, tool_call_count) = match result {
         Ok(r) => (r.text, r.tool_call_count),
@@ -129,34 +138,40 @@ pub async fn pull_focus_ticket(
         }
     };
 
-    tracing::info!("[PULL-TICKET] Agent output: {} chars, tool_calls: {}", result_text.len(), tool_call_count);
+    tracing::info!(
+        "[PULL-TICKET] Agent output: {} chars, tool_calls: {}",
+        result_text.len(),
+        tool_call_count
+    );
 
     // Parse <selected_ticket>T-XXXXXXXX</selected_ticket>
-    let ticket_id = parse_selected_ticket(&result_text)
-        .ok_or_else(|| {
-            tracing::error!("[PULL-TICKET] No <selected_ticket> tag found in output");
-            // Store the run as failed with output for debugging
-            let failed_run = ticketing_system::AgentRun {
-                session_id: session_id.clone(),
-                organization: Some(org.clone()),
-                epic_id: None,
-                slice_id: None,
-                ticket_id: None,
-                agent_type: "pull-ticket".to_string(),
-                status: "failed".to_string(),
-                started_at: String::new(),
-                completed_at: Some(chrono::Utc::now().to_rfc3339()),
-                input_message: String::new(),
-                output_summary: Some(truncate_output(&result_text)),
-                tool_call_count,
-                cc_session_id: None,
-            };
-            let db_clone = db.clone();
-            tokio::spawn(async move {
-                let _ = ticketing_system::agent_runs::update_agent_run(&db_clone, &failed_run).await;
-            });
-            (StatusCode::UNPROCESSABLE_ENTITY, "Agent did not select a ticket".to_string())
-        })?;
+    let ticket_id = parse_selected_ticket(&result_text).ok_or_else(|| {
+        tracing::error!("[PULL-TICKET] No <selected_ticket> tag found in output");
+        // Store the run as failed with output for debugging
+        let failed_run = ticketing_system::AgentRun {
+            session_id: session_id.clone(),
+            organization: Some(org.clone()),
+            epic_id: None,
+            slice_id: None,
+            ticket_id: None,
+            agent_type: "pull-ticket".to_string(),
+            status: "failed".to_string(),
+            started_at: String::new(),
+            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+            input_message: String::new(),
+            output_summary: Some(truncate_output(&result_text)),
+            tool_call_count,
+            cc_session_id: None,
+        };
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            let _ = ticketing_system::agent_runs::update_agent_run(&db_clone, &failed_run).await;
+        });
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Agent did not select a ticket".to_string(),
+        )
+    })?;
 
     if ticket_id == "NONE" {
         // Store as completed with NONE result
@@ -176,7 +191,10 @@ pub async fn pull_focus_ticket(
             cc_session_id: None,
         };
         let _ = ticketing_system::agent_runs::update_agent_run(&db, &completed_run).await;
-        return Err((StatusCode::NOT_FOUND, "No suitable tickets found".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "No suitable tickets found".to_string(),
+        ));
     }
 
     tracing::info!("[PULL-TICKET] Selected ticket: {}", ticket_id);
@@ -186,7 +204,10 @@ pub async fn pull_focus_ticket(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| {
-            tracing::error!("[PULL-TICKET] Ticket {} not found — agent hallucinated", ticket_id);
+            tracing::error!(
+                "[PULL-TICKET] Ticket {} not found — agent hallucinated",
+                ticket_id
+            );
             // Store as failed with output for debugging
             let failed_run = ticketing_system::AgentRun {
                 session_id: session_id.clone(),
@@ -199,15 +220,23 @@ pub async fn pull_focus_ticket(
                 started_at: String::new(),
                 completed_at: Some(chrono::Utc::now().to_rfc3339()),
                 input_message: String::new(),
-                output_summary: Some(format!("Hallucinated ticket ID: {}\n\n{}", ticket_id, truncate_output(&result_text))),
+                output_summary: Some(format!(
+                    "Hallucinated ticket ID: {}\n\n{}",
+                    ticket_id,
+                    truncate_output(&result_text)
+                )),
                 tool_call_count,
                 cc_session_id: None,
             };
             let db_clone = db.clone();
             tokio::spawn(async move {
-                let _ = ticketing_system::agent_runs::update_agent_run(&db_clone, &failed_run).await;
+                let _ =
+                    ticketing_system::agent_runs::update_agent_run(&db_clone, &failed_run).await;
             });
-            (StatusCode::NOT_FOUND, format!("Ticket {} not found", ticket_id))
+            (
+                StatusCode::NOT_FOUND,
+                format!("Ticket {} not found", ticket_id),
+            )
         })?;
 
     // Add to focus
@@ -224,7 +253,10 @@ pub async fn pull_focus_ticket(
     .map_err(|e| {
         let msg = e.to_string();
         if msg.contains("UNIQUE") {
-            (StatusCode::CONFLICT, format!("Ticket {} is already in focus", ticket_id))
+            (
+                StatusCode::CONFLICT,
+                format!("Ticket {} is already in focus", ticket_id),
+            )
         } else {
             (StatusCode::INTERNAL_SERVER_ERROR, msg)
         }
@@ -248,7 +280,11 @@ pub async fn pull_focus_ticket(
     };
     let _ = ticketing_system::agent_runs::update_agent_run(&db, &completed_run).await;
 
-    tracing::info!("[PULL-TICKET] Added to focus: {} — {}", item.ticket_id, item.ticket_title);
+    tracing::info!(
+        "[PULL-TICKET] Added to focus: {} — {}",
+        item.ticket_id,
+        item.ticket_title
+    );
     Ok(Json(item))
 }
 
@@ -329,7 +365,10 @@ async fn build_org_data_snapshot(db: &SqlitePool, org: &str) -> Result<String, S
             .map_err(|e| format!("Failed to list slices: {}", e))?;
 
         for slice in &slices {
-            output.push_str(&format!("\n#### Slice: {} — {}\n", slice.slice_id, slice.title));
+            output.push_str(&format!(
+                "\n#### Slice: {} — {}\n",
+                slice.slice_id, slice.title
+            ));
 
             // Filter tickets for this slice
             let slice_tickets: Vec<_> = all_tickets
@@ -340,10 +379,7 @@ async fn build_org_data_snapshot(db: &SqlitePool, org: &str) -> Result<String, S
             for ticket in &slice_tickets {
                 output.push_str(&format!(
                     "- {} | {} | status={} | type={:?}",
-                    ticket.ticket_id,
-                    ticket.title,
-                    ticket.status,
-                    ticket.ticket_type,
+                    ticket.ticket_id, ticket.title, ticket.status, ticket.ticket_type,
                 ));
                 if let Some(ref blocked_by) = ticket.blocked_by {
                     if !blocked_by.is_empty() {
@@ -369,7 +405,10 @@ async fn build_org_data_snapshot(db: &SqlitePool, org: &str) -> Result<String, S
 /// Truncate output to a reasonable size for storage
 fn truncate_output(text: &str) -> String {
     if text.len() > 50000 {
-        let end = (0..=50000).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+        let end = (0..=50000)
+            .rev()
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(0);
         format!("{}...\n\n[Output truncated at {} bytes]", &text[..end], end)
     } else {
         text.to_string()

@@ -189,9 +189,7 @@ fn next_trigger_from_now(now: NaiveDateTime, run_hour_utc: u32) -> Duration {
     };
 
     let delta = next_trigger - now;
-    delta
-        .to_std()
-        .unwrap_or_else(|_| Duration::from_secs(60))
+    delta.to_std().unwrap_or_else(|_| Duration::from_secs(60))
 }
 
 #[cfg(test)]

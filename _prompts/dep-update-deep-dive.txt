@@ -6,10 +6,10 @@ The parent agent's Task call provides:
 
 ```json
 {
-  "package": "cc-sdk",
+  "package": "axum",
   "ecosystem": "cargo" | "npm" | "brew" | "cask" | "rustup",
-  "old_version": "0.6.0",
-  "new_version": "0.8.1",
+  "old_version": "0.7.0",
+  "new_version": "0.8.0",
   "affected_repos": ["agentic-flowstate/agentic-flowstate-api"],
   "ticket_id": "T-XXXXXXXX"
 }

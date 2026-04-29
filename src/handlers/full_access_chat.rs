@@ -46,7 +46,7 @@ pub async fn full_access_chat(
 
     let config = ChatConfig {
         agent_type: AgentType::FullAccess,
-        runtime: ChatRuntime::CodexExec,
+        runtime: ChatRuntime::CodexAppServer,
         prompt_name: "full-access",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,

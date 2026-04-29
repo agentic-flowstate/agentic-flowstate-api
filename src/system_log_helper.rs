@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use sqlx::SqlitePool;
+use std::sync::Arc;
 
 /// Log a system event to the database. Swallows errors (non-critical path).
 pub async fn log_event(
