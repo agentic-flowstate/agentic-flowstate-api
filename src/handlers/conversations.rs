@@ -427,6 +427,73 @@ pub struct RecentEvent {
     pub created_at: i64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ConversationEventsPageQuery {
+    pub starting_after: Option<i32>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversationEventsPageResponse {
+    pub events: Vec<RecentEvent>,
+    pub last_event_index: i32,
+}
+
+/// GET /api/v1/conversations/:id/events/page?starting_after=N&limit=M
+/// JSON event replay endpoint used by iOS delta-sync. Unlike `/checkpoint`,
+/// this returns the actual rows after the supplied cursor for both active and
+/// idle conversations, so foreground repair does not depend on a capped active
+/// checkpoint tail.
+pub async fn list_conversation_events_page(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+    Query(query): Query<ConversationEventsPageQuery>,
+) -> Result<Json<ConversationEventsPageResponse>, (StatusCode, String)> {
+    let conv = conversations::get_conversation(&pool, &id, false)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+    if conv.user_id != user.user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
+
+    let after = query.starting_after.unwrap_or(-1);
+    let limit = query.limit.unwrap_or(200).clamp(1, 500);
+    let last_event_index = conversations::get_max_event_index(&pool, &id)
+        .await
+        .unwrap_or(-1);
+    let raw = conversations::get_events_after_limited(&pool, &id, after, limit)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut events = Vec::with_capacity(raw.len());
+    for e in raw {
+        let event_data = conversations::load_event_payload_str(&pool, &e)
+            .await
+            .map_err(|err| {
+                tracing::error!(
+                    "Failed to materialize payload for event {}/{}: {}",
+                    e.conversation_id,
+                    e.event_index,
+                    err
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+            })?;
+        events.push(RecentEvent {
+            event_index: e.event_index,
+            event_type: e.event_type,
+            event_data,
+            created_at: e.created_at,
+        });
+    }
+
+    Ok(Json(ConversationEventsPageResponse {
+        events,
+        last_event_index,
+    }))
+}
+
 /// Query parameters for the reconnect SSE endpoint.
 #[derive(Debug, Deserialize)]
 pub struct ReconnectQuery {

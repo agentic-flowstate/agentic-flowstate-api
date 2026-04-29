@@ -184,19 +184,16 @@ pub async fn resume_conversation_stream(
     // iPhone that held this resume stream open while the user tapped
     // Send would hit a 429 on the POST and the chat would hang on
     // "Connecting..." until the app was relaunched.
-    let permit = match rate_limiter.check(
-        &user.user_id,
-        &id,
-        crate::rate_limiting::StreamKind::Resume,
-    ) {
-        RateLimitDecision::Allow(permit) => permit,
-        RateLimitDecision::Deny {
-            retry_after,
-            reason,
-        } => {
-            return rate_limited_response(retry_after, reason);
-        }
-    };
+    let permit =
+        match rate_limiter.check(&user.user_id, &id, crate::rate_limiting::StreamKind::Resume) {
+            RateLimitDecision::Allow(permit) => permit,
+            RateLimitDecision::Deny {
+                retry_after,
+                reason,
+            } => {
+                return rate_limited_response(retry_after, reason);
+            }
+        };
 
     // ---- 3. Retention validation: compare cursor to earliest retained. ----
     //
@@ -495,9 +492,11 @@ fn build_resume_stream(
                             if event_index > last_event_index {
                                 last_event_index = event_index;
                                 sleep.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                                let event_name = event_name_from_payload(&event_data);
                                 record_stream_event_emitted(&conversation_id, event_data.len());
                                 yield Ok(Event::default()
                                     .id(event_index.to_string())
+                                    .event(event_name)
                                     .data(event_data));
                             }
                         }
@@ -589,6 +588,19 @@ fn build_resume_stream(
             }
         }
     }
+}
+
+fn event_name_from_payload(payload: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "message".to_string())
 }
 
 /// RAII drop guard that records `stream_closed_total` + duration when
@@ -1425,4 +1437,15 @@ mod tests {
         assert_eq!(frames[2].0, "2");
     }
 
+    #[test]
+    fn live_broadcast_event_name_comes_from_payload_type() {
+        assert_eq!(
+            event_name_from_payload(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#
+            ),
+            "content_block_delta"
+        );
+        assert_eq!(event_name_from_payload(r#"{"status":"running"}"#), "message");
+        assert_eq!(event_name_from_payload("not json"), "message");
+    }
 }
