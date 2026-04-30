@@ -937,6 +937,14 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_conversation_checkpoint),
         )
         .route(
+            "/api/conversations/:id/agent-status",
+            get(handlers::get_conversation_run_status),
+        )
+        .route(
+            "/api/conversations/:id/agent-status/stream",
+            get(handlers::stream_conversation_run_status),
+        )
+        .route(
             "/api/conversations/:id/stream",
             get(handlers::reconnect_conversation_stream),
         )

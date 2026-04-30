@@ -26,6 +26,7 @@ use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
 use crate::agents::{AgentType, StreamEvent};
 use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
 use crate::rate_limiting::{self, RateLimitDecision, StreamPermit};
+use ticketing_system::checkpoints;
 
 /// Image data attached to a chat message (base64-encoded)
 #[derive(Debug, Clone, Deserialize)]
@@ -116,6 +117,27 @@ pub async fn submit(
         }
     };
 
+    if let Err(e) = checkpoints::upsert_checkpoint(&db, &conv_id, "queued", 0).await {
+        tracing::error!(
+            "[CHAT] Failed to create run status for non-streaming submit {}: {}",
+            conv_id,
+            e
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create conversation run status: {}", e),
+        )
+            .into_response();
+    }
+    if let Err(e) = super::conversations::publish_conversation_run_status(&db, &conv_id).await {
+        tracing::warn!(
+            "[CHAT] Failed to publish run status for non-streaming submit {}: {}",
+            conv_id,
+            e
+        );
+    }
+
+    let status_db = db.clone();
     let worker_tx = WORKER_MANAGER
         .get_or_create(conv_id.clone(), db, manager)
         .await;
@@ -136,6 +158,22 @@ pub async fn submit(
             "[CHAT] Worker channel closed for non-streaming submit {}",
             conv_id
         );
+        if let Err(e) = checkpoints::mark_interrupted(&status_db, &conv_id).await {
+            tracing::warn!(
+                "[CHAT] Failed to mark run status interrupted after worker send failure {}: {}",
+                conv_id,
+                e
+            );
+        }
+        if let Err(e) =
+            super::conversations::publish_conversation_run_status(&status_db, &conv_id).await
+        {
+            tracing::warn!(
+                "[CHAT] Failed to publish interrupted run status after worker send failure {}: {}",
+                conv_id,
+                e
+            );
+        }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "Worker unavailable for conversation",
@@ -147,7 +185,7 @@ pub async fn submit(
         StatusCode::ACCEPTED,
         Json(ChatSubmitResponse {
             conversation_id: conv_id,
-            status: "queued",
+            status: "running",
         }),
     )
         .into_response()

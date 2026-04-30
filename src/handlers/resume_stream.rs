@@ -1445,7 +1445,10 @@ mod tests {
             ),
             "content_block_delta"
         );
-        assert_eq!(event_name_from_payload(r#"{"status":"running"}"#), "message");
+        assert_eq!(
+            event_name_from_payload(r#"{"status":"running"}"#),
+            "message"
+        );
         assert_eq!(event_name_from_payload("not json"), "message");
     }
 }

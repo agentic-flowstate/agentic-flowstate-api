@@ -1,3 +1,4 @@
+use async_stream::stream;
 use axum::{
     extract::{Extension, Path, Query, State},
     http::{header, StatusCode},
@@ -8,7 +9,9 @@ use axum::{
     Json,
 };
 use futures::stream::Stream;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,6 +28,11 @@ use crate::auth_middleware::AuthenticatedUser;
 use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_opened, DisconnectReason,
 };
+use tokio::sync::{broadcast, RwLock};
+
+static CONVERSATION_STATUS_BROADCASTER: Lazy<
+    RwLock<HashMap<String, broadcast::Sender<ConversationRunStatusResponse>>>,
+> = Lazy::new(|| RwLock::new(HashMap::new()));
 
 #[derive(Debug, Deserialize)]
 pub struct ListConversationsQuery {
@@ -40,6 +48,97 @@ pub struct ListConversationsQuery {
 pub struct ConversationListResponse {
     pub conversations: Vec<Conversation>,
     pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationRunStatusResponse {
+    pub conversation_id: String,
+    /// App-facing normalized state: idle, running, completed, or failed.
+    pub status: String,
+    /// Raw checkpoint status for diagnostics: running, completed, interrupted, etc.
+    pub checkpoint_status: Option<String>,
+    pub is_processing: bool,
+    pub should_fetch: bool,
+    pub updated_at: i64,
+    pub last_event_index: i32,
+    pub server_time: i64,
+}
+
+fn normalize_checkpoint_status(status: Option<&str>) -> String {
+    match status {
+        Some("running") | Some("pending") | Some("queued") => "running",
+        Some("completed") => "completed",
+        Some("none") | None => "idle",
+        Some("interrupted") | Some("failed") | Some("cancelled") | Some("timeout") => "failed",
+        Some(_) => "failed",
+    }
+    .to_string()
+}
+
+async fn conversation_run_status_snapshot(
+    pool: &SqlitePool,
+    conversation_id: &str,
+) -> anyhow::Result<ConversationRunStatusResponse> {
+    let checkpoint = checkpoints::get_checkpoint(pool, conversation_id).await?;
+    let checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
+    let status = normalize_checkpoint_status(checkpoint_status.as_deref());
+    let is_processing = status == "running";
+    let last_event_index = conversations::get_max_event_index(pool, conversation_id)
+        .await
+        .unwrap_or(-1);
+
+    Ok(ConversationRunStatusResponse {
+        conversation_id: conversation_id.to_string(),
+        status,
+        checkpoint_status,
+        is_processing,
+        should_fetch: !is_processing,
+        updated_at: checkpoint.map(|cp| cp.updated_at).unwrap_or(0),
+        last_event_index,
+        server_time: chrono::Utc::now().timestamp(),
+    })
+}
+
+async fn get_status_sender(
+    conversation_id: &str,
+) -> broadcast::Sender<ConversationRunStatusResponse> {
+    {
+        let map = CONVERSATION_STATUS_BROADCASTER.read().await;
+        if let Some(tx) = map.get(conversation_id) {
+            return tx.clone();
+        }
+    }
+    let mut map = CONVERSATION_STATUS_BROADCASTER.write().await;
+    if let Some(tx) = map.get(conversation_id) {
+        return tx.clone();
+    }
+    let (tx, _) = broadcast::channel(32);
+    map.insert(conversation_id.to_string(), tx.clone());
+    tx
+}
+
+async fn remove_status_sender(conversation_id: &str) {
+    let mut map = CONVERSATION_STATUS_BROADCASTER.write().await;
+    map.remove(conversation_id);
+}
+
+pub async fn publish_conversation_run_status(
+    pool: &SqlitePool,
+    conversation_id: &str,
+) -> anyhow::Result<()> {
+    let snapshot = conversation_run_status_snapshot(pool, conversation_id).await?;
+    let sender = {
+        let map = CONVERSATION_STATUS_BROADCASTER.read().await;
+        map.get(conversation_id).cloned()
+    };
+
+    if let Some(tx) = sender {
+        let _ = tx.send(snapshot.clone());
+    }
+    if !snapshot.is_processing {
+        remove_status_sender(conversation_id).await;
+    }
+    Ok(())
 }
 
 /// List conversations (GET /api/conversations)
@@ -425,6 +524,119 @@ pub struct RecentEvent {
     /// as-is so the client can reuse its SSE parser with zero divergence.
     pub event_data: String,
     pub created_at: i64,
+}
+
+/// GET /api/conversations/:id/agent-status
+///
+/// Bare-bones lifecycle endpoint for ChatLab. This intentionally returns no
+/// assistant content and no recent event tail; clients use it only to decide
+/// whether to show the single "agent is processing" state or fetch persisted
+/// conversation output.
+pub async fn get_conversation_run_status(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ConversationRunStatusResponse>, (StatusCode, String)> {
+    let conv = conversations::get_conversation(&pool, &id, false)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+    if conv.user_id != user.user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
+
+    let snapshot = conversation_run_status_snapshot(&pool, &id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(snapshot))
+}
+
+/// GET /api/conversations/:id/agent-status/stream
+///
+/// Status-only SSE for the simplified app flow. The stream sends an initial
+/// status snapshot, then only sends another snapshot when the backend publishes
+/// a lifecycle transition. It never carries assistant tokens, tool progress, or
+/// replayed content frames.
+pub async fn stream_conversation_run_status(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+) -> Result<Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>, (StatusCode, String)>
+{
+    let conv = conversations::get_conversation(&pool, &id, false)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+    if conv.user_id != user.user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
+
+    let status_tx = get_status_sender(&id).await;
+    let mut status_rx = status_tx.subscribe();
+    drop(status_tx);
+
+    let initial = conversation_run_status_snapshot(&pool, &id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let stream_pool = pool.clone();
+    let stream_conversation_id = id.clone();
+
+    let out = stream! {
+        yield Ok(status_sse_event(&initial));
+        if initial.is_processing {
+            loop {
+                match status_rx.recv().await {
+                    Ok(snapshot) => {
+                        yield Ok(status_sse_event(&snapshot));
+                        if !snapshot.is_processing {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        match conversation_run_status_snapshot(&stream_pool, &stream_conversation_id).await {
+                            Ok(snapshot) => {
+                                yield Ok(status_sse_event(&snapshot));
+                                if !snapshot.is_processing {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to rebuild chat run status after lag for {}: {}",
+                                    stream_conversation_id,
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        } else {
+            remove_status_sender(&stream_conversation_id).await;
+        }
+    };
+
+    Ok(
+        Sse::new(Box::pin(out) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+            .keep_alive(
+                KeepAlive::new()
+                    .interval(Duration::from_secs(30))
+                    .text("ping"),
+            ),
+    )
+}
+
+fn status_sse_event(snapshot: &ConversationRunStatusResponse) -> Event {
+    let payload = serde_json::to_string(snapshot)
+        .expect("ConversationRunStatusResponse serialization should not fail");
+    Event::default()
+        .event("conversation_status")
+        .id(snapshot.last_event_index.to_string())
+        .data(payload)
 }
 
 #[derive(Debug, Deserialize)]

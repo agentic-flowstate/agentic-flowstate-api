@@ -1,9 +1,9 @@
+use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use anyhow::Result;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
 use sqlx::SqlitePool;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -253,6 +253,30 @@ impl ConversationWorker {
             .await;
     }
 
+    async fn publish_run_status(&self) {
+        if let Err(e) =
+            super::conversations::publish_conversation_run_status(&self.db, &self.conversation_id)
+                .await
+        {
+            tracing::warn!(
+                "[WORKER] Failed to publish run status for {}: {}",
+                self.conversation_id,
+                e
+            );
+        }
+    }
+
+    async fn mark_checkpoint_interrupted(&self) {
+        if let Err(e) = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await {
+            tracing::warn!(
+                "[WORKER] Failed to mark checkpoint interrupted for {}: {}",
+                self.conversation_id,
+                e
+            );
+        }
+        self.publish_run_status().await;
+    }
+
     async fn consume_cancelled_turn_before_agent_start(&mut self, stage: &str) -> bool {
         if !self.manager.is_turn_cancelled(&self.conversation_id).await {
             return false;
@@ -270,7 +294,7 @@ impl ConversationWorker {
             self.conversation_id,
             stage
         );
-        let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+        self.mark_checkpoint_interrupted().await;
         self.emit_event(&StreamEvent::Status {
             status: "cancelled".to_string(),
             message: Some("Cancelled by user".to_string()),
@@ -452,6 +476,8 @@ impl ConversationWorker {
             checkpoints::upsert_checkpoint(&self.db, &self.conversation_id, "pending", 0).await
         {
             tracing::warn!("[WORKER] Failed to create checkpoint: {}", e);
+        } else {
+            self.publish_run_status().await;
         }
 
         if self
@@ -526,7 +552,7 @@ impl ConversationWorker {
             }
             Err(e) => {
                 tracing::error!("[WORKER] Failed to create assistant message: {}", e);
-                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.mark_checkpoint_interrupted().await;
                 self.emit_event(&StreamEvent::Status {
                     status: "failed".to_string(),
                     message: Some(format!("Failed to create assistant message: {}", e)),
@@ -759,7 +785,7 @@ impl ConversationWorker {
                         self.conversation_id,
                         e
                     );
-                    let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                    self.mark_checkpoint_interrupted().await;
                     persist_failed_codex_message(
                         self,
                         &assistant_message_id,
@@ -803,7 +829,7 @@ impl ConversationWorker {
                     self.conversation_id,
                     e
                 );
-                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.mark_checkpoint_interrupted().await;
                 persist_failed_codex_message(
                     self,
                     &assistant_message_id,
@@ -1058,7 +1084,7 @@ impl ConversationWorker {
                     self.conversation_id,
                     e
                 );
-                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.mark_checkpoint_interrupted().await;
                 persist_failed_codex_message(
                     self,
                     &assistant_message_id,
@@ -1168,6 +1194,7 @@ impl ConversationWorker {
                 if let Err(e) = checkpoints::mark_completed(&self.db, &self.conversation_id).await {
                     tracing::warn!("[WORKER] Failed to mark checkpoint completed: {}", e);
                 }
+                self.publish_run_status().await;
 
                 if let Some(apns) = crate::apns::ApnsService::global() {
                     tracing::info!(
@@ -1216,7 +1243,7 @@ impl ConversationWorker {
                 .await;
             }
             CodexTurnCompletion::Cancelled { session_id } => {
-                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.mark_checkpoint_interrupted().await;
                 self.emit_event(&StreamEvent::Result {
                     session_id,
                     status: "cancelled".to_string(),
@@ -1230,7 +1257,7 @@ impl ConversationWorker {
                     self.conversation_id,
                     message
                 );
-                let _ = checkpoints::mark_interrupted(&self.db, &self.conversation_id).await;
+                self.mark_checkpoint_interrupted().await;
                 persist_failed_codex_message(
                     self,
                     &assistant_message_id,
@@ -1378,7 +1405,6 @@ impl ConversationWorker {
             }
         }
     }
-
 }
 
 /// Flush accumulated text content to the database.
