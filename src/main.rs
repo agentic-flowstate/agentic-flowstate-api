@@ -188,8 +188,8 @@ async fn main() -> anyhow::Result<()> {
     let db_pool = Arc::new(ticketing_system::init_db().await?);
     tracing::info!("SQLite database pool initialized");
 
-    // Mark any interrupted agent checkpoints from previous run
-    match ticketing_system::checkpoints::mark_all_running_as_interrupted(&db_pool).await {
+    // Mark any active agent checkpoints from the previous process as interrupted.
+    match ticketing_system::checkpoints::mark_all_active_as_interrupted(&db_pool).await {
         Ok(count) if count > 0 => {
             tracing::warn!(
                 "Marked {} interrupted agent checkpoint(s) from previous run",
@@ -1253,8 +1253,8 @@ async fn shutdown_signal(
     tracing::info!("Waiting 10 seconds for in-flight operations to complete...");
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
-    // Mark any still-running checkpoints as interrupted
-    match ticketing_system::checkpoints::mark_all_running_as_interrupted(&db_pool).await {
+    // Mark any still-active checkpoints as interrupted
+    match ticketing_system::checkpoints::mark_all_active_as_interrupted(&db_pool).await {
         Ok(count) if count > 0 => {
             tracing::warn!(
                 "Marked {} agent checkpoint(s) as interrupted during shutdown",

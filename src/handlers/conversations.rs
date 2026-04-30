@@ -445,7 +445,7 @@ pub async fn get_conversation_checkpoint(
     // where the client has all the history via /messages.
     let include_active = matches!(
         checkpoint.as_ref().map(|c| c.status.as_str()),
-        Some("running") | Some("pending")
+        Some("running") | Some("pending") | Some("queued")
     );
 
     let recent_events: Vec<RecentEvent> = if include_active {

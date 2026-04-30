@@ -612,7 +612,7 @@ pub fn create_conversation_reconnect_stream(
         }
 
         // Phase 2: If agent is still running, subscribe to live broadcast
-        if checkpoint_status == "running" || checkpoint_status == "pending" {
+        if matches!(checkpoint_status.as_str(), "running" | "pending" | "queued") {
             let broadcast_tx = get_broadcast_sender(&conversation_id).await;
             let mut broadcast_rx = broadcast_tx.subscribe();
             // Drop our clone of the sender so we don't keep the channel alive

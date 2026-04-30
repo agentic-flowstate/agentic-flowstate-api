@@ -470,8 +470,10 @@ fn build_resume_stream(
         // Only run the live phase when the worker is actively producing
         // events. A stream that was fresh-reconnected to a completed
         // conversation closes cleanly after the replay.
-        let worker_active =
-            checkpoint_status == "running" || checkpoint_status == "pending";
+        let worker_active = matches!(
+            checkpoint_status.as_str(),
+            "running" | "pending" | "queued"
+        );
         if !worker_active {
             return;
         }
