@@ -69,6 +69,51 @@ pub async fn scoped_workspace_chat(
     .await
 }
 
+/// POST /api/scoped-workspace/chat/submit
+pub async fn scoped_workspace_chat_submit(
+    State(db): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    headers: HeaderMap,
+    Json(req): Json<ScopedWorkspaceChatRequest>,
+) -> Response {
+    tracing::info!(
+        "=== SCOPED_WORKSPACE_CHAT_SUBMIT START === user={}",
+        user.user_id
+    );
+
+    let client_id = match chat_stream::extract_client_id(&headers) {
+        Ok(v) => v,
+        Err(e) => return chat_stream::malformed_idempotency_key_response(e),
+    };
+
+    let display_name = lookup_display_name(&db, &user.user_id).await;
+
+    let mut prompt_vars = HashMap::new();
+    prompt_vars.insert("USER_ID".to_string(), user.user_id.clone());
+    prompt_vars.insert("USER_NAME".to_string(), display_name);
+
+    let config = ChatConfig {
+        agent_type: AgentType::ScopedWorkspace,
+        runtime: ChatRuntime::CodexAppServer,
+        prompt_name: "scoped-workspace",
+        working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
+        prompt_vars,
+    };
+
+    chat_stream::submit(
+        db,
+        manager,
+        req.message,
+        req.conversation_id,
+        config,
+        user.user_id,
+        req.images,
+        client_id,
+    )
+    .await
+}
+
 async fn lookup_display_name(db: &SqlitePool, user_id: &str) -> String {
     match ticketing_system::users::get_user(db, user_id).await {
         Ok(Some(user)) => user.name,

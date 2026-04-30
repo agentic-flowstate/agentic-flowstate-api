@@ -64,3 +64,49 @@ pub async fn full_access_chat(
     )
     .await
 }
+
+/// POST /api/full-access/chat/submit
+pub async fn full_access_chat_submit(
+    State(db): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    headers: HeaderMap,
+    Json(req): Json<FullAccessChatRequest>,
+) -> Response {
+    tracing::info!(
+        "=== FULL_ACCESS_CHAT_SUBMIT START === user={}",
+        user.user_id
+    );
+
+    let client_id = match chat_stream::extract_client_id(&headers) {
+        Ok(v) => v,
+        Err(e) => return chat_stream::malformed_idempotency_key_response(e),
+    };
+
+    let agents_md = std::fs::read_to_string("/Users/jarvisgpt/projects/AGENTS.md")
+        .unwrap_or_else(|e| format!("(Failed to read AGENTS.md: {})", e));
+
+    let mut prompt_vars = HashMap::new();
+    prompt_vars.insert("USER_ID".to_string(), user.user_id.clone());
+    prompt_vars.insert("AGENTS_MD".to_string(), agents_md);
+
+    let config = ChatConfig {
+        agent_type: AgentType::FullAccess,
+        runtime: ChatRuntime::CodexAppServer,
+        prompt_name: "full-access",
+        working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
+        prompt_vars,
+    };
+
+    chat_stream::submit(
+        db,
+        manager,
+        req.message,
+        req.conversation_id,
+        config,
+        user.user_id,
+        req.images,
+        client_id,
+    )
+    .await
+}

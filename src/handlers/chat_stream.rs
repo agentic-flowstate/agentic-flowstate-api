@@ -17,7 +17,7 @@ use ticketing_system::conversations;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::chat_client_manager::ChatClientManager;
 use super::conversation_worker::WorkerMessage;
@@ -80,6 +80,77 @@ pub struct ChatConfig {
     pub prompt_name: &'static str,
     pub working_dir: PathBuf,
     pub prompt_vars: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatSubmitResponse {
+    pub conversation_id: String,
+    pub status: &'static str,
+}
+
+/// Submit a chat turn to the conversation worker and return immediately.
+///
+/// This is the non-streaming chat path used by the native app. The worker
+/// already persists every generated event to `conversation_events` and keeps
+/// `messages` updated as the turn progresses; clients catch up through the
+/// JSON event/page and message endpoints instead of holding an SSE response
+/// open.
+pub async fn submit(
+    db: Arc<SqlitePool>,
+    manager: Arc<ChatClientManager>,
+    message: String,
+    conversation_id: Option<String>,
+    config: ChatConfig,
+    user_id: String,
+    images: Option<Vec<ChatImageData>>,
+    client_id: Option<String>,
+) -> Response {
+    let conv_id = match conversation_id {
+        Some(id) => id,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "conversation_id is required for non-streaming chat submit",
+            )
+                .into_response();
+        }
+    };
+
+    let worker_tx = WORKER_MANAGER
+        .get_or_create(conv_id.clone(), db, manager)
+        .await;
+
+    if worker_tx
+        .send(WorkerMessage {
+            user_id,
+            message,
+            config,
+            images,
+            completion_tx: None,
+            client_id,
+        })
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            "[CHAT] Worker channel closed for non-streaming submit {}",
+            conv_id
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Worker unavailable for conversation",
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(ChatSubmitResponse {
+            conversation_id: conv_id,
+            status: "queued",
+        }),
+    )
+        .into_response()
 }
 
 /// Forward worker/broadcast events into the per-request SSE channel.

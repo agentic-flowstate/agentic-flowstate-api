@@ -688,6 +688,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/workspace-manager/chat",
             post(handlers::workspace_manager_chat),
         )
+        .route(
+            "/api/workspace-manager/chat/submit",
+            post(handlers::workspace_manager_chat_submit),
+        )
         // Document routes (artifact-based)
         .route(
             "/api/tickets/:ticket_id/docs",
@@ -838,12 +842,24 @@ async fn main() -> anyhow::Result<()> {
         )
         // Home Planner routes
         .route("/api/home-planner/chat", post(handlers::home_planner_chat))
+        .route(
+            "/api/home-planner/chat/submit",
+            post(handlers::home_planner_chat_submit),
+        )
         // Full Access Chat routes
         .route("/api/full-access/chat", post(handlers::full_access_chat))
+        .route(
+            "/api/full-access/chat/submit",
+            post(handlers::full_access_chat_submit),
+        )
         // Scoped Workspace Chat routes (restricted agent for external collaborators)
         .route(
             "/api/scoped-workspace/chat",
             post(handlers::scoped_workspace_chat),
+        )
+        .route(
+            "/api/scoped-workspace/chat/submit",
+            post(handlers::scoped_workspace_chat_submit),
         )
         // Unified SSE (single multiplexed connection for all topics)
         .route(
@@ -1090,6 +1106,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/meeting-agent/chat",
             post(handlers::meeting_agent_chat),
+        )
+        .route(
+            "/api/meeting-agent/chat/submit",
+            post(handlers::meeting_agent_chat_submit),
         )
         .layer(axum::middleware::from_fn_with_state(
             app_state.db.clone(),

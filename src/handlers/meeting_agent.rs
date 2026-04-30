@@ -141,3 +141,72 @@ pub async fn meeting_agent_chat(
     )
     .await
 }
+
+/// POST /api/meeting-agent/chat/submit
+pub async fn meeting_agent_chat_submit(
+    State(db): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    headers: HeaderMap,
+    Json(req): Json<MeetingAgentRequest>,
+) -> Response {
+    tracing::info!(
+        "=== MEETING_AGENT_CHAT_SUBMIT START === user={} room={}",
+        user.user_id,
+        req.room_id
+    );
+
+    let client_id = match chat_stream::extract_client_id(&headers) {
+        Ok(v) => v,
+        Err(e) => return chat_stream::malformed_idempotency_key_response(e),
+    };
+
+    let user_name = match ticketing_system::users::get_user(&db, &user.user_id).await {
+        Ok(Some(u)) => u.name,
+        _ => user.user_id.clone(),
+    };
+
+    let mut prompt_vars = HashMap::new();
+    prompt_vars.insert("USER_NAME".to_string(), user_name);
+
+    let config = ChatConfig {
+        agent_type: AgentType::MeetingAgent,
+        runtime: ChatRuntime::CodexAppServer,
+        prompt_name: "meeting-agent",
+        working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
+        prompt_vars,
+    };
+
+    let message = if let Some(ref conv_id) = req.conversation_id {
+        let has_session = ticketing_system::conversations::get_conversation(&db, conv_id, false)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|c| c.session_id)
+            .is_some();
+
+        if has_session {
+            req.message
+        } else if let Some(ctx) = load_meeting_context(&db, &req.room_id).await {
+            format!("{}\n\n{}", ctx, req.message)
+        } else {
+            req.message
+        }
+    } else if let Some(ctx) = load_meeting_context(&db, &req.room_id).await {
+        format!("{}\n\n{}", ctx, req.message)
+    } else {
+        req.message
+    };
+
+    chat_stream::submit(
+        db,
+        manager,
+        message,
+        req.conversation_id,
+        config,
+        user.user_id,
+        req.images,
+        client_id,
+    )
+    .await
+}

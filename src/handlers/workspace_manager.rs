@@ -60,3 +60,29 @@ pub async fn workspace_manager_chat(
     )
     .await
 }
+
+/// POST /api/workspace-manager/chat/submit
+pub async fn workspace_manager_chat_submit(
+    State(db): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    headers: HeaderMap,
+    Json(req): Json<WorkspaceManagerRequest>,
+) -> Response {
+    tracing::info!("=== WORKSPACE_MANAGER_CHAT_SUBMIT START ===");
+    let client_id = match chat_stream::extract_client_id(&headers) {
+        Ok(v) => v,
+        Err(e) => return chat_stream::malformed_idempotency_key_response(e),
+    };
+    chat_stream::submit(
+        db,
+        manager,
+        req.message,
+        req.conversation_id,
+        config(),
+        user.user_id,
+        req.images,
+        client_id,
+    )
+    .await
+}
