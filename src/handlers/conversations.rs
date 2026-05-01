@@ -368,10 +368,17 @@ pub async fn update_message(
 /// messages strictly older than that index (chronological). Used by the
 /// iOS app for pull-to-load-older pagination — pass the smallest known
 /// `message_index` to load the previous page of older history.
+///
+/// `defer_active=true` is the ChatLab completed-turn reveal mode. While a
+/// backend run is active, the endpoint omits the latest assistant row from the
+/// response so clients can show only the user's message plus a processing
+/// indicator. Once the run is terminal the same request returns the full
+/// completed turn, including tool/thinking blocks.
 #[derive(Debug, Deserialize)]
 pub struct ListMessagesQuery {
     pub limit: Option<i64>,
     pub before: Option<i64>,
+    pub defer_active: Option<bool>,
 }
 
 /// List messages for a conversation (GET /api/conversations/:id/messages)
@@ -390,9 +397,24 @@ pub async fn list_messages(
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
 
-    let messages = conversations::list_messages(&pool, &id, params.limit, params.before)
+    let mut messages = conversations::list_messages(&pool, &id, params.limit, params.before)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if params.defer_active.unwrap_or(false) {
+        let checkpoint = checkpoints::get_checkpoint(&pool, &id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let is_processing = matches!(
+            checkpoint.as_ref().map(|cp| cp.status.as_str()),
+            Some("running") | Some("pending") | Some("queued")
+        );
+        if is_processing {
+            if let Some(idx) = messages.iter().rposition(|m| m.role == "assistant") {
+                messages.remove(idx);
+            }
+        }
+    }
 
     Ok(Json(messages))
 }
