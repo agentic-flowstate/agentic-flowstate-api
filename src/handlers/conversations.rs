@@ -64,6 +64,12 @@ pub struct ConversationRunStatusResponse {
     pub server_time: i64,
 }
 
+const ACTIVE_CHECKPOINT_STALE_SECONDS: i64 = 60;
+
+fn is_active_checkpoint_status(status: Option<&str>) -> bool {
+    matches!(status, Some("running") | Some("pending") | Some("queued"))
+}
+
 fn normalize_checkpoint_status(status: Option<&str>) -> String {
     match status {
         Some("running") | Some("pending") | Some("queued") => "running",
@@ -78,11 +84,41 @@ fn normalize_checkpoint_status(status: Option<&str>) -> String {
 async fn conversation_run_status_snapshot(
     pool: &SqlitePool,
     conversation_id: &str,
+    manager: Option<&ChatClientManager>,
 ) -> anyhow::Result<ConversationRunStatusResponse> {
-    let checkpoint = checkpoints::get_checkpoint(pool, conversation_id).await?;
-    let checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
-    let status = normalize_checkpoint_status(checkpoint_status.as_deref());
-    let is_processing = status == "running";
+    let mut checkpoint = checkpoints::get_checkpoint(pool, conversation_id).await?;
+    let mut checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
+    let mut status = normalize_checkpoint_status(checkpoint_status.as_deref());
+    let mut is_processing = status == "running";
+
+    if is_processing {
+        if let (Some(manager), Some(checkpoint_row)) = (manager, checkpoint.as_ref()) {
+            let has_live_turn = manager.has_app_server_turn(conversation_id).await;
+            let has_worker = WORKER_MANAGER.has_worker(conversation_id).await;
+            let checkpoint_age = chrono::Utc::now()
+                .timestamp()
+                .saturating_sub(checkpoint_row.updated_at);
+
+            if !has_live_turn
+                && !has_worker
+                && checkpoint_age > ACTIVE_CHECKPOINT_STALE_SECONDS
+                && is_active_checkpoint_status(checkpoint_status.as_deref())
+            {
+                tracing::warn!(
+                    "[CHAT-STATUS] Marking stale checkpoint interrupted: conv={} status={} age={}s",
+                    conversation_id,
+                    checkpoint_status.as_deref().unwrap_or("none"),
+                    checkpoint_age
+                );
+                checkpoints::mark_interrupted(pool, conversation_id).await?;
+                checkpoint = checkpoints::get_checkpoint(pool, conversation_id).await?;
+                checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
+                status = normalize_checkpoint_status(checkpoint_status.as_deref());
+                is_processing = false;
+            }
+        }
+    }
+
     let last_event_index = conversations::get_max_event_index(pool, conversation_id)
         .await
         .unwrap_or(-1);
@@ -126,7 +162,7 @@ pub async fn publish_conversation_run_status(
     pool: &SqlitePool,
     conversation_id: &str,
 ) -> anyhow::Result<()> {
-    let snapshot = conversation_run_status_snapshot(pool, conversation_id).await?;
+    let snapshot = conversation_run_status_snapshot(pool, conversation_id, None).await?;
     let sender = {
         let map = CONVERSATION_STATUS_BROADCASTER.read().await;
         map.get(conversation_id).cloned()
@@ -144,10 +180,11 @@ pub async fn publish_conversation_run_status(
 /// List conversations (GET /api/conversations)
 pub async fn list_conversations(
     State(pool): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListConversationsQuery>,
 ) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
-    let list = conversations::list_conversations(
+    let mut list = conversations::list_conversations(
         &pool,
         params.organization.as_deref(),
         Some(&user.user_id),
@@ -158,6 +195,15 @@ pub async fn list_conversations(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    for conv in &mut list {
+        if conv.is_active == Some(true) {
+            let status = conversation_run_status_snapshot(&pool, &conv.id, Some(manager.as_ref()))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            conv.is_active = Some(status.is_processing);
+        }
+    }
 
     let total = list.len() as i64;
 
@@ -298,6 +344,32 @@ pub async fn cancel_conversation(
                     id
                 );
                 let _ = manager.consume_cancelled_turn(&id).await;
+                match checkpoints::get_checkpoint(&pool, &id).await {
+                    Ok(Some(checkpoint))
+                        if is_active_checkpoint_status(Some(checkpoint.status.as_str())) =>
+                    {
+                        if let Err(e) = checkpoints::mark_interrupted(&pool, &id).await {
+                            tracing::warn!(
+                                "[CANCEL] Failed to clear stale checkpoint for {}: {}",
+                                id,
+                                e
+                            );
+                        }
+                        if let Err(e) = publish_conversation_run_status(&pool, &id).await {
+                            tracing::warn!(
+                                "[CANCEL] Failed to publish stale checkpoint cleanup for {}: {}",
+                                id,
+                                e
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        "[CANCEL] Failed to inspect checkpoint for stale cleanup {}: {}",
+                        id,
+                        e
+                    ),
+                }
             }
         }
         Err(e) => {
@@ -556,6 +628,7 @@ pub struct RecentEvent {
 /// conversation output.
 pub async fn get_conversation_run_status(
     State(pool): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ConversationRunStatusResponse>, (StatusCode, String)> {
@@ -567,7 +640,7 @@ pub async fn get_conversation_run_status(
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
 
-    let snapshot = conversation_run_status_snapshot(&pool, &id)
+    let snapshot = conversation_run_status_snapshot(&pool, &id, Some(manager.as_ref()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(snapshot))
@@ -581,6 +654,7 @@ pub async fn get_conversation_run_status(
 /// replayed content frames.
 pub async fn stream_conversation_run_status(
     State(pool): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>, (StatusCode, String)>
@@ -597,10 +671,11 @@ pub async fn stream_conversation_run_status(
     let mut status_rx = status_tx.subscribe();
     drop(status_tx);
 
-    let initial = conversation_run_status_snapshot(&pool, &id)
+    let initial = conversation_run_status_snapshot(&pool, &id, Some(manager.as_ref()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let stream_pool = pool.clone();
+    let stream_manager = manager.clone();
     let stream_conversation_id = id.clone();
 
     let out = stream! {
@@ -615,7 +690,13 @@ pub async fn stream_conversation_run_status(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        match conversation_run_status_snapshot(&stream_pool, &stream_conversation_id).await {
+                        match conversation_run_status_snapshot(
+                            &stream_pool,
+                            &stream_conversation_id,
+                            Some(stream_manager.as_ref()),
+                        )
+                        .await
+                        {
                             Ok(snapshot) => {
                                 yield Ok(status_sse_event(&snapshot));
                                 if !snapshot.is_processing {

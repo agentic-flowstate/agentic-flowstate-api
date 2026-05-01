@@ -32,6 +32,13 @@ impl ChatClientManager {
         turns.remove(conversation_id);
     }
 
+    /// Whether a live Codex app-server subprocess is currently registered for
+    /// this conversation.
+    pub async fn has_app_server_turn(&self, conversation_id: &str) -> bool {
+        let turns = self.app_server_turns.lock().await;
+        turns.contains_key(conversation_id)
+    }
+
     /// Mark the current turn as cancelled. The worker consumes this marker
     /// either before the queued turn starts or when an in-flight turn exits.
     pub async fn mark_cancelled_turn(&self, conversation_id: &str) {
