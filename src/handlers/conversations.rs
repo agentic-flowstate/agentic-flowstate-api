@@ -17,8 +17,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use ticketing_system::{
-    checkpoints, conversations, AddMessageRequest, Conversation, ConversationMessage,
-    CreateConversationRequest, SqlitePool, UpdateConversationRequest,
+    agent_runners, checkpoints, conversation_turn_jobs, conversations, AddMessageRequest,
+    Conversation, ConversationMessage, CreateConversationRequest, SqlitePool,
+    UpdateConversationRequest,
 };
 
 use super::chat_client_manager::ChatClientManager;
@@ -95,12 +96,22 @@ async fn conversation_run_status_snapshot(
         if let (Some(manager), Some(checkpoint_row)) = (manager, checkpoint.as_ref()) {
             let has_live_turn = manager.has_app_server_turn(conversation_id).await;
             let has_worker = WORKER_MANAGER.has_worker(conversation_id).await;
+            let has_runner_turn =
+                agent_runners::has_active_turn_for_conversation(pool, conversation_id)
+                    .await
+                    .unwrap_or(false);
+            let has_active_job =
+                conversation_turn_jobs::has_active_job_for_conversation(pool, conversation_id)
+                    .await
+                    .unwrap_or(false);
             let checkpoint_age = chrono::Utc::now()
                 .timestamp()
                 .saturating_sub(checkpoint_row.updated_at);
 
             if !has_live_turn
                 && !has_worker
+                && !has_runner_turn
+                && !has_active_job
                 && checkpoint_age > ACTIVE_CHECKPOINT_STALE_SECONDS
                 && is_active_checkpoint_status(checkpoint_status.as_deref())
             {
@@ -316,7 +327,25 @@ pub async fn cancel_conversation(
     }
 
     manager.mark_cancelled_turn(&id).await;
+    if let Err(e) = agent_runners::request_cancel(&pool, &id).await {
+        tracing::warn!(
+            "[CANCEL] Failed to persist cancellation request for {}: {}",
+            id,
+            e
+        );
+    }
+    let cancelled_pending_jobs =
+        match conversation_turn_jobs::cancel_pending_jobs_for_conversation(&pool, &id).await {
+            Ok(count) => count,
+            Err(e) => {
+                tracing::warn!("[CANCEL] Failed to cancel pending jobs for {}: {}", id, e);
+                0
+            }
+        };
     let worker_exists = WORKER_MANAGER.has_worker(&id).await;
+    let runner_turn_exists = agent_runners::has_active_turn_for_conversation(&pool, &id)
+        .await
+        .unwrap_or(false);
 
     // Try to interrupt the running agent
     match manager.interrupt(&id).await {
@@ -333,15 +362,16 @@ pub async fn cancel_conversation(
             }
         }
         Ok(false) => {
-            if worker_exists {
+            if worker_exists || runner_turn_exists {
                 tracing::info!(
-                    "[CANCEL] Marked queued turn cancelled for conversation {}",
+                    "[CANCEL] Marked active/queued turn cancelled for conversation {}",
                     id
                 );
             } else {
                 tracing::info!(
-                    "[CANCEL] No active or queued turn for conversation {}, nothing to cancel",
-                    id
+                    "[CANCEL] No active runner turn for conversation {}, cancelled {} pending job(s)",
+                    id,
+                    cancelled_pending_jobs
                 );
                 let _ = manager.consume_cancelled_turn(&id).await;
                 match checkpoints::get_checkpoint(&pool, &id).await {
@@ -681,15 +711,47 @@ pub async fn stream_conversation_run_status(
     let out = stream! {
         yield Ok(status_sse_event(&initial));
         if initial.is_processing {
+            let mut poll = tokio::time::interval(Duration::from_secs(5));
             loop {
-                match status_rx.recv().await {
-                    Ok(snapshot) => {
-                        yield Ok(status_sse_event(&snapshot));
-                        if !snapshot.is_processing {
-                            break;
+                tokio::select! {
+                    recv = status_rx.recv() => {
+                        match recv {
+                            Ok(snapshot) => {
+                                yield Ok(status_sse_event(&snapshot));
+                                if !snapshot.is_processing {
+                                    break;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                match conversation_run_status_snapshot(
+                                    &stream_pool,
+                                    &stream_conversation_id,
+                                    Some(stream_manager.as_ref()),
+                                )
+                                .await
+                                {
+                                    Ok(snapshot) => {
+                                        yield Ok(status_sse_event(&snapshot));
+                                        if !snapshot.is_processing {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to rebuild chat run status after lag for {}: {}",
+                                            stream_conversation_id,
+                                            e
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                break;
+                            }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                    _ = poll.tick() => {
                         match conversation_run_status_snapshot(
                             &stream_pool,
                             &stream_conversation_id,
@@ -705,16 +767,13 @@ pub async fn stream_conversation_run_status(
                             }
                             Err(e) => {
                                 tracing::error!(
-                                    "Failed to rebuild chat run status after lag for {}: {}",
+                                    "Failed to poll chat run status for {}: {}",
                                     stream_conversation_id,
                                     e
                                 );
                                 break;
                             }
                         }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        break;
                     }
                 }
             }

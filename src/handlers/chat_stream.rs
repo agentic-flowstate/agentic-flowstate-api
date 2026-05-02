@@ -26,10 +26,10 @@ use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
 use crate::agents::{AgentType, StreamEvent};
 use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
 use crate::rate_limiting::{self, RateLimitDecision, StreamPermit};
-use ticketing_system::checkpoints;
+use ticketing_system::{checkpoints, conversation_turn_jobs};
 
 /// Image data attached to a chat message (base64-encoded)
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatImageData {
     /// Base64-encoded image data
     pub data: String,
@@ -73,6 +73,14 @@ pub enum ChatRuntime {
     CodexAppServer,
 }
 
+impl ChatRuntime {
+    pub fn as_job_runtime(self) -> &'static str {
+        match self {
+            Self::CodexAppServer => "codex-app-server",
+        }
+    }
+}
+
 /// Configuration for a chat SSE endpoint
 #[derive(Clone)]
 pub struct ChatConfig {
@@ -98,7 +106,7 @@ pub struct ChatSubmitResponse {
 /// open.
 pub async fn submit(
     db: Arc<SqlitePool>,
-    manager: Arc<ChatClientManager>,
+    _manager: Arc<ChatClientManager>,
     message: String,
     conversation_id: Option<String>,
     config: ChatConfig,
@@ -137,46 +145,60 @@ pub async fn submit(
         );
     }
 
-    let status_db = db.clone();
-    let worker_tx = WORKER_MANAGER
-        .get_or_create(conv_id.clone(), db, manager)
-        .await;
+    let images_json = match images {
+        Some(images) => match serde_json::to_string(&images) {
+            Ok(json) => Some(json),
+            Err(e) => {
+                tracing::error!(
+                    "[CHAT] Failed to serialize images for non-streaming submit {}: {}",
+                    conv_id,
+                    e
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to serialize chat images: {}", e),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
 
-    if worker_tx
-        .send(WorkerMessage {
-            user_id,
-            message,
-            config,
-            images,
-            completion_tx: None,
-            client_id,
-        })
-        .await
-        .is_err()
-    {
+    let payload = conversation_turn_jobs::ConversationTurnJobPayload {
+        user_id,
+        message,
+        agent_type: config.agent_type.as_str().to_string(),
+        runtime: config.runtime.as_job_runtime().to_string(),
+        prompt_name: config.prompt_name.to_string(),
+        working_dir: config.working_dir.to_string_lossy().to_string(),
+        prompt_vars: config.prompt_vars,
+        images_json,
+        client_id,
+    };
+
+    if let Err(e) = conversation_turn_jobs::enqueue_job(&db, &conv_id, payload).await {
         tracing::error!(
-            "[CHAT] Worker channel closed for non-streaming submit {}",
-            conv_id
+            "[CHAT] Failed to enqueue durable non-streaming submit {}: {}",
+            conv_id,
+            e
         );
-        if let Err(e) = checkpoints::mark_interrupted(&status_db, &conv_id).await {
+        if let Err(e) = checkpoints::mark_interrupted(&db, &conv_id).await {
             tracing::warn!(
-                "[CHAT] Failed to mark run status interrupted after worker send failure {}: {}",
+                "[CHAT] Failed to mark run status interrupted after enqueue failure {}: {}",
                 conv_id,
                 e
             );
         }
-        if let Err(e) =
-            super::conversations::publish_conversation_run_status(&status_db, &conv_id).await
-        {
+        if let Err(e) = super::conversations::publish_conversation_run_status(&db, &conv_id).await {
             tracing::warn!(
-                "[CHAT] Failed to publish interrupted run status after worker send failure {}: {}",
+                "[CHAT] Failed to publish interrupted run status after enqueue failure {}: {}",
                 conv_id,
                 e
             );
         }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Worker unavailable for conversation",
+            "Runner queue unavailable for conversation",
         )
             .into_response();
     }

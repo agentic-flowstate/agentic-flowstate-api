@@ -277,15 +277,49 @@ impl ConversationWorker {
         self.publish_run_status().await;
     }
 
-    async fn consume_cancelled_turn_before_agent_start(&mut self, stage: &str) -> bool {
-        if !self.manager.is_turn_cancelled(&self.conversation_id).await {
-            return false;
+    async fn is_turn_cancelled(&self) -> bool {
+        if self.manager.is_turn_cancelled(&self.conversation_id).await {
+            return true;
         }
-        if !self
+        match agent_runners::is_cancel_requested(&self.db, &self.conversation_id).await {
+            Ok(cancelled) => cancelled,
+            Err(e) => {
+                tracing::warn!(
+                    "[WORKER] Failed to inspect persistent cancellation for {}: {}",
+                    self.conversation_id,
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    async fn consume_cancelled_turn(&self) -> bool {
+        let memory_cancelled = self
             .manager
             .consume_cancelled_turn(&self.conversation_id)
-            .await
-        {
+            .await;
+        let persistent_cancelled =
+            match agent_runners::consume_cancel_request(&self.db, &self.conversation_id).await {
+                Ok(cancelled) => cancelled,
+                Err(e) => {
+                    tracing::warn!(
+                        "[WORKER] Failed to consume persistent cancellation for {}: {}",
+                        self.conversation_id,
+                        e
+                    );
+                    false
+                }
+            };
+
+        memory_cancelled || persistent_cancelled
+    }
+
+    async fn consume_cancelled_turn_before_agent_start(&mut self, stage: &str) -> bool {
+        if !self.is_turn_cancelled().await {
+            return false;
+        }
+        if !self.consume_cancelled_turn().await {
             return false;
         }
 
@@ -805,6 +839,36 @@ impl ConversationWorker {
             return;
         }
 
+        let runner_turn_id = match agent_runners::start_turn(
+            &self.db,
+            self.manager.runner_generation_id(),
+            &self.conversation_id,
+        )
+        .await
+        {
+            Ok(turn_id) => turn_id,
+            Err(e) => {
+                let mut accumulated_text = String::new();
+                let mut content_blocks = Vec::new();
+                let failure_message = format!("Failed to claim runner turn: {}", e);
+                tracing::error!(
+                    "[WORKER] Failed to claim runner turn for {}: {}",
+                    self.conversation_id,
+                    e
+                );
+                self.mark_checkpoint_interrupted().await;
+                persist_failed_codex_message(
+                    self,
+                    &assistant_message_id,
+                    &mut accumulated_text,
+                    &mut content_blocks,
+                    failure_message,
+                )
+                .await;
+                return;
+            }
+        };
+
         let mut turn = match spawn_codex_app_server(CodexAppServerOptions {
             model: msg.config.agent_type.model(),
             reasoning_effort: msg.config.agent_type.effort(),
@@ -829,36 +893,15 @@ impl ConversationWorker {
                     self.conversation_id,
                     e
                 );
-                self.mark_checkpoint_interrupted().await;
-                persist_failed_codex_message(
-                    self,
-                    &assistant_message_id,
-                    &mut accumulated_text,
-                    &mut content_blocks,
-                    failure_message,
-                )
-                .await;
-                return;
-            }
-        };
-
-        let runner_turn_id = match agent_runners::start_turn(
-            &self.db,
-            self.manager.runner_generation_id(),
-            &self.conversation_id,
-        )
-        .await
-        {
-            Ok(turn_id) => turn_id,
-            Err(e) => {
-                let mut accumulated_text = String::new();
-                let mut content_blocks = Vec::new();
-                let failure_message = format!("Failed to claim runner turn: {}", e);
-                tracing::error!(
-                    "[WORKER] Failed to claim runner turn for {}: {}",
-                    self.conversation_id,
-                    e
-                );
+                if let Err(finish_err) =
+                    agent_runners::finish_turn(&self.db, &runner_turn_id, "failed").await
+                {
+                    tracing::warn!(
+                        "[WORKER] Failed to mark runner turn failed after Codex spawn error for {}: {}",
+                        self.conversation_id,
+                        finish_err
+                    );
+                }
                 self.mark_checkpoint_interrupted().await;
                 persist_failed_codex_message(
                     self,
@@ -893,7 +936,7 @@ impl ConversationWorker {
         // only record the marker; there may be no registered child yet. Re-check
         // immediately after registration so we do not wait for the first event
         // or the 15s heartbeat before killing the subprocess.
-        if self.manager.is_turn_cancelled(&self.conversation_id).await {
+        if self.is_turn_cancelled().await {
             kill_requested = true;
             if let Err(e) = turn.terminate().await {
                 tracing::warn!(
@@ -1079,9 +1122,7 @@ impl ConversationWorker {
                         }
                     }
 
-                    if !kill_requested
-                        && self.manager.is_turn_cancelled(&self.conversation_id).await
-                    {
+                    if !kill_requested && self.is_turn_cancelled().await {
                         kill_requested = true;
                         if let Err(e) = turn.terminate().await {
                             tracing::warn!(
@@ -1100,9 +1141,7 @@ impl ConversationWorker {
                     let _ = checkpoints::touch_checkpoint(&self.db, &self.conversation_id).await;
                     let _ = agent_runners::touch_turn(&self.db, &runner_turn_id).await;
 
-                    if !kill_requested
-                        && self.manager.is_turn_cancelled(&self.conversation_id).await
-                    {
+                    if !kill_requested && self.is_turn_cancelled().await {
                         kill_requested = true;
                         if let Err(e) = turn.terminate().await {
                             tracing::warn!(
@@ -1179,10 +1218,7 @@ impl ConversationWorker {
             Failed(String),
         }
 
-        let cancelled = self
-            .manager
-            .consume_cancelled_turn(&self.conversation_id)
-            .await;
+        let cancelled = self.consume_cancelled_turn().await;
         let completion = if cancelled {
             CodexTurnCompletion::Cancelled {
                 session_id: thread_id

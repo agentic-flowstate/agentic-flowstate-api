@@ -108,6 +108,12 @@ exec bash -l '{home}/projects/agentic-flowstate/agentic-flowstate-setup/setup.sh
                 uid
             ));
         }
+        if matches!(service, "agent-runner" | "all") {
+            commands.push(format!(
+                "launchctl kickstart -k gui/{}/com.agentic.runner 2>&1 || true",
+                uid
+            ));
+        }
         if matches!(service, "frontend" | "all") {
             commands.push(format!(
                 "launchctl kickstart -k gui/{}/com.agentic.frontend 2>&1 || true",
@@ -247,17 +253,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Clear any stale restart queue entries from before the restart
-    match ticketing_system::restart_queue::clear_all_pending(&db_pool).await {
-        Ok(count) if count > 0 => {
+    // Pending restart entries are durable on purpose. If the API restarts while
+    // a runner restart is queued, the watcher below must resume that queue
+    // instead of deleting it and losing the drain request.
+    match ticketing_system::restart_queue::get_pending_restart(&db_pool).await {
+        Ok(Some(entry)) => {
             tracing::info!(
-                "Cleared {} stale pending restart(s) from previous run",
-                count
+                "Preserving pending restart {} for service '{}' requested at {}",
+                entry.id,
+                entry.service,
+                entry.requested_at
             );
         }
-        Ok(_) => {}
+        Ok(None) => {}
         Err(e) => {
-            tracing::warn!("Failed to clear stale restart queue: {}", e);
+            tracing::warn!("Failed to inspect pending restart queue: {}", e);
         }
     }
 
@@ -574,14 +584,18 @@ async fn main() -> anyhow::Result<()> {
                     };
 
                 // Pending restart found — check if any agent runs are still active
-                let active =
-                    match ticketing_system::restart_queue::count_active_work(&restart_pool).await {
-                        Ok(a) => a,
-                        Err(e) => {
-                            tracing::warn!("[RESTART_WATCHER] Failed to count active work: {}", e);
-                            continue;
-                        }
-                    };
+                let active = match if pending.service == "api-server" {
+                    ticketing_system::restart_queue::count_api_restart_blocking_work(&restart_pool)
+                        .await
+                } else {
+                    ticketing_system::restart_queue::count_active_work(&restart_pool).await
+                } {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!("[RESTART_WATCHER] Failed to count active work: {}", e);
+                        continue;
+                    }
+                };
 
                 if active.total > 0 {
                     tracing::debug!(
