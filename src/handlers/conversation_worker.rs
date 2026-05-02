@@ -24,7 +24,7 @@ use crate::observability::streaming::{
     record_ticket_preflight_error,
 };
 use ticketing_system::{
-    checkpoints, conversations, token_usage, AddMessageRequest, ContentBlockDesc,
+    agent_runners, checkpoints, conversations, token_usage, AddMessageRequest, ContentBlockDesc,
     ConversationMessage, UpdateConversationRequest,
 };
 
@@ -842,6 +842,36 @@ impl ConversationWorker {
             }
         };
 
+        let runner_turn_id = match agent_runners::start_turn(
+            &self.db,
+            self.manager.runner_generation_id(),
+            &self.conversation_id,
+        )
+        .await
+        {
+            Ok(turn_id) => turn_id,
+            Err(e) => {
+                let mut accumulated_text = String::new();
+                let mut content_blocks = Vec::new();
+                let failure_message = format!("Failed to claim runner turn: {}", e);
+                tracing::error!(
+                    "[WORKER] Failed to claim runner turn for {}: {}",
+                    self.conversation_id,
+                    e
+                );
+                self.mark_checkpoint_interrupted().await;
+                persist_failed_codex_message(
+                    self,
+                    &assistant_message_id,
+                    &mut accumulated_text,
+                    &mut content_blocks,
+                    failure_message,
+                )
+                .await;
+                return;
+            }
+        };
+
         self.manager
             .insert_app_server_turn(self.conversation_id.clone(), turn.child())
             .await;
@@ -879,6 +909,19 @@ impl ConversationWorker {
                 maybe_event = turn.events.recv() => {
                     match maybe_event {
                         Some(CodexAppServerEvent::ThreadStarted { thread_id: tid }) => {
+                            if let Err(e) = agent_runners::set_turn_session(
+                                &self.db,
+                                &runner_turn_id,
+                                &tid,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "[WORKER] Failed to persist runner turn session for {}: {}",
+                                    self.conversation_id,
+                                    e
+                                );
+                            }
                             thread_id = Some(tid);
                         }
                         Some(CodexAppServerEvent::AgentMessageDelta { id, text }) => {
@@ -1055,6 +1098,7 @@ impl ConversationWorker {
                         message: None,
                     }).await;
                     let _ = checkpoints::touch_checkpoint(&self.db, &self.conversation_id).await;
+                    let _ = agent_runners::touch_turn(&self.db, &runner_turn_id).await;
 
                     if !kill_requested
                         && self.manager.is_turn_cancelled(&self.conversation_id).await
@@ -1084,6 +1128,15 @@ impl ConversationWorker {
                     self.conversation_id,
                     e
                 );
+                if let Err(finish_err) =
+                    agent_runners::finish_turn(&self.db, &runner_turn_id, "failed").await
+                {
+                    tracing::warn!(
+                        "[WORKER] Failed to mark runner turn failed for {}: {}",
+                        self.conversation_id,
+                        finish_err
+                    );
+                }
                 self.mark_checkpoint_interrupted().await;
                 persist_failed_codex_message(
                     self,
@@ -1145,6 +1198,22 @@ impl ConversationWorker {
                 "Codex app-server completed without returning a thread id".to_string(),
             )
         };
+
+        let runner_terminal_status = match &completion {
+            CodexTurnCompletion::Completed { .. } => "completed",
+            CodexTurnCompletion::Cancelled { .. } => "cancelled",
+            CodexTurnCompletion::Failed(_) => "failed",
+        };
+        if let Err(e) =
+            agent_runners::finish_turn(&self.db, &runner_turn_id, runner_terminal_status).await
+        {
+            tracing::warn!(
+                "[WORKER] Failed to mark runner turn {} for {}: {}",
+                runner_terminal_status,
+                self.conversation_id,
+                e
+            );
+        }
 
         flush_to_db(&self.db, &assistant_message_id, &accumulated_text).await;
 

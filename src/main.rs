@@ -28,6 +28,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use handlers::chat_client_manager::ChatClientManager;
 
+const RUNNER_HEARTBEAT_STALE_SECONDS: i64 = 90;
+const RUNNER_HEARTBEAT_INTERVAL_SECONDS: u64 = 15;
+
 /// Shared application state.
 /// Implements `FromRef` so handlers can extract individual components.
 ///
@@ -188,16 +191,24 @@ async fn main() -> anyhow::Result<()> {
     let db_pool = Arc::new(ticketing_system::init_db().await?);
     tracing::info!("SQLite database pool initialized");
 
-    // Mark any active agent checkpoints from the previous process as interrupted.
-    match ticketing_system::checkpoints::mark_all_active_as_interrupted(&db_pool).await {
+    // Mark active checkpoints as interrupted only when no fresh runner
+    // generation still owns them. This preserves the future split-runner
+    // contract: API restart must not automatically kill turns owned by a
+    // still-heartbeating runner generation.
+    match ticketing_system::agent_runners::mark_unowned_active_checkpoints_interrupted(
+        &db_pool,
+        RUNNER_HEARTBEAT_STALE_SECONDS,
+    )
+    .await
+    {
         Ok(count) if count > 0 => {
             tracing::warn!(
-                "Marked {} interrupted agent checkpoint(s) from previous run",
+                "Marked {} unowned agent checkpoint(s) interrupted from previous run",
                 count
             );
         }
         Ok(_) => {
-            tracing::debug!("No interrupted agent checkpoints to clean up");
+            tracing::debug!("No unowned interrupted agent checkpoints to clean up");
         }
         Err(e) => {
             tracing::error!("Failed to clean up interrupted checkpoints: {}", e);
@@ -299,7 +310,48 @@ async fn main() -> anyhow::Result<()> {
 
     // Create chat client manager for live Codex app-server turns.
     let chat_manager = Arc::new(ChatClientManager::new());
-    tracing::info!("Chat client manager initialized");
+    let runner_generation_id = chat_manager.runner_generation_id().to_string();
+    ticketing_system::agent_runners::register_generation(
+        &db_pool,
+        &runner_generation_id,
+        "api-embedded",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id() as i64,
+    )
+    .await?;
+    tracing::info!(
+        "Chat client manager initialized with runner generation {}",
+        runner_generation_id
+    );
+
+    {
+        let runner_pool = db_pool.clone();
+        let runner_shutdown = shutdown_token.child_token();
+        let heartbeat_generation_id = runner_generation_id.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+                RUNNER_HEARTBEAT_INTERVAL_SECONDS,
+            ));
+            loop {
+                tokio::select! {
+                    _ = runner_shutdown.cancelled() => break,
+                    _ = interval.tick() => {}
+                }
+                if let Err(e) = ticketing_system::agent_runners::heartbeat_generation(
+                    &runner_pool,
+                    &heartbeat_generation_id,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "[RUNNER] Failed to heartbeat generation {}: {}",
+                        heartbeat_generation_id,
+                        e
+                    );
+                }
+            }
+        });
+    }
 
     // Initialize the legacy alert-style APNs push service. Its `init()`
     // populates the process-wide `APNS_INSTANCE` OnceCell; downstream
@@ -382,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Clone db_pool for shutdown handler before building router (which moves app_state)
     let shutdown_db = db_pool.clone();
+    let shutdown_runner_generation_id = runner_generation_id.clone();
 
     // Session cleanup background task (every 6 hours)
     {
@@ -491,8 +544,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Deferred restart watcher: polls every 10 seconds for queued restarts.
-    // When a restart is pending AND no active agent runs remain, executes the restart.
-    // Only agent runs block restarts — conversations (MCP tool calls) do NOT.
+    // When a restart is pending AND no active runner-owned work remains,
+    // executes the restart. ChatLab checkpoints and Codex app-server turns
+    // block restarts just like agent_runs.
     {
         let restart_pool = db_pool.clone();
         let restart_shutdown = shutdown_token.clone();
@@ -531,8 +585,12 @@ async fn main() -> anyhow::Result<()> {
 
                 if active.total > 0 {
                     tracing::debug!(
-                        "[RESTART_WATCHER] Restart queued for '{}' but {} agent run(s) still active, waiting...",
-                        pending.service, active.agent_run_count
+                        "[RESTART_WATCHER] Restart queued for '{}' but {} active work item(s) still running (agent_runs={}, runner_turns={}, checkpoints={}), waiting...",
+                        pending.service,
+                        active.total,
+                        active.agent_run_count,
+                        active.runner_turn_count,
+                        active.checkpoint_count
                     );
                     continue;
                 }
@@ -1190,15 +1248,17 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
-    // Spawn a force-exit watchdog. After shutdown_signal completes and cancels
-    // the token, this gives 5 seconds for connections to drain, then force-exits.
-    // Without this, axum waits indefinitely for SSE/WebSocket connections to close.
+    // Spawn a force-exit watchdog. `shutdown_signal` cancels the token before
+    // its 10-second cleanup/drain window, so this must outlast that window or
+    // cleanup never runs.
     {
         let exit_token = shutdown_token.child_token();
         tokio::spawn(async move {
             exit_token.cancelled().await;
-            tracing::info!("Shutdown watchdog: waiting 5s for connections to drain...");
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            tracing::info!(
+                "Shutdown watchdog: waiting 20s for cleanup and connections to drain..."
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
             tracing::info!("Shutdown watchdog: force exiting");
             std::process::exit(0);
         });
@@ -1206,7 +1266,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Run server with graceful shutdown
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_db, shutdown_token))
+        .with_graceful_shutdown(shutdown_signal(
+            shutdown_db,
+            shutdown_token,
+            shutdown_runner_generation_id,
+        ))
         .await?;
 
     Ok(())
@@ -1217,6 +1281,7 @@ async fn main() -> anyhow::Result<()> {
 async fn shutdown_signal(
     db_pool: Arc<ticketing_system::SqlitePool>,
     shutdown_token: CancellationToken,
+    runner_generation_id: String,
 ) {
     let ctrl_c = async {
         signal::ctrl_c()
@@ -1247,17 +1312,31 @@ async fn shutdown_signal(
     // Mark service as not ready immediately — health probes return 503
     handlers::health::set_not_ready();
 
+    if let Err(e) =
+        ticketing_system::agent_runners::mark_generation_draining(&db_pool, &runner_generation_id)
+            .await
+    {
+        tracing::warn!(
+            "Failed to mark runner generation {} draining during shutdown: {}",
+            runner_generation_id,
+            e
+        );
+    }
+
     // Cancel all background tasks (email fetcher, cleanup loops, etc.)
     shutdown_token.cancel();
 
     tracing::info!("Waiting 10 seconds for in-flight operations to complete...");
     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
-    // Mark any still-active checkpoints as interrupted
-    match ticketing_system::checkpoints::mark_all_active_as_interrupted(&db_pool).await {
+    // Mark any still-active checkpoints as interrupted if this embedded API
+    // runner did not drain before launchd terminates the process.
+    match ticketing_system::agent_runners::mark_unowned_active_checkpoints_interrupted(&db_pool, 0)
+        .await
+    {
         Ok(count) if count > 0 => {
             tracing::warn!(
-                "Marked {} agent checkpoint(s) as interrupted during shutdown",
+                "Marked {} unowned agent checkpoint(s) as interrupted during shutdown",
                 count
             );
         }
@@ -1278,6 +1357,47 @@ async fn shutdown_signal(
         Err(e) => {
             tracing::error!("Failed to mark agent runs as failed: {}", e);
         }
+    }
+
+    match ticketing_system::agent_runners::get_active_turns(&db_pool).await {
+        Ok(turns)
+            if turns
+                .iter()
+                .any(|turn| turn.generation_id == runner_generation_id) =>
+        {
+            if let Err(e) = ticketing_system::agent_runners::mark_generation_failed(
+                &db_pool,
+                &runner_generation_id,
+                "api shutdown before generation drained",
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to mark runner generation {} failed during shutdown: {}",
+                    runner_generation_id,
+                    e
+                );
+            }
+        }
+        Ok(_) => {
+            if let Err(e) = ticketing_system::agent_runners::mark_generation_exited(
+                &db_pool,
+                &runner_generation_id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    "Failed to mark runner generation {} exited during shutdown: {}",
+                    runner_generation_id,
+                    e
+                );
+            }
+        }
+        Err(e) => tracing::warn!(
+            "Failed to inspect runner generation {} during shutdown: {}",
+            runner_generation_id,
+            e
+        ),
     }
 
     // Log shutdown to system_logs

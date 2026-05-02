@@ -65,8 +65,20 @@ pub async fn ready_with_agents(State(db): State<Arc<sqlx::SqlitePool>>) -> Respo
     let ready = is_ready();
     let active_agents = ticketing_system::restart_queue::count_active_work(&db)
         .await
+        .ok();
+    let active_agent_runs = active_agents
+        .as_ref()
         .map(|w| w.agent_run_count)
         .unwrap_or(0);
+    let active_runner_turns = active_agents
+        .as_ref()
+        .map(|w| w.runner_turn_count)
+        .unwrap_or(0);
+    let active_checkpoints = active_agents
+        .as_ref()
+        .map(|w| w.checkpoint_count)
+        .unwrap_or(0);
+    let active_total = active_agents.as_ref().map(|w| w.total).unwrap_or(0);
 
     let status_code = if ready {
         StatusCode::OK
@@ -79,7 +91,10 @@ pub async fn ready_with_agents(State(db): State<Arc<sqlx::SqlitePool>>) -> Respo
         status_code,
         Json(json!({
             "status": status_str,
-            "active_agent_runs": active_agents
+            "active_agent_runs": active_agent_runs,
+            "active_runner_turns": active_runner_turns,
+            "active_checkpoints": active_checkpoints,
+            "active_work_total": active_total
         })),
     )
         .into_response()

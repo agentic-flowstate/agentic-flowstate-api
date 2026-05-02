@@ -7,16 +7,26 @@ use crate::agents::codex_app_server::terminate_child_process;
 
 /// Manages live Codex app-server turns and cancellation markers.
 pub struct ChatClientManager {
+    runner_generation_id: String,
     app_server_turns: Mutex<HashMap<String, Arc<Mutex<Child>>>>,
     cancelled_turns: Mutex<HashSet<String>>,
 }
 
 impl ChatClientManager {
     pub fn new() -> Self {
+        Self::with_runner_generation_id(format!("api-embedded-{}", uuid::Uuid::new_v4()))
+    }
+
+    pub fn with_runner_generation_id(runner_generation_id: String) -> Self {
         Self {
+            runner_generation_id,
             app_server_turns: Mutex::new(HashMap::new()),
             cancelled_turns: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub fn runner_generation_id(&self) -> &str {
+        &self.runner_generation_id
     }
 
     /// Register a live Codex app-server subprocess for a conversation turn so the
