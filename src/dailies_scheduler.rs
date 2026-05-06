@@ -4,6 +4,7 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use ticketing_system::text_normalization::normalize_daily_research_output;
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::executor::run_codex_agent_turn;
@@ -124,6 +125,7 @@ async fn execute_daily_run(
 
     match turn {
         Ok(turn) => {
+            let output_summary = normalize_daily_research_output(&turn.output_summary);
             let completed_at = Utc::now().to_rfc3339();
             ticketing_system::agent_runs::update_agent_run(
                 &pool,
@@ -138,7 +140,7 @@ async fn execute_daily_run(
                     started_at: run_started_at(&run),
                     completed_at: Some(completed_at),
                     input_message: prompt.clone(),
-                    output_summary: Some(turn.output_summary.clone()),
+                    output_summary: Some(output_summary.clone()),
                     tool_call_count: turn.tool_call_count,
                     cc_session_id: turn.runtime_session_id.clone(),
                 },
@@ -150,7 +152,7 @@ async fn execute_daily_run(
                 &pool,
                 ticketing_system::CreateArtifactRequest {
                     title: artifact_title(&daily),
-                    content: turn.output_summary.clone(),
+                    content: output_summary.clone(),
                     artifact_type: "research".to_string(),
                     created_by: "daily-research".to_string(),
                     source_step_id: Some(run.run_id.clone()),
@@ -171,7 +173,7 @@ async fn execute_daily_run(
                     status: "completed".to_string(),
                     agent_run_id: Some(session_id),
                     artifact_id: Some(artifact.artifact_id),
-                    summary: Some(turn.output_summary),
+                    summary: Some(output_summary),
                     error: None,
                 },
             )

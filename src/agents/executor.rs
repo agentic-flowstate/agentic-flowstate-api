@@ -3,6 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
+use ticketing_system::text_normalization::normalize_codex_token_delta_output;
+
 use super::codex_app_server::{
     spawn_codex_app_server, CodexAppServerEvent, CodexAppServerOptions, CodexSandboxMode,
     CodexToolProfile,
@@ -73,12 +75,12 @@ fn build_agent_prompt(
     }
 }
 
-fn finalize_output(output_parts: &[String]) -> Option<String> {
-    if output_parts.is_empty() {
+fn finalize_output(output: &str) -> Option<String> {
+    if output.trim().is_empty() {
         return None;
     }
 
-    let full_output = output_parts.join("\n\n");
+    let full_output = normalize_codex_token_delta_output(output);
     if full_output.len() > 100000 {
         let end = (0..=100000)
             .rev()
@@ -116,7 +118,8 @@ pub async fn run_codex_agent_turn(
     .await
     .map_err(anyhow::Error::msg)?;
 
-    let mut output_parts = Vec::new();
+    let mut message_order: Vec<String> = Vec::new();
+    let mut agent_messages: HashMap<String, String> = HashMap::new();
     let mut tool_call_count = 0;
     let mut runtime_session_id = resume_session_id.map(str::to_string);
     let mut usage = (0_i64, 0_i64);
@@ -131,19 +134,30 @@ pub async fn run_codex_agent_turn(
                 if text.is_empty() {
                     continue;
                 }
+                if !agent_messages.contains_key(&id) {
+                    message_order.push(id.clone());
+                    agent_messages.insert(id.clone(), String::new());
+                }
+                if let Some(message) = agent_messages.get_mut(&id) {
+                    message.push_str(&text);
+                }
                 streamed_agent_message_items.insert(id);
-                output_parts.push(text.clone());
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(StreamEvent::Text { content: text }).await;
                 }
             }
             CodexAppServerEvent::AgentMessageCompleted { id, text } => {
-                if text.is_empty() || streamed_agent_message_items.contains(&id) {
+                if text.is_empty() {
                     continue;
                 }
-                output_parts.push(text.clone());
+                if !agent_messages.contains_key(&id) {
+                    message_order.push(id.clone());
+                }
+                agent_messages.insert(id.clone(), text.clone());
                 if let Some(ref tx) = event_tx {
-                    let _ = tx.send(StreamEvent::Text { content: text }).await;
+                    if !streamed_agent_message_items.contains(&id) {
+                        let _ = tx.send(StreamEvent::Text { content: text }).await;
+                    }
                 }
             }
             CodexAppServerEvent::ReasoningDelta { text, .. } => {
@@ -186,8 +200,13 @@ pub async fn run_codex_agent_turn(
         anyhow::bail!("{}", outcome.failure_summary("codex app-server"));
     }
 
+    let final_message = message_order
+        .iter()
+        .rev()
+        .find_map(|id| agent_messages.get(id))
+        .ok_or_else(|| anyhow::anyhow!("No output from agent"))?;
     let output_summary =
-        finalize_output(&output_parts).ok_or_else(|| anyhow::anyhow!("No output from agent"))?;
+        finalize_output(final_message).ok_or_else(|| anyhow::anyhow!("No output from agent"))?;
     let emitted_session_id = runtime_session_id
         .clone()
         .unwrap_or_else(|| result_session_id.to_string());
