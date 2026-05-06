@@ -64,6 +64,8 @@ pub enum AgentType {
     TicketAssistant,
     /// EXA-powered deep research agent - uses EXA API for web search/content and model analysis
     ExaResearch,
+    /// Recurring research agent invoked by Dailies automation
+    DailyResearch,
     /// Critically evaluates and synthesizes research findings into structured, actionable output
     ResearchSynthesis,
     /// Plans follow-up tickets by checking existing system for duplicates and producing a mermaid graph
@@ -99,6 +101,7 @@ impl AgentType {
             AgentType::MeetingNotes => "meeting-notes",
             AgentType::TicketAssistant => "ticket-assistant",
             AgentType::ExaResearch => "exa-research",
+            AgentType::DailyResearch => "daily-research",
             AgentType::ResearchSynthesis => "research-synthesis",
             AgentType::TicketPlanner => "ticket-planner",
             AgentType::TicketCreator => "ticket-creator",

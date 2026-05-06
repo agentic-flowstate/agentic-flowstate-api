@@ -1,6 +1,7 @@
 mod agents;
 pub mod apns;
 mod auth_middleware;
+mod dailies_scheduler;
 mod email_fetcher;
 mod handlers;
 mod health_monitor;
@@ -253,6 +254,21 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    match ticketing_system::dailies::mark_running_runs_failed(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!(
+                "Marked {} interrupted daily run(s) as failed from previous run",
+                count
+            );
+        }
+        Ok(_) => {
+            tracing::debug!("No interrupted daily runs to clean up");
+        }
+        Err(e) => {
+            tracing::error!("Failed to clean up interrupted daily runs: {}", e);
+        }
+    }
+
     // Pending restart entries are durable on purpose. If the API restarts while
     // a runner restart is queued, the watcher below must resume that queue
     // instead of deleting it and losing the drain request.
@@ -297,6 +313,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Nightly scheduler DISABLED — do not re-enable until conversation integration is validated.
     tracing::info!("Nightly scheduler is DISABLED");
+
+    tracing::info!("Starting Dailies scheduler");
+    dailies_scheduler::spawn_dailies_scheduler(db_pool.clone(), shutdown_token.child_token());
 
     // Conversation-events retention prune (T-65DA4D32). Fires once per
     // day at RETENTION_RUN_HOUR_UTC (default 03:00 UTC). Set
@@ -785,6 +804,28 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/library/artifacts/:artifact_id",
             get(handlers::get_library_artifact),
+        )
+        // Dailies scheduled automation routes
+        .route(
+            "/api/dailies",
+            get(handlers::list_dailies).post(handlers::create_daily),
+        )
+        .route(
+            "/api/dailies/:daily_id",
+            get(handlers::get_daily).patch(handlers::update_daily),
+        )
+        .route("/api/dailies/:daily_id/pause", post(handlers::pause_daily))
+        .route(
+            "/api/dailies/:daily_id/resume",
+            post(handlers::resume_daily),
+        )
+        .route(
+            "/api/dailies/:daily_id/run-now",
+            post(handlers::run_daily_now),
+        )
+        .route(
+            "/api/dailies/:daily_id/runs/:run_id/read",
+            post(handlers::mark_daily_run_read),
         )
         .route(
             "/api/library/documents",
@@ -1370,6 +1411,16 @@ async fn shutdown_signal(
         Ok(_) => {}
         Err(e) => {
             tracing::error!("Failed to mark agent runs as failed: {}", e);
+        }
+    }
+
+    match ticketing_system::dailies::mark_running_runs_failed(&db_pool).await {
+        Ok(count) if count > 0 => {
+            tracing::warn!("Marked {} daily run(s) as failed during shutdown", count);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("Failed to mark daily runs as failed: {}", e);
         }
     }
 

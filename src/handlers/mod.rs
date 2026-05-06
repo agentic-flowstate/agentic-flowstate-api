@@ -10,6 +10,7 @@ pub mod client_telemetry;
 pub mod conversation_worker;
 pub mod conversation_worker_manager;
 pub mod conversations;
+pub mod dailies;
 pub mod daily_plan;
 pub mod data_events;
 pub mod debug_log;
@@ -50,6 +51,7 @@ pub mod workspace_manager;
 
 pub use agent_runs::*;
 pub use conversations::*;
+pub use dailies::*;
 pub use daily_plan::*;
 pub use data_events::*;
 pub use dms::*;

@@ -20,6 +20,18 @@
         "mcp__agentic-mcp__search_artifacts"
       ]
     },
+    "daily-research": {
+      "model": "codex",
+      "effort": "xhigh",
+      "prompt_file": "daily-research.txt",
+      "tools": [
+        "mcp__agentic-mcp__exa_search",
+        "mcp__agentic-mcp__exa_get_contents",
+        "mcp__agentic-mcp__search_artifacts",
+        "mcp__agentic-mcp__list_artifacts",
+        "mcp__agentic-mcp__get_artifact"
+      ]
+    },
     "research-synthesis": {
       "model": "codex",
       "effort": "xhigh",
