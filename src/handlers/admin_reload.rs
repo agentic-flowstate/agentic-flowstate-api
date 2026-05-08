@@ -426,7 +426,17 @@ sleep 1
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_api: atomic binary replacement + codesign"
 cp '{binary}' '{binary}.tmp'
 mv '{binary}.tmp' '{binary}'
-codesign -f -s - '{binary}' 2>&1
+if [ -n "${{AGENTIC_CODESIGN_IDENTITY:-}}" ]; then
+    identity="${{AGENTIC_CODESIGN_IDENTITY}}"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -Fq '"Apple Development: Alexander Lewis (J3L5DMAP39)"'; then
+    identity="Apple Development: Alexander Lewis (J3L5DMAP39)"
+elif security find-identity -v -p codesigning 2>/dev/null | grep -Fq '"Apple Distribution: Alexander Lewis (M3C97KFGK9)"'; then
+    identity="Apple Distribution: Alexander Lewis (M3C97KFGK9)"
+else
+    echo "No valid Apple code-signing identity found; cannot restart API with stable privacy identity"
+    exit 1
+fi
+codesign --force --sign "$identity" --identifier com.agentic.flowstate.api '{binary}' 2>&1
 xattr -d com.apple.provenance '{binary}' 2>/dev/null || true
 
 # kickstart -k kills and restarts without deregistering the service.
