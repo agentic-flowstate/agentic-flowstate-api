@@ -93,6 +93,28 @@ async fn conversation_run_status_snapshot(
     let mut is_processing = status == "running";
 
     if is_processing {
+        let recovered = agent_runners::recover_stale_active_work_for_conversation(
+            pool,
+            conversation_id,
+            ACTIVE_CHECKPOINT_STALE_SECONDS,
+        )
+        .await?;
+        if recovered.any() {
+            tracing::warn!(
+                "[CHAT-STATUS] Recovered stale active work: conv={} turns_failed={} jobs_failed={} checkpoints_interrupted={}",
+                conversation_id,
+                recovered.turns_failed,
+                recovered.jobs_failed,
+                recovered.checkpoints_interrupted
+            );
+            checkpoint = checkpoints::get_checkpoint(pool, conversation_id).await?;
+            checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
+            status = normalize_checkpoint_status(checkpoint_status.as_deref());
+            is_processing = status == "running";
+        }
+    }
+
+    if is_processing {
         if let (Some(manager), Some(checkpoint_row)) = (manager, checkpoint.as_ref()) {
             let has_live_turn = manager.has_app_server_turn(conversation_id).await;
             let has_worker = WORKER_MANAGER.has_worker(conversation_id).await;
@@ -504,6 +526,19 @@ pub async fn list_messages(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if params.defer_active.unwrap_or(false) {
+        if let Err(e) = agent_runners::recover_stale_active_work_for_conversation(
+            &pool,
+            &id,
+            ACTIVE_CHECKPOINT_STALE_SECONDS,
+        )
+        .await
+        {
+            tracing::warn!(
+                "[CHAT-MESSAGES] Failed to recover stale active work for {} before defer_active: {}",
+                id,
+                e
+            );
+        }
         let checkpoint = checkpoints::get_checkpoint(&pool, &id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -552,6 +587,20 @@ pub async fn get_conversation_checkpoint(
         .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
     if conv.user_id != user.user_id {
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
+
+    if let Err(e) = agent_runners::recover_stale_active_work_for_conversation(
+        &pool,
+        &id,
+        ACTIVE_CHECKPOINT_STALE_SECONDS,
+    )
+    .await
+    {
+        tracing::warn!(
+            "[CHAT-CHECKPOINT] Failed to recover stale active work for {}: {}",
+            id,
+            e
+        );
     }
 
     let checkpoint = ticketing_system::checkpoints::get_checkpoint(&pool, &id)
