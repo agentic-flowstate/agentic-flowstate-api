@@ -8,7 +8,9 @@ use futures::FutureExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use ticketing_system::{agent_runners, checkpoints, conversation_turn_jobs, restart_queue};
+use ticketing_system::{
+    agent_runners, checkpoints, conversation_turn_jobs, conversations, restart_queue,
+};
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -267,6 +269,7 @@ async fn run_claimed_job_inner(
     manager: Arc<ChatClientManager>,
     job: conversation_turn_jobs::ConversationTurnJob,
 ) -> Result<String> {
+    verify_job_conversation_owner(&db, &job).await?;
     let worker_message = worker_message_from_job(&job)?;
     let (tx, rx) = mpsc::channel(1);
     tx.send(worker_message)
@@ -294,6 +297,19 @@ async fn run_claimed_job_inner(
     };
 
     Ok(status.to_string())
+}
+
+async fn verify_job_conversation_owner(
+    db: &ticketing_system::SqlitePool,
+    job: &conversation_turn_jobs::ConversationTurnJob,
+) -> Result<()> {
+    let conversation = conversations::get_conversation(db, &job.conversation_id, false)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("Conversation not found for queued job"))?;
+    if conversation.user_id != job.payload.user_id {
+        anyhow::bail!("Conversation job user does not own the target conversation");
+    }
+    Ok(())
 }
 
 fn worker_message_from_job(

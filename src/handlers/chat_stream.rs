@@ -97,6 +97,32 @@ pub struct ChatSubmitResponse {
     pub status: &'static str,
 }
 
+async fn authorize_conversation_turn(
+    db: &SqlitePool,
+    conversation_id: &str,
+    user_id: &str,
+) -> Result<(), Response> {
+    match conversations::get_conversation(db, conversation_id, false).await {
+        Ok(Some(conv)) if conv.user_id == user_id => Ok(()),
+        Ok(Some(_)) | Ok(None) => {
+            Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()).into_response())
+        }
+        Err(e) => {
+            tracing::error!(
+                "[CHAT] Failed to authorize conversation {} for user {}: {}",
+                conversation_id,
+                user_id,
+                e
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to authorize conversation".to_string(),
+            )
+                .into_response())
+        }
+    }
+}
+
 /// Submit a chat turn to the conversation worker and return immediately.
 ///
 /// This is the non-streaming chat path used by the native app. The worker
@@ -124,6 +150,10 @@ pub async fn submit(
                 .into_response();
         }
     };
+
+    if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
+        return response;
+    }
 
     if let Err(e) = checkpoints::upsert_checkpoint(&db, &conv_id, "queued", 0).await {
         tracing::error!(
@@ -366,6 +396,10 @@ pub async fn chat(
             return create_sse_stream_raw(rx, wrapper_conv_id).into_response();
         }
     };
+
+    if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
+        return response;
+    }
 
     // Subscribe before enqueue so we do not miss the worker's first frames.
     let broadcast_tx = get_broadcast_sender(&conv_id).await;
@@ -731,6 +765,81 @@ pub fn create_conversation_reconnect_stream(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod conversation_authorization_tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::ConnectOptions;
+    use std::str::FromStr;
+
+    async fn fresh_pool() -> SqlitePool {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .expect("parse sqlite url")
+            .foreign_keys(true)
+            .disable_statement_logging();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("connect sqlite");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                session_id TEXT,
+                organization TEXT NOT NULL,
+                agent TEXT,
+                title TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                archived_at TEXT,
+                router_ticket_id TEXT,
+                router_organization TEXT,
+                last_event_index INTEGER NOT NULL DEFAULT -1
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create conversations");
+
+        sqlx::query(
+            r#"
+            INSERT INTO conversations
+                (id, user_id, organization, agent, title, started_at, updated_at)
+            VALUES
+                ('conv-alex', 'alex', 'global', 'full-access', 'Alex conversation', 'now', 'now')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed conversation");
+
+        pool
+    }
+
+    #[tokio::test]
+    async fn authorizes_owner_for_chat_turns() {
+        let pool = fresh_pool().await;
+        assert!(authorize_conversation_turn(&pool, "conv-alex", "alex")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_other_user_for_chat_turns() {
+        let pool = fresh_pool().await;
+        let response = match authorize_conversation_turn(&pool, "conv-alex", "jakegreene").await {
+            Ok(()) => panic!("expected authorization failure"),
+            Err(response) => response,
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
 

@@ -47,6 +47,25 @@ fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile
     }
 }
 
+fn codex_sandbox_policy_for_chat_agent(
+    agent_type: &AgentType,
+) -> (CodexSandboxMode, bool, CodexToolProfile) {
+    let tool_profile = codex_tool_profile_for_chat_agent(agent_type);
+    if tool_profile == CodexToolProfile::RestrictedMcpOnly {
+        (
+            CodexSandboxMode::ReadOnly,
+            false,
+            CodexToolProfile::RestrictedMcpOnly,
+        )
+    } else {
+        (
+            CodexSandboxMode::DangerFullAccess,
+            true,
+            CodexToolProfile::Default,
+        )
+    }
+}
+
 /// Message sent to a ConversationWorker via its mpsc channel.
 pub struct WorkerMessage {
     pub user_id: String,
@@ -869,17 +888,20 @@ impl ConversationWorker {
             }
         };
 
+        let (sandbox, bypass_approvals_and_sandbox, tool_profile) =
+            codex_sandbox_policy_for_chat_agent(&msg.config.agent_type);
+
         let mut turn = match spawn_codex_app_server(CodexAppServerOptions {
             model: msg.config.agent_type.model(),
             reasoning_effort: msg.config.agent_type.effort(),
             system_prompt: &system_prompt,
             working_dir: &msg.config.working_dir,
             prompt: final_message,
-            sandbox: CodexSandboxMode::DangerFullAccess,
-            bypass_approvals_and_sandbox: true,
+            sandbox,
+            bypass_approvals_and_sandbox,
             resume_session_id: None,
             ephemeral: true,
-            tool_profile: codex_tool_profile_for_chat_agent(&msg.config.agent_type),
+            tool_profile,
             scoped_user_id: Some(&msg.user_id),
         })
         .await
@@ -1750,7 +1772,8 @@ mod streaming_persistence_tests {
                 status TEXT NOT NULL DEFAULT 'open',
                 archived_at TEXT,
                 router_ticket_id TEXT,
-                router_organization TEXT
+                router_organization TEXT,
+                last_event_index INTEGER NOT NULL DEFAULT -1
             )
             "#,
         )

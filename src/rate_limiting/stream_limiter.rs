@@ -827,11 +827,11 @@ mod tests {
 
         // Create two buckets; let both go idle (drop their permits).
         {
-            let _p1 = match limiter.check("alex", "conv-a", StreamKind::Generate) {
+            let _p1 = match limiter.check("alex", "conv-a", StreamKind::Resume) {
                 RateLimitDecision::Allow(p) => p,
                 other => panic!("{:?}", other),
             };
-            let _p2 = match limiter.check("bob", "conv-b", StreamKind::Generate) {
+            let _p2 = match limiter.check("bob", "conv-b", StreamKind::Resume) {
                 RateLimitDecision::Allow(p) => p,
                 other => panic!("{:?}", other),
             };

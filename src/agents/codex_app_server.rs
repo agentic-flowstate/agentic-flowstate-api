@@ -29,12 +29,26 @@ const REQUIRED_CODEX_PATH_ENTRIES: &[&str] = &[
 // shell, plugin, and tool-discovery features so Codex cannot widen itself
 // back into desktop or local-file access during those turns.
 const RESTRICTED_MCP_ONLY_DISABLED_FEATURES: &[&str] = &[
-    "plugins",
     "apps",
-    "tool_search",
+    "browser_use",
+    "computer_use",
+    "enable_mcp_apps",
+    "image_generation",
+    "in_app_browser",
+    "multi_agent",
+    "multi_agent_v2",
+    "plugins",
+    "plugin_hooks",
+    "remote_plugin",
+    "skill_env_var_dependency_prompt",
+    "skill_mcp_dependency_install",
     "shell_tool",
-    "shell_zsh_fork",
     "shell_snapshot",
+    "shell_zsh_fork",
+    "tool_search",
+    "tool_suggest",
+    "unified_exec",
+    "workspace_dependencies",
 ];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -603,6 +617,9 @@ pub async fn spawn_codex_app_server(
 }
 
 fn effective_sandbox(options: &CodexAppServerOptions<'_>) -> CodexSandboxMode {
+    if options.tool_profile == CodexToolProfile::RestrictedMcpOnly {
+        return CodexSandboxMode::ReadOnly;
+    }
     if options.bypass_approvals_and_sandbox {
         CodexSandboxMode::DangerFullAccess
     } else {
@@ -1331,6 +1348,7 @@ mod tests {
     fn app_server_command_keeps_mcp_override_and_feature_disables() {
         let mut options = sample_app_server_options(Some("session-123"));
         options.tool_profile = CodexToolProfile::RestrictedMcpOnly;
+        options.scoped_user_id = Some("jakegreene");
         let command = build_codex_app_server_command(
             &options,
             Path::new("/tmp/agentic_mcp"),
@@ -1348,6 +1366,25 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--disable" && pair[1] == "tool_search"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--disable" && pair[1] == "shell_tool"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--disable" && pair[1] == "browser_use"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--disable" && pair[1] == "multi_agent"));
+    }
+
+    #[test]
+    fn restricted_profile_forces_read_only_sandbox() {
+        let mut options = sample_app_server_options(None);
+        options.tool_profile = CodexToolProfile::RestrictedMcpOnly;
+        options.sandbox = CodexSandboxMode::DangerFullAccess;
+        options.bypass_approvals_and_sandbox = true;
+
+        assert_eq!(effective_sandbox(&options), CodexSandboxMode::ReadOnly);
     }
 
     #[test]

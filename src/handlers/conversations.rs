@@ -270,6 +270,18 @@ pub async fn create_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Json(mut req): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, Json<Conversation>), (StatusCode, String)> {
+    if req.agent.as_deref() == Some("full-access") {
+        let is_admin = ticketing_system::system_logs::is_admin(&pool, &user.user_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !is_admin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "Admin access required for full-access conversations".to_string(),
+            ));
+        }
+    }
+
     req.user_id = user.user_id;
     let conv = conversations::create_conversation(&pool, req)
         .await
