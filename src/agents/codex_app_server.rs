@@ -112,6 +112,7 @@ pub struct CodexAppServerOptions<'a> {
     pub resume_session_id: Option<&'a str>,
     pub ephemeral: bool,
     pub tool_profile: CodexToolProfile,
+    pub scoped_user_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +266,14 @@ fn mcp_server_command_override(server_name: &str, command: &str) -> Result<Strin
     let quoted_command = config_string_literal(command)?;
     Ok(format!(
         "mcp_servers.{quoted_name}.command={quoted_command}"
+    ))
+}
+
+fn mcp_server_env_override(server_name: &str, key: &str, value: &str) -> Result<String, String> {
+    let quoted_name = config_string_literal(server_name)?;
+    let quoted_value = config_string_literal(value)?;
+    Ok(format!(
+        "mcp_servers.{quoted_name}.env.{key}={quoted_value}"
     ))
 }
 
@@ -455,6 +464,22 @@ fn build_codex_app_server_command(
         "agentic-mcp",
         agentic_mcp_command.to_string_lossy().as_ref(),
     )?);
+
+    if options.tool_profile == CodexToolProfile::RestrictedMcpOnly {
+        let user_id = options.scoped_user_id.ok_or_else(|| {
+            "Restricted MCP profile requires scoped_user_id for tool enforcement".to_string()
+        })?;
+        command.arg("-c").arg(mcp_server_env_override(
+            "agentic-mcp",
+            "AGENTIC_MCP_PROFILE",
+            "scoped-workspace",
+        )?);
+        command.arg("-c").arg(mcp_server_env_override(
+            "agentic-mcp",
+            "AGENTIC_MCP_USER_ID",
+            user_id,
+        )?);
+    }
 
     for config_override in options.tool_profile.config_overrides() {
         command.arg("-c").arg(config_override);
@@ -1040,6 +1065,7 @@ pub async fn run_codex_text(
         resume_session_id: None,
         ephemeral: true,
         tool_profile: CodexToolProfile::Default,
+        scoped_user_id: None,
     })
     .await?;
     let mut last_agent_message = None;
@@ -1242,6 +1268,7 @@ mod tests {
             resume_session_id,
             ephemeral: true,
             tool_profile: CodexToolProfile::Default,
+            scoped_user_id: None,
         }
     }
 

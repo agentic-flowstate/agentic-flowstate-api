@@ -399,31 +399,28 @@ pub async fn remove_relationship_nested(
 
 // Get ticket by ID only (uses index lookup - ticket_id is globally unique)
 pub async fn get_ticket_by_id(
-    State(_pool): State<Arc<SqlitePool>>,
+    State(pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path(ticket_id): Path<String>,
 ) -> Response {
-    // ticket_id is globally unique, no organization needed
-    let args = json!({
-        "ticket_id": ticket_id
-    });
+    let organization = get_organization(&headers);
 
-    match call_mcp_tool("get_ticket", Some(args)).await {
-        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+    match ticketing_system::tickets::get_ticket_by_id(&pool, &ticket_id).await {
+        Ok(Some(ticket)) if ticket.organization == organization => {
+            (StatusCode::OK, Json(ticket)).into_response()
+        }
+        Ok(Some(_)) | Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Ticket not found" })),
+        )
+            .into_response(),
         Err(e) => {
             error!("Failed to get ticket by id: {:?}", e);
-            if e.to_string().contains("not found") {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({ "error": "Ticket not found" })),
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to get ticket: {}", e) })),
-                )
-                    .into_response()
-            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to get ticket: {}", e) })),
+            )
+                .into_response()
         }
     }
 }

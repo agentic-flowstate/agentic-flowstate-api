@@ -114,6 +114,7 @@ pub async fn run_codex_agent_turn(
         resume_session_id,
         ephemeral: !persist_session,
         tool_profile: CodexToolProfile::Default,
+        scoped_user_id: None,
     })
     .await
     .map_err(anyhow::Error::msg)?;

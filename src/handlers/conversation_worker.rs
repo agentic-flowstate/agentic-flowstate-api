@@ -880,6 +880,7 @@ impl ConversationWorker {
             resume_session_id: None,
             ephemeral: true,
             tool_profile: codex_tool_profile_for_chat_agent(&msg.config.agent_type),
+            scoped_user_id: Some(&msg.user_id),
         })
         .await
         {

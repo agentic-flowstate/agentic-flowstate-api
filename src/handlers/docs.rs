@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,8 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tracing::error;
+
+use super::get_organization;
 
 #[derive(Debug, Deserialize)]
 pub struct DocContentQuery {
@@ -20,12 +22,21 @@ pub struct DocContentQuery {
 /// The artifact_id must exist in the ticket's documentation list.
 pub async fn serve_document_content(
     State(pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path(ticket_id): Path<String>,
     Query(query): Query<DocContentQuery>,
 ) -> Response {
+    let org = get_organization(&headers);
     // Look up ticket
     let ticket = match ticketing_system::tickets::get_ticket_by_id(&pool, &ticket_id).await {
-        Ok(Some(t)) => t,
+        Ok(Some(t)) if t.organization == org => t,
+        Ok(Some(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({ "error": "Ticket not found" })),
+            )
+                .into_response()
+        }
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -92,11 +103,20 @@ pub struct ArtifactDocSummary {
 /// Returns summaries of all artifacts attached to a ticket's documentation list.
 pub async fn list_ticket_docs(
     State(pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path(ticket_id): Path<String>,
 ) -> Response {
+    let org = get_organization(&headers);
     // Look up ticket
     let ticket = match ticketing_system::tickets::get_ticket_by_id(&pool, &ticket_id).await {
-        Ok(Some(t)) => t,
+        Ok(Some(t)) if t.organization == org => t,
+        Ok(Some(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({ "error": "Ticket not found" })),
+            )
+                .into_response()
+        }
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,

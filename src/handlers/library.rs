@@ -69,11 +69,15 @@ pub async fn search_library_artifacts(
 /// GET /api/library/artifacts/:artifact_id — get a single artifact with content
 pub async fn get_library_artifact(
     State(pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path(artifact_id): Path<String>,
 ) -> Response {
+    let org = get_organization(&headers);
     match ticketing_system::artifacts::get_artifact(&pool, &artifact_id).await {
-        Ok(Some(artifact)) => (StatusCode::OK, Json(json!(artifact))).into_response(),
-        Ok(None) => (
+        Ok(Some(artifact)) if artifact.organization == org => {
+            (StatusCode::OK, Json(json!(artifact))).into_response()
+        }
+        Ok(Some(_)) | Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Artifact not found" })),
         )
@@ -147,12 +151,21 @@ pub struct DownloadQuery {
 /// Pass ?inline=true to serve for embedding (Content-Disposition: inline)
 pub async fn download_library_document(
     State(pool): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
     Path(document_id): Path<String>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
+    let org = get_organization(&headers);
     // Get metadata for Content-Type and filename
     let doc = match ticketing_system::documents::get_document(&pool, &document_id).await {
-        Ok(Some(d)) => d,
+        Ok(Some(d)) if d.organization == org => d,
+        Ok(Some(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Document not found" })),
+            )
+                .into_response()
+        }
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,

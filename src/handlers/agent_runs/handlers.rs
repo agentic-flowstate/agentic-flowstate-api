@@ -1,8 +1,8 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
-    Json,
+    Extension, Json,
 };
 use futures::stream::Stream;
 use sqlx::SqlitePool;
@@ -23,15 +23,19 @@ use crate::agents::{
     AgentRunsResponse, AgentType, RunAgentRequest, RunAgentResponse, SendMessageRequest,
     StreamEvent,
 };
+use crate::auth_middleware::AuthenticatedUser;
 use crate::handlers::chat_client_manager::ChatClientManager;
+use crate::handlers::get_organization;
 
-/// POST /api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/agent-runs
-pub async fn run_agent(
-    Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
-    State(db): State<Arc<SqlitePool>>,
-    Json(req): Json<RunAgentRequest>,
-) -> Result<Json<RunAgentResponse>, (StatusCode, String)> {
-    let ticket = ticketing_system::tickets::get_ticket_by_id(&db, &ticket_id)
+async fn load_authorized_ticket(
+    db: &SqlitePool,
+    headers: &HeaderMap,
+    epic_id: &str,
+    slice_id: &str,
+    ticket_id: &str,
+) -> Result<ticketing_system::Ticket, (StatusCode, String)> {
+    let organization = get_organization(headers);
+    let ticket = ticketing_system::tickets::get_ticket_by_id(db, ticket_id)
         .await
         .map_err(|e| {
             (
@@ -40,6 +44,56 @@ pub async fn run_agent(
             )
         })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Ticket not found".to_string()))?;
+
+    if ticket.organization != organization
+        || ticket.epic_id != epic_id
+        || ticket.slice_id != slice_id
+    {
+        return Err((StatusCode::NOT_FOUND, "Ticket not found".to_string()));
+    }
+
+    Ok(ticket)
+}
+
+async fn agent_run_visible_to_user(
+    db: &SqlitePool,
+    user_id: &str,
+    run: &ticketing_system::AgentRun,
+) -> Result<bool, String> {
+    if ticketing_system::system_logs::is_admin(db, user_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(true);
+    }
+
+    let organization = if let Some(org) = run.organization.as_deref() {
+        Some(org.to_string())
+    } else if let Some(ticket_id) = run.ticket_id.as_deref() {
+        ticketing_system::tickets::get_ticket_by_id(db, ticket_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|ticket| ticket.organization)
+    } else {
+        None
+    };
+
+    match organization {
+        Some(org) => ticketing_system::memberships::check_membership(db, user_id, &org)
+            .await
+            .map_err(|e| e.to_string()),
+        None => Ok(false),
+    }
+}
+
+/// POST /api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/agent-runs
+pub async fn run_agent(
+    Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
+    State(db): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
+    Json(req): Json<RunAgentRequest>,
+) -> Result<Json<RunAgentResponse>, (StatusCode, String)> {
+    let ticket = load_authorized_ticket(&db, &headers, &epic_id, &slice_id, &ticket_id).await?;
 
     let context = build_ticket_context(
         &epic_id,
@@ -129,7 +183,10 @@ pub async fn run_agent(
 pub async fn list_agent_runs(
     Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
     State(db): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
 ) -> Result<Json<AgentRunsResponse>, (StatusCode, String)> {
+    load_authorized_ticket(&db, &headers, &epic_id, &slice_id, &ticket_id).await?;
+
     let db_runs =
         ticketing_system::agent_runs::list_agent_runs(&db, &epic_id, &slice_id, &ticket_id)
             .await
@@ -148,6 +205,7 @@ pub async fn list_agent_runs(
 pub async fn get_agent_run(
     Path(session_id): Path<String>,
     State(db): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<AgentRun>, (StatusCode, String)> {
     let db_run = ticketing_system::agent_runs::get_agent_run(&db, &session_id)
         .await
@@ -159,6 +217,13 @@ pub async fn get_agent_run(
         })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Agent run not found".to_string()))?;
 
+    if !agent_run_visible_to_user(&db, &user.user_id, &db_run)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    {
+        return Err((StatusCode::NOT_FOUND, "Agent run not found".to_string()));
+    }
+
     Ok(Json(db_run_to_api_run(db_run)))
 }
 
@@ -167,13 +232,17 @@ pub async fn stream_agent_run(
     Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
     State(db): State<Arc<SqlitePool>>,
     State(_client_manager): State<Arc<ChatClientManager>>,
+    headers: HeaderMap,
     Json(req): Json<RunAgentRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     tracing::info!("=== STREAM_AGENT_RUN START ===");
     tracing::info!("Ticket: {}/{}/{}", epic_id, slice_id, ticket_id);
 
     let (tx, rx) = mpsc::channel::<StreamEvent>(100);
-    let ticket_result = ticketing_system::tickets::get_ticket_by_id(&db, &ticket_id).await;
+    let ticket_result = load_authorized_ticket(&db, &headers, &epic_id, &slice_id, &ticket_id)
+        .await
+        .map(Some)
+        .map_err(|(_, message)| message);
     let db_clone = db.clone();
 
     // Generate session_id upfront
@@ -420,7 +489,10 @@ pub async fn stream_agent_run(
 pub async fn get_active_agent_run(
     Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
     State(db): State<Arc<SqlitePool>>,
+    headers: HeaderMap,
 ) -> Result<Json<AgentRun>, (StatusCode, String)> {
+    load_authorized_ticket(&db, &headers, &epic_id, &slice_id, &ticket_id).await?;
+
     let db_run =
         ticketing_system::agent_runs::get_active_agent_run(&db, &epic_id, &slice_id, &ticket_id)
             .await
@@ -441,16 +513,26 @@ pub async fn get_active_agent_run(
 pub async fn reconnect_agent_stream(
     Path(session_id): Path<String>,
     State(db): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let run_result = ticketing_system::agent_runs::get_agent_run(&db, &session_id).await;
     let events_result = ticketing_system::agent_runs::get_events(&db, &session_id).await;
 
     let stream: Box<dyn Stream<Item = Result<Event, Infallible>> + Send + Unpin> = match run_result
     {
-        Ok(Some(run)) => {
-            let events = events_result.unwrap_or_default();
-            Box::new(Box::pin(create_reconnect_stream(run, events)))
-        }
+        Ok(Some(run)) => match agent_run_visible_to_user(&db, &user.user_id, &run).await {
+            Ok(true) => {
+                let events = events_result.unwrap_or_default();
+                Box::new(Box::pin(create_reconnect_stream(run, events)))
+            }
+            Ok(false) => Box::new(Box::pin(create_error_stream(
+                "Agent run not found".to_string(),
+            ))),
+            Err(e) => Box::new(Box::pin(create_error_stream(format!(
+                "Database error: {}",
+                e
+            )))),
+        },
         Ok(None) => Box::new(Box::pin(create_error_stream(
             "Agent run not found".to_string(),
         ))),
@@ -471,6 +553,7 @@ pub async fn send_message_to_agent(
     Path(session_id): Path<String>,
     State(db): State<Arc<SqlitePool>>,
     State(_client_manager): State<Arc<ChatClientManager>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<SendMessageRequest>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     tracing::info!("=== SEND_MESSAGE_TO_AGENT START === session={}", session_id);
@@ -478,6 +561,7 @@ pub async fn send_message_to_agent(
     let (tx, rx) = mpsc::channel::<StreamEvent>(100);
     let session_id_clone = session_id.clone();
     let db_clone = db.clone();
+    let user_id = user.user_id.clone();
 
     tokio::spawn(async move {
         let db = db_clone;
@@ -504,6 +588,28 @@ pub async fn send_message_to_agent(
                 return;
             }
         };
+
+        match agent_run_visible_to_user(&db, &user_id, &db_run).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = tx
+                    .send(StreamEvent::Status {
+                        status: "failed".to_string(),
+                        message: Some("Agent run not found in database.".to_string()),
+                    })
+                    .await;
+                return;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(StreamEvent::Status {
+                        status: "failed".to_string(),
+                        message: Some(format!("Database error: {}", e)),
+                    })
+                    .await;
+                return;
+            }
+        }
 
         let runtime_session_id = match &db_run.cc_session_id {
             Some(sid) => sid.clone(),

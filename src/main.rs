@@ -959,12 +959,6 @@ async fn main() -> anyhow::Result<()> {
             "/api/home-planner/chat/submit",
             post(handlers::home_planner_chat_submit),
         )
-        // Full Access Chat routes
-        .route("/api/full-access/chat", post(handlers::full_access_chat))
-        .route(
-            "/api/full-access/chat/submit",
-            post(handlers::full_access_chat_submit),
-        )
         // Scoped Workspace Chat routes (restricted agent for external collaborators)
         .route(
             "/api/scoped-workspace/chat",
@@ -1195,6 +1189,12 @@ async fn main() -> anyhow::Result<()> {
     let admin_routes = Router::new()
         .route("/api/admin/logs", get(handlers::admin_logs::list_logs))
         .route("/api/admin/check", get(handlers::admin_logs::check_admin))
+        // Full Access Chat routes are admin-only; external collaborators use scoped-workspace.
+        .route("/api/full-access/chat", post(handlers::full_access_chat))
+        .route(
+            "/api/full-access/chat/submit",
+            post(handlers::full_access_chat_submit),
+        )
         .route(
             "/api/admin/reload",
             post(handlers::admin_reload::reload_services),

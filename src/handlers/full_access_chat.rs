@@ -1,10 +1,11 @@
 use axum::{
     extract::{Extension, State},
-    http::HeaderMap,
-    response::Response,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
+use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,6 +23,29 @@ pub struct FullAccessChatRequest {
     pub images: Option<Vec<ChatImageData>>,
 }
 
+async fn reject_unless_admin(db: &SqlitePool, user_id: &str) -> Option<Response> {
+    match ticketing_system::system_logs::is_admin(db, user_id).await {
+        Ok(true) => None,
+        Ok(false) => Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "Admin access required"})),
+            )
+                .into_response(),
+        ),
+        Err(e) => {
+            tracing::error!("Full-access admin check failed for {}: {:?}", user_id, e);
+            Some(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Admin access check failed"})),
+                )
+                    .into_response(),
+            )
+        }
+    }
+}
+
 /// POST /api/full-access/chat
 pub async fn full_access_chat(
     State(db): State<Arc<SqlitePool>>,
@@ -31,6 +55,10 @@ pub async fn full_access_chat(
     Json(req): Json<FullAccessChatRequest>,
 ) -> Response {
     tracing::info!("=== FULL_ACCESS_CHAT START === user={}", user.user_id);
+
+    if let Some(response) = reject_unless_admin(&db, &user.user_id).await {
+        return response;
+    }
 
     let client_id = match chat_stream::extract_client_id(&headers) {
         Ok(v) => v,
@@ -77,6 +105,10 @@ pub async fn full_access_chat_submit(
         "=== FULL_ACCESS_CHAT_SUBMIT START === user={}",
         user.user_id
     );
+
+    if let Some(response) = reject_unless_admin(&db, &user.user_id).await {
+        return response;
+    }
 
     let client_id = match chat_stream::extract_client_id(&headers) {
         Ok(v) => v,

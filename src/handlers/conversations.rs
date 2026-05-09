@@ -4,7 +4,7 @@ use axum::{
     http::{header, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     Json,
 };
@@ -1165,8 +1165,15 @@ pub async fn subscribe_conversations(
 /// GET /api/chat-images/:conversation_id/:filename
 /// Serve an image attachment from the chat-images directory.
 pub async fn get_chat_image(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path((conversation_id, filename)): Path<(String, String)>,
-) -> impl IntoResponse {
+) -> Response {
+    match conversations::get_conversation(&pool, &conversation_id, false).await {
+        Ok(Some(conv)) if conv.user_id == user.user_id => {}
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    }
+
     let path = dirs::home_dir()
         .unwrap_or_default()
         .join(".agentic-flowstate/chat-images")
