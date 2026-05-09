@@ -29,17 +29,27 @@ const REQUIRED_CODEX_PATH_ENTRIES: &[&str] = &[
 // shell, plugin, and tool-discovery features so Codex cannot widen itself
 // back into desktop or local-file access during those turns.
 const RESTRICTED_MCP_ONLY_DISABLED_FEATURES: &[&str] = &[
+    "apply_patch_freeform",
+    "apply_patch_streaming_events",
     "apps",
+    "artifact",
     "browser_use",
+    "code_mode",
+    "code_mode_only",
+    "codex_git_commit",
+    "codex_hooks",
     "computer_use",
     "enable_mcp_apps",
+    "exec_permission_approvals",
     "image_generation",
     "in_app_browser",
+    "memories",
     "multi_agent",
     "multi_agent_v2",
     "plugins",
     "plugin_hooks",
     "remote_plugin",
+    "remote_control",
     "skill_env_var_dependency_prompt",
     "skill_mcp_dependency_install",
     "shell_tool",
@@ -301,22 +311,71 @@ fn default_codex_home() -> Result<PathBuf, String> {
         .ok_or_else(|| "Failed to resolve home directory for CODEX_HOME".to_string())
 }
 
-fn app_server_codex_home() -> Result<PathBuf, String> {
-    if let Some(home) = std::env::var_os("AGENTIC_CODEX_HOME") {
-        return Ok(PathBuf::from(home));
-    }
+fn app_server_codex_home(profile: CodexToolProfile) -> Result<PathBuf, String> {
+    match profile {
+        CodexToolProfile::Default => {
+            if let Some(home) = std::env::var_os("AGENTIC_CODEX_HOME") {
+                return Ok(PathBuf::from(home));
+            }
 
-    dirs::home_dir()
-        .map(|home| {
-            home.join(".agentic-flowstate")
-                .join("codex-app-server-home")
-        })
-        .ok_or_else(|| "Failed to resolve home directory for AGENTIC_CODEX_HOME".to_string())
+            dirs::home_dir()
+                .map(|home| {
+                    home.join(".agentic-flowstate")
+                        .join("codex-app-server-home")
+                })
+                .ok_or_else(|| {
+                    "Failed to resolve home directory for AGENTIC_CODEX_HOME".to_string()
+                })
+        }
+        CodexToolProfile::RestrictedMcpOnly => {
+            if let Some(home) = std::env::var_os("AGENTIC_CODEX_RESTRICTED_HOME") {
+                return Ok(PathBuf::from(home));
+            }
+
+            dirs::home_dir()
+                .map(|home| {
+                    home.join(".agentic-flowstate")
+                        .join("codex-restricted-home")
+                })
+                .ok_or_else(|| {
+                    "Failed to resolve home directory for AGENTIC_CODEX_RESTRICTED_HOME".to_string()
+                })
+        }
+    }
 }
 
-fn prepare_codex_app_server_home(agentic_mcp_command: &Path) -> Result<PathBuf, String> {
+fn restricted_runtime_working_dir() -> Result<PathBuf, String> {
+    let dir = dirs::home_dir()
+        .map(|home| {
+            home.join(".agentic-flowstate")
+                .join("codex-scoped-workspace")
+        })
+        .ok_or_else(|| {
+            "Failed to resolve home directory for scoped Codex runtime working directory"
+                .to_string()
+        })?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "Failed to create scoped Codex runtime working directory at {}: {e}",
+            dir.display()
+        )
+    })?;
+    Ok(dir)
+}
+
+fn effective_working_dir(options: &CodexAppServerOptions<'_>) -> Result<PathBuf, String> {
+    match options.tool_profile {
+        CodexToolProfile::Default => Ok(options.working_dir.to_path_buf()),
+        CodexToolProfile::RestrictedMcpOnly => restricted_runtime_working_dir(),
+    }
+}
+
+fn prepare_codex_app_server_home(
+    agentic_mcp_command: &Path,
+    profile: CodexToolProfile,
+) -> Result<PathBuf, String> {
     let source_home = default_codex_home()?;
-    let target_home = app_server_codex_home()?;
+    let target_home = app_server_codex_home(profile)?;
     std::fs::create_dir_all(&target_home).map_err(|e| {
         format!(
             "Failed to create Codex app-server home at {}: {e}",
@@ -340,12 +399,20 @@ fn prepare_codex_app_server_home(agentic_mcp_command: &Path) -> Result<PathBuf, 
     })?;
 
     let source_agents = source_home.join("AGENTS.md");
-    if source_agents.is_file() {
+    let target_agents = target_home.join("AGENTS.md");
+    if profile == CodexToolProfile::Default && source_agents.is_file() {
         std::fs::copy(&source_agents, target_home.join("AGENTS.md")).map_err(|e| {
             format!(
                 "Failed to copy Codex AGENTS.md from {} to {}: {e}",
                 source_agents.display(),
                 target_home.join("AGENTS.md").display()
+            )
+        })?;
+    } else if profile == CodexToolProfile::RestrictedMcpOnly && target_agents.exists() {
+        std::fs::remove_file(&target_agents).map_err(|e| {
+            format!(
+                "Failed to remove AGENTS.md from restricted Codex home at {}: {e}",
+                target_agents.display()
             )
         })?;
     }
@@ -459,8 +526,9 @@ fn build_codex_app_server_command(
     agentic_mcp_command: &Path,
     codex_home: &Path,
 ) -> Result<StdCommand, String> {
+    let working_dir = effective_working_dir(options)?;
     let mut command = StdCommand::new("codex");
-    command.current_dir(options.working_dir);
+    command.current_dir(&working_dir);
     command.env("PATH", launchd_safe_path());
     command.env("CODEX_HOME", codex_home);
     command
@@ -470,7 +538,7 @@ fn build_codex_app_server_command(
         .arg("-c")
         .arg("forced_login_method=\"chatgpt\"");
 
-    for trust_override in working_dir_trust_overrides(options.working_dir)? {
+    for trust_override in working_dir_trust_overrides(&working_dir)? {
         command.arg("-c").arg(trust_override);
     }
 
@@ -523,7 +591,8 @@ pub async fn spawn_codex_app_server(
 ) -> Result<RunningCodexAppServer, String> {
     let normalized_effort = normalize_reasoning_effort(options.reasoning_effort).to_string();
     let agentic_mcp_command = agentic_mcp_binary()?;
-    let codex_home = prepare_codex_app_server_home(&agentic_mcp_command)?;
+    let codex_home = prepare_codex_app_server_home(&agentic_mcp_command, options.tool_profile)?;
+    let working_dir = effective_working_dir(&options)?;
     let mut command = Command::from(build_codex_app_server_command(
         &options,
         &agentic_mcp_command,
@@ -532,7 +601,7 @@ pub async fn spawn_codex_app_server(
 
     tracing::info!(
         "[CODEX] Launching app-server: cwd={}, codex_home={}, model={}, effort={}, sandbox={}, profile={:?}, mcp_servers={:?}, disabled_features={:?}",
-        options.working_dir.display(),
+        working_dir.display(),
         codex_home.display(),
         resolve_codex_model(options.model),
         normalized_effort,
@@ -572,7 +641,7 @@ pub async fn spawn_codex_app_server(
         model: resolve_codex_model(options.model).to_string(),
         reasoning_effort: normalized_effort,
         system_prompt: options.system_prompt.to_string(),
-        working_dir: options.working_dir.to_string_lossy().to_string(),
+        working_dir: working_dir.to_string_lossy().to_string(),
         prompt: options.prompt.to_string(),
         sandbox: effective_sandbox(&options),
         resume_session_id: options.resume_session_id.map(str::to_string),
@@ -1365,6 +1434,9 @@ mod tests {
             .any(|pair| pair[0] == "--disable" && pair[1] == "apps"));
         assert!(args
             .windows(2)
+            .any(|pair| pair[0] == "--disable" && pair[1] == "apply_patch_freeform"));
+        assert!(args
+            .windows(2)
             .any(|pair| pair[0] == "--disable" && pair[1] == "tool_search"));
         assert!(args
             .windows(2)
@@ -1375,6 +1447,10 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--disable" && pair[1] == "multi_agent"));
+        assert_ne!(
+            command.get_current_dir(),
+            Some(Path::new("/tmp/codex-workspace"))
+        );
     }
 
     #[test]
