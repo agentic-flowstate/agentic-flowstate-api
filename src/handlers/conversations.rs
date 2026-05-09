@@ -82,6 +82,37 @@ fn normalize_checkpoint_status(status: Option<&str>) -> String {
     .to_string()
 }
 
+async fn repair_checkpoint_from_active_durable_work(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    checkpoint_status: Option<&str>,
+) -> anyhow::Result<bool> {
+    if is_active_checkpoint_status(checkpoint_status) {
+        return Ok(false);
+    }
+
+    let has_active_job =
+        conversation_turn_jobs::has_active_job_for_conversation(pool, conversation_id).await?;
+    let has_active_turn =
+        agent_runners::has_active_turn_for_conversation(pool, conversation_id).await?;
+
+    if !has_active_job && !has_active_turn {
+        return Ok(false);
+    }
+
+    let repaired_status = if has_active_turn { "running" } else { "queued" };
+    tracing::warn!(
+        "[CHAT-STATUS] Repairing checkpoint from active durable work: conv={} checkpoint_status={} repaired_status={} has_active_job={} has_active_turn={}",
+        conversation_id,
+        checkpoint_status.unwrap_or("none"),
+        repaired_status,
+        has_active_job,
+        has_active_turn
+    );
+    checkpoints::upsert_checkpoint(pool, conversation_id, repaired_status, 0).await?;
+    Ok(true)
+}
+
 async fn conversation_run_status_snapshot(
     pool: &SqlitePool,
     conversation_id: &str,
@@ -91,6 +122,20 @@ async fn conversation_run_status_snapshot(
     let mut checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
     let mut status = normalize_checkpoint_status(checkpoint_status.as_deref());
     let mut is_processing = status == "running";
+
+    if !is_processing
+        && repair_checkpoint_from_active_durable_work(
+            pool,
+            conversation_id,
+            checkpoint_status.as_deref(),
+        )
+        .await?
+    {
+        checkpoint = checkpoints::get_checkpoint(pool, conversation_id).await?;
+        checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
+        status = normalize_checkpoint_status(checkpoint_status.as_deref());
+        is_processing = status == "running";
+    }
 
     if is_processing {
         let recovered = agent_runners::recover_stale_active_work_for_conversation(
@@ -551,9 +596,18 @@ pub async fn list_messages(
                 e
             );
         }
-        let checkpoint = checkpoints::get_checkpoint(&pool, &id)
+        let mut checkpoint = checkpoints::get_checkpoint(&pool, &id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
+        if repair_checkpoint_from_active_durable_work(&pool, &id, checkpoint_status.as_deref())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        {
+            checkpoint = checkpoints::get_checkpoint(&pool, &id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
         let is_processing = matches!(
             checkpoint.as_ref().map(|cp| cp.status.as_str()),
             Some("running") | Some("pending") | Some("queued")
@@ -615,9 +669,18 @@ pub async fn get_conversation_checkpoint(
         );
     }
 
-    let checkpoint = ticketing_system::checkpoints::get_checkpoint(&pool, &id)
+    let mut checkpoint = ticketing_system::checkpoints::get_checkpoint(&pool, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
+    if repair_checkpoint_from_active_durable_work(&pool, &id, checkpoint_status.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    {
+        checkpoint = ticketing_system::checkpoints::get_checkpoint(&pool, &id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
 
     let last_event_index = conversations::get_max_event_index(&pool, &id)
         .await

@@ -167,13 +167,6 @@ pub async fn submit(
         )
             .into_response();
     }
-    if let Err(e) = super::conversations::publish_conversation_run_status(&db, &conv_id).await {
-        tracing::warn!(
-            "[CHAT] Failed to publish run status for non-streaming submit {}: {}",
-            conv_id,
-            e
-        );
-    }
 
     let images_json = match images {
         Some(images) => match serde_json::to_string(&images) {
@@ -231,6 +224,13 @@ pub async fn submit(
             "Runner queue unavailable for conversation",
         )
             .into_response();
+    }
+    if let Err(e) = super::conversations::publish_conversation_run_status(&db, &conv_id).await {
+        tracing::warn!(
+            "[CHAT] Failed to publish run status for non-streaming submit {}: {}",
+            conv_id,
+            e
+        );
     }
 
     (
