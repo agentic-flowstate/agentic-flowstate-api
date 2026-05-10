@@ -71,6 +71,13 @@ fn is_active_checkpoint_status(status: Option<&str>) -> bool {
     matches!(status, Some("running") | Some("pending") | Some("queued"))
 }
 
+fn is_terminal_checkpoint_status(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("completed" | "interrupted" | "failed" | "cancelled" | "timeout")
+    )
+}
+
 fn normalize_checkpoint_status(status: Option<&str>) -> String {
     match status {
         Some("running") | Some("pending") | Some("queued") => "running",
@@ -88,6 +95,9 @@ async fn repair_checkpoint_from_active_durable_work(
     checkpoint_status: Option<&str>,
 ) -> anyhow::Result<bool> {
     if is_active_checkpoint_status(checkpoint_status) {
+        return Ok(false);
+    }
+    if is_terminal_checkpoint_status(checkpoint_status) {
         return Ok(false);
     }
 
