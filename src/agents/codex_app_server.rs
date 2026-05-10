@@ -447,6 +447,10 @@ fn build_app_server_config(
     );
 
     let mut agentic_mcp = source_agentic_mcp_table(source_home)?.unwrap_or_default();
+    // The API runs Codex app-server turns unattended. User-facing approval
+    // prompts from the interactive Codex config cannot be answered here, so
+    // enforce safety through route auth + MCP scope checks instead.
+    agentic_mcp.remove("tools");
     agentic_mcp.insert(
         "command".to_string(),
         toml::Value::String(agentic_mcp_command.to_string_lossy().to_string()),
@@ -1490,6 +1494,56 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("/tmp/source-codex-home")
         );
+    }
+
+    #[test]
+    fn app_server_config_strips_source_tool_approval_entries() {
+        let source_home = std::env::temp_dir().join(format!(
+            "agentic-codex-config-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&source_home).expect("create source home");
+        std::fs::write(
+            source_home.join("config.toml"),
+            r#"
+[mcp_servers.agentic-mcp]
+command = "/tmp/old_agentic_mcp"
+
+[mcp_servers.agentic-mcp.env]
+EXA_API_KEY = "keep-for-mcp"
+
+[mcp_servers.agentic-mcp.tools.list_tickets]
+approval_mode = "approve"
+"#,
+        )
+        .expect("write source config");
+
+        let config =
+            build_app_server_config(&source_home, Path::new("/tmp/agentic_mcp")).expect("config");
+        let parsed: toml::Value = toml::from_str(&config).expect("parse config");
+        let agentic_mcp = parsed
+            .get("mcp_servers")
+            .and_then(|servers| servers.get("agentic-mcp"))
+            .expect("agentic-mcp config");
+
+        assert_eq!(
+            agentic_mcp.get("command").and_then(|value| value.as_str()),
+            Some("/tmp/agentic_mcp")
+        );
+        assert!(agentic_mcp.get("tools").is_none());
+        assert_eq!(
+            agentic_mcp
+                .get("env")
+                .and_then(|env| env.get("EXA_API_KEY"))
+                .and_then(|value| value.as_str()),
+            Some("keep-for-mcp")
+        );
+
+        let _ = std::fs::remove_dir_all(source_home);
     }
 
     #[test]
