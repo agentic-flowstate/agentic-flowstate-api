@@ -1,4 +1,6 @@
+use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -190,6 +192,42 @@ pub struct CodexAppServerOutcome {
     pub exit_status: ExitStatus,
     pub stderr_text: String,
     turn_completion: Option<TurnCompletion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAccountRateLimits {
+    pub rate_limits: CodexRateLimitSnapshot,
+    #[serde(default)]
+    pub rate_limits_by_limit_id: Option<HashMap<String, CodexRateLimitSnapshot>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRateLimitSnapshot {
+    pub limit_id: Option<String>,
+    pub limit_name: Option<String>,
+    pub primary: Option<CodexRateLimitWindow>,
+    pub secondary: Option<CodexRateLimitWindow>,
+    pub credits: Option<CodexCreditsSnapshot>,
+    pub plan_type: Option<String>,
+    pub rate_limit_reached_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexRateLimitWindow {
+    pub used_percent: i32,
+    pub window_duration_mins: Option<i64>,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexCreditsSnapshot {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub balance: Option<String>,
 }
 
 impl CodexAppServerOutcome {
@@ -687,6 +725,135 @@ pub async fn spawn_codex_app_server(
             Err(format!("codex app-server startup task exited: {e}"))
         }
     }
+}
+
+pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, String> {
+    let agentic_mcp_command = agentic_mcp_binary()?;
+    let codex_home =
+        prepare_codex_app_server_home(&agentic_mcp_command, CodexToolProfile::Default)?;
+    let options = CodexAppServerOptions {
+        model: DEFAULT_CODEX_MODEL,
+        reasoning_effort: "medium",
+        system_prompt: "",
+        working_dir: &codex_home,
+        prompt: "",
+        sandbox: CodexSandboxMode::ReadOnly,
+        bypass_approvals_and_sandbox: false,
+        resume_session_id: None,
+        ephemeral: true,
+        tool_profile: CodexToolProfile::Default,
+        scoped_user_id: None,
+    };
+    let mut command = Command::from(build_codex_app_server_command(
+        &options,
+        &agentic_mcp_command,
+        &codex_home,
+    )?);
+
+    tracing::info!(
+        "[CODEX] Reading account rate limits: codex_home={}",
+        codex_home.display()
+    );
+
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start codex app-server for account rate limits: {e}"))?;
+
+    let stdin = Arc::new(Mutex::new(Some(child.stdin.take().ok_or_else(|| {
+        "Failed to capture codex app-server stdin for account rate limits".to_string()
+    })?)));
+    let stdout = child.stdout.take().ok_or_else(|| {
+        "Failed to capture codex app-server stdout for account rate limits".to_string()
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        "Failed to capture codex app-server stderr for account rate limits".to_string()
+    })?;
+
+    let child = Arc::new(Mutex::new(child));
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr_text = String::new();
+        let mut reader = BufReader::new(stderr);
+        reader.read_to_string(&mut stderr_text).await?;
+        Ok::<String, std::io::Error>(stderr_text)
+    });
+
+    let result = async {
+        let mut lines = BufReader::new(stdout).lines();
+        let (tx, _rx) = mpsc::channel(16);
+        let mut latest_usage = TokenUsageBreakdown::default();
+
+        send_app_server_message(
+            &stdin,
+            json!({
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": APP_SERVER_CLIENT_NAME,
+                        "title": APP_SERVER_CLIENT_TITLE,
+                        "version": APP_SERVER_CLIENT_VERSION
+                    },
+                    "capabilities": {
+                        "experimentalApi": true
+                    }
+                }
+            }),
+        )
+        .await?;
+        read_response(&mut lines, &stdin, &tx, &mut latest_usage, 1, "initialize").await?;
+
+        send_app_server_message(
+            &stdin,
+            json!({
+                "method": "initialized",
+                "params": {}
+            }),
+        )
+        .await?;
+
+        send_app_server_message(
+            &stdin,
+            json!({
+                "id": 2,
+                "method": "account/rateLimits/read",
+                "params": null
+            }),
+        )
+        .await?;
+        let value = read_response(
+            &mut lines,
+            &stdin,
+            &tx,
+            &mut latest_usage,
+            2,
+            "account/rateLimits/read",
+        )
+        .await?;
+
+        serde_json::from_value::<CodexAccountRateLimits>(value)
+            .map_err(|e| format!("Failed parsing Codex account rate limits: {e}"))
+    }
+    .await;
+
+    close_stdin(&stdin).await;
+    let _ = terminate_child_process(&child).await;
+    let _ = child.lock().await.wait().await;
+    let stderr_text = stderr_task
+        .await
+        .map_err(|e| format!("Failed joining app-server stderr reader: {e}"))?
+        .map_err(|e| format!("Failed reading app-server stderr: {e}"))?;
+
+    result.map_err(|e| {
+        let stderr_text = stderr_text.trim();
+        if stderr_text.is_empty() {
+            e
+        } else {
+            format!("{e}: {stderr_text}")
+        }
+    })
 }
 
 fn effective_sandbox(options: &CodexAppServerOptions<'_>) -> CodexSandboxMode {
@@ -1244,18 +1411,26 @@ fn parse_item_completed(item: &Value) -> Option<CodexAppServerEvent> {
 }
 
 fn parse_token_usage(params: &Value) -> TokenUsageBreakdown {
-    let last = params
-        .get("tokenUsage")
-        .and_then(|usage| usage.get("last"))
-        .unwrap_or(&Value::Null);
+    let token_usage = params.get("tokenUsage").unwrap_or(&Value::Null);
+    let last = token_usage.get("last").unwrap_or(&Value::Null);
+    let total = token_usage.get("total").unwrap_or(&Value::Null);
+    let context_window_tokens = token_usage
+        .get("modelContextWindow")
+        .and_then(|value| value.as_i64())
+        .filter(|tokens| *tokens > 0);
     let mut usage = TokenUsageBreakdown {
         input_tokens: token_count(last, "inputTokens"),
         cached_input_tokens: token_count(last, "cachedInputTokens"),
         output_tokens: token_count(last, "outputTokens"),
         reasoning_output_tokens: token_count(last, "reasoningOutputTokens"),
         total_tokens: token_count(last, "totalTokens"),
+        thread_total_tokens: token_count(total, "totalTokens"),
+        context_window_tokens,
     };
     usage.total_tokens = usage.total_or_derived();
+    if usage.thread_total_tokens == 0 {
+        usage.thread_total_tokens = usage.total_tokens;
+    }
     usage
 }
 
@@ -1625,12 +1800,13 @@ approval_mode = "approve"
                     "totalTokens": 17
                 },
                 "total": {
-                    "inputTokens": 10,
-                    "cachedInputTokens": 0,
-                    "outputTokens": 5,
-                    "reasoningOutputTokens": 2,
-                    "totalTokens": 17
-                }
+                    "inputTokens": 30,
+                    "cachedInputTokens": 4,
+                    "outputTokens": 15,
+                    "reasoningOutputTokens": 8,
+                    "totalTokens": 53
+                },
+                "modelContextWindow": 200000
             }
         });
         assert_eq!(
@@ -1641,6 +1817,8 @@ approval_mode = "approve"
                 output_tokens: 5,
                 reasoning_output_tokens: 2,
                 total_tokens: 17,
+                thread_total_tokens: 53,
+                context_window_tokens: Some(200000),
             }
         );
     }
