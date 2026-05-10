@@ -24,8 +24,9 @@ use crate::observability::streaming::{
     record_ticket_preflight_error,
 };
 use ticketing_system::{
-    agent_runners, checkpoints, conversations, token_usage, AddMessageRequest, ContentBlockDesc,
-    ConversationMessage, UpdateConversationRequest,
+    agent_runners, checkpoints, conversations,
+    token_usage::{self, TokenUsageBreakdown},
+    AddMessageRequest, ContentBlockDesc, ConversationMessage, UpdateConversationRequest,
 };
 
 /// How often to flush accumulated content to the database (ms).
@@ -950,7 +951,7 @@ impl ConversationWorker {
         let mut content_blocks: Vec<ContentBlockDesc> = Vec::new();
         let mut blocks_dirty = false;
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
-        let mut usage: Option<(i64, i64)> = None;
+        let mut usage: Option<TokenUsageBreakdown> = None;
         let mut kill_requested = false;
         let mut streamed_agent_message_items: HashSet<String> = HashSet::new();
         heartbeat.tick().await;
@@ -1119,11 +1120,8 @@ impl ConversationWorker {
                             })
                             .await;
                         }
-                        Some(CodexAppServerEvent::TurnCompleted {
-                            input_tokens,
-                            output_tokens,
-                        }) => {
-                            usage = Some((input_tokens, output_tokens));
+                        Some(CodexAppServerEvent::TurnCompleted { usage: event_usage }) => {
+                            usage = Some(event_usage);
                         }
                         None => break,
                     }
@@ -1212,8 +1210,8 @@ impl ConversationWorker {
             }
         };
 
-        if let Some((input_tok, output_tok)) = usage {
-            if input_tok > 0 || output_tok > 0 {
+        if let Some(usage) = usage {
+            if usage.has_usage() {
                 let db_ref = self.db.clone();
                 let conv_id = self.conversation_id.clone();
                 let uid = msg.user_id.clone();
@@ -1224,8 +1222,7 @@ impl ConversationWorker {
                         &conv_id,
                         Some(&uid),
                         None,
-                        input_tok,
-                        output_tok,
+                        usage,
                     )
                     .await
                     {

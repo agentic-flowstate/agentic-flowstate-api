@@ -5,6 +5,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::Arc;
+use ticketing_system::token_usage::TokenUsageBreakdown;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -166,8 +167,7 @@ pub enum CodexAppServerEvent {
         is_error: bool,
     },
     TurnCompleted {
-        input_tokens: i64,
-        output_tokens: i64,
+        usage: TokenUsageBreakdown,
     },
 }
 
@@ -717,7 +717,7 @@ async fn run_app_server_stdout(
     ready_tx: oneshot::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     let mut lines = BufReader::new(stdout).lines();
-    let mut latest_usage = (0_i64, 0_i64);
+    let mut latest_usage = TokenUsageBreakdown::default();
 
     let startup_result =
         bootstrap_app_server(&stdin, &mut lines, &tx, &mut latest_usage, &startup).await;
@@ -750,7 +750,7 @@ async fn bootstrap_app_server(
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
     lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     tx: &mpsc::Sender<CodexAppServerEvent>,
-    latest_usage: &mut (i64, i64),
+    latest_usage: &mut TokenUsageBreakdown,
     startup: &AppServerStartup,
 ) -> Result<(), String> {
     send_app_server_message(
@@ -858,7 +858,7 @@ async fn read_response(
     lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
     tx: &mpsc::Sender<CodexAppServerEvent>,
-    latest_usage: &mut (i64, i64),
+    latest_usage: &mut TokenUsageBreakdown,
     request_id: i64,
     method: &str,
 ) -> Result<Value, String> {
@@ -906,7 +906,7 @@ async fn handle_app_server_message(
     tx: &mpsc::Sender<CodexAppServerEvent>,
     stdin: &Arc<Mutex<Option<ChildStdin>>>,
     completion: &Arc<Mutex<Option<TurnCompletion>>>,
-    latest_usage: &mut (i64, i64),
+    latest_usage: &mut TokenUsageBreakdown,
 ) -> Result<bool, String> {
     let value: Value = serde_json::from_str(line)
         .map_err(|e| format!("Failed parsing codex app-server JSON: {e}: {line}"))?;
@@ -933,7 +933,7 @@ async fn handle_app_server_value(
     value: &Value,
     tx: &mpsc::Sender<CodexAppServerEvent>,
     completion: &Arc<Mutex<Option<TurnCompletion>>>,
-    latest_usage: &mut (i64, i64),
+    latest_usage: &mut TokenUsageBreakdown,
 ) -> Result<bool, String> {
     let Some(method) = value.get("method").and_then(|v| v.as_str()) else {
         return Ok(false);
@@ -993,8 +993,7 @@ async fn handle_app_server_value(
             *completion.lock().await = Some(parsed);
             let _ = tx
                 .send(CodexAppServerEvent::TurnCompleted {
-                    input_tokens: latest_usage.0,
-                    output_tokens: latest_usage.1,
+                    usage: *latest_usage,
                 })
                 .await;
             return Ok(true);
@@ -1240,20 +1239,24 @@ fn parse_item_completed(item: &Value) -> Option<CodexAppServerEvent> {
     }
 }
 
-fn parse_token_usage(params: &Value) -> (i64, i64) {
+fn parse_token_usage(params: &Value) -> TokenUsageBreakdown {
     let last = params
         .get("tokenUsage")
         .and_then(|usage| usage.get("last"))
         .unwrap_or(&Value::Null);
-    let input_tokens = last
-        .get("inputTokens")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(0);
-    let output_tokens = last
-        .get("outputTokens")
-        .and_then(|value| value.as_i64())
-        .unwrap_or(0);
-    (input_tokens, output_tokens)
+    let mut usage = TokenUsageBreakdown {
+        input_tokens: token_count(last, "inputTokens"),
+        cached_input_tokens: token_count(last, "cachedInputTokens"),
+        output_tokens: token_count(last, "outputTokens"),
+        reasoning_output_tokens: token_count(last, "reasoningOutputTokens"),
+        total_tokens: token_count(last, "totalTokens"),
+    };
+    usage.total_tokens = usage.total_or_derived();
+    usage
+}
+
+fn token_count(value: &Value, key: &str) -> i64 {
+    value.get(key).and_then(|value| value.as_i64()).unwrap_or(0)
 }
 
 fn parse_turn_completion(params: &Value) -> TurnCompletion {
@@ -1576,6 +1579,15 @@ mod tests {
                 }
             }
         });
-        assert_eq!(parse_token_usage(&params), (10, 5));
+        assert_eq!(
+            parse_token_usage(&params),
+            TokenUsageBreakdown {
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                output_tokens: 5,
+                reasoning_output_tokens: 2,
+                total_tokens: 17,
+            }
+        );
     }
 }

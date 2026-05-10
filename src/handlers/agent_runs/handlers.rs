@@ -711,15 +711,14 @@ pub async fn send_message_to_agent(
         .await
         {
             Ok(turn) => {
-                if turn.input_tokens > 0 || turn.output_tokens > 0 {
+                if turn.usage.has_usage() {
                     if let Err(e) = ticketing_system::token_usage::insert_token_usage(
                         &db,
                         "agent_run",
                         &session_id_clone,
                         None,
                         None,
-                        turn.input_tokens,
-                        turn.output_tokens,
+                        turn.usage,
                     )
                     .await
                     {

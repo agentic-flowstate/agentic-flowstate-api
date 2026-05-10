@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use ticketing_system::text_normalization::normalize_codex_token_delta_output;
+use ticketing_system::token_usage::TokenUsageBreakdown;
 
 use super::codex_app_server::{
     spawn_codex_app_server, CodexAppServerEvent, CodexAppServerOptions, CodexSandboxMode,
@@ -16,8 +17,7 @@ pub struct CodexAgentTurnResult {
     pub output_summary: String,
     pub tool_call_count: i32,
     pub runtime_session_id: Option<String>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
+    pub usage: TokenUsageBreakdown,
 }
 
 fn codex_policy_for_agent_type(agent_type: &AgentType) -> (CodexSandboxMode, bool) {
@@ -123,7 +123,7 @@ pub async fn run_codex_agent_turn(
     let mut agent_messages: HashMap<String, String> = HashMap::new();
     let mut tool_call_count = 0;
     let mut runtime_session_id = resume_session_id.map(str::to_string);
-    let mut usage = (0_i64, 0_i64);
+    let mut usage = TokenUsageBreakdown::default();
     let mut streamed_agent_message_items: HashSet<String> = HashSet::new();
 
     while let Some(event) = turn.events.recv().await {
@@ -187,11 +187,8 @@ pub async fn run_codex_agent_turn(
                         .await;
                 }
             }
-            CodexAppServerEvent::TurnCompleted {
-                input_tokens,
-                output_tokens,
-            } => {
-                usage = (input_tokens, output_tokens);
+            CodexAppServerEvent::TurnCompleted { usage: event_usage } => {
+                usage = event_usage;
             }
         }
     }
@@ -226,8 +223,7 @@ pub async fn run_codex_agent_turn(
         output_summary,
         tool_call_count,
         runtime_session_id,
-        input_tokens: usage.0,
-        output_tokens: usage.1,
+        usage,
     })
 }
 
