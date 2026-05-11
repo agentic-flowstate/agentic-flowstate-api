@@ -35,17 +35,8 @@ const DB_FLUSH_INTERVAL_MS: u64 = 500;
 /// How long a worker idles before shutting down.
 const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
-/// Maximum prior user messages to load into prompt context per turn.
-const PROMPT_HISTORY_USER_MESSAGE_LIMIT: usize = 2;
-
-/// Maximum prior assistant/agent messages to load into prompt context per turn.
-const PROMPT_HISTORY_ASSISTANT_MESSAGE_LIMIT: usize = 2;
-
-/// Maximum tool-call summaries to include from a single assistant message.
-const PROMPT_HISTORY_TOOL_CALL_LIMIT_PER_MESSAGE: usize = 12;
-
-/// Maximum assistant message body characters to include in prompt context.
-const PROMPT_HISTORY_ASSISTANT_CHAR_LIMIT: usize = 2000;
+/// Maximum number of prior messages to load into prompt context per turn.
+const PROMPT_HISTORY_MESSAGE_LIMIT: usize = 30;
 
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
     match agent_type {
@@ -1676,7 +1667,11 @@ fn build_codex_conversation_history(messages: &[ConversationMessage]) -> String 
 }
 
 fn append_conversation_history(history: &mut String, messages: &[ConversationMessage]) {
-    let recent = select_prompt_history_messages(messages);
+    let recent = if messages.len() > PROMPT_HISTORY_MESSAGE_LIMIT {
+        &messages[messages.len() - PROMPT_HISTORY_MESSAGE_LIMIT..]
+    } else {
+        messages
+    };
 
     for msg in recent {
         let has_content = !msg.content.is_empty();
@@ -1695,16 +1690,9 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
         };
 
         // User messages: include in full (they're typically short)
-        // Assistant messages: allow enough room for useful summaries without
-        // replaying long research transcripts into every new app-server turn.
-        let content = if msg.role != "user"
-            && msg.content.chars().count() > PROMPT_HISTORY_ASSISTANT_CHAR_LIMIT
-        {
-            let truncated: String = msg
-                .content
-                .chars()
-                .take(PROMPT_HISTORY_ASSISTANT_CHAR_LIMIT)
-                .collect();
+        // Assistant messages: allow up to 2000 chars (was 300 — way too aggressive)
+        let content = if msg.role == "assistant" && msg.content.len() > 2000 {
+            let truncated: String = msg.content.chars().take(2000).collect();
             format!("{}… [truncated]", truncated)
         } else {
             msg.content.clone()
@@ -1720,20 +1708,7 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
         if let Some(ref summaries) = msg.tool_call_summaries {
             if !summaries.is_empty() {
                 history.push_str("**Tool calls made:**\n");
-                let omitted = summaries
-                    .len()
-                    .saturating_sub(PROMPT_HISTORY_TOOL_CALL_LIMIT_PER_MESSAGE);
-                if omitted > 0 {
-                    history.push_str(&format!(
-                        "- … {} earlier tool calls omitted from prompt context.\n",
-                        omitted
-                    ));
-                }
-                for tc in summaries
-                    .iter()
-                    .skip(omitted)
-                    .take(PROMPT_HISTORY_TOOL_CALL_LIMIT_PER_MESSAGE)
-                {
+                for tc in summaries {
                     let status = if tc.is_error { " [ERROR]" } else { "" };
                     let preview = tc.result_preview.as_deref().unwrap_or("");
                     let preview_truncated = if preview.len() > 200 {
@@ -1751,59 +1726,6 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
             }
         }
     }
-}
-
-fn select_prompt_history_messages(messages: &[ConversationMessage]) -> Vec<&ConversationMessage> {
-    let mut selected = HashSet::new();
-    let mut user_count = 0;
-    let mut assistant_count = 0;
-
-    for (idx, msg) in messages.iter().enumerate().rev() {
-        if !message_has_prompt_context(msg) {
-            continue;
-        }
-
-        if msg.role == "user" {
-            if user_count < PROMPT_HISTORY_USER_MESSAGE_LIMIT {
-                selected.insert(idx);
-                user_count += 1;
-            }
-        } else if assistant_count < PROMPT_HISTORY_ASSISTANT_MESSAGE_LIMIT
-            && !is_synthetic_codex_failure_message(msg)
-        {
-            selected.insert(idx);
-            assistant_count += 1;
-        }
-
-        if user_count >= PROMPT_HISTORY_USER_MESSAGE_LIMIT
-            && assistant_count >= PROMPT_HISTORY_ASSISTANT_MESSAGE_LIMIT
-        {
-            break;
-        }
-    }
-
-    messages
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, msg)| selected.contains(&idx).then_some(msg))
-        .collect()
-}
-
-fn message_has_prompt_context(msg: &ConversationMessage) -> bool {
-    !msg.content.is_empty()
-        || msg
-            .tool_call_summaries
-            .as_ref()
-            .map_or(false, |t| !t.is_empty())
-}
-
-fn is_synthetic_codex_failure_message(msg: &ConversationMessage) -> bool {
-    msg.role == "assistant"
-        && msg.content.starts_with("Codex error:")
-        && msg
-            .tool_call_summaries
-            .as_ref()
-            .map_or(true, |summaries| summaries.is_empty())
 }
 
 // =============================================================================
@@ -2205,85 +2127,6 @@ mod streaming_persistence_tests {
         assert_eq!(first, "msg-1::item_2");
         assert_eq!(second, "msg-2::item_2");
         assert_ne!(first, second);
-    }
-
-    fn test_message(
-        message_index: i32,
-        role: &str,
-        content: &str,
-        tool_count: usize,
-    ) -> ConversationMessage {
-        let id = format!("msg-{message_index}");
-        ConversationMessage {
-            id: id.clone(),
-            conversation_id: "conv-1".to_string(),
-            role: role.to_string(),
-            content: content.to_string(),
-            attachments: None,
-            tool_call_summaries: (tool_count > 0).then(|| {
-                (0..tool_count)
-                    .map(|idx| ticketing_system::ToolCallSummary {
-                        id: format!("{id}::tool-{idx}"),
-                        tool_name: format!("tool-{idx}"),
-                        is_error: false,
-                        input: Some(format!("{{\"idx\":{idx}}}")),
-                        result_preview: Some(format!("result-{idx}")),
-                    })
-                    .collect()
-            }),
-            content_blocks: None,
-            created_at: i64::from(message_index),
-            message_index,
-        }
-    }
-
-    #[test]
-    fn prompt_history_keeps_recent_useful_turns_and_skips_codex_failures() {
-        let messages = vec![
-            test_message(0, "user", "initial assay ask", 0),
-            test_message(1, "assistant", "assay research summary", 2),
-            test_message(2, "user", "switch to AAV research", 0),
-            test_message(3, "assistant", "AAV research summary", 2),
-            test_message(4, "user", "Research", 0),
-            test_message(
-                5,
-                "assistant",
-                "Codex error: Codex turn failed: codex app-server error notification",
-                0,
-            ),
-            test_message(6, "user", "Test", 0),
-            test_message(7, "assistant", "I'm here and the session is working.", 0),
-            test_message(8, "user", "Continue working", 0),
-            test_message(
-                9,
-                "assistant",
-                "Codex error: Codex turn failed: codex app-server error notification",
-                0,
-            ),
-        ];
-
-        let mut history = String::new();
-        append_conversation_history(&mut history, &messages);
-
-        assert!(history.contains("AAV research summary"));
-        assert!(history.contains("I'm here and the session is working."));
-        assert!(history.contains("Test"));
-        assert!(history.contains("Continue working"));
-        assert!(!history.contains("Codex error:"));
-        assert!(!history.contains("assay research summary"));
-    }
-
-    #[test]
-    fn prompt_history_caps_tool_call_summaries_per_message() {
-        let messages = vec![test_message(0, "assistant", "tool-heavy summary", 15)];
-
-        let mut history = String::new();
-        append_conversation_history(&mut history, &messages);
-
-        assert!(history.contains("3 earlier tool calls omitted"));
-        assert!(!history.contains("`tool-2`"));
-        assert!(history.contains("`tool-3`"));
-        assert!(history.contains("`tool-14`"));
     }
 
     #[test]
