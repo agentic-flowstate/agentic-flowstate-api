@@ -16,6 +16,7 @@ use crate::agents::AgentType;
 
 const POLL_SECONDS: u64 = 60;
 const DAILY_RESEARCH_TIMEOUT_SECONDS: u64 = 360;
+const DAILY_RESEARCH_MAX_TOOL_CALLS: i32 = 30;
 
 pub fn spawn_dailies_scheduler(pool: Arc<SqlitePool>, token: CancellationToken) {
     tokio::spawn(async move {
@@ -123,11 +124,12 @@ async fn execute_daily_run(
         .context("Failed to attach daily run to agent run")?;
 
     tracing::info!(
-        "[DAILIES] started run {} for {} with agent_run_id={} timeout_seconds={}",
+        "[DAILIES] started run {} for {} with agent_run_id={} timeout_seconds={} max_tool_calls={}",
         run.run_id,
         daily.daily_id,
         session_id,
-        DAILY_RESEARCH_TIMEOUT_SECONDS
+        DAILY_RESEARCH_TIMEOUT_SECONDS,
+        DAILY_RESEARCH_MAX_TOOL_CALLS
     );
 
     let turn = run_codex_agent_turn_with_timeout(
@@ -140,6 +142,7 @@ async fn execute_daily_run(
         None,
         &session_id,
         tokio::time::Duration::from_secs(DAILY_RESEARCH_TIMEOUT_SECONDS),
+        Some(DAILY_RESEARCH_MAX_TOOL_CALLS),
     )
     .await;
 

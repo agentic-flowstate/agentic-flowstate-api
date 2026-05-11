@@ -113,6 +113,7 @@ pub async fn run_codex_agent_turn(
         event_tx,
         result_session_id,
         None,
+        None,
     )
     .await
 }
@@ -127,6 +128,7 @@ pub async fn run_codex_agent_turn_with_timeout(
     event_tx: Option<mpsc::Sender<StreamEvent>>,
     result_session_id: &str,
     timeout: Duration,
+    max_tool_calls: Option<i32>,
 ) -> Result<CodexAgentTurnResult> {
     run_codex_agent_turn_inner(
         agent_type,
@@ -138,6 +140,7 @@ pub async fn run_codex_agent_turn_with_timeout(
         event_tx,
         result_session_id,
         Some(timeout),
+        max_tool_calls,
     )
     .await
 }
@@ -152,6 +155,7 @@ async fn run_codex_agent_turn_inner(
     event_tx: Option<mpsc::Sender<StreamEvent>>,
     result_session_id: &str,
     timeout: Option<Duration>,
+    max_tool_calls: Option<i32>,
 ) -> Result<CodexAgentTurnResult> {
     let (sandbox, bypass_approvals_and_sandbox) = codex_policy_for_agent_type(agent_type);
     let mut turn = spawn_codex_app_server(CodexAppServerOptions {
@@ -255,6 +259,22 @@ async fn run_codex_agent_turn_inner(
             }
             CodexAppServerEvent::ToolCallStarted { id, name, input } => {
                 tool_call_count += 1;
+                if let Some(max_tool_calls) = max_tool_calls {
+                    if tool_call_count > max_tool_calls {
+                        tracing::warn!(
+                            "Codex agent turn exceeded max tool calls: count={} max={}",
+                            tool_call_count,
+                            max_tool_calls
+                        );
+                        if let Err(e) = turn.terminate().await {
+                            tracing::warn!(
+                                "Failed to terminate tool-call-limited Codex app-server turn: {e}"
+                            );
+                        }
+                        let _ = turn.wait().await;
+                        anyhow::bail!("Codex agent turn exceeded {} tool calls", max_tool_calls);
+                    }
+                }
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(StreamEvent::ToolUse { id, name, input }).await;
                 }
