@@ -3,7 +3,7 @@ use agentic_api::apns;
 use agentic_api::handlers::chat_client_manager::ChatClientManager;
 use agentic_api::handlers::chat_stream::{ChatConfig, ChatImageData, ChatRuntime};
 use agentic_api::handlers::conversation_worker::{ConversationWorker, WorkerMessage};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use futures::FutureExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,7 +59,11 @@ async fn main() -> Result<()> {
     spawn_heartbeat(db.clone(), generation_id.clone(), shutdown.child_token());
     spawn_shutdown_listener(shutdown.clone());
 
-    let concurrency = runner_concurrency();
+    let concurrency = runner_concurrency()?;
+    match concurrency {
+        Some(limit) => tracing::info!("Agentic runner concurrency limited to {}", limit),
+        None => tracing::info!("Agentic runner concurrency is unlimited"),
+    }
     let mut joins = JoinSet::<(String, Result<String>)>::new();
     let mut accepting = true;
 
@@ -78,7 +82,7 @@ async fn main() -> Result<()> {
             agent_runners::mark_generation_draining(&db, &generation_id).await?;
         }
 
-        while accepting && joins.len() < concurrency {
+        while accepting && concurrency_allows_claim(concurrency, joins.len()) {
             match conversation_turn_jobs::claim_next_job(&db, &generation_id).await? {
                 Some(job) => {
                     let job_id = job.id.clone();
@@ -132,12 +136,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn runner_concurrency() -> usize {
-    std::env::var("AGENTIC_RUNNER_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(3)
+fn runner_concurrency() -> Result<Option<usize>> {
+    parse_runner_concurrency(std::env::var("AGENTIC_RUNNER_CONCURRENCY").ok().as_deref())
+}
+
+fn parse_runner_concurrency(value: Option<&str>) -> Result<Option<usize>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let limit = trimmed
+        .parse::<usize>()
+        .with_context(|| "AGENTIC_RUNNER_CONCURRENCY must be a positive integer")?;
+    if limit == 0 {
+        bail!("AGENTIC_RUNNER_CONCURRENCY must be greater than zero");
+    }
+    Ok(Some(limit))
+}
+
+fn concurrency_allows_claim(concurrency: Option<usize>, active_jobs: usize) -> bool {
+    concurrency.map(|limit| active_jobs < limit).unwrap_or(true)
 }
 
 fn init_apns() -> Result<()> {
@@ -356,5 +379,35 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
         "meeting-agent" => Ok("meeting-agent"),
         "home-planner" => Ok("home-planner"),
         other => anyhow::bail!("Unsupported conversation job prompt: {}", other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{concurrency_allows_claim, parse_runner_concurrency};
+
+    #[test]
+    fn absent_runner_concurrency_is_unlimited() {
+        assert_eq!(parse_runner_concurrency(None).unwrap(), None);
+        assert!(concurrency_allows_claim(None, usize::MAX));
+    }
+
+    #[test]
+    fn empty_runner_concurrency_is_unlimited() {
+        assert_eq!(parse_runner_concurrency(Some("  ")).unwrap(), None);
+    }
+
+    #[test]
+    fn configured_runner_concurrency_limits_claims() {
+        let concurrency = parse_runner_concurrency(Some("4")).unwrap();
+
+        assert!(concurrency_allows_claim(concurrency, 3));
+        assert!(!concurrency_allows_claim(concurrency, 4));
+    }
+
+    #[test]
+    fn invalid_runner_concurrency_fails() {
+        assert!(parse_runner_concurrency(Some("0")).is_err());
+        assert!(parse_runner_concurrency(Some("abc")).is_err());
     }
 }
