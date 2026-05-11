@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const RUNNER_KIND: &str = "agent-runner";
+const RUNNER_HEARTBEAT_STALE_SECONDS: i64 = 90;
 const RUNNER_HEARTBEAT_INTERVAL_SECONDS: u64 = 15;
 const RUNNER_POLL_INTERVAL_MS: u64 = 750;
 
@@ -49,6 +50,22 @@ async fn main() -> Result<()> {
         generation_id,
         drained
     );
+    match agent_runners::reconcile_stale_runner_generations(&db, RUNNER_HEARTBEAT_STALE_SECONDS)
+        .await
+    {
+        Ok(reconciled) if reconciled.any() => {
+            tracing::warn!(
+                "Reconciled stale agent runner generation metadata: counts_recomputed={} generations_terminalized={}",
+                reconciled.generations_recomputed,
+                reconciled.generations_terminalized
+            );
+        }
+        Ok(_) => tracing::debug!("No stale agent runner generation metadata to reconcile"),
+        Err(e) => tracing::error!(
+            "Failed to reconcile stale runner generation metadata: {}",
+            e
+        ),
+    }
 
     let manager = Arc::new(ChatClientManager::with_runner_generation_id(
         generation_id.clone(),

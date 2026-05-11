@@ -199,6 +199,30 @@ async fn main() -> anyhow::Result<()> {
     let db_pool = Arc::new(ticketing_system::init_db().await?);
     tracing::info!("SQLite database pool initialized");
 
+    match ticketing_system::agent_runners::reconcile_stale_runner_generations(
+        &db_pool,
+        RUNNER_HEARTBEAT_STALE_SECONDS,
+    )
+    .await
+    {
+        Ok(reconciled) if reconciled.any() => {
+            tracing::warn!(
+                "Reconciled stale agent runner generation metadata: counts_recomputed={} generations_terminalized={}",
+                reconciled.generations_recomputed,
+                reconciled.generations_terminalized
+            );
+        }
+        Ok(_) => {
+            tracing::debug!("No stale agent runner generation metadata to reconcile");
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to reconcile stale runner generation metadata: {}",
+                e
+            );
+        }
+    }
+
     // Mark active checkpoints as interrupted only when no fresh runner
     // generation still owns them. This preserves the future split-runner
     // contract: API restart must not automatically kill turns owned by a
