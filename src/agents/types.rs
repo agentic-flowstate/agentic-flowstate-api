@@ -131,6 +131,13 @@ impl AgentType {
         self.config().tools.iter().map(|s| s.as_str()).collect()
     }
 
+    pub fn approved_mcp_tool_names(&self) -> Vec<String> {
+        self.allowed_tools()
+            .into_iter()
+            .filter_map(|tool| tool.strip_prefix("mcp__agentic-mcp__").map(str::to_string))
+            .collect()
+    }
+
     pub fn model(&self) -> &str {
         let config = self.config();
         AgentsConfig::get().resolve_model(&config.model)

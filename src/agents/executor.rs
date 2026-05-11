@@ -115,6 +115,7 @@ pub async fn run_codex_agent_turn(
         ephemeral: !persist_session,
         tool_profile: CodexToolProfile::Default,
         scoped_user_id: None,
+        approved_mcp_tools: agent_type.approved_mcp_tool_names(),
     })
     .await
     .map_err(anyhow::Error::msg)?;

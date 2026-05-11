@@ -904,6 +904,7 @@ impl ConversationWorker {
             ephemeral: true,
             tool_profile,
             scoped_user_id: Some(&msg.user_id),
+            approved_mcp_tools: msg.config.agent_type.approved_mcp_tool_names(),
         })
         .await
         {
