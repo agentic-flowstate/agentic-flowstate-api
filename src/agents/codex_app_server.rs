@@ -1276,16 +1276,55 @@ async fn handle_app_server_value(
             return Ok(true);
         }
         "error" => {
-            let message = params
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown app-server error");
+            let message = app_server_error_notification_message(params);
             return Err(format!("codex app-server error notification: {message}"));
         }
         _ => {}
     }
 
     Ok(false)
+}
+
+fn app_server_error_notification_message(params: &Value) -> String {
+    if let Some(message) = params.get("message").and_then(|v| v.as_str()) {
+        return message.to_string();
+    }
+
+    if let Some(message) = params
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(|v| v.as_str())
+    {
+        return message.to_string();
+    }
+
+    if let Some(error) = params.get("error").and_then(|v| v.as_str()) {
+        return error.to_string();
+    }
+
+    if let Some(reason) = params.get("reason").and_then(|v| v.as_str()) {
+        return reason.to_string();
+    }
+
+    if !params.is_null() {
+        let raw = serde_json::to_string(params).unwrap_or_else(|_| params.to_string());
+        return format!(
+            "unknown app-server error payload: {}",
+            truncate_error_text(&raw)
+        );
+    }
+
+    "unknown app-server error".to_string()
+}
+
+fn truncate_error_text(text: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 2000;
+    if text.chars().count() <= MAX_ERROR_CHARS {
+        return text.to_string();
+    }
+
+    let truncated: String = text.chars().take(MAX_ERROR_CHARS).collect();
+    format!("{truncated}… [truncated]")
 }
 
 async fn send_app_server_message(
@@ -1352,7 +1391,10 @@ impl RunningCodexAppServer {
             .stdout_task
             .await
             .map_err(|e| format!("Failed joining codex app-server stdout reader: {e}"))?;
-        stdout_result?;
+
+        if stdout_result.is_err() {
+            let _ = terminate_child_process(&self.child).await;
+        }
 
         let exit_status = {
             let mut child = self.child.lock().await;
@@ -1367,6 +1409,15 @@ impl RunningCodexAppServer {
             .await
             .map_err(|e| format!("Failed joining codex app-server stderr reader: {e}"))?
             .map_err(|e| format!("Failed reading codex app-server stderr: {e}"))?;
+
+        if let Err(e) = stdout_result {
+            let stderr = stderr_text.trim();
+            if stderr.is_empty() {
+                return Err(e);
+            }
+
+            return Err(format!("{}; stderr: {}", e, truncate_error_text(stderr)));
+        }
 
         let turn_completion = self.completion.lock().await.clone();
 
@@ -1910,6 +1961,31 @@ approval_mode = "approve"
             Some("approve")
         );
         assert!(agentic_mcp.get("enabled_tools").is_none());
+    }
+
+    #[test]
+    fn extracts_nested_app_server_error_message() {
+        let params = json!({
+            "error": {
+                "code": "invalid_request",
+                "message": "context too large"
+            }
+        });
+
+        assert_eq!(
+            app_server_error_notification_message(&params),
+            "context too large"
+        );
+    }
+
+    #[test]
+    fn app_server_error_message_preserves_unknown_payload() {
+        let params = json!({"code":"bad_turn","detail":"missing item"});
+        let message = app_server_error_notification_message(&params);
+
+        assert!(message.starts_with("unknown app-server error payload: "));
+        assert!(message.contains("bad_turn"));
+        assert!(message.contains("missing item"));
     }
 
     #[test]
