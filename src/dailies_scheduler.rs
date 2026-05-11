@@ -9,12 +9,13 @@ use ticketing_system::text_normalization::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::agents::executor::run_codex_agent_turn;
+use crate::agents::executor::run_codex_agent_turn_with_timeout;
 use crate::agents::prompts::load_prompt;
 use crate::agents::working_dir::resolve_working_dir;
 use crate::agents::AgentType;
 
 const POLL_SECONDS: u64 = 60;
+const DAILY_RESEARCH_TIMEOUT_SECONDS: u64 = 360;
 
 pub fn spawn_dailies_scheduler(pool: Arc<SqlitePool>, token: CancellationToken) {
     tokio::spawn(async move {
@@ -117,7 +118,19 @@ async fn execute_daily_run(
     .await
     .context("Failed to create agent run for daily")?;
 
-    let turn = run_codex_agent_turn(
+    ticketing_system::dailies::attach_agent_run(&pool, &run.run_id, &session_id)
+        .await
+        .context("Failed to attach daily run to agent run")?;
+
+    tracing::info!(
+        "[DAILIES] started run {} for {} with agent_run_id={} timeout_seconds={}",
+        run.run_id,
+        daily.daily_id,
+        session_id,
+        DAILY_RESEARCH_TIMEOUT_SECONDS
+    );
+
+    let turn = run_codex_agent_turn_with_timeout(
         &agent_type,
         &working_dir,
         &system_prompt,
@@ -126,6 +139,7 @@ async fn execute_daily_run(
         true,
         None,
         &session_id,
+        tokio::time::Duration::from_secs(DAILY_RESEARCH_TIMEOUT_SECONDS),
     )
     .await;
 
@@ -155,6 +169,13 @@ async fn execute_daily_run(
             )
             .await
             .context("Failed to update completed daily agent run")?;
+
+            tracing::info!(
+                "[DAILIES] completed run {} for {} tool_calls={}",
+                run.run_id,
+                daily.daily_id,
+                turn.tool_call_count
+            );
 
             let artifact = ticketing_system::artifacts::create_artifact(
                 &pool,
@@ -192,6 +213,12 @@ async fn execute_daily_run(
         Err(e) => {
             let completed_at = Utc::now().to_rfc3339();
             let error = e.to_string();
+            tracing::warn!(
+                "[DAILIES] failed run {} for {}: {}",
+                run.run_id,
+                daily.daily_id,
+                error
+            );
             let _ = ticketing_system::agent_runs::update_agent_run(
                 &pool,
                 &ticketing_system::AgentRun {

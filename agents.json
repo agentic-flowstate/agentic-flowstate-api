@@ -22,7 +22,7 @@
     },
     "daily-research": {
       "model": "codex",
-      "effort": "xhigh",
+      "effort": "medium",
       "prompt_file": "daily-research.txt",
       "tools": [
         "mcp__agentic-mcp__exa_search",
