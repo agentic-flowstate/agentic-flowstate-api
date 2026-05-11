@@ -223,6 +223,14 @@ async fn conversation_run_status_snapshot(
     })
 }
 
+fn apply_run_status_to_conversation(
+    mut conv: Conversation,
+    status: &ConversationRunStatusResponse,
+) -> Conversation {
+    conv.is_active = Some(status.is_processing);
+    conv
+}
+
 async fn get_status_sender(
     conversation_id: &str,
 ) -> broadcast::Sender<ConversationRunStatusResponse> {
@@ -304,6 +312,7 @@ pub async fn list_conversations(
 /// Get single conversation by ID (GET /api/conversations/:id)
 pub async fn get_conversation(
     State(pool): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<Json<Conversation>, (StatusCode, String)> {
@@ -316,7 +325,11 @@ pub async fn get_conversation(
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
 
-    Ok(Json(conv))
+    let status = conversation_run_status_snapshot(&pool, &id, Some(manager.as_ref()))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(apply_run_status_to_conversation(conv, &status)))
 }
 
 /// Create a conversation (POST /api/conversations)
@@ -1281,5 +1294,72 @@ pub async fn get_chat_image(
             ([(header::CONTENT_TYPE, mime)], data).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conversation_with_activity(is_active: Option<bool>) -> Conversation {
+        Conversation {
+            id: "conv-1".to_string(),
+            user_id: "alex".to_string(),
+            session_id: None,
+            organization: "agentic-flowstate".to_string(),
+            agent: Some("full-access".to_string()),
+            title: "Conversation Error Investigation".to_string(),
+            started_at: "2026-05-11T22:22:17Z".to_string(),
+            updated_at: "2026-05-11T22:39:19Z".to_string(),
+            status: "open".to_string(),
+            archived_at: None,
+            router_ticket_id: None,
+            router_organization: None,
+            message_count: Some(2),
+            last_event_index: Some(128),
+            is_active,
+            messages: Some(vec![]),
+        }
+    }
+
+    fn run_status(is_processing: bool) -> ConversationRunStatusResponse {
+        ConversationRunStatusResponse {
+            conversation_id: "conv-1".to_string(),
+            status: if is_processing {
+                "running"
+            } else {
+                "completed"
+            }
+            .to_string(),
+            checkpoint_status: Some(
+                if is_processing {
+                    "running"
+                } else {
+                    "completed"
+                }
+                .to_string(),
+            ),
+            is_processing,
+            should_fetch: !is_processing,
+            updated_at: 1_778_539_159,
+            last_event_index: 128,
+            server_time: 1_778_539_160,
+        }
+    }
+
+    #[test]
+    fn apply_run_status_clears_stale_selected_conversation_activity() {
+        let conv = conversation_with_activity(Some(true));
+        let conv = apply_run_status_to_conversation(conv, &run_status(false));
+
+        assert_eq!(conv.is_active, Some(false));
+    }
+
+    #[test]
+    fn apply_run_status_sets_selected_conversation_activity() {
+        let conv = conversation_with_activity(None);
+        let conv = apply_run_status_to_conversation(conv, &run_status(true));
+
+        assert_eq!(conv.is_active, Some(true));
     }
 }
