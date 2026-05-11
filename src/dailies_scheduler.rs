@@ -4,7 +4,9 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use ticketing_system::text_normalization::normalize_daily_research_output;
+use ticketing_system::text_normalization::{
+    normalize_daily_research_output, split_daily_research_output, DailyResearchSections,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::agents::executor::run_codex_agent_turn;
@@ -75,6 +77,8 @@ pub async fn spawn_daily_run(
                     agent_run_id: None,
                     artifact_id: None,
                     summary: None,
+                    lookup_summary: None,
+                    sources_summary: None,
                     error: Some(e.to_string()),
                 },
             )
@@ -93,7 +97,9 @@ async fn execute_daily_run(
     let agent_type = agent_type_for_daily(&daily)?;
     let working_dir = resolve_daily_working_dir(&pool, &agent_type, &daily.organization).await?;
     let session_id = uuid::Uuid::new_v4().to_string();
-    let prompt = build_run_prompt(&daily, &run);
+    let prior_runs =
+        ticketing_system::dailies::recent_completed_runs(&pool, &daily.daily_id, 3).await?;
+    let prompt = build_run_prompt(&daily, &run, &prior_runs);
     let system_prompt = build_system_prompt(&daily)?;
 
     ticketing_system::agent_runs::create_agent_run(
@@ -126,6 +132,8 @@ async fn execute_daily_run(
     match turn {
         Ok(turn) => {
             let output_summary = normalize_daily_research_output(&turn.output_summary);
+            let sections = split_daily_research_output(&output_summary);
+            let artifact_content = compose_daily_artifact(&sections);
             let completed_at = Utc::now().to_rfc3339();
             ticketing_system::agent_runs::update_agent_run(
                 &pool,
@@ -152,7 +160,7 @@ async fn execute_daily_run(
                 &pool,
                 ticketing_system::CreateArtifactRequest {
                     title: artifact_title(&daily),
-                    content: output_summary.clone(),
+                    content: artifact_content,
                     artifact_type: "research".to_string(),
                     created_by: "daily-research".to_string(),
                     source_step_id: Some(run.run_id.clone()),
@@ -173,7 +181,9 @@ async fn execute_daily_run(
                     status: "completed".to_string(),
                     agent_run_id: Some(session_id),
                     artifact_id: Some(artifact.artifact_id),
-                    summary: Some(output_summary),
+                    summary: Some(sections.report),
+                    lookup_summary: sections.lookup_summary,
+                    sources_summary: sections.sources_summary,
                     error: None,
                 },
             )
@@ -210,6 +220,8 @@ async fn execute_daily_run(
                     agent_run_id: Some(session_id),
                     artifact_id: None,
                     summary: None,
+                    lookup_summary: None,
+                    sources_summary: None,
                     error: Some(error),
                 },
             )
@@ -254,9 +266,13 @@ fn build_system_prompt(daily: &ticketing_system::Daily) -> Result<String> {
     load_prompt("daily-research", vars).context("Failed to load daily-research prompt")
 }
 
-fn build_run_prompt(daily: &ticketing_system::Daily, run: &ticketing_system::DailyRun) -> String {
+fn build_run_prompt(
+    daily: &ticketing_system::Daily,
+    run: &ticketing_system::DailyRun,
+    prior_runs: &[ticketing_system::DailyRun],
+) -> String {
     format!(
-        "Run this Daily research automation now.\n\nDaily ID: {}\nRun ID: {}\nTitle: {}\nDescription: {}\nSearch query: {}\nMax age hours: {}\n\nInstructions:\n{}\n\nUse fresh search. Return the full report in markdown. Do not create artifacts; the API will persist your final output.",
+        "Run this Daily research automation now.\n\nDaily ID: {}\nRun ID: {}\nTitle: {}\nDescription: {}\nSearch query: {}\nMax age hours: {}\n\nInstructions:\n{}\n\nPrior completed runs to use as the baseline:\n{}\n\nRun discipline:\n- Search fresh every time, but treat the prior runs as already-read context.\n- Lead with material deltas. If nothing meaningful changed, say \"No material change\" and keep the brief short.\n- Do not restate old background unless it changed, becomes newly relevant, or resolves a prior watch item.\n- Vary the lookup enough to check the Daily's primary query, authoritative source pages, and targeted delta queries from prior watch items.\n- Put query/source coverage in Lookup Notes and provenance in Sources. Keep the main report readable.\n\nReturn markdown only. Do not create artifacts; the API will persist your final output.",
         daily.daily_id,
         run.run_id,
         daily.title,
@@ -266,8 +282,86 @@ fn build_run_prompt(daily: &ticketing_system::Daily, run: &ticketing_system::Dai
             .max_age_hours
             .map(|v| v.to_string())
             .unwrap_or_else(|| "not set".to_string()),
-        daily.prompt
+        daily.prompt,
+        build_prior_run_context(prior_runs)
     )
+}
+
+fn build_prior_run_context(prior_runs: &[ticketing_system::DailyRun]) -> String {
+    if prior_runs.is_empty() {
+        return "No prior completed runs are available. Establish the baseline in this run, then make later runs delta-first.".to_string();
+    }
+
+    prior_runs
+        .iter()
+        .map(|run| {
+            let summary = run
+                .summary
+                .as_deref()
+                .map(|value| truncate_for_prompt(value, 1800))
+                .unwrap_or_else(|| "No prior summary stored.".to_string());
+            let lookup = run
+                .lookup_summary
+                .as_deref()
+                .map(|value| truncate_for_prompt(value, 900));
+            let sources = run
+                .sources_summary
+                .as_deref()
+                .map(|value| truncate_for_prompt(value, 900));
+
+            let mut block = format!(
+                "## Previous Run {}\n- Scheduled: {}\n- Completed: {}\n\n### Prior Report\n{}",
+                run.run_id,
+                prompt_time(Some(run.scheduled_for)),
+                prompt_time(run.completed_at),
+                summary
+            );
+
+            if let Some(lookup) = lookup {
+                block.push_str("\n\n### Prior Lookup Notes\n");
+                block.push_str(&lookup);
+            }
+
+            if let Some(sources) = sources {
+                block.push_str("\n\n### Prior Sources\n");
+                block.push_str(&sources);
+            }
+
+            block
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn prompt_time(timestamp: Option<i64>) -> String {
+    timestamp
+        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| "not set".to_string())
+}
+
+fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...\n[truncated]", truncated.trim_end())
+    } else {
+        truncated
+    }
+}
+
+fn compose_daily_artifact(sections: &DailyResearchSections) -> String {
+    let mut parts = vec![sections.report.clone()];
+
+    if let Some(lookup) = &sections.lookup_summary {
+        parts.push(format!("# Lookup Notes\n\n{}", lookup));
+    }
+
+    if let Some(sources) = &sections.sources_summary {
+        parts.push(format!("# Sources\n\n{}", sources));
+    }
+
+    parts.join("\n\n")
 }
 
 fn artifact_title(daily: &ticketing_system::Daily) -> String {
