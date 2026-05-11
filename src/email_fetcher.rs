@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 type ImapSession = async_imap::Session<async_native_tls::TlsStream<TcpStream>>;
+const EMAIL_FETCH_WINDOW: u32 = 500;
 
 /// Shared signal that account handlers can use to wake the account manager immediately.
 /// Call `notify_one()` after creating or deleting an email account.
@@ -96,17 +97,16 @@ async fn account_manager(db_pool: Arc<SqlitePool>, shutdown: CancellationToken) 
 
             tracing::info!("[IDLE] Starting watchers for account: {}", account.email);
 
-            let folders = vec![("INBOX", "INBOX"), ("Sent Items", "Sent")];
+            let folders = vec!["INBOX", "Sent"];
 
             let mut handles = Vec::new();
-            for (imap_folder, db_folder) in folders {
+            for db_folder in folders {
                 let pool = db_pool.clone();
                 let acct = account.clone();
-                let imap_f = imap_folder.to_string();
                 let db_f = db_folder.to_string();
 
                 let handle = tokio::spawn(async move {
-                    idle_watcher(pool, acct, imap_f, db_f).await;
+                    idle_watcher(pool, acct, db_f).await;
                 });
                 handles.push(handle);
             }
@@ -138,12 +138,7 @@ async fn account_manager(db_pool: Arc<SqlitePool>, shutdown: CancellationToken) 
 
 /// IDLE watcher for a single folder on a single account.
 /// Maintains a persistent IMAP connection with IDLE, reconnects on failure.
-async fn idle_watcher(
-    db_pool: Arc<SqlitePool>,
-    account: EmailAccountInternal,
-    imap_folder: String,
-    db_folder: String,
-) {
+async fn idle_watcher(db_pool: Arc<SqlitePool>, account: EmailAccountInternal, db_folder: String) {
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(60);
     // IDLE timeout: 14 minutes to stay within NAT gateway timeouts (typically 15 min)
@@ -151,7 +146,7 @@ async fn idle_watcher(
     let idle_timeout = Duration::from_secs(14 * 60);
 
     loop {
-        match idle_loop(&db_pool, &account, &imap_folder, &db_folder, idle_timeout).await {
+        match idle_loop(&db_pool, &account, &db_folder, idle_timeout).await {
             Ok(()) => {
                 // Clean exit (shouldn't happen in normal operation)
                 tracing::info!(
@@ -190,7 +185,6 @@ async fn idle_watcher(
 async fn idle_loop(
     db_pool: &SqlitePool,
     account: &EmailAccountInternal,
-    imap_folder: &str,
     db_folder: &str,
     idle_timeout: Duration,
 ) -> Result<()> {
@@ -212,25 +206,17 @@ async fn idle_loop(
         .await
         .map_err(|e| anyhow::anyhow!("IMAP login failed: {:?}", e.0))?;
 
-    // Select folder
-    let _mailbox = match session.select(imap_folder).await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!(
-                "[IDLE] Could not select {} for {}: {:?}",
-                imap_folder,
-                account.email,
-                e
-            );
+    let imap_folder = match select_logical_folder(&mut session, account, db_folder).await? {
+        Some(folder) => folder,
+        None => {
             session.logout().await.ok();
-            // Folder doesn't exist — sleep long and retry (maybe it gets created later)
             tokio::time::sleep(Duration::from_secs(300)).await;
             return Ok(());
         }
     };
 
     // Initial full fetch to sync any missed messages
-    if let Err(e) = fetch_folder(&mut session, db_pool, account, imap_folder, db_folder).await {
+    if let Err(e) = fetch_folder(&mut session, db_pool, account, &imap_folder, db_folder).await {
         tracing::warn!(
             "[IDLE] Initial fetch failed for {} {}: {:?}",
             account.email,
@@ -265,7 +251,7 @@ async fn idle_loop(
                 );
                 // Fetch new messages
                 if let Err(e) =
-                    fetch_folder(&mut session, db_pool, account, imap_folder, db_folder).await
+                    fetch_folder(&mut session, db_pool, account, &imap_folder, db_folder).await
                 {
                     tracing::warn!(
                         "[IDLE] Fetch after event failed for {} {}: {:?}",
@@ -326,13 +312,13 @@ pub async fn fetch_emails_for_account(
         .await
         .map_err(|e| anyhow::anyhow!("IMAP login failed: {:?}", e.0))?;
 
-    let folders = vec![("INBOX", "INBOX"), ("Sent Items", "Sent")];
+    let folders = vec!["INBOX", "Sent"];
 
-    for (imap_folder, db_folder) in folders {
-        if let Err(e) = fetch_folder(&mut session, db_pool, account, imap_folder, db_folder).await {
+    for db_folder in folders {
+        if let Err(e) = fetch_logical_folder(&mut session, db_pool, account, db_folder).await {
             tracing::warn!(
                 "Failed to fetch {} for {}: {:?}",
-                imap_folder,
+                db_folder,
                 account.email,
                 e
             );
@@ -351,13 +337,13 @@ async fn fetch_folder(
     account: &EmailAccountInternal,
     imap_folder: &str,
     db_folder: &str,
-) -> Result<()> {
+) -> Result<bool> {
     // Select folder (re-select to get fresh EXISTS count)
     let mailbox = match session.select(imap_folder).await {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!("Could not select folder {}: {:?}", imap_folder, e);
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -402,10 +388,11 @@ async fn fetch_folder(
         }
     }
 
-    // Fetch the last 50 messages for new email ingestion
-    let fetch_count = std::cmp::min(mailbox.exists, 50);
+    // Fetch a bounded recent window for new email ingestion. This keeps reconnects
+    // cheap while avoiding the old 50-message ceiling that hid recent setup mail.
+    let fetch_count = std::cmp::min(mailbox.exists, EMAIL_FETCH_WINDOW);
     if fetch_count == 0 {
-        return Ok(());
+        return Ok(true);
     }
 
     let start = mailbox.exists.saturating_sub(fetch_count) + 1;
@@ -568,5 +555,73 @@ async fn fetch_folder(
         }
     }
 
+    Ok(true)
+}
+
+async fn fetch_logical_folder(
+    session: &mut ImapSession,
+    db_pool: &SqlitePool,
+    account: &EmailAccountInternal,
+    db_folder: &str,
+) -> Result<()> {
+    let mut last_error: Option<String> = None;
+    for imap_folder in folder_candidates(db_folder) {
+        match fetch_folder(session, db_pool, account, imap_folder, db_folder).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => continue,
+            Err(e) => last_error = Some(format!("{e:?}")),
+        }
+    }
+
+    if let Some(error) = last_error {
+        return Err(anyhow::anyhow!(
+            "No usable IMAP folder for logical folder {}: {}",
+            db_folder,
+            error
+        ));
+    }
+
+    tracing::debug!(
+        "No IMAP folder found for logical folder {} on {}",
+        db_folder,
+        account.email
+    );
     Ok(())
+}
+
+async fn select_logical_folder(
+    session: &mut ImapSession,
+    account: &EmailAccountInternal,
+    db_folder: &str,
+) -> Result<Option<String>> {
+    for imap_folder in folder_candidates(db_folder) {
+        match session.select(imap_folder).await {
+            Ok(_) => return Ok(Some(imap_folder.to_string())),
+            Err(e) => {
+                tracing::debug!(
+                    "[IDLE] Could not select {} for {}: {:?}",
+                    imap_folder,
+                    account.email,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn folder_candidates(db_folder: &str) -> Vec<&'static str> {
+    match db_folder {
+        "INBOX" => vec!["INBOX"],
+        "Sent" => vec![
+            "Sent Items",
+            "Sent",
+            "Sent Messages",
+            "Sent Mail",
+            "[Gmail]/Sent Mail",
+            "INBOX.Sent",
+        ],
+        _ => vec![],
+    }
 }

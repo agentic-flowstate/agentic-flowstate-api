@@ -180,14 +180,16 @@ pub async fn list_emails(
         let total = emails::count_emails(&pool, mailbox, folder)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let unread = emails::count_unread_emails(&pool, mailbox)
+        let mailbox_filter = vec![mailbox.clone()];
+        let unread = emails::count_unread_emails_for_mailboxes(&pool, &mailbox_filter, folder)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         (list, total, unread)
     } else {
         // No specific mailbox — filter to user's accessible mailboxes
         let accessible = get_user_mailboxes(&pool, &user.user_id).await?;
-        let list = if let Some(folder) = &params.folder {
+        let folder = params.folder.as_deref();
+        let list = if let Some(folder) = folder {
             emails::list_emails_by_mailboxes(&pool, &accessible, folder, limit, offset)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -196,8 +198,12 @@ pub async fn list_emails(
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         };
-        let total = list.len() as i64;
-        let unread = list.iter().filter(|e| !e.is_read).count() as i64;
+        let total = emails::count_emails_for_mailboxes(&pool, &accessible, folder)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let unread = emails::count_unread_emails_for_mailboxes(&pool, &accessible, folder)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         (list, total, unread)
     };
 
@@ -291,10 +297,11 @@ pub async fn get_email_stats(
 
     let mut stats = Vec::new();
     for mailbox in accessible {
-        let total = emails::count_emails(&pool, &mailbox, None)
+        let mailbox_filter = vec![mailbox.clone()];
+        let total = emails::count_emails_for_mailboxes(&pool, &mailbox_filter, None)
             .await
             .unwrap_or(0);
-        let unread = emails::count_unread_emails(&pool, &mailbox)
+        let unread = emails::count_unread_emails_for_mailboxes(&pool, &mailbox_filter, None)
             .await
             .unwrap_or(0);
 
