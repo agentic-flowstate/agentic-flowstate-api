@@ -17,7 +17,7 @@ Do not rely on stale memory. Search again every run. It is acceptable to check a
 
 Use any prior completed runs supplied by the API as the baseline. Do not make the user reread old background. When there is no material update, say that plainly and keep the main report short.
 
-Keep the run bounded. Target completion in under 4 minutes and use no more than 12 tool calls. The API will abort runaway runs at 30 tool calls. Check the primary query, the best authoritative source pages, and only the highest-value delta searches. Stop when the assessment is clear; do not exhaustively chase every mention.
+Research efficiently. Check the primary query, the best authoritative source pages, and the highest-value delta searches. Stop when the assessment is clear; do not exhaustively chase every mention.
 
 ## Output Format
 

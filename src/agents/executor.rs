@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, Instant};
 
 use ticketing_system::text_normalization::normalize_codex_token_delta_output;
 use ticketing_system::token_usage::TokenUsageBreakdown;
@@ -112,35 +111,6 @@ pub async fn run_codex_agent_turn(
         persist_session,
         event_tx,
         result_session_id,
-        None,
-        None,
-    )
-    .await
-}
-
-pub async fn run_codex_agent_turn_with_timeout(
-    agent_type: &AgentType,
-    working_dir: &Path,
-    system_prompt: &str,
-    prompt: &str,
-    resume_session_id: Option<&str>,
-    persist_session: bool,
-    event_tx: Option<mpsc::Sender<StreamEvent>>,
-    result_session_id: &str,
-    timeout: Duration,
-    max_tool_calls: Option<i32>,
-) -> Result<CodexAgentTurnResult> {
-    run_codex_agent_turn_inner(
-        agent_type,
-        working_dir,
-        system_prompt,
-        prompt,
-        resume_session_id,
-        persist_session,
-        event_tx,
-        result_session_id,
-        Some(timeout),
-        max_tool_calls,
     )
     .await
 }
@@ -154,8 +124,6 @@ async fn run_codex_agent_turn_inner(
     persist_session: bool,
     event_tx: Option<mpsc::Sender<StreamEvent>>,
     result_session_id: &str,
-    timeout: Option<Duration>,
-    max_tool_calls: Option<i32>,
 ) -> Result<CodexAgentTurnResult> {
     let (sandbox, bypass_approvals_and_sandbox) = codex_policy_for_agent_type(agent_type);
     let mut turn = spawn_codex_app_server(CodexAppServerOptions {
@@ -181,39 +149,9 @@ async fn run_codex_agent_turn_inner(
     let mut runtime_session_id = resume_session_id.map(str::to_string);
     let mut usage = TokenUsageBreakdown::default();
     let mut streamed_agent_message_items: HashSet<String> = HashSet::new();
-    let deadline = timeout.map(|duration| Instant::now() + duration);
-    let timeout_seconds = timeout.map(|duration| duration.as_secs());
 
     loop {
-        let event = match deadline {
-            Some(deadline) => {
-                enum ReceiveResult<T> {
-                    Event(Option<T>),
-                    Timeout,
-                }
-
-                match tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => ReceiveResult::Timeout,
-                    event = turn.events.recv() => ReceiveResult::Event(event),
-                } {
-                    ReceiveResult::Event(event) => event,
-                    ReceiveResult::Timeout => {
-                        if let Err(e) = turn.terminate().await {
-                            tracing::warn!(
-                                "Failed to terminate timed-out Codex app-server turn: {e}"
-                            );
-                        }
-                        let _ = turn.wait().await;
-                        anyhow::bail!(
-                            "Codex agent turn exceeded {} seconds",
-                            timeout_seconds.unwrap_or_default()
-                        );
-                    }
-                }
-            }
-            None => turn.events.recv().await,
-        };
-
+        let event = turn.events.recv().await;
         let Some(event) = event else {
             break;
         };
@@ -259,22 +197,6 @@ async fn run_codex_agent_turn_inner(
             }
             CodexAppServerEvent::ToolCallStarted { id, name, input } => {
                 tool_call_count += 1;
-                if let Some(max_tool_calls) = max_tool_calls {
-                    if tool_call_count > max_tool_calls {
-                        tracing::warn!(
-                            "Codex agent turn exceeded max tool calls: count={} max={}",
-                            tool_call_count,
-                            max_tool_calls
-                        );
-                        if let Err(e) = turn.terminate().await {
-                            tracing::warn!(
-                                "Failed to terminate tool-call-limited Codex app-server turn: {e}"
-                            );
-                        }
-                        let _ = turn.wait().await;
-                        anyhow::bail!("Codex agent turn exceeded {} tool calls", max_tool_calls);
-                    }
-                }
                 if let Some(ref tx) = event_tx {
                     let _ = tx.send(StreamEvent::ToolUse { id, name, input }).await;
                 }

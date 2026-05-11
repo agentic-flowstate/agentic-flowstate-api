@@ -2735,13 +2735,17 @@ name = "mcp-handlers"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-native-tls",
+ "async-std",
  "base64 0.22.1",
  "chrono",
  "chrono-tz",
  "dirs",
+ "futures",
  "futures-util",
  "jsonwebtoken",
  "libc",
+ "mail-builder",
  "md5",
  "once_cell",
  "regex",
