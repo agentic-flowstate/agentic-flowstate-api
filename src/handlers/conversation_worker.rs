@@ -380,11 +380,9 @@ impl ConversationWorker {
         // the next `message_start` frame). When `None`, it stays `None`
         // end-to-end — no synthetic fallbacks.
         self.encoder.set_pending_client_id(msg.client_id.clone());
-        // Clear stale events from previous message but keep event_index monotonically
-        // increasing. Resetting to 0 here was causing the "one turn late" bug: the app's
-        // SSE cursor (e.g., lastEventIndex=50) would be higher than all new events (0,1,2...),
-        // so reconnection with starting_after=50 returned nothing.
-        let _ = conversations::delete_events(&self.db, &self.conversation_id).await;
+        // Keep the durable event log intact. Cursor repair, foreground
+        // delta-sync, and replay depend on prior turn events remaining
+        // queryable; retention is handled by the scheduled pruner.
 
         // Emit running status
         self.emit_event(&StreamEvent::Status {
