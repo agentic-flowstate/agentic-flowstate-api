@@ -207,6 +207,12 @@ struct TurnCompletion {
     error_message: Option<String>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AppServerErrorNotification {
+    message: String,
+    will_retry: bool,
+}
+
 pub struct RunningCodexAppServer {
     child: Arc<Mutex<Child>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
@@ -1276,11 +1282,32 @@ async fn handle_app_server_value(
             return Ok(true);
         }
         "error" => {
-            let message = params
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown app-server error");
-            return Err(format!("codex app-server error notification: {message}"));
+            let error = parse_error_notification(params);
+            if error.will_retry {
+                tracing::warn!(
+                    "[CODEX] Retryable app-server error notification: {}",
+                    error.message
+                );
+                return Ok(false);
+            }
+            return Err(format!(
+                "codex app-server error notification: {}",
+                error.message
+            ));
+        }
+        "mcpServer/startupStatus/updated" => {
+            let status = params.get("status").and_then(|value| value.as_str());
+            if status == Some("failed") {
+                let name = params
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown");
+                let error = params
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown MCP startup error");
+                tracing::warn!("[CODEX] MCP server {name} failed to start: {error}");
+            }
         }
         _ => {}
     }
@@ -1561,6 +1588,90 @@ fn parse_turn_completion(params: &Value) -> TurnCompletion {
         status,
         error_message,
     }
+}
+
+fn parse_error_notification(params: &Value) -> AppServerErrorNotification {
+    let will_retry = params
+        .get("willRetry")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let error = params.get("error").unwrap_or(&Value::Null);
+    let mut message = error
+        .get("message")
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get("message").and_then(|value| value.as_str()))
+        .or_else(|| error.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "unknown app-server error payload {}",
+                truncate_for_log(&compact_json(params), 500)
+            )
+        });
+
+    if let Some(details) = error
+        .get("additionalDetails")
+        .and_then(|value| value.as_str())
+        .filter(|details| !details.is_empty())
+    {
+        message.push_str(": ");
+        message.push_str(details);
+    }
+
+    if let Some(codex_error_info) = summarize_codex_error_info(error.get("codexErrorInfo")) {
+        message.push_str(" (");
+        message.push_str(&codex_error_info);
+        message.push(')');
+    }
+
+    AppServerErrorNotification {
+        message,
+        will_retry,
+    }
+}
+
+fn summarize_codex_error_info(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    collect_string_field(value, "code", &mut parts);
+    collect_string_field(value, "type", &mut parts);
+    collect_i64_field(value, "httpStatusCode", &mut parts);
+
+    if parts.is_empty() {
+        Some(truncate_for_log(&compact_json(value), 240))
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+fn collect_string_field(value: &Value, key: &str, parts: &mut Vec<String>) {
+    if let Some(field) = value.get(key).and_then(|field| field.as_str()) {
+        parts.push(format!("{key}={field}"));
+    }
+}
+
+fn collect_i64_field(value: &Value, key: &str, parts: &mut Vec<String>) {
+    if let Some(field) = value.get(key).and_then(|field| field.as_i64()) {
+        parts.push(format!("{key}={field}"));
+    }
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut truncated = value.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn extract_command_result_text(item: &Value) -> String {
@@ -2010,6 +2121,48 @@ approval_mode = "approve"
                 total_tokens: 17,
                 thread_total_tokens: 53,
                 context_window_tokens: Some(200000),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_retryable_app_server_error_notification() {
+        let params = json!({
+            "threadId": "thread",
+            "turnId": "turn",
+            "willRetry": true,
+            "error": {
+                "message": "stream disconnected",
+                "additionalDetails": "retrying sampling request",
+                "codexErrorInfo": {
+                    "code": "websocket_timeout",
+                    "httpStatusCode": 504
+                }
+            }
+        });
+
+        assert_eq!(
+            parse_error_notification(&params),
+            AppServerErrorNotification {
+                message:
+                    "stream disconnected: retrying sampling request (code=websocket_timeout, httpStatusCode=504)"
+                        .to_string(),
+                will_retry: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_legacy_app_server_error_notification_message() {
+        let params = json!({
+            "message": "legacy failure"
+        });
+
+        assert_eq!(
+            parse_error_notification(&params),
+            AppServerErrorNotification {
+                message: "legacy failure".to_string(),
+                will_retry: false,
             }
         );
     }
