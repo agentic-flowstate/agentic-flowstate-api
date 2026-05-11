@@ -339,7 +339,7 @@ pub struct SendEmailResponse {
     pub success: bool,
 }
 
-/// Send email via SES and store in Sent folder (POST /api/emails/send)
+/// Send email and store it in Sent (POST /api/emails/send)
 ///
 /// When `in_reply_to` is set, constructs raw MIME with In-Reply-To and References
 /// headers so mail clients thread the conversation properly.
@@ -348,44 +348,38 @@ pub async fn send_email(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<SendEmailRequest>,
 ) -> Result<Json<SendEmailResponse>, (StatusCode, String)> {
-    // Verify user has access to send from this email account
-    verify_mailbox_access(&pool, &user.user_id, &req.from).await?;
+    let delivery = crate::email_delivery::send_outbound_email(
+        &pool,
+        &user.user_id,
+        &crate::email_delivery::OutboundEmail {
+            from: req.from.clone(),
+            to: req.to.clone(),
+            cc: req.cc.clone(),
+            bcc: req.bcc.clone(),
+            subject: req.subject.clone(),
+            body_text: req.body_text.clone(),
+            body_html: req.body_html.clone(),
+            reply_to: req.reply_to.clone(),
+            in_reply_to: req.in_reply_to.clone(),
+        },
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Email send failed: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to send email: {}", e),
+        )
+    })?;
 
-    // Look up sender's email account for AWS credentials
-    let account = email_accounts::get_email_account(&pool, &req.from)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Unknown sender email '{}': {}", req.from, e),
-            )
-        })?;
-
-    let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(account.aws_region.clone()));
-    if let Some(ref profile) = account.aws_profile {
-        config_loader = config_loader.profile_name(profile);
-    }
-    let config = config_loader.load().await;
-
-    let ses_client = aws_sdk_sesv2::Client::new(&config);
-
-    let result = if req.in_reply_to.is_some() {
-        // Reply/forward: use raw MIME to set In-Reply-To and References headers
-        send_raw_email(&ses_client, &req).await?
-    } else {
-        // New email: use simple SES API
-        send_simple_email(&ses_client, &req).await?
-    };
-
-    let message_id = result;
+    let message_id = delivery.message_id;
     tracing::info!("Email sent successfully, message_id: {}", message_id);
 
     // Store in Sent folder
     let now = chrono::Utc::now().timestamp();
     let create_req = ticketing_system::CreateEmailRequest {
         message_id: message_id.clone(),
-        mailbox: req.from.clone(),
+        mailbox: delivery.source_mailbox,
         folder: "Sent".to_string(),
         from_address: req.from.clone(),
         from_name: None,
@@ -411,158 +405,6 @@ pub async fn send_email(
         message_id,
         success: true,
     }))
-}
-
-/// Send via SES Simple API (no threading headers needed)
-async fn send_simple_email(
-    ses_client: &aws_sdk_sesv2::Client,
-    req: &SendEmailRequest,
-) -> Result<String, (StatusCode, String)> {
-    use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message};
-
-    let mut destination_builder = Destination::builder();
-    for to in &req.to {
-        destination_builder = destination_builder.to_addresses(to);
-    }
-    for cc in &req.cc {
-        destination_builder = destination_builder.cc_addresses(cc);
-    }
-    for bcc in &req.bcc {
-        destination_builder = destination_builder.bcc_addresses(bcc);
-    }
-
-    let mut body_builder = Body::builder();
-    if let Some(text) = &req.body_text {
-        body_builder = body_builder.text(
-            Content::builder()
-                .data(text)
-                .charset("UTF-8")
-                .build()
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
-        );
-    }
-    if let Some(html) = &req.body_html {
-        body_builder = body_builder.html(
-            Content::builder()
-                .data(html)
-                .charset("UTF-8")
-                .build()
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
-        );
-    }
-
-    let message = Message::builder()
-        .subject(
-            Content::builder()
-                .data(&req.subject)
-                .charset("UTF-8")
-                .build()
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
-        )
-        .body(body_builder.build())
-        .build();
-
-    let email_content = EmailContent::builder().simple(message).build();
-
-    let mut send_request = ses_client
-        .send_email()
-        .from_email_address(&req.from)
-        .destination(destination_builder.build())
-        .content(email_content);
-
-    if let Some(reply_to) = &req.reply_to {
-        send_request = send_request.reply_to_addresses(reply_to);
-    }
-
-    let result = send_request.send().await.map_err(|e| {
-        tracing::error!("SES send failed: {:?}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to send email: {}", e),
-        )
-    })?;
-
-    Ok(result.message_id().unwrap_or("unknown").to_string())
-}
-
-/// Send via SES Raw API with In-Reply-To and References headers for threading
-async fn send_raw_email(
-    ses_client: &aws_sdk_sesv2::Client,
-    req: &SendEmailRequest,
-) -> Result<String, (StatusCode, String)> {
-    use aws_sdk_sesv2::primitives::Blob;
-    use aws_sdk_sesv2::types::{EmailContent, RawMessage};
-    use mail_builder::MessageBuilder;
-
-    let mut builder = MessageBuilder::new();
-    builder = builder.from(req.from.as_str());
-
-    for to in &req.to {
-        builder = builder.to(to.as_str());
-    }
-    for cc in &req.cc {
-        builder = builder.cc(cc.as_str());
-    }
-    for bcc in &req.bcc {
-        builder = builder.bcc(bcc.as_str());
-    }
-
-    builder = builder.subject(&req.subject);
-
-    if let Some(in_reply_to) = &req.in_reply_to {
-        builder = builder.in_reply_to(in_reply_to.as_str());
-        // References = In-Reply-To for single-level threading
-        builder = builder.header(
-            "References",
-            mail_builder::headers::raw::Raw::new(in_reply_to.as_str()),
-        );
-    }
-
-    // Build body: multipart/alternative if both text and html, otherwise single part
-    match (&req.body_text, &req.body_html) {
-        (Some(text), Some(html)) => {
-            builder = builder.text_body(text);
-            builder = builder.html_body(html);
-        }
-        (Some(text), None) => {
-            builder = builder.text_body(text);
-        }
-        (None, Some(html)) => {
-            builder = builder.html_body(html);
-        }
-        (None, None) => {
-            builder = builder.text_body("");
-        }
-    }
-
-    let raw_bytes = builder.write_to_vec().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to build MIME: {}", e),
-        )
-    })?;
-
-    let raw_message = RawMessage::builder()
-        .data(Blob::new(raw_bytes))
-        .build()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let email_content = EmailContent::builder().raw(raw_message).build();
-
-    let result = ses_client
-        .send_email()
-        .content(email_content)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("SES raw send failed: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to send email: {}", e),
-            )
-        })?;
-
-    Ok(result.message_id().unwrap_or("unknown").to_string())
 }
 
 // ============================================================================

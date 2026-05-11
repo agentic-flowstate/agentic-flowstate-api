@@ -2,6 +2,7 @@ mod agents;
 pub mod apns;
 mod auth_middleware;
 mod dailies_scheduler;
+mod email_delivery;
 mod email_fetcher;
 mod handlers;
 mod health_monitor;
@@ -880,6 +881,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/email-accounts/:email/sync",
             post(handlers::sync_email_account),
+        )
+        .route(
+            "/api/email-identities",
+            get(handlers::list_email_identities),
         )
         // Email SSE (live updates)
         .route("/api/emails/subscribe", get(handlers::subscribe_emails))

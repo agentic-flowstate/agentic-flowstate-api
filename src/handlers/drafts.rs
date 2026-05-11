@@ -1,14 +1,16 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ticketing_system::{
-    drafts, email_accounts, email_thread_tickets, CreateDraftRequest, EmailDraft,
-    LinkThreadTicketRequest, SqlitePool, UpdateDraftRequest,
+    drafts, email_thread_tickets, CreateDraftRequest, EmailDraft, LinkThreadTicketRequest,
+    SqlitePool, UpdateDraftRequest,
 };
+
+use crate::auth_middleware::AuthenticatedUser;
 
 #[derive(Debug, Deserialize)]
 pub struct ListDraftsQuery {
@@ -127,13 +129,12 @@ pub async fn delete_draft(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Send a draft via SES (POST /api/drafts/:id/send)
+/// Send a draft (POST /api/drafts/:id/send)
 pub async fn send_draft(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<i64>,
 ) -> Result<Json<SendDraftResponse>, (StatusCode, String)> {
-    use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message};
-
     // Get the draft
     let draft = drafts::get_draft_by_id(&pool, id)
         .await
@@ -146,91 +147,51 @@ pub async fn send_draft(
         ));
     }
 
-    // Look up sender's email account for AWS credentials
-    let account = email_accounts::get_email_account(&pool, &draft.from_address)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Unknown sender email '{}': {}", draft.from_address, e),
-            )
-        })?;
-
-    let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(account.aws_region.clone()));
-    if let Some(ref profile) = account.aws_profile {
-        config_loader = config_loader.profile_name(profile);
-    }
-    let config = config_loader.load().await;
-
-    let ses_client = aws_sdk_sesv2::Client::new(&config);
-
-    // Build destination
-    let mut destination_builder = Destination::builder();
-    // Parse to addresses (comma-separated)
-    for to in draft
+    let to_addresses: Vec<String> = draft
         .to_address
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-    {
-        destination_builder = destination_builder.to_addresses(to);
-    }
-    // Parse cc addresses if present
-    if let Some(cc) = &draft.cc_address {
-        for cc_addr in cc.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            destination_builder = destination_builder.cc_addresses(cc_addr);
-        }
-    }
-    let destination = destination_builder.build();
+        .map(ToString::to_string)
+        .collect();
+    let cc_addresses: Vec<String> = draft
+        .cc_address
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
 
-    // Build email body
-    let body = Body::builder()
-        .text(
-            Content::builder()
-                .data(&draft.body)
-                .charset("UTF-8")
-                .build()
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
+    let delivery = crate::email_delivery::send_outbound_email(
+        &pool,
+        &user.user_id,
+        &crate::email_delivery::OutboundEmail {
+            from: draft.from_address.clone(),
+            to: to_addresses.clone(),
+            cc: cc_addresses.clone(),
+            bcc: vec![],
+            subject: draft.subject.clone(),
+            body_text: Some(draft.body.clone()),
+            body_html: Some(format!(
+                "<pre style=\"font-family: sans-serif; white-space: pre-wrap;\">{}</pre>",
+                draft.body
+            )),
+            reply_to: None,
+            in_reply_to: None,
+        },
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Draft send failed: {:?}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to send email: {}", e),
         )
-        .html(
-            Content::builder()
-                .data(&format!(
-                    "<pre style=\"font-family: sans-serif; white-space: pre-wrap;\">{}</pre>",
-                    draft.body
-                ))
-                .charset("UTF-8")
-                .build()
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
-        )
-        .build();
+    })?;
 
-    let subject = Content::builder()
-        .data(&draft.subject)
-        .charset("UTF-8")
-        .build()
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    let message = Message::builder().subject(subject).body(body).build();
-
-    let email_content = EmailContent::builder().simple(message).build();
-
-    let result = ses_client
-        .send_email()
-        .from_email_address(&draft.from_address)
-        .destination(destination)
-        .content(email_content)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!("SES send failed: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to send email: {}", e),
-            )
-        })?;
-
-    let message_id = result.message_id().unwrap_or("unknown").to_string();
+    let message_id = delivery.message_id;
     tracing::info!("Draft {} sent successfully, message_id: {}", id, message_id);
 
     // Mark draft as sent
@@ -240,18 +201,11 @@ pub async fn send_draft(
 
     // Store in Sent folder
     let now = chrono::Utc::now().timestamp();
-    let to_addresses: Vec<String> = draft
-        .to_address
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let cc_addresses: Option<Vec<String>> = draft.cc_address.map(|cc| {
-        cc.split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    });
+    let cc_addresses = if cc_addresses.is_empty() {
+        None
+    } else {
+        Some(cc_addresses)
+    };
 
     // Save values for history logging before they get moved
     let history_to_address = draft.to_address.clone();
@@ -262,7 +216,7 @@ pub async fn send_draft(
 
     let create_req = ticketing_system::CreateEmailRequest {
         message_id: message_id.clone(),
-        mailbox: draft.from_address.clone(),
+        mailbox: delivery.source_mailbox,
         folder: "Sent".to_string(),
         from_address: draft.from_address.clone(),
         from_name: None,

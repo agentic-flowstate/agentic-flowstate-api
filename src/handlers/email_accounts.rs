@@ -5,7 +5,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use ticketing_system::{email_accounts, CreateEmailAccountRequest, EmailAccount, SqlitePool};
+use ticketing_system::{
+    email_accounts, CreateEmailAccountRequest, EmailAccount, EmailIdentity, SqlitePool,
+};
 
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -14,11 +16,23 @@ pub async fn list_email_accounts(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Result<Json<Vec<EmailAccount>>, (StatusCode, String)> {
-    let accounts = email_accounts::list_email_accounts_for_user(&pool, &user.user_id, false)
+    let accounts = email_accounts::list_email_accounts_for_user(&pool, &user.user_id, true)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(accounts))
+}
+
+/// List send identities for the authenticated user (GET /api/email-identities)
+pub async fn list_email_identities(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Result<Json<Vec<EmailIdentity>>, (StatusCode, String)> {
+    let identities = email_accounts::list_email_identities_for_user(&pool, &user.user_id, true)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(identities))
 }
 
 /// Create an email account (POST /api/email-accounts)
