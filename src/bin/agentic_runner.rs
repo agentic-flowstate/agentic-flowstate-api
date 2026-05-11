@@ -8,9 +8,7 @@ use futures::FutureExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use ticketing_system::{
-    agent_runners, checkpoints, conversation_turn_jobs, conversations, restart_queue,
-};
+use ticketing_system::{agent_runners, checkpoints, conversation_turn_jobs, conversations};
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -71,15 +69,6 @@ async fn main() -> Result<()> {
         if shutdown.is_cancelled() {
             accepting = false;
             let _ = agent_runners::mark_generation_draining(&db, &generation_id).await;
-        }
-
-        if accepting && restart_pending_for_runner(&db).await.unwrap_or(false) {
-            accepting = false;
-            tracing::info!(
-                "Runner generation {} entering drain mode because a runner restart is queued",
-                generation_id
-            );
-            agent_runners::mark_generation_draining(&db, &generation_id).await?;
         }
 
         while accepting && concurrency_allows_claim(concurrency, joins.len()) {
@@ -251,13 +240,6 @@ fn spawn_shutdown_listener(shutdown: CancellationToken) {
         }
         shutdown.cancel();
     });
-}
-
-async fn restart_pending_for_runner(db: &ticketing_system::SqlitePool) -> Result<bool> {
-    Ok(restart_queue::get_pending_restart(db)
-        .await?
-        .map(|entry| matches!(entry.service.as_str(), "agent-runner" | "all"))
-        .unwrap_or(false))
 }
 
 async fn run_claimed_job(
