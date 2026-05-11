@@ -465,6 +465,15 @@ impl ConversationWorker {
             msg.message.clone()
         };
 
+        if let Err(e) = ticketing_system::conversation_next_actions::delete_for_conversation(
+            &self.db,
+            &self.conversation_id,
+        )
+        .await
+        {
+            tracing::warn!("[WORKER] Failed to clear stale next actions: {}", e);
+        }
+
         // Store user message in DB (original text, not enhanced)
         let stored_msg = conversations::add_message(
             &self.db,
@@ -1321,6 +1330,15 @@ impl ConversationWorker {
                     tracing::warn!("[WORKER] Failed to mark checkpoint completed: {}", e);
                 }
                 self.publish_run_status().await;
+
+                super::conversation_next_actions::spawn_generation(
+                    self.db.clone(),
+                    msg.user_id.clone(),
+                    self.conversation_id.clone(),
+                    assistant_message_id.clone(),
+                    msg.config.prompt_name.to_string(),
+                    accumulated_text.clone(),
+                );
 
                 if let Some(apns) = crate::apns::ApnsService::global() {
                     tracing::info!(

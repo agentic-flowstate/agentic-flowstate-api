@@ -1049,6 +1049,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_conversation_checkpoint),
         )
         .route(
+            "/api/conversations/:id/next-actions",
+            get(handlers::list_conversation_next_actions),
+        )
+        .route(
             "/api/conversations/:id/agent-status",
             get(handlers::get_conversation_run_status),
         )

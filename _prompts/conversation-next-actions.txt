@@ -1,0 +1,24 @@
+Read the completed assistant output below and propose exactly 3 useful follow-up messages the user may want to send next.
+
+Agent: {{AGENT_NAME}}
+
+Output:
+<assistant_output>
+{{ASSISTANT_OUTPUT}}
+</assistant_output>
+
+Each suggestion must be ready for a mobile chat UI:
+- `label`: short pill label, 2-4 words, 24 characters or fewer.
+- `preview`: one short sentence, 120 characters or fewer, explaining what the follow-up asks for.
+- `message`: the full user message to insert into the composer. Make it concrete, directly relevant to the assistant output, and editable by the user before sending.
+
+Return exactly this JSON shape:
+{
+  "suggestions": [
+    {
+      "label": "Add tests",
+      "preview": "Ask the agent to add focused regression tests.",
+      "message": "Add focused regression tests for the behavior you just changed."
+    }
+  ]
+}
