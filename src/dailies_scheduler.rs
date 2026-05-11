@@ -272,7 +272,7 @@ fn build_run_prompt(
     prior_runs: &[ticketing_system::DailyRun],
 ) -> String {
     format!(
-        "Run this Daily research automation now.\n\nDaily ID: {}\nRun ID: {}\nTitle: {}\nDescription: {}\nSearch query: {}\nMax age hours: {}\n\nInstructions:\n{}\n\nPrior completed runs to use as the baseline:\n{}\n\nRun discipline:\n- Search fresh every time, but treat the prior runs as already-read context.\n- Lead with material deltas. If nothing meaningful changed, say \"No material change\" and keep the brief short.\n- Do not restate old background unless it changed, becomes newly relevant, or resolves a prior watch item.\n- Vary the lookup enough to check the Daily's primary query, authoritative source pages, and targeted delta queries from prior watch items.\n- Put query/source coverage in Lookup Notes and provenance in Sources. Keep the main report readable.\n\nReturn markdown only. Do not create artifacts; the API will persist your final output.",
+        "Run this Daily research automation now.\n\nDaily ID: {}\nRun ID: {}\nTitle: {}\nDescription: {}\nSearch query: {}\nMax age hours: {}\n\nInstructions:\n{}\n\nPrior completed runs to use as the baseline:\n{}\n\nRun discipline:\n- Search fresh every time, but treat the prior runs as already-read context.\n- Lead with material deltas. If nothing meaningful changed, say \"No material change\" and keep the brief short.\n- Do not restate old background unless it changed, becomes newly relevant, or resolves a prior watch item.\n- Vary the research enough to check the Daily's primary query, authoritative source pages, and targeted delta queries from prior watch items.\n- Put provenance in Sources only. Do not include lookup notes, search logs, queries-run sections, or tool transcripts.\n\nReturn markdown only. Do not create artifacts; the API will persist your final output.",
         daily.daily_id,
         run.run_id,
         daily.title,
@@ -300,10 +300,6 @@ fn build_prior_run_context(prior_runs: &[ticketing_system::DailyRun]) -> String 
                 .as_deref()
                 .map(|value| truncate_for_prompt(value, 1800))
                 .unwrap_or_else(|| "No prior summary stored.".to_string());
-            let lookup = run
-                .lookup_summary
-                .as_deref()
-                .map(|value| truncate_for_prompt(value, 900));
             let sources = run
                 .sources_summary
                 .as_deref()
@@ -316,11 +312,6 @@ fn build_prior_run_context(prior_runs: &[ticketing_system::DailyRun]) -> String 
                 prompt_time(run.completed_at),
                 summary
             );
-
-            if let Some(lookup) = lookup {
-                block.push_str("\n\n### Prior Lookup Notes\n");
-                block.push_str(&lookup);
-            }
 
             if let Some(sources) = sources {
                 block.push_str("\n\n### Prior Sources\n");
@@ -352,10 +343,6 @@ fn truncate_for_prompt(value: &str, max_chars: usize) -> String {
 
 fn compose_daily_artifact(sections: &DailyResearchSections) -> String {
     let mut parts = vec![sections.report.clone()];
-
-    if let Some(lookup) = &sections.lookup_summary {
-        parts.push(format!("# Lookup Notes\n\n{}", lookup));
-    }
 
     if let Some(sources) = &sections.sources_summary {
         parts.push(format!("# Sources\n\n{}", sources));

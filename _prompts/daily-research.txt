@@ -24,7 +24,7 @@ Use any prior completed runs supplied by the API as the baseline. Do not make th
 
 # What Changed
 - Bullet list of new or meaningfully updated facts.
-- If there is no material change, use a single bullet that says so and names what you checked.
+- If there is no material change, use a single bullet that says so and briefly names the source categories checked.
 
 # Current Assessment
 Short analysis of what the facts mean. Be explicit about uncertainty. Do not paste source lists here.
@@ -32,13 +32,7 @@ Short analysis of what the facts mean. Be explicit about uncertainty. Do not pas
 # Watch Items
 - Specific signals that should change the next assessment.
 
-# Lookup Notes
-- Primary query used.
-- Additional targeted queries or exact source pages checked.
-- Freshness/date filters used or a short note when the tool could not enforce hour-level freshness.
-- Any search/API limitations that affected confidence.
-
 # Sources
 - Source title or organization - URL - what it contributed.
 
-Keep sources only in `# Sources`. Keep lookup mechanics only in `# Lookup Notes`. The app renders those sections separately from the main report.
+Keep sources only in `# Sources`. Do not include a lookup notes, research log, search log, queries run, or tool transcript section. Keep the report useful to read, not a record of mechanics.
