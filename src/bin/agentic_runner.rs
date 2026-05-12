@@ -19,6 +19,7 @@ const RUNNER_KIND: &str = "agent-runner";
 const RUNNER_HEARTBEAT_STALE_SECONDS: i64 = 90;
 const RUNNER_HEARTBEAT_INTERVAL_SECONDS: u64 = 15;
 const RUNNER_POLL_INTERVAL_MS: u64 = 750;
+const RUNNER_RECONCILE_INTERVAL_SECONDS: u64 = 60;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -72,6 +73,7 @@ async fn main() -> Result<()> {
     ));
     let shutdown = CancellationToken::new();
     spawn_heartbeat(db.clone(), generation_id.clone(), shutdown.child_token());
+    spawn_runner_generation_reconciler(db.clone(), shutdown.child_token());
     spawn_shutdown_listener(shutdown.clone());
 
     let concurrency = runner_concurrency()?;
@@ -227,6 +229,46 @@ fn spawn_heartbeat(
                     generation_id,
                     e
                 );
+            }
+        }
+    });
+}
+
+fn spawn_runner_generation_reconciler(
+    db: Arc<ticketing_system::SqlitePool>,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(RUNNER_RECONCILE_INTERVAL_SECONDS));
+        interval.reset();
+
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+
+            match agent_runners::reconcile_stale_runner_generations(
+                &db,
+                RUNNER_HEARTBEAT_STALE_SECONDS,
+            )
+            .await
+            {
+                Ok(reconciled) if reconciled.any() => {
+                    tracing::warn!(
+                        "Reconciled stale agent runner generation metadata: counts_recomputed={} generations_terminalized={}",
+                        reconciled.generations_recomputed,
+                        reconciled.generations_terminalized
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to reconcile stale runner generation metadata: {}",
+                        e
+                    );
+                }
             }
         }
     });

@@ -32,6 +32,7 @@ use handlers::chat_client_manager::ChatClientManager;
 
 const RUNNER_HEARTBEAT_STALE_SECONDS: i64 = 90;
 const RUNNER_HEARTBEAT_INTERVAL_SECONDS: u64 = 15;
+const RUNNER_RECONCILE_INTERVAL_SECONDS: u64 = 60;
 
 /// Shared application state.
 /// Implements `FromRef` so handlers can extract individual components.
@@ -331,6 +332,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tracing::info!("[SSE_KEEPALIVE] shutdown token registered");
     }
+
+    spawn_runner_generation_reconciler(db_pool.clone(), shutdown_token.child_token());
 
     // Start email fetcher background task (queries email_accounts table each cycle)
     tracing::info!("Starting email fetcher (hot-reload from database)");
@@ -1362,6 +1365,47 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     Ok(())
+}
+
+fn spawn_runner_generation_reconciler(
+    db_pool: Arc<ticketing_system::SqlitePool>,
+    shutdown_token: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(
+            RUNNER_RECONCILE_INTERVAL_SECONDS,
+        ));
+        interval.reset();
+
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                _ = interval.tick() => {}
+            }
+
+            match ticketing_system::agent_runners::reconcile_stale_runner_generations(
+                &db_pool,
+                RUNNER_HEARTBEAT_STALE_SECONDS,
+            )
+            .await
+            {
+                Ok(reconciled) if reconciled.any() => {
+                    tracing::warn!(
+                        "Reconciled stale agent runner generation metadata: counts_recomputed={} generations_terminalized={}",
+                        reconciled.generations_recomputed,
+                        reconciled.generations_terminalized
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to reconcile stale runner generation metadata: {}",
+                        e
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Graceful shutdown signal handler
