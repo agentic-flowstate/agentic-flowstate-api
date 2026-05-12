@@ -6,11 +6,13 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex;
 
 use crate::agents::prompts::load_prompt;
 use crate::agents::run_oneshot;
@@ -20,6 +22,8 @@ use crate::observability::next_actions::{
 };
 
 const NEXT_ACTION_ICONS: [&str; 3] = ["sparkles", "checklist", "questionmark.bubble"];
+
+static BACKFILL_IN_FLIGHT: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Serialize)]
 pub struct ConversationNextActionResponse {
@@ -47,6 +51,12 @@ struct NextActionPromptContext {
     assistant_output: String,
 }
 
+struct LatestCompletedTurn {
+    source_message_id: String,
+    triggering_user_message: String,
+    assistant_output: String,
+}
+
 /// GET /api/conversations/:id/next-actions
 pub async fn list_conversation_next_actions(
     State(pool): State<Arc<SqlitePool>>,
@@ -64,6 +74,22 @@ pub async fn list_conversation_next_actions(
     let actions = ticketing_system::conversation_next_actions::list_for_conversation(&pool, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if actions.is_empty() {
+        if let Err(e) = spawn_backfill_for_completed_conversation(
+            pool.clone(),
+            user.user_id.clone(),
+            id.clone(),
+        )
+        .await
+        {
+            tracing::warn!(
+                "[NEXT-ACTIONS] Failed to schedule backfill for conv={}: {}",
+                id,
+                e
+            );
+        }
+    }
 
     Ok(Json(
         actions
@@ -140,6 +166,151 @@ pub fn spawn_generation(
             }
         }
     });
+}
+
+async fn spawn_backfill_for_completed_conversation(
+    db: Arc<SqlitePool>,
+    user_id: String,
+    conversation_id: String,
+) -> Result<()> {
+    if conversation_has_active_turn(&db, &conversation_id).await? {
+        tracing::debug!(
+            "[NEXT-ACTIONS] Skipping backfill for active conversation conv={}",
+            conversation_id
+        );
+        return Ok(());
+    }
+
+    let Some(source) = latest_completed_turn(&db, &conversation_id).await? else {
+        tracing::debug!(
+            "[NEXT-ACTIONS] No completed assistant turn available for backfill conv={}",
+            conversation_id
+        );
+        return Ok(());
+    };
+
+    {
+        let mut in_flight = BACKFILL_IN_FLIGHT.lock().await;
+        if !in_flight.insert(conversation_id.clone()) {
+            tracing::debug!(
+                "[NEXT-ACTIONS] Backfill already in flight conv={}",
+                conversation_id
+            );
+            return Ok(());
+        }
+    }
+
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let source_message_id = source.source_message_id;
+        tracing::info!(
+            "[NEXT-ACTIONS] Starting backfill generation conv={} msg={}",
+            conversation_id,
+            source_message_id
+        );
+
+        match generate_and_store(
+            db,
+            &user_id,
+            &conversation_id,
+            &source_message_id,
+            &source.triggering_user_message,
+            &source.assistant_output,
+        )
+        .await
+        {
+            Ok(suggestion_count) => {
+                let status = if suggestion_count == 0 {
+                    NextActionGenerationStatus::SkippedEmptyOutput
+                } else {
+                    NextActionGenerationStatus::Success
+                };
+                record_generation(
+                    &conversation_id,
+                    &source_message_id,
+                    "conversation-open-backfill",
+                    status,
+                    elapsed_ms(started),
+                    suggestion_count,
+                );
+            }
+            Err(error) => {
+                record_generation(
+                    &conversation_id,
+                    &source_message_id,
+                    "conversation-open-backfill",
+                    NextActionGenerationStatus::Error,
+                    elapsed_ms(started),
+                    0,
+                );
+                tracing::warn!(
+                    "[NEXT-ACTIONS] Failed backfill generation conv={} msg={}: {}",
+                    conversation_id,
+                    source_message_id,
+                    error
+                );
+            }
+        }
+
+        BACKFILL_IN_FLIGHT.lock().await.remove(&conversation_id);
+    });
+
+    Ok(())
+}
+
+async fn conversation_has_active_turn(db: &SqlitePool, conversation_id: &str) -> Result<bool> {
+    let active_jobs = ticketing_system::conversation_turn_jobs::has_active_job_for_conversation(
+        db,
+        conversation_id,
+    )
+    .await?;
+    if active_jobs {
+        return Ok(true);
+    }
+
+    let active_runner_turns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_runner_turns \
+         WHERE conversation_id = ? AND status IN ('queued', 'running')",
+    )
+    .bind(conversation_id)
+    .fetch_one(db)
+    .await?;
+
+    Ok(active_runner_turns > 0)
+}
+
+async fn latest_completed_turn(
+    db: &SqlitePool,
+    conversation_id: &str,
+) -> Result<Option<LatestCompletedTurn>> {
+    let row = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT assistant.id, user.content, assistant.content \
+         FROM conversation_messages assistant \
+         JOIN conversation_messages user ON user.id = ( \
+             SELECT prior_user.id FROM conversation_messages prior_user \
+             WHERE prior_user.conversation_id = assistant.conversation_id \
+               AND prior_user.role = 'user' \
+               AND prior_user.message_index < assistant.message_index \
+             ORDER BY prior_user.message_index DESC \
+             LIMIT 1 \
+         ) \
+         WHERE assistant.conversation_id = ? \
+           AND assistant.role = 'assistant' \
+           AND trim(assistant.content) != '' \
+         ORDER BY assistant.message_index DESC \
+         LIMIT 1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(db)
+    .await?;
+
+    Ok(row.map(
+        |(source_message_id, triggering_user_message, assistant_output)| LatestCompletedTurn {
+            source_message_id,
+            triggering_user_message,
+            assistant_output,
+        },
+    ))
 }
 
 async fn generate_and_store(
