@@ -59,6 +59,7 @@ pub struct ConversationInfo {
 pub struct ContextInfo {
     pub conversation_id: String,
     pub thread_total_tokens: i64,
+    pub context_used_tokens: i64,
     pub context_window_tokens: i64,
     pub context_percentage: f64,
     pub event_count: i64,
@@ -162,12 +163,14 @@ fn context_info(c: ConversationUsage) -> Option<ContextInfo> {
     if context_window_tokens <= 0 {
         return None;
     }
-    let percentage = (c.thread_total_tokens as f64 / context_window_tokens as f64) * 100.0;
+    let context_used_tokens = c.context_used_tokens?;
+    let percentage = (context_used_tokens as f64 / context_window_tokens as f64) * 100.0;
     Some(ContextInfo {
         conversation_id: c.conversation_id,
         thread_total_tokens: c.thread_total_tokens,
+        context_used_tokens,
         context_window_tokens,
-        context_percentage: (percentage * 10.0).round() / 10.0,
+        context_percentage: ((percentage * 10.0).round() / 10.0).clamp(0.0, 100.0),
         event_count: c.event_count,
     })
 }
@@ -220,5 +223,50 @@ fn credits_info(credits: CodexCreditsSnapshot) -> CreditsInfo {
         has_credits: credits.has_credits,
         unlimited: credits.unlimited,
         balance: credits.balance,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_percentage_uses_active_context_tokens_not_cumulative_thread_total() {
+        let context = context_info(ConversationUsage {
+            conversation_id: "conv-1".to_string(),
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            thread_total_tokens: 691_491,
+            context_used_tokens: Some(76_280),
+            context_window_tokens: Some(258_400),
+            event_count: 2,
+        })
+        .expect("context info");
+
+        assert_eq!(context.thread_total_tokens, 691_491);
+        assert_eq!(context.context_used_tokens, 76_280);
+        assert_eq!(context.context_percentage, 29.5);
+    }
+
+    #[test]
+    fn context_percentage_is_clamped_to_display_bounds() {
+        let context = context_info(ConversationUsage {
+            conversation_id: "conv-1".to_string(),
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 0,
+            thread_total_tokens: 1_000_000,
+            context_used_tokens: Some(300_000),
+            context_window_tokens: Some(258_400),
+            event_count: 2,
+        })
+        .expect("context info");
+
+        assert_eq!(context.context_percentage, 100.0);
     }
 }
