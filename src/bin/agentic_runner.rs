@@ -171,15 +171,23 @@ fn concurrency_allows_claim(concurrency: Option<usize>, active_jobs: usize) -> b
     concurrency.map(|limit| active_jobs < limit).unwrap_or(true)
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
 fn init_apns() -> Result<()> {
-    if apns::ApnsService::init().is_some() {
+    let alert_enabled = env_flag_enabled("APNS_ALERT_ENABLED");
+    if alert_enabled {
+        apns::ApnsService::init_from_env().context("APNs alert push init failed")?;
         tracing::info!("APNs alert push service initialized for runner");
+    } else {
+        tracing::info!("APNs alert push disabled for runner");
     }
 
     let apns_silent = Arc::new(apns::ApnsClient::new());
-    let silent_enabled = std::env::var("APNS_SILENT_ENABLED")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false);
+    let silent_enabled = env_flag_enabled("APNS_SILENT_ENABLED");
 
     if silent_enabled {
         let cfg = apns_silent

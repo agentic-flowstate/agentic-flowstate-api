@@ -8,10 +8,75 @@ use tokio::sync::RwLock;
 
 const APNS_PRODUCTION: &str = "https://api.push.apple.com";
 const APNS_SANDBOX: &str = "https://api.sandbox.push.apple.com";
-const BUNDLE_ID: &str = "com.agenticflowstate.app";
 const TOKEN_REFRESH_SECS: u64 = 50 * 60; // Refresh every 50 minutes (Apple max is 60)
 
 static APNS_INSTANCE: OnceCell<Arc<ApnsService>> = OnceCell::new();
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApnsAlertError {
+    #[error("APNs alert push misconfigured: {0}")]
+    MissingConfig(String),
+
+    #[error("Failed to read APNs .p8 key at {path}: {source}")]
+    KeyRead {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Failed to parse APNs .p8 key: {0}")]
+    KeyParse(#[source] jsonwebtoken::errors::Error),
+
+    #[error("Failed to build HTTP/2 APNs client: {0}")]
+    ClientBuild(#[source] reqwest::Error),
+}
+
+#[derive(Debug, Clone)]
+pub struct ApnsAlertConfig {
+    pub key_id: String,
+    pub team_id: String,
+    pub bundle_id: String,
+    pub key_path: String,
+    pub use_sandbox: bool,
+}
+
+impl ApnsAlertConfig {
+    pub fn from_env() -> Result<Self, ApnsAlertError> {
+        fn require(key: &str) -> Result<String, ApnsAlertError> {
+            match std::env::var(key) {
+                Ok(v) if !v.trim().is_empty() => Ok(v),
+                _ => Err(ApnsAlertError::MissingConfig(format!(
+                    "env var {} is required and must be non-empty",
+                    key
+                ))),
+            }
+        }
+
+        let key_id = require("APNS_KEY_ID")?;
+        let team_id = require("APNS_TEAM_ID")?;
+        let bundle_id = require("APNS_BUNDLE_ID")?;
+        let key_path = require("APNS_KEY_PATH")?;
+        let sandbox_raw = require("APNS_USE_SANDBOX")?;
+        let use_sandbox = match sandbox_raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            other => {
+                return Err(ApnsAlertError::MissingConfig(format!(
+                    "APNS_USE_SANDBOX must be true/false (got {:?})",
+                    other
+                )));
+            }
+        };
+
+        Ok(Self {
+            key_id,
+            team_id,
+            bundle_id,
+            key_path,
+            use_sandbox,
+        })
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct Claims {
@@ -56,6 +121,7 @@ pub struct ApnsService {
     encoding_key: EncodingKey,
     key_id: String,
     team_id: String,
+    bundle_id: String,
     base_url: String,
     client: reqwest::Client,
     cached_token: RwLock<Option<CachedToken>>,
@@ -67,48 +133,23 @@ impl ApnsService {
         APNS_INSTANCE.get()
     }
 
-    /// Initialize from environment. Returns None if .p8 key not found (APNs disabled).
-    pub fn init() -> Option<Arc<Self>> {
-        let key_path = dirs::home_dir()?
-            .join(".agentic-flowstate")
-            .join("apns-key.p8");
+    pub fn init_from_env() -> Result<Arc<Self>, ApnsAlertError> {
+        let cfg = ApnsAlertConfig::from_env()?;
+        Self::init(cfg)
+    }
 
-        if !key_path.exists() {
-            tracing::warn!(
-                "[APNS] No .p8 key found at {:?} — push notifications disabled",
-                key_path
-            );
-            return None;
+    pub fn init(cfg: ApnsAlertConfig) -> Result<Arc<Self>, ApnsAlertError> {
+        if let Some(existing) = APNS_INSTANCE.get() {
+            return Ok(existing.clone());
         }
 
-        let key_id = match std::env::var("APNS_KEY_ID") {
-            Ok(id) => id,
-            Err(_) => {
-                tracing::warn!("[APNS] APNS_KEY_ID not set — push notifications disabled");
-                return None;
-            }
-        };
+        let key_data = std::fs::read(&cfg.key_path).map_err(|e| ApnsAlertError::KeyRead {
+            path: cfg.key_path.clone(),
+            source: e,
+        })?;
+        let encoding_key = EncodingKey::from_ec_pem(&key_data).map_err(ApnsAlertError::KeyParse)?;
 
-        let team_id = std::env::var("APNS_TEAM_ID").unwrap_or_else(|_| "M3C97KFGK9".to_string());
-
-        let key_data = match std::fs::read(&key_path) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::error!("[APNS] Failed to read .p8 key: {}", e);
-                return None;
-            }
-        };
-
-        let encoding_key = match EncodingKey::from_ec_pem(&key_data) {
-            Ok(key) => key,
-            Err(e) => {
-                tracing::error!("[APNS] Failed to parse .p8 key: {}", e);
-                return None;
-            }
-        };
-
-        let is_sandbox = std::env::var("APNS_SANDBOX").unwrap_or_default() == "true";
-        let base_url = if is_sandbox {
+        let base_url = if cfg.use_sandbox {
             APNS_SANDBOX
         } else {
             APNS_PRODUCTION
@@ -119,21 +160,28 @@ impl ApnsService {
             .use_rustls_tls()
             .http2_prior_knowledge()
             .build()
-            .expect("Failed to build HTTP/2 APNs client");
+            .map_err(ApnsAlertError::ClientBuild)?;
 
-        tracing::info!("[APNS] Initialized (endpoint: {})", base_url);
+        tracing::info!(
+            "[APNS] Alert push initialized (bundle_id={}, endpoint={}, team={}, key={})",
+            cfg.bundle_id,
+            base_url,
+            cfg.team_id,
+            cfg.key_id
+        );
 
         let service = Arc::new(Self {
             encoding_key,
-            key_id,
-            team_id,
+            key_id: cfg.key_id,
+            team_id: cfg.team_id,
+            bundle_id: cfg.bundle_id,
             base_url,
             client,
             cached_token: RwLock::new(None),
         });
 
         let _ = APNS_INSTANCE.set(service.clone());
-        Some(service)
+        Ok(service)
     }
 
     /// Get or refresh the JWT bearer token.
@@ -219,7 +267,7 @@ impl ApnsService {
             .client
             .post(&url)
             .header("authorization", format!("bearer {}", token))
-            .header("apns-topic", BUNDLE_ID)
+            .header("apns-topic", &self.bundle_id)
             .header("apns-push-type", "alert")
             .header("apns-priority", "10")
             .header(

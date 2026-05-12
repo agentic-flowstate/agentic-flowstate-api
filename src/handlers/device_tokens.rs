@@ -185,14 +185,13 @@ pub struct RemoveTokenRequest {
 /// `POST /api/device-tokens` — legacy alert-push registration entry point.
 ///
 /// The legacy body only carries `device_token` + `device_name`, so platform
-/// is fixed to `"ios"` and bundle id is taken from `APNS_BUNDLE_ID` if set,
-/// else the app's standard bundle id constant.
+/// is fixed to `"ios"` and bundle id is taken from required `APNS_BUNDLE_ID`.
 pub async fn register_device_token(
     State(db): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<RegisterTokenRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let bundle_id = legacy_bundle_id();
+    let bundle_id = configured_bundle_id()?;
     upsert_device_token(
         &db,
         &user.user_id,
@@ -231,11 +230,11 @@ pub async fn remove_device_token(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn legacy_bundle_id() -> String {
+fn configured_bundle_id() -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     std::env::var("APNS_BUNDLE_ID")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "com.agenticflowstate.app".to_string())
+        .ok_or_else(|| internal("APNS_BUNDLE_ID is required for legacy device-token registration"))
 }
 
 fn bad_request(msg: &str) -> (StatusCode, Json<serde_json::Value>) {

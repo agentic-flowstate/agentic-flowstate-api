@@ -86,6 +86,12 @@ impl FromRef<AppState> for Arc<rate_limiting::StreamRateLimiter> {
     }
 }
 
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
 fn spawn_direct_restart_or_setup(service: &str, action: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
     let log = "/tmp/agentic-restart-watcher.log";
@@ -410,13 +416,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Initialize the legacy alert-style APNs push service. Its `init()`
-    // populates the process-wide `APNS_INSTANCE` OnceCell; downstream
-    // callers access it via `ApnsService::global()`. We deliberately
-    // drop the returned handle here — keeping it on AppState was dead
-    // weight (the singleton owns its own Arc clone via OnceCell).
-    if apns::ApnsService::init().is_some() {
-        tracing::info!("APNs push notification service initialized");
+    // Initialize user-visible APNs alert pushes for completed conversations.
+    // This is gated separately from silent background pushes because alert
+    // delivery is a user-facing product path: when enabled, every APNS_* value
+    // is required and startup fails loudly on misconfiguration.
+    let alert_enabled = env_flag_enabled("APNS_ALERT_ENABLED");
+    if alert_enabled {
+        apns::ApnsService::init_from_env().map_err(|e| {
+            tracing::error!("[APNS_ALERT] init failed: {}", e);
+            anyhow::anyhow!("APNs alert push init failed: {}", e)
+        })?;
+        tracing::info!("[APNS_ALERT] initialized");
+    } else {
+        tracing::info!("[APNS_ALERT] disabled (APNS_ALERT_ENABLED not set to true)");
     }
 
     // Initialize silent-push sender (durable chat streaming wake signals).
@@ -424,9 +436,7 @@ async fn main() -> anyhow::Result<()> {
     // provisioned .p8 key. When enabled, ALL five env vars are required —
     // init() returns an error that we propagate via `?`, crashing startup.
     let apns_silent = Arc::new(apns::ApnsClient::new());
-    let silent_enabled = std::env::var("APNS_SILENT_ENABLED")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-        .unwrap_or(false);
+    let silent_enabled = env_flag_enabled("APNS_SILENT_ENABLED");
     if silent_enabled {
         let cfg = apns_silent.init_from_env().map_err(|e| {
             tracing::error!("[APNS_SILENT] init failed: {}", e);
