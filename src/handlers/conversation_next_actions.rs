@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::agents::prompts::load_prompt;
 use crate::agents::run_oneshot;
 use crate::auth_middleware::AuthenticatedUser;
+use crate::observability::next_actions::{record_generation, NextActionGenerationStatus};
 
 const NEXT_ACTION_ICONS: [&str; 3] = ["sparkles", "checklist", "questionmark.bubble"];
 
@@ -22,7 +24,6 @@ pub struct ConversationNextActionResponse {
     pub id: String,
     pub label: String,
     pub icon: String,
-    pub preview: String,
     pub message: String,
     pub sort_order: i64,
 }
@@ -35,7 +36,6 @@ struct GeneratedNextActions {
 #[derive(Deserialize)]
 struct GeneratedNextAction {
     label: String,
-    preview: String,
     message: String,
 }
 
@@ -64,7 +64,6 @@ pub async fn list_conversation_next_actions(
                 id: action.id,
                 label: action.label,
                 icon: action.icon,
-                preview: action.preview,
                 message: action.message,
                 sort_order: action.sort_order,
             })
@@ -81,7 +80,15 @@ pub fn spawn_generation(
     assistant_output: String,
 ) {
     tokio::spawn(async move {
-        if let Err(error) = generate_and_store(
+        let started = Instant::now();
+        tracing::info!(
+            "[NEXT-ACTIONS] Starting generation conv={} msg={} agent={}",
+            conversation_id,
+            source_message_id,
+            agent_name
+        );
+
+        match generate_and_store(
             db,
             &user_id,
             &conversation_id,
@@ -91,12 +98,37 @@ pub fn spawn_generation(
         )
         .await
         {
-            tracing::warn!(
-                "[NEXT-ACTIONS] Failed to generate suggestions for conv={} msg={}: {}",
-                conversation_id,
-                source_message_id,
-                error
-            );
+            Ok(suggestion_count) => {
+                let status = if suggestion_count == 0 {
+                    NextActionGenerationStatus::SkippedEmptyOutput
+                } else {
+                    NextActionGenerationStatus::Success
+                };
+                record_generation(
+                    &conversation_id,
+                    &source_message_id,
+                    &agent_name,
+                    status,
+                    elapsed_ms(started),
+                    suggestion_count,
+                );
+            }
+            Err(error) => {
+                record_generation(
+                    &conversation_id,
+                    &source_message_id,
+                    &agent_name,
+                    NextActionGenerationStatus::Error,
+                    elapsed_ms(started),
+                    0,
+                );
+                tracing::warn!(
+                    "[NEXT-ACTIONS] Failed to generate suggestions for conv={} msg={}: {}",
+                    conversation_id,
+                    source_message_id,
+                    error
+                );
+            }
         }
     });
 }
@@ -108,10 +140,10 @@ async fn generate_and_store(
     source_message_id: &str,
     agent_name: &str,
     assistant_output: &str,
-) -> Result<()> {
+) -> Result<usize> {
     let output = assistant_output.trim();
     if output.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
     let conv = ticketing_system::conversations::get_conversation(&db, conversation_id, false)
@@ -136,6 +168,7 @@ async fn generate_and_store(
 
     let generated = parse_generated_actions(&result.text)?;
     let actions = normalize_generated_actions(generated)?;
+    let suggestion_count = actions.len();
     ticketing_system::conversation_next_actions::replace_for_conversation(
         &db,
         conversation_id,
@@ -144,7 +177,11 @@ async fn generate_and_store(
     )
     .await?;
 
-    Ok(())
+    Ok(suggestion_count)
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn parse_generated_actions(text: &str) -> Result<GeneratedNextActions> {
@@ -185,24 +222,17 @@ fn normalize_generated_actions(
         .enumerate()
         .map(|(idx, suggestion)| {
             let label = suggestion.label.trim().to_string();
-            let preview = suggestion.preview.trim().to_string();
             let message = suggestion.message.trim().to_string();
-            if label.is_empty() || preview.is_empty() || message.is_empty() {
+            if label.is_empty() || message.is_empty() {
                 bail!("next-actions suggestion contains an empty field");
             }
             if label.chars().count() > 24 {
                 bail!("next-actions label is longer than 24 characters: {}", label);
             }
-            if preview.chars().count() > 120 {
-                bail!(
-                    "next-actions preview is longer than 120 characters: {}",
-                    preview
-                );
-            }
             Ok(ticketing_system::NewConversationNextAction {
                 label,
                 icon: NEXT_ACTION_ICONS[idx].to_string(),
-                preview,
+                preview: String::new(),
                 message,
                 sort_order: idx as i64,
             })

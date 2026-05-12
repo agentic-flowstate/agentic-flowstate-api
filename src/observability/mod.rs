@@ -4,6 +4,7 @@
 //!
 //! * [`streaming`] — durable-streaming metrics (T-56987678): stream
 //!   lifecycle, push delivery, gap detection, session start.
+//! * [`next_actions`] — post-turn follow-up suggestion generation metrics.
 //!
 //! # Integration
 //!
@@ -22,6 +23,7 @@
 //! * Every `tracing::info!` emitted from this module MUST also update a
 //!   metric — and vice-versa — so dashboards and logs agree.
 
+pub mod next_actions;
 pub mod streaming;
 
 use std::sync::Arc;
