@@ -47,8 +47,16 @@ pub struct ListConversationsQuery {
 
 #[derive(Debug, Serialize)]
 pub struct ConversationListResponse {
-    pub conversations: Vec<Conversation>,
+    pub conversations: Vec<ConversationSummary>,
     pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationSummary {
+    #[serde(flatten)]
+    pub conversation: Conversation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tool_call_started_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +70,8 @@ pub struct ConversationRunStatusResponse {
     pub should_fetch: bool,
     pub updated_at: i64,
     pub last_event_index: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tool_call_started_at: Option<String>,
     pub server_time: i64,
 }
 
@@ -87,6 +97,84 @@ fn normalize_checkpoint_status(status: Option<&str>) -> String {
         Some(_) => "failed",
     }
     .to_string()
+}
+
+fn format_central_tool_call_time(timestamp: i64) -> Option<String> {
+    let utc = chrono::DateTime::from_timestamp(timestamp, 0)?;
+    let local = utc.with_timezone(&chrono_tz::America::Chicago);
+    let suffix = if local.format("%p").to_string() == "AM" {
+        "a.m."
+    } else {
+        "p.m."
+    };
+    Some(format!("{} {}", local.format("%-I:%M"), suffix))
+}
+
+#[derive(sqlx::FromRow)]
+struct LastToolCallStartedAtRow {
+    conversation_id: String,
+    last_started_at: Option<i64>,
+}
+
+async fn last_tool_call_started_at_map(
+    pool: &SqlitePool,
+    conversation_ids: &[String],
+) -> anyhow::Result<HashMap<String, String>> {
+    if conversation_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(conversation_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT conversation_id, MAX(created_at) AS last_started_at
+        FROM conversation_tool_calls
+        WHERE conversation_id IN ({})
+        GROUP BY conversation_id
+        "#,
+        placeholders
+    );
+
+    let mut query = sqlx::query_as::<_, LastToolCallStartedAtRow>(&sql);
+    for id in conversation_ids {
+        query = query.bind(id);
+    }
+
+    let rows = query.fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some((
+                row.conversation_id,
+                format_central_tool_call_time(row.last_started_at?)?,
+            ))
+        })
+        .collect())
+}
+
+pub(crate) async fn conversation_summaries(
+    pool: &SqlitePool,
+    conversations: Vec<Conversation>,
+) -> anyhow::Result<Vec<ConversationSummary>> {
+    let ids = conversations
+        .iter()
+        .map(|conv| conv.id.clone())
+        .collect::<Vec<_>>();
+    let last_tool_calls = last_tool_call_started_at_map(pool, &ids).await?;
+
+    Ok(conversations
+        .into_iter()
+        .map(|conversation| {
+            let last_tool_call_started_at = last_tool_calls.get(&conversation.id).cloned();
+            ConversationSummary {
+                conversation,
+                last_tool_call_started_at,
+            }
+        })
+        .collect())
 }
 
 async fn repair_checkpoint_from_active_durable_work(
@@ -210,6 +298,9 @@ async fn conversation_run_status_snapshot(
     let last_event_index = conversations::get_max_event_index(pool, conversation_id)
         .await
         .unwrap_or(-1);
+    let mut last_tool_calls =
+        last_tool_call_started_at_map(pool, &[conversation_id.to_string()]).await?;
+    let last_tool_call_started_at = last_tool_calls.remove(conversation_id);
 
     Ok(ConversationRunStatusResponse {
         conversation_id: conversation_id.to_string(),
@@ -219,6 +310,7 @@ async fn conversation_run_status_snapshot(
         should_fetch: !is_processing,
         updated_at: checkpoint.map(|cp| cp.updated_at).unwrap_or(0),
         last_event_index,
+        last_tool_call_started_at,
         server_time: chrono::Utc::now().timestamp(),
     })
 }
@@ -302,9 +394,12 @@ pub async fn list_conversations(
     }
 
     let total = list.len() as i64;
+    let conversations = conversation_summaries(&pool, list)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(ConversationListResponse {
-        conversations: list,
+        conversations,
         total,
     }))
 }
@@ -315,7 +410,7 @@ pub async fn get_conversation(
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
-) -> Result<Json<Conversation>, (StatusCode, String)> {
+) -> Result<Json<ConversationSummary>, (StatusCode, String)> {
     let conv = conversations::get_conversation(&pool, &id, true)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -329,7 +424,18 @@ pub async fn get_conversation(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(apply_run_status_to_conversation(conv, &status)))
+    let conversation = apply_run_status_to_conversation(conv, &status);
+    let summary = conversation_summaries(&pool, vec![conversation])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .into_iter()
+        .next()
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Conversation summary missing".to_string(),
+        ))?;
+
+    Ok(Json(summary))
 }
 
 /// Create a conversation (POST /api/conversations)
@@ -1200,7 +1306,7 @@ pub enum ConversationStreamEvent {
     /// Full list of conversations (sent on connect and when changes detected)
     #[serde(rename = "sync")]
     Sync {
-        conversations: Vec<Conversation>,
+        conversations: Vec<ConversationSummary>,
         updated_at: i64,
     },
 }
@@ -1221,21 +1327,29 @@ pub async fn subscribe_conversations(
             // Get current conversations for this user
             match conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user_id), params.agent.as_deref(), params.status.as_deref(), None, None).await {
                 Ok(convs) => {
+                    let summaries = match conversation_summaries(&pool, convs).await {
+                        Ok(summaries) => summaries,
+                        Err(e) => {
+                            tracing::error!("Failed to summarize conversations for SSE: {}", e);
+                            continue;
+                        }
+                    };
                     // Simple change detection: hash the updated_at timestamps
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    for conv in &convs {
-                        conv.updated_at.hash(&mut hasher);
-                        conv.id.hash(&mut hasher);
+                    for summary in &summaries {
+                        summary.conversation.updated_at.hash(&mut hasher);
+                        summary.conversation.id.hash(&mut hasher);
+                        summary.last_tool_call_started_at.hash(&mut hasher);
                     }
-                    convs.len().hash(&mut hasher);
+                    summaries.len().hash(&mut hasher);
                     let current_hash = hasher.finish();
 
                     // Only send if changed
                     if current_hash != last_sync_hash {
                         last_sync_hash = current_hash;
                         let event = ConversationStreamEvent::Sync {
-                            conversations: convs,
+                            conversations: summaries,
                             updated_at: chrono::Utc::now().timestamp(),
                         };
                         if let Ok(json) = serde_json::to_string(&event) {
@@ -1343,6 +1457,7 @@ mod tests {
             should_fetch: !is_processing,
             updated_at: 1_778_539_159,
             last_event_index: 128,
+            last_tool_call_started_at: Some("11:38 a.m.".to_string()),
             server_time: 1_778_539_160,
         }
     }

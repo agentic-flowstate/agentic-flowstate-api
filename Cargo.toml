@@ -47,6 +47,7 @@ metrics-exporter-prometheus = { version = "0.13", default-features = false }
 # Utils
 uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 once_cell = "1.19"
 # Sharded concurrent hash map. Used by the per-(user, conversation)
 # stream rate limiter (T-C410DD96) so a single global bucket table is

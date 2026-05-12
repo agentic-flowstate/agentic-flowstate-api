@@ -232,12 +232,20 @@ pub async fn subscribe_unified_events(
                 if let Ok(convs) = ticketing_system::conversations::list_conversations(
                     &pool, validated_org.as_deref(), Some(&user_id), None, None, None, None,
                 ).await {
-                    let hash = hash_conversation_list(&convs);
+                    let summaries = match crate::handlers::conversations::conversation_summaries(&pool, convs).await {
+                        Ok(summaries) => summaries,
+                        Err(e) => {
+                            tracing::error!("Failed to summarize conversations for unified SSE: {}", e);
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                    };
+                    let hash = hash_conversation_list(&summaries);
                     if hash != hash_conversations {
                         hash_conversations = hash;
                         let payload = serde_json::json!({
                             "type": "sync",
-                            "conversations": convs,
+                            "conversations": summaries,
                             "updated_at": chrono::Utc::now().timestamp(),
                         });
                         if let Ok(json) = serde_json::to_string(&payload) {
@@ -419,11 +427,12 @@ fn hash_daily_plan(plan: &ticketing_system::DailyPlanView) -> u64 {
     hasher.finish()
 }
 
-fn hash_conversation_list(convs: &[ticketing_system::Conversation]) -> u64 {
+fn hash_conversation_list(convs: &[crate::handlers::conversations::ConversationSummary]) -> u64 {
     let mut hasher = DefaultHasher::new();
-    for conv in convs {
-        conv.updated_at.hash(&mut hasher);
-        conv.id.hash(&mut hasher);
+    for summary in convs {
+        summary.conversation.updated_at.hash(&mut hasher);
+        summary.conversation.id.hash(&mut hasher);
+        summary.last_tool_call_started_at.hash(&mut hasher);
     }
     convs.len().hash(&mut hasher);
     hasher.finish()
