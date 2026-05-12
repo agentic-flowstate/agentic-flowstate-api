@@ -222,6 +222,32 @@ pub struct RunningCodexAppServer {
     completion: Arc<Mutex<Option<TurnCompletion>>>,
 }
 
+#[derive(Default)]
+struct AgentMessageTextCollector {
+    delta_text: String,
+    completed_text: Option<String>,
+}
+
+impl AgentMessageTextCollector {
+    fn push_delta(&mut self, text: &str) {
+        self.delta_text.push_str(text);
+    }
+
+    fn set_completed(&mut self, text: String) {
+        self.completed_text = Some(text);
+    }
+
+    fn finish(self) -> Option<String> {
+        self.completed_text.or_else(|| {
+            if self.delta_text.trim().is_empty() {
+                None
+            } else {
+                Some(self.delta_text)
+            }
+        })
+    }
+}
+
 pub struct CodexAppServerOutcome {
     pub exit_status: ExitStatus,
     pub stderr_text: String,
@@ -1458,13 +1484,17 @@ pub async fn run_codex_text(
         approved_mcp_tools: Vec::new(),
     })
     .await?;
-    let mut last_agent_message = None;
+    let mut agent_message = AgentMessageTextCollector::default();
 
     while let Some(event) = running.events.recv().await {
-        if let CodexAppServerEvent::AgentMessageDelta { text, .. }
-        | CodexAppServerEvent::AgentMessageCompleted { text, .. } = event
-        {
-            last_agent_message = Some(text);
+        match event {
+            CodexAppServerEvent::AgentMessageDelta { text, .. } => {
+                agent_message.push_delta(&text);
+            }
+            CodexAppServerEvent::AgentMessageCompleted { text, .. } => {
+                agent_message.set_completed(text);
+            }
+            _ => {}
         }
     }
 
@@ -1473,7 +1503,7 @@ pub async fn run_codex_text(
         return Err(outcome.failure_summary("codex app-server"));
     }
 
-    last_agent_message.ok_or_else(|| {
+    agent_message.finish().ok_or_else(|| {
         let stderr_text = outcome.stderr_text.trim();
         if stderr_text.is_empty() {
             "codex app-server returned no agentMessage output".to_string()
@@ -2034,6 +2064,28 @@ approval_mode = "approve"
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn text_collector_accumulates_delta_only_messages() {
+        let mut collector = AgentMessageTextCollector::default();
+        collector.push_delta("{\"suggestions\":[");
+        collector.push_delta("{\"label\":\"Add tests\",\"message\":\"Add tests.\"}");
+        collector.push_delta("]}");
+
+        assert_eq!(
+            collector.finish().as_deref(),
+            Some("{\"suggestions\":[{\"label\":\"Add tests\",\"message\":\"Add tests.\"}]}")
+        );
+    }
+
+    #[test]
+    fn text_collector_prefers_completed_message() {
+        let mut collector = AgentMessageTextCollector::default();
+        collector.push_delta("partial");
+        collector.set_completed("complete".to_string());
+
+        assert_eq!(collector.finish().as_deref(), Some("complete"));
     }
 
     #[test]
