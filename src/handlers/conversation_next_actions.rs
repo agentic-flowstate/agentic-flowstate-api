@@ -40,6 +40,13 @@ struct GeneratedNextActions {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum GeneratedNextActionsPayload {
+    Object(GeneratedNextActions),
+    Array(Vec<GeneratedNextAction>),
+}
+
+#[derive(Deserialize)]
 struct GeneratedNextAction {
     label: String,
     message: String,
@@ -350,19 +357,7 @@ async fn generate_and_store(
         prompt_context.assistant_output.chars().count()
     );
 
-    let mut vars = HashMap::new();
-    vars.insert(
-        "first_user_message".to_string(),
-        prompt_context.first_user_message,
-    );
-    vars.insert(
-        "triggering_user_message".to_string(),
-        prompt_context.triggering_user_message,
-    );
-    vars.insert(
-        "assistant_output".to_string(),
-        prompt_context.assistant_output,
-    );
+    let vars = prompt_vars(&prompt_context);
     let prompt =
         load_prompt("conversation-next-actions", vars).context("load next-actions user prompt")?;
 
@@ -371,8 +366,41 @@ async fn generate_and_store(
         .await
         .map_err(|e| anyhow!(e))?;
 
-    let generated = parse_generated_actions(&result.text)?;
-    let actions = normalize_generated_actions(generated)?;
+    let actions = match parse_and_normalize_actions(&result.text) {
+        Ok(actions) => actions,
+        Err(initial_error) => {
+            let initial_error_text = format!("{:#}", initial_error);
+            tracing::warn!(
+                "[NEXT-ACTIONS] Initial JSON parse/validation failed conv={} msg={}: {}; attempting repair; output_preview={}",
+                conversation_id,
+                source_message_id,
+                initial_error_text,
+                output_preview(&result.text)
+            );
+
+            let repair_system_prompt =
+                load_prompt("conversation-next-actions-repair-system", HashMap::new())
+                    .context("load next-actions repair system prompt")?;
+            let mut repair_vars = prompt_vars(&prompt_context);
+            repair_vars.insert("raw_output".to_string(), result.text.clone());
+            let repair_prompt = load_prompt("conversation-next-actions-repair", repair_vars)
+                .context("load next-actions repair prompt")?;
+            let repair_result =
+                run_oneshot(None, &repair_system_prompt, &working_dir, repair_prompt)
+                    .await
+                    .map_err(|e| anyhow!(e))?;
+
+            parse_and_normalize_actions(&repair_result.text).with_context(|| {
+                format!(
+                    "parse repaired next-actions JSON; initial_error={}; initial_output_preview={}; repair_output_preview={}",
+                    initial_error_text,
+                    output_preview(&result.text),
+                    output_preview(&repair_result.text)
+                )
+            })?
+        }
+    };
+
     let replacement = ticketing_system::conversation_next_actions::replace_for_conversation(
         &db,
         conversation_id,
@@ -419,30 +447,177 @@ async fn load_prompt_context(
     })
 }
 
+fn prompt_vars(context: &NextActionPromptContext) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    vars.insert(
+        "first_user_message".to_string(),
+        context.first_user_message.clone(),
+    );
+    vars.insert(
+        "triggering_user_message".to_string(),
+        context.triggering_user_message.clone(),
+    );
+    vars.insert(
+        "assistant_output".to_string(),
+        context.assistant_output.clone(),
+    );
+    vars
+}
+
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn parse_generated_actions(text: &str) -> Result<GeneratedNextActions> {
-    let json = extract_json_object(text)?;
-    serde_json::from_str(json).context("parse next-actions JSON")
+fn parse_and_normalize_actions(
+    text: &str,
+) -> Result<Vec<ticketing_system::NewConversationNextAction>> {
+    let generated = parse_generated_actions(text)?;
+    normalize_generated_actions(generated)
 }
 
-fn extract_json_object(text: &str) -> Result<&str> {
+fn parse_generated_actions(text: &str) -> Result<GeneratedNextActions> {
+    let json = extract_json_payload(text)?;
+    match parse_generated_payload(json) {
+        Ok(generated) => Ok(generated),
+        Err(first_error) => {
+            let repaired = remove_trailing_commas(json);
+            if repaired == json {
+                return Err(first_error).context("parse next-actions JSON");
+            }
+            parse_generated_payload(&repaired).with_context(|| {
+                format!(
+                    "parse next-actions JSON after removing trailing commas; original_error={}",
+                    first_error
+                )
+            })
+        }
+    }
+}
+
+fn parse_generated_payload(json: &str) -> Result<GeneratedNextActions, serde_json::Error> {
+    match serde_json::from_str::<GeneratedNextActionsPayload>(json)? {
+        GeneratedNextActionsPayload::Object(generated) => Ok(generated),
+        GeneratedNextActionsPayload::Array(suggestions) => Ok(GeneratedNextActions { suggestions }),
+    }
+}
+
+fn extract_json_payload(text: &str) -> Result<&str> {
     let trimmed = text.trim();
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        return Ok(trimmed);
+    if trimmed.is_empty() {
+        bail!("next-actions output is empty");
     }
-    let start = trimmed
-        .find('{')
-        .ok_or_else(|| anyhow!("next-actions output did not contain a JSON object"))?;
-    let end = trimmed
-        .rfind('}')
-        .ok_or_else(|| anyhow!("next-actions output did not contain a complete JSON object"))?;
-    if end < start {
-        bail!("next-actions JSON bounds are invalid");
+
+    if let Some(end) = balanced_json_end(trimmed, 0) {
+        return Ok(&trimmed[..=end]);
     }
-    Ok(&trimmed[start..=end])
+
+    for (start, ch) in trimmed.char_indices() {
+        if (ch == '{' || ch == '[') && start > 0 {
+            if let Some(end) = balanced_json_end(trimmed, start) {
+                return Ok(&trimmed[start..=end]);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "next-actions output did not contain a complete JSON object or array"
+    ))
+}
+
+fn balanced_json_end(text: &str, start: usize) -> Option<usize> {
+    let first = text[start..].chars().next()?;
+    if first != '{' && first != '[' {
+        return None;
+    }
+
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in text[start..].char_indices() {
+        let idx = start + offset;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn remove_trailing_commas(json: &str) -> String {
+    let mut repaired = String::with_capacity(json.len());
+    let mut chars = json.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if in_string {
+            repaired.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_string = true;
+                repaired.push(ch);
+            }
+            ',' => {
+                let mut lookahead = chars.clone();
+                while matches!(lookahead.peek(), Some(next) if next.is_whitespace()) {
+                    lookahead.next();
+                }
+                if matches!(lookahead.peek(), Some('}' | ']')) {
+                    continue;
+                }
+                repaired.push(ch);
+            }
+            _ => repaired.push(ch),
+        }
+    }
+
+    repaired
+}
+
+fn output_preview(text: &str) -> String {
+    const MAX_PREVIEW_CHARS: usize = 500;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = collapsed
+        .chars()
+        .take(MAX_PREVIEW_CHARS)
+        .collect::<String>();
+    if collapsed.chars().count() > MAX_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn normalize_generated_actions(
@@ -477,4 +652,80 @@ fn normalize_generated_actions(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object_payload() -> &'static str {
+        r#"{
+  "suggestions": [
+    {
+      "label": "Add tests",
+      "message": "Add focused regression tests."
+    },
+    {
+      "label": "Deploy it",
+      "message": "Deploy the change and check logs."
+    },
+    {
+      "label": "Show diff",
+      "message": "Show me the final diff."
+    }
+  ]
+}"#
+    }
+
+    #[test]
+    fn parses_fenced_json_object() {
+        let text = format!("```json\n{}\n```", object_payload());
+        let actions = parse_and_normalize_actions(&text).unwrap();
+
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].label, "Add tests");
+        assert_eq!(actions[1].sort_order, 1);
+        assert_eq!(actions[2].icon, "questionmark.bubble");
+    }
+
+    #[test]
+    fn parses_top_level_array_payload() {
+        let actions = parse_and_normalize_actions(
+            r#"[
+  {"label":"Add tests","message":"Add focused regression tests."},
+  {"label":"Deploy it","message":"Deploy the change and check logs."},
+  {"label":"Show diff","message":"Show me the final diff."}
+]"#,
+        )
+        .unwrap();
+
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].icon, "sparkles");
+    }
+
+    #[test]
+    fn removes_trailing_commas_before_parse() {
+        let actions = parse_and_normalize_actions(
+            r#"{
+  "suggestions": [
+    {"label":"Add tests","message":"Add focused regression tests.",},
+    {"label":"Deploy it","message":"Deploy the change and check logs.",},
+    {"label":"Show diff","message":"Show me the final diff.",},
+  ],
+}"#,
+        )
+        .unwrap();
+
+        assert_eq!(actions.len(), 3);
+    }
+
+    #[test]
+    fn rejects_wrong_suggestion_count() {
+        let err = parse_and_normalize_actions(
+            r#"{"suggestions":[{"label":"Add tests","message":"Add focused regression tests."}]}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("expected 3"));
+    }
 }

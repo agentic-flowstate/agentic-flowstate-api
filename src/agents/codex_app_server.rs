@@ -364,6 +364,17 @@ fn config_string_literal(value: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to encode Codex config string value: {e}"))
 }
 
+fn config_key_literal(value: &str) -> Result<String, String> {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Ok(value.to_string());
+    }
+    config_string_literal(value)
+}
+
 fn working_dir_trust_overrides(path: &Path) -> Result<Vec<String>, String> {
     let mut paths = vec![path.to_string_lossy().to_string()];
 
@@ -384,7 +395,7 @@ fn working_dir_trust_overrides(path: &Path) -> Result<Vec<String>, String> {
 }
 
 fn mcp_server_command_override(server_name: &str, command: &str) -> Result<String, String> {
-    let quoted_name = config_string_literal(server_name)?;
+    let quoted_name = config_key_literal(server_name)?;
     let quoted_command = config_string_literal(command)?;
     Ok(format!(
         "mcp_servers.{quoted_name}.command={quoted_command}"
@@ -392,7 +403,7 @@ fn mcp_server_command_override(server_name: &str, command: &str) -> Result<Strin
 }
 
 fn mcp_server_env_override(server_name: &str, key: &str, value: &str) -> Result<String, String> {
-    let quoted_name = config_string_literal(server_name)?;
+    let quoted_name = config_key_literal(server_name)?;
     let quoted_value = config_string_literal(value)?;
     Ok(format!(
         "mcp_servers.{quoted_name}.env.{key}={quoted_value}"
@@ -1859,7 +1870,7 @@ mod tests {
 
         assert!(args
             .iter()
-            .any(|arg| arg == "mcp_servers.\"agentic-mcp\".command=\"/tmp/agentic_mcp\""));
+            .any(|arg| arg == "mcp_servers.agentic-mcp.command=\"/tmp/agentic_mcp\""));
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--disable" && pair[1] == "apps"));

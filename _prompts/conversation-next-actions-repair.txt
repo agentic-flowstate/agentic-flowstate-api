@@ -1,4 +1,4 @@
-Read only these three conversation excerpts and propose exactly 3 useful follow-up messages the user may want to send next.
+The previous next-action generator returned invalid output. Produce a valid replacement using the same conversation context.
 
 First user message in the conversation:
 <first_user_message>
@@ -15,11 +15,10 @@ Assistant output that just completed:
 {{ASSISTANT_OUTPUT}}
 </assistant_output>
 
-Do not assume hidden conversation history beyond these excerpts.
-
-Each suggestion must be ready for a mobile chat UI:
-- `label`: short pill label, 2-4 words, 24 characters or fewer.
-- `message`: the full user message to insert into the composer. Make it concrete, directly relevant to the assistant output, and editable by the user before sending.
+Invalid generator output:
+<raw_output>
+{{RAW_OUTPUT}}
+</raw_output>
 
 Return exactly this JSON shape with exactly 3 suggestions:
 {
