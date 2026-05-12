@@ -15,7 +15,9 @@ use std::time::Instant;
 use crate::agents::prompts::load_prompt;
 use crate::agents::run_oneshot;
 use crate::auth_middleware::AuthenticatedUser;
-use crate::observability::next_actions::{record_generation, NextActionGenerationStatus};
+use crate::observability::next_actions::{
+    record_generation, record_storage, NextActionGenerationStatus,
+};
 
 const NEXT_ACTION_ICONS: [&str; 3] = ["sparkles", "checklist", "questionmark.bubble"];
 
@@ -37,6 +39,12 @@ struct GeneratedNextActions {
 struct GeneratedNextAction {
     label: String,
     message: String,
+}
+
+struct NextActionPromptContext {
+    first_user_message: String,
+    triggering_user_message: String,
+    assistant_output: String,
 }
 
 /// GET /api/conversations/:id/next-actions
@@ -77,6 +85,7 @@ pub fn spawn_generation(
     conversation_id: String,
     source_message_id: String,
     agent_name: String,
+    triggering_user_message: String,
     assistant_output: String,
 ) {
     tokio::spawn(async move {
@@ -93,7 +102,7 @@ pub fn spawn_generation(
             &user_id,
             &conversation_id,
             &source_message_id,
-            &agent_name,
+            &triggering_user_message,
             &assistant_output,
         )
         .await
@@ -138,12 +147,16 @@ async fn generate_and_store(
     user_id: &str,
     conversation_id: &str,
     source_message_id: &str,
-    agent_name: &str,
+    triggering_user_message: &str,
     assistant_output: &str,
 ) -> Result<usize> {
     let output = assistant_output.trim();
     if output.is_empty() {
         return Ok(0);
+    }
+    let triggering_user_message = triggering_user_message.trim();
+    if triggering_user_message.is_empty() {
+        bail!("triggering user message is empty");
     }
 
     let conv = ticketing_system::conversations::get_conversation(&db, conversation_id, false)
@@ -155,9 +168,30 @@ async fn generate_and_store(
 
     let system_prompt = load_prompt("conversation-next-actions-system", HashMap::new())
         .context("load next-actions system prompt")?;
+    let prompt_context =
+        load_prompt_context(&db, conversation_id, triggering_user_message, output).await?;
+    tracing::info!(
+        "[NEXT-ACTIONS] Loaded prompt context conv={} msg={} first_user_chars={} triggering_user_chars={} assistant_output_chars={}",
+        conversation_id,
+        source_message_id,
+        prompt_context.first_user_message.chars().count(),
+        prompt_context.triggering_user_message.chars().count(),
+        prompt_context.assistant_output.chars().count()
+    );
+
     let mut vars = HashMap::new();
-    vars.insert("agent_name".to_string(), agent_name.to_string());
-    vars.insert("assistant_output".to_string(), output.to_string());
+    vars.insert(
+        "first_user_message".to_string(),
+        prompt_context.first_user_message,
+    );
+    vars.insert(
+        "triggering_user_message".to_string(),
+        prompt_context.triggering_user_message,
+    );
+    vars.insert(
+        "assistant_output".to_string(),
+        prompt_context.assistant_output,
+    );
     let prompt =
         load_prompt("conversation-next-actions", vars).context("load next-actions user prompt")?;
 
@@ -168,16 +202,50 @@ async fn generate_and_store(
 
     let generated = parse_generated_actions(&result.text)?;
     let actions = normalize_generated_actions(generated)?;
-    let suggestion_count = actions.len();
-    ticketing_system::conversation_next_actions::replace_for_conversation(
+    let replacement = ticketing_system::conversation_next_actions::replace_for_conversation(
         &db,
         conversation_id,
         source_message_id,
         actions,
     )
     .await?;
+    let suggestion_count = replacement.inserted.len();
+    record_storage(
+        conversation_id,
+        source_message_id,
+        replacement.deleted_count,
+        suggestion_count,
+    );
 
     Ok(suggestion_count)
+}
+
+async fn load_prompt_context(
+    db: &SqlitePool,
+    conversation_id: &str,
+    triggering_user_message: &str,
+    assistant_output: &str,
+) -> Result<NextActionPromptContext> {
+    let first_user_message = sqlx::query_scalar::<_, String>(
+        "SELECT content FROM conversation_messages \
+         WHERE conversation_id = ? AND role = 'user' \
+         ORDER BY message_index ASC LIMIT 1",
+    )
+    .bind(conversation_id)
+    .fetch_optional(db)
+    .await?
+    .ok_or_else(|| anyhow!("conversation has no user messages"))?
+    .trim()
+    .to_string();
+    if first_user_message.is_empty() {
+        bail!("first user message is empty");
+    }
+
+    Ok(NextActionPromptContext {
+        first_user_message,
+        triggering_user_message: triggering_user_message.to_string(),
+        assistant_output: assistant_output.to_string(),
+    })
 }
 
 fn elapsed_ms(started: Instant) -> u64 {

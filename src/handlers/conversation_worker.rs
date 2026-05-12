@@ -19,6 +19,7 @@ use crate::agents::codex_app_server::{
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
+use crate::observability::next_actions::{record_clear, NextActionClearReason};
 use crate::observability::streaming::{
     record_gap_detected, record_stream_event_emitted, record_ticket_preflight,
     record_ticket_preflight_error,
@@ -465,13 +466,18 @@ impl ConversationWorker {
             msg.message.clone()
         };
 
-        if let Err(e) = ticketing_system::conversation_next_actions::delete_for_conversation(
+        match ticketing_system::conversation_next_actions::delete_for_conversation(
             &self.db,
             &self.conversation_id,
         )
         .await
         {
-            tracing::warn!("[WORKER] Failed to clear stale next actions: {}", e);
+            Ok(deleted_count) => record_clear(
+                &self.conversation_id,
+                NextActionClearReason::NewUserTurn,
+                deleted_count,
+            ),
+            Err(e) => tracing::warn!("[WORKER] Failed to clear stale next actions: {}", e),
         }
 
         // Store user message in DB (original text, not enhanced)
@@ -1337,6 +1343,7 @@ impl ConversationWorker {
                     self.conversation_id.clone(),
                     assistant_message_id.clone(),
                     msg.config.prompt_name.to_string(),
+                    msg.message.clone(),
                     accumulated_text.clone(),
                 );
 

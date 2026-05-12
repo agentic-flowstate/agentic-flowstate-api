@@ -4,7 +4,7 @@
 //!
 //! * [`streaming`] — durable-streaming metrics (T-56987678): stream
 //!   lifecycle, push delivery, gap detection, session start.
-//! * [`next_actions`] — post-turn follow-up suggestion generation metrics.
+//! * [`next_actions`] — post-turn follow-up suggestion generation and storage metrics.
 //!
 //! # Integration
 //!

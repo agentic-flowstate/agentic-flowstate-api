@@ -8,6 +8,15 @@ pub const METRIC_NEXT_ACTIONS_GENERATION_TOTAL: &str = "next_actions_generation_
 pub const METRIC_NEXT_ACTIONS_GENERATION_DURATION_MS: &str = "next_actions_generation_duration_ms";
 pub const METRIC_NEXT_ACTIONS_SUGGESTIONS_GENERATED: &str =
     "next_actions_suggestions_generated_total";
+pub const METRIC_NEXT_ACTIONS_STORAGE_REPLACEMENTS_TOTAL: &str =
+    "next_actions_storage_replacements_total";
+pub const METRIC_NEXT_ACTIONS_STORAGE_ROWS_DELETED_TOTAL: &str =
+    "next_actions_storage_rows_deleted_total";
+pub const METRIC_NEXT_ACTIONS_STORAGE_ROWS_INSERTED_TOTAL: &str =
+    "next_actions_storage_rows_inserted_total";
+pub const METRIC_NEXT_ACTIONS_CLEARS_TOTAL: &str = "next_actions_clears_total";
+pub const METRIC_NEXT_ACTIONS_CLEAR_ROWS_DELETED_TOTAL: &str =
+    "next_actions_clear_rows_deleted_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NextActionGenerationStatus {
@@ -22,6 +31,19 @@ impl fmt::Display for NextActionGenerationStatus {
             NextActionGenerationStatus::Success => "success",
             NextActionGenerationStatus::SkippedEmptyOutput => "skipped_empty_output",
             NextActionGenerationStatus::Error => "error",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NextActionClearReason {
+    NewUserTurn,
+}
+
+impl fmt::Display for NextActionClearReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            NextActionClearReason::NewUserTurn => "new_user_turn",
         })
     }
 }
@@ -52,5 +74,48 @@ pub fn record_generation(
         duration_ms,
         suggestion_count,
         "next-action suggestion generation completed"
+    );
+}
+
+pub fn record_storage(
+    conversation_id: &str,
+    source_message_id: &str,
+    deleted_count: u64,
+    inserted_count: usize,
+) {
+    counter!(METRIC_NEXT_ACTIONS_STORAGE_REPLACEMENTS_TOTAL).increment(1);
+    if deleted_count > 0 {
+        counter!(METRIC_NEXT_ACTIONS_STORAGE_ROWS_DELETED_TOTAL).increment(deleted_count);
+    }
+    if inserted_count > 0 {
+        counter!(METRIC_NEXT_ACTIONS_STORAGE_ROWS_INSERTED_TOTAL).increment(inserted_count as u64);
+    }
+
+    tracing::info!(
+        target: "observability.next_actions",
+        event = "next_actions.storage_replace",
+        conversation_id = %conversation_id,
+        source_message_id = %source_message_id,
+        deleted_count,
+        inserted_count,
+        "next-action suggestions replaced for conversation"
+    );
+}
+
+pub fn record_clear(conversation_id: &str, reason: NextActionClearReason, deleted_count: u64) {
+    let reason_label = reason.to_string();
+    counter!(METRIC_NEXT_ACTIONS_CLEARS_TOTAL, "reason" => reason_label.clone()).increment(1);
+    if deleted_count > 0 {
+        counter!(METRIC_NEXT_ACTIONS_CLEAR_ROWS_DELETED_TOTAL, "reason" => reason_label.clone())
+            .increment(deleted_count);
+    }
+
+    tracing::info!(
+        target: "observability.next_actions",
+        event = "next_actions.clear",
+        conversation_id = %conversation_id,
+        reason = %reason,
+        deleted_count,
+        "next-action suggestions cleared"
     );
 }

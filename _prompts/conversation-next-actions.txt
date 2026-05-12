@@ -1,11 +1,21 @@
-Read the completed assistant output below and propose exactly 3 useful follow-up messages the user may want to send next.
+Read only these three conversation excerpts and propose exactly 3 useful follow-up messages the user may want to send next.
 
-Agent: {{AGENT_NAME}}
+First user message in the conversation:
+<first_user_message>
+{{FIRST_USER_MESSAGE}}
+</first_user_message>
 
-Output:
+User message that triggered this assistant output:
+<triggering_user_message>
+{{TRIGGERING_USER_MESSAGE}}
+</triggering_user_message>
+
+Assistant output that just completed:
 <assistant_output>
 {{ASSISTANT_OUTPUT}}
 </assistant_output>
+
+Do not assume hidden conversation history beyond these excerpts.
 
 Each suggestion must be ready for a mobile chat UI:
 - `label`: short pill label, 2-4 words, 24 characters or fewer.
