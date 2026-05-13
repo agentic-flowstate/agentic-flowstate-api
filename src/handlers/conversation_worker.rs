@@ -1353,36 +1353,74 @@ impl ConversationWorker {
                         msg.user_id,
                         self.conversation_id
                     );
-                    let push_db = (*self.db).clone();
-                    let push_user = msg.user_id.clone();
-                    let push_agent = msg.config.prompt_name.to_string();
-                    let push_conv_id = self.conversation_id.clone();
-                    let apns = apns.clone();
-                    tokio::spawn(async move {
-                        match apns
-                            .send_to_user(
-                                &push_db,
-                                &push_user,
-                                "Agent finished",
-                                &format!("{} has completed processing.", push_agent),
-                                Some(&push_conv_id),
-                                Some(&push_agent),
-                            )
-                            .await
-                        {
-                            Ok(()) => {
-                                tracing::info!(
-                                    "[WORKER] Push notification sent for user={}",
-                                    push_user
-                                )
+                    let push_title = match conversations::get_conversation(
+                        &self.db,
+                        &self.conversation_id,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(Some(conversation)) => {
+                            let title = conversation.title.trim();
+                            if title.is_empty() {
+                                tracing::warn!(
+                                    "[WORKER] Skipping completion push for conv={} - empty conversation title",
+                                    self.conversation_id
+                                );
+                                None
+                            } else {
+                                Some(title.to_string())
                             }
-                            Err(e) => tracing::warn!(
-                                "[WORKER] Push notification failed for user={}: {}",
-                                push_user,
-                                e
-                            ),
                         }
-                    });
+                        Ok(None) => {
+                            tracing::warn!(
+                                "[WORKER] Skipping completion push for conv={} - conversation not found",
+                                self.conversation_id
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[WORKER] Skipping completion push for conv={} - title lookup failed: {}",
+                                self.conversation_id,
+                                e
+                            );
+                            None
+                        }
+                    };
+
+                    if let Some(push_title) = push_title {
+                        let push_db = (*self.db).clone();
+                        let push_user = msg.user_id.clone();
+                        let push_agent = msg.config.prompt_name.to_string();
+                        let push_conv_id = self.conversation_id.clone();
+                        let apns = apns.clone();
+                        tokio::spawn(async move {
+                            match apns
+                                .send_to_user(
+                                    &push_db,
+                                    &push_user,
+                                    &push_title,
+                                    "",
+                                    Some(&push_conv_id),
+                                    Some(&push_agent),
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "[WORKER] Push notification sent for user={}",
+                                        push_user
+                                    )
+                                }
+                                Err(e) => tracing::warn!(
+                                    "[WORKER] Push notification failed for user={}: {}",
+                                    push_user,
+                                    e
+                                ),
+                            }
+                        });
+                    }
                 } else {
                     tracing::warn!("[WORKER] APNs not initialized — skipping push notification");
                 }

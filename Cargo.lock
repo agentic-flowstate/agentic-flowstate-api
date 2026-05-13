@@ -4783,6 +4783,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "base64 0.22.1",
  "chrono",
  "dirs",
  "hex",
@@ -4794,6 +4795,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "unicode-normalization",
  "uuid",
 ]
 
