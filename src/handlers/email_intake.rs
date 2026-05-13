@@ -96,8 +96,6 @@ pub struct LinkThreadApiRequest {
 #[derive(Debug, Deserialize)]
 pub struct EmailAgentActionGateApiRequest {
     pub requested_action: String,
-    #[serde(default)]
-    pub human_approved: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,7 +251,7 @@ pub async fn check_email_agent_action_gate(
         &pool,
         email_id,
         &req.requested_action,
-        req.human_approved,
+        false,
         &user.user_id,
     )
     .await
@@ -270,12 +268,18 @@ pub async fn build_safe_agent_email_payload(
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
     verify_mailbox_access(&pool, &user.user_id, &email.mailbox).await?;
+    if req.audience != "tool_agent" || req.include_body || req.human_approved_raw {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Agent payload endpoint only returns tool_agent metadata-only payloads".to_string(),
+        ));
+    }
     let payload = email_intake::build_safe_agent_email_payload(
         &pool,
         req.email_id,
-        &req.audience,
-        req.include_body,
-        req.human_approved_raw,
+        "tool_agent",
+        false,
+        false,
         &user.user_id,
     )
     .await
