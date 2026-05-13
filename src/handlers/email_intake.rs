@@ -43,6 +43,7 @@ pub struct IntakeListQuery {
     pub status: Option<String>,
     pub item_type: Option<String>,
     pub risk_level: Option<String>,
+    pub exposure_policy: Option<String>,
     pub limit: Option<i64>,
 }
 
@@ -90,6 +91,28 @@ pub struct LinkThreadApiRequest {
     pub mailbox: Option<String>,
     pub confidence: Option<f64>,
     pub link_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmailAgentActionGateApiRequest {
+    pub requested_action: String,
+    #[serde(default)]
+    pub human_approved: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SafeAgentEmailPayloadApiRequest {
+    pub email_id: i64,
+    #[serde(default = "default_tool_agent_audience")]
+    pub audience: String,
+    #[serde(default)]
+    pub include_body: bool,
+    #[serde(default)]
+    pub human_approved_raw: bool,
+}
+
+fn default_tool_agent_audience() -> String {
+    "tool_agent".to_string()
 }
 
 pub async fn list_email_attention_items(
@@ -161,6 +184,103 @@ pub async fn list_email_security_scans(
         );
     }
     Ok(Json(scans))
+}
+
+pub async fn list_email_agent_guardrails(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Query(params): Query<IntakeListQuery>,
+) -> Result<Json<Vec<email_intake::EmailAgentGuardrail>>, (StatusCode, String)> {
+    let mailboxes = scoped_mailboxes(&pool, &user.user_id, params.mailbox.as_deref()).await?;
+    let mut guardrails = Vec::new();
+    for mailbox in mailboxes {
+        guardrails.extend(
+            email_intake::list_email_agent_guardrails(
+                &pool,
+                Some(&mailbox),
+                params.exposure_policy.as_deref(),
+                params.status.as_deref().or(Some("active")),
+                params.limit.unwrap_or(100),
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+        );
+    }
+    Ok(Json(guardrails))
+}
+
+pub async fn get_email_agent_guardrail(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(email_id): Path<i64>,
+) -> Result<Json<email_intake::EmailAgentGuardrail>, (StatusCode, String)> {
+    let email = emails::get_email_by_id(&pool, email_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    verify_mailbox_access(&pool, &user.user_id, &email.mailbox).await?;
+    let guardrail = email_intake::get_email_agent_guardrail(&pool, email_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(Json(guardrail))
+}
+
+pub async fn evaluate_email_agent_guardrail(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(email_id): Path<i64>,
+) -> Result<Json<email_intake::EmailAgentGuardrail>, (StatusCode, String)> {
+    let email = emails::get_email_by_id(&pool, email_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    verify_mailbox_access(&pool, &user.user_id, &email.mailbox).await?;
+    let guardrail = email_intake::evaluate_email_agent_guardrail(&pool, email_id, &user.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(guardrail))
+}
+
+pub async fn check_email_agent_action_gate(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(email_id): Path<i64>,
+    Json(req): Json<EmailAgentActionGateApiRequest>,
+) -> Result<Json<email_intake::EmailAgentActionGateDecision>, (StatusCode, String)> {
+    let email = emails::get_email_by_id(&pool, email_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    verify_mailbox_access(&pool, &user.user_id, &email.mailbox).await?;
+    let decision = email_intake::check_email_agent_action_gate(
+        &pool,
+        email_id,
+        &req.requested_action,
+        req.human_approved,
+        &user.user_id,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(decision))
+}
+
+pub async fn build_safe_agent_email_payload(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(req): Json<SafeAgentEmailPayloadApiRequest>,
+) -> Result<Json<email_intake::SafeAgentEmailPayload>, (StatusCode, String)> {
+    let email = emails::get_email_by_id(&pool, req.email_id)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    verify_mailbox_access(&pool, &user.user_id, &email.mailbox).await?;
+    let payload = email_intake::build_safe_agent_email_payload(
+        &pool,
+        req.email_id,
+        &req.audience,
+        req.include_body,
+        req.human_approved_raw,
+        &user.user_id,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(payload))
 }
 
 pub async fn list_email_contexts(

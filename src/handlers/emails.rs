@@ -333,6 +333,12 @@ pub struct SendEmailRequest {
     pub in_reply_to: Option<String>,
     /// Thread ID for grouping in conversation view
     pub thread_id: Option<String>,
+    /// Source inbound email for an agent-derived reply/action. When omitted,
+    /// in_reply_to is used to find the source message when possible.
+    pub source_email_id: Option<i64>,
+    /// Explicit human approval for high-impact email-derived actions.
+    #[serde(default)]
+    pub human_approved_agent_action: bool,
     /// When true, create an expected-response record after the sent email is stored.
     #[serde(default)]
     pub track_response: bool,
@@ -359,6 +365,30 @@ pub async fn send_email(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<SendEmailRequest>,
 ) -> Result<Json<SendEmailResponse>, (StatusCode, String)> {
+    if let Some(source_email_id) =
+        resolve_source_email_id(&pool, req.source_email_id, req.in_reply_to.as_deref()).await?
+    {
+        let source = emails::get_email_by_id(&pool, source_email_id)
+            .await
+            .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+        verify_mailbox_access(&pool, &user.user_id, &source.mailbox).await?;
+        let gate = email_intake::check_email_agent_action_gate(
+            &pool,
+            source_email_id,
+            "send_email",
+            req.human_approved_agent_action,
+            &user.user_id,
+        )
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !gate.allowed {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("Email guardrail blocked send: {}", gate.reason),
+            ));
+        }
+    }
+
     let delivery = crate::email_delivery::send_outbound_email(
         &pool,
         &user.user_id,
@@ -463,6 +493,23 @@ pub async fn send_email(
         success: true,
         expected_response_id,
     }))
+}
+
+async fn resolve_source_email_id(
+    pool: &SqlitePool,
+    source_email_id: Option<i64>,
+    in_reply_to: Option<&str>,
+) -> Result<Option<i64>, (StatusCode, String)> {
+    if source_email_id.is_some() {
+        return Ok(source_email_id);
+    }
+    let Some(message_id) = in_reply_to.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let email = emails::get_email_by_message_id(pool, message_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(email.map(|email| email.id))
 }
 
 fn expected_response_due_at(req: &SendEmailRequest, now: i64) -> Result<i64, (StatusCode, String)> {
