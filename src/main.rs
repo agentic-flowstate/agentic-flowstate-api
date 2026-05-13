@@ -174,6 +174,36 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: direct restart complete"
     }
 }
 
+async fn mark_matching_pending_restarts_executed(
+    pool: &sqlx::SqlitePool,
+    service: &str,
+    action: &str,
+) -> anyhow::Result<u64> {
+    let now = chrono::Utc::now().timestamp();
+    let result = sqlx::query(
+        r#"
+        UPDATE restart_queue
+        SET status = 'executed', executed_at = ?
+        WHERE status = 'pending'
+          AND service = ?
+          AND action = ?
+          AND requested_at <= ?
+        "#,
+    )
+    .bind(now)
+    .bind(service)
+    .bind(action)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+fn restart_watcher_should_exit_after_spawn(service: &str, action: &str) -> bool {
+    action == "setup" || matches!(service, "api-server" | "all")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing
@@ -678,8 +708,35 @@ async fn main() -> anyhow::Result<()> {
                     pending.action, pending.service, pending.requested_by
                 );
 
-                let _ =
-                    ticketing_system::restart_queue::mark_executed(&restart_pool, pending.id).await;
+                match mark_matching_pending_restarts_executed(
+                    &restart_pool,
+                    &pending.service,
+                    &pending.action,
+                )
+                .await
+                {
+                    Ok(count) if count > 1 => {
+                        tracing::info!(
+                            "[RESTART_WATCHER] Coalesced {} pending {} request(s) for '{}'",
+                            count,
+                            pending.action,
+                            pending.service
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "[RESTART_WATCHER] Failed to coalesce restart queue entry {}; marking only this entry: {}",
+                            pending.id,
+                            e
+                        );
+                        let _ = ticketing_system::restart_queue::mark_executed(
+                            &restart_pool,
+                            pending.id,
+                        )
+                        .await;
+                    }
+                }
 
                 system_log_helper::log_info(
                     &restart_pool,
@@ -694,7 +751,9 @@ async fn main() -> anyhow::Result<()> {
 
                 spawn_direct_restart_or_setup(&pending.service, &pending.action);
 
-                break;
+                if restart_watcher_should_exit_after_spawn(&pending.service, &pending.action) {
+                    break;
+                }
             }
         });
     }
