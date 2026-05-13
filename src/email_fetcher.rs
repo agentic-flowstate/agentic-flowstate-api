@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use ticketing_system::{
-    email_accounts, emails, CreateEmailRequest, Email, EmailAccountInternal, SqlitePool,
+    email_accounts, email_intake, emails, CreateEmailRequest, Email, EmailAccountInternal,
+    SqlitePool,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -585,6 +586,20 @@ async fn fetch_folder(
                                     }
                                 }
                             }
+                        }
+
+                        if let Err(e) = email_intake::process_email_intake(
+                            db_pool,
+                            stored_email.id,
+                            "email_fetcher",
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "Failed to run email intake for email {}: {:?}",
+                                stored_email.id,
+                                e
+                            );
                         }
                     }
                     Err(e) => {

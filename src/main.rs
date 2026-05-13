@@ -4,6 +4,7 @@ mod auth_middleware;
 mod dailies_scheduler;
 mod email_delivery;
 mod email_fetcher;
+mod email_intake_scheduler;
 mod handlers;
 mod health_monitor;
 mod mcp_wrapper;
@@ -344,6 +345,12 @@ async fn main() -> anyhow::Result<()> {
     // Start email fetcher background task (queries email_accounts table each cycle)
     tracing::info!("Starting email fetcher (hot-reload from database)");
     email_fetcher::start_email_fetcher(db_pool.clone(), shutdown_token.child_token());
+
+    tracing::info!("Starting email intake scheduler");
+    email_intake_scheduler::spawn_email_intake_scheduler(
+        db_pool.clone(),
+        shutdown_token.child_token(),
+    );
 
     // Nightly scheduler DISABLED — do not re-enable until conversation integration is validated.
     tracing::info!("Nightly scheduler is DISABLED");
@@ -934,6 +941,40 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/emails/unarchive", post(handlers::unarchive_emails))
         .route("/api/emails/threads", get(handlers::list_threads))
         .route("/api/emails/threads/:thread_id", get(handlers::get_thread))
+        .route("/api/email-intake/run", post(handlers::run_email_intake))
+        .route(
+            "/api/email-intake/attention",
+            get(handlers::list_email_attention_items),
+        )
+        .route(
+            "/api/email-intake/attention/:id/resolve",
+            post(handlers::resolve_email_attention_item),
+        )
+        .route(
+            "/api/email-intake/security-scans",
+            get(handlers::list_email_security_scans),
+        )
+        .route(
+            "/api/email-intake/contexts",
+            get(handlers::list_email_contexts).post(handlers::create_email_context),
+        )
+        .route(
+            "/api/email-intake/contexts/:context_id",
+            get(handlers::get_email_context),
+        )
+        .route(
+            "/api/email-intake/contexts/:context_id/threads",
+            post(handlers::link_email_thread_to_context),
+        )
+        .route(
+            "/api/email-intake/expected-responses",
+            get(handlers::list_expected_email_responses)
+                .post(handlers::create_expected_email_response),
+        )
+        .route(
+            "/api/email-intake/expected-responses/refresh",
+            post(handlers::refresh_expected_email_responses),
+        )
         .route(
             "/api/emails/attachments/:attachment_id",
             get(handlers::download_attachment),

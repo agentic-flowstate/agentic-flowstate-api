@@ -5,7 +5,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use ticketing_system::{email_accounts, emails, Email, EmailAttachment, EmailThread, SqlitePool};
+use ticketing_system::{
+    email_accounts, email_intake, emails, Email, EmailAttachment, EmailThread, SqlitePool,
+};
 
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -331,12 +333,21 @@ pub struct SendEmailRequest {
     pub in_reply_to: Option<String>,
     /// Thread ID for grouping in conversation view
     pub thread_id: Option<String>,
+    /// When true, create an expected-response record after the sent email is stored.
+    #[serde(default)]
+    pub track_response: bool,
+    /// Explicit Unix timestamp for the expected response deadline.
+    pub expected_response_due_at: Option<i64>,
+    /// Convenience deadline. Converted to now + N days when expected_response_due_at is absent.
+    pub expected_response_due_in_days: Option<i64>,
+    pub expected_response_notes: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct SendEmailResponse {
     pub message_id: String,
     pub success: bool,
+    pub expected_response_id: Option<i64>,
 }
 
 /// Send email and store it in Sent (POST /api/emails/send)
@@ -373,13 +384,14 @@ pub async fn send_email(
     })?;
 
     let message_id = delivery.message_id;
+    let source_mailbox = delivery.source_mailbox;
     tracing::info!("Email sent successfully, message_id: {}", message_id);
 
     // Store in Sent folder
     let now = chrono::Utc::now().timestamp();
     let create_req = ticketing_system::CreateEmailRequest {
         message_id: message_id.clone(),
-        mailbox: delivery.source_mailbox,
+        mailbox: source_mailbox,
         folder: "Sent".to_string(),
         from_address: req.from.clone(),
         from_name: None,
@@ -397,14 +409,88 @@ pub async fn send_email(
         in_reply_to: req.in_reply_to.clone(),
     };
 
-    if let Err(e) = emails::create_email(&pool, &create_req).await {
-        tracing::warn!("Failed to store sent email in database: {}", e);
+    let stored_email = emails::create_email(&pool, &create_req)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to store sent email in database: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to store sent email: {}", e),
+            )
+        })?;
+
+    if let Err(e) = email_intake::process_email_intake(&pool, stored_email.id, "api_send").await {
+        tracing::warn!(
+            "Failed to run intake for sent email {}: {:?}",
+            stored_email.id,
+            e
+        );
     }
+
+    let expected_response_id = if req.track_response
+        || req.expected_response_due_at.is_some()
+        || req.expected_response_due_in_days.is_some()
+    {
+        let due_at = expected_response_due_at(&req, now)?;
+        let response = email_intake::create_expected_response(
+            &pool,
+            &email_intake::CreateExpectedResponseRequest {
+                sent_email_id: Some(stored_email.id),
+                context_id: None,
+                thread_id: None,
+                mailbox: None,
+                correspondent_email: req.to.first().cloned(),
+                subject: Some(req.subject.clone()),
+                due_at,
+                notes: req.expected_response_notes.clone(),
+                created_by: Some(user.user_id.clone()),
+            },
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create expected response: {}", e),
+            )
+        })?;
+        Some(response.id)
+    } else {
+        None
+    };
 
     Ok(Json(SendEmailResponse {
         message_id,
         success: true,
+        expected_response_id,
     }))
+}
+
+fn expected_response_due_at(req: &SendEmailRequest, now: i64) -> Result<i64, (StatusCode, String)> {
+    if let Some(due_at) = req.expected_response_due_at {
+        if due_at <= now {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "expected_response_due_at must be in the future".to_string(),
+            ));
+        }
+        return Ok(due_at);
+    }
+
+    if let Some(days) = req.expected_response_due_in_days {
+        if days <= 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "expected_response_due_in_days must be positive".to_string(),
+            ));
+        }
+        return Ok(now + days * 24 * 60 * 60);
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        "track_response requires expected_response_due_at or expected_response_due_in_days"
+            .to_string(),
+    ))
 }
 
 // ============================================================================
