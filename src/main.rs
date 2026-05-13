@@ -93,6 +93,17 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn launchd_reload_command(uid: &str, home: &str, label: &str) -> String {
+    format!(
+        "launchctl bootout gui/{uid}/{label} 2>/dev/null || true\n\
+         sleep 1\n\
+         launchctl bootstrap gui/{uid} '{home}/Library/LaunchAgents/{label}.plist' 2>&1 || true",
+        uid = uid,
+        home = home,
+        label = label
+    )
+}
+
 fn spawn_direct_restart_or_setup(service: &str, action: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
     let log = "/tmp/agentic-restart-watcher.log";
@@ -113,28 +124,16 @@ exec bash -l '{home}/projects/agentic-flowstate/agentic-flowstate-setup/setup.sh
             .unwrap_or_else(|_| "501".to_string());
         let mut commands = Vec::new();
         if matches!(service, "api-server" | "all") {
-            commands.push(format!(
-                "launchctl kickstart -k gui/{}/com.agentic.api 2>&1 || true",
-                uid
-            ));
+            commands.push(launchd_reload_command(&uid, &home, "com.agentic.api"));
         }
         if matches!(service, "agent-runner" | "all") {
-            commands.push(format!(
-                "launchctl kickstart -k gui/{}/com.agentic.runner 2>&1 || true",
-                uid
-            ));
+            commands.push(launchd_reload_command(&uid, &home, "com.agentic.runner"));
         }
         if matches!(service, "frontend" | "all") {
-            commands.push(format!(
-                "launchctl kickstart -k gui/{}/com.agentic.frontend 2>&1 || true",
-                uid
-            ));
+            commands.push(launchd_reload_command(&uid, &home, "com.agentic.frontend"));
         }
         if matches!(service, "mcp-server" | "all") {
-            commands.push(format!(
-                "launchctl kickstart -k gui/{}/com.agentic.mcp 2>&1 || true",
-                uid
-            ));
+            commands.push(launchd_reload_command(&uid, &home, "com.agentic.mcp"));
         }
 
         if commands.is_empty() {
