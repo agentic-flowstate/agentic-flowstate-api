@@ -15,6 +15,15 @@ use crate::email_attachment_safety::sanitize_attachment_filename;
 /// Sanitize HTML email body to prevent XSS
 fn sanitize_email_html(html: &str) -> String {
     ammonia::Builder::default()
+        .rm_tags(&["img"])
+        .rm_tag_attributes("div", &["style"])
+        .rm_tag_attributes("span", &["style"])
+        .rm_tag_attributes("p", &["style"])
+        .rm_tag_attributes("table", &["style"])
+        .rm_tag_attributes("tr", &["style"])
+        .rm_tag_attributes("td", &["style"])
+        .rm_tag_attributes("th", &["style"])
+        .rm_tag_attributes("col", &["style"])
         .add_tags(&[
             "div",
             "span",
@@ -48,7 +57,6 @@ fn sanitize_email_html(html: &str) -> String {
             "blockquote",
             "pre",
             "code",
-            "img",
             "hr",
             "sup",
             "sub",
@@ -64,28 +72,15 @@ fn sanitize_email_html(html: &str) -> String {
             "font",
         ])
         .add_tag_attributes("a", &["href", "title", "target"])
-        .add_tag_attributes("img", &["src", "alt", "width", "height", "style"])
-        .add_tag_attributes(
-            "td",
-            &["colspan", "rowspan", "style", "align", "valign", "width"],
-        )
-        .add_tag_attributes(
-            "th",
-            &["colspan", "rowspan", "style", "align", "valign", "width"],
-        )
-        .add_tag_attributes(
-            "table",
-            &["style", "width", "cellpadding", "cellspacing", "border"],
-        )
-        .add_tag_attributes("tr", &["style"])
-        .add_tag_attributes("div", &["style", "class"])
-        .add_tag_attributes("span", &["style", "class"])
-        .add_tag_attributes("p", &["style"])
+        .add_tag_attributes("td", &["colspan", "rowspan", "align", "valign", "width"])
+        .add_tag_attributes("th", &["colspan", "rowspan", "align", "valign", "width"])
+        .add_tag_attributes("table", &["width", "cellpadding", "cellspacing", "border"])
+        .add_tag_attributes("div", &["class"])
+        .add_tag_attributes("span", &["class"])
         .add_tag_attributes("font", &["color", "size", "face"])
-        .add_tag_attributes("col", &["width", "style"])
-        .url_schemes(std::collections::HashSet::from([
-            "http", "https", "mailto", "cid",
-        ]))
+        .add_tag_attributes("col", &["width"])
+        .url_relative(ammonia::UrlRelative::Deny)
+        .url_schemes(std::collections::HashSet::from(["http", "https", "mailto"]))
         .link_rel(Some("noopener noreferrer"))
         .clean(html)
         .to_string()
@@ -101,6 +96,28 @@ fn sanitize_email(mut email: Email) -> Email {
 
 fn sanitize_emails(emails: Vec<Email>) -> Vec<Email> {
     emails.into_iter().map(sanitize_email).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitized_email_html_blocks_remote_rendering_affordances() {
+        let sanitized = sanitize_email_html(
+            r#"
+            <p style="background-image:url(https://tracker.example/pixel)">Hello</p>
+            <img src="https://tracker.example/pixel.png" alt="tracker">
+            <a href="/relative">relative</a>
+            <a href="https://example.com">allowed</a>
+            "#,
+        );
+
+        assert!(!sanitized.contains("<img"));
+        assert!(!sanitized.contains("style="));
+        assert!(!sanitized.contains("href=\"/relative\""));
+        assert!(sanitized.contains("href=\"https://example.com\""));
+    }
 }
 
 #[derive(Debug, Serialize)]
