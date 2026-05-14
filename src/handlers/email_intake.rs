@@ -24,6 +24,13 @@ async fn verify_mailbox_access(
     user_id: &str,
     mailbox: &str,
 ) -> Result<(), (StatusCode, String)> {
+    let is_admin = ticketing_system::system_logs::is_admin(pool, user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if is_admin {
+        return Ok(());
+    }
+
     let has_access = email_accounts::user_has_email_access(pool, mailbox, user_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
