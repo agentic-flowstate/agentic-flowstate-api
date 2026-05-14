@@ -14,6 +14,8 @@ use ticketing_system::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::email_attachment_safety::unique_attachment_filename;
+
 type ImapSession = async_imap::Session<async_native_tls::TlsStream<TcpStream>>;
 const EMAIL_FETCH_WINDOW: u32 = 500;
 const SPAM_FOLDER: &str = "Junk";
@@ -545,11 +547,17 @@ async fn fetch_folder(
                             if let Err(e) = std::fs::create_dir_all(&attachments_dir) {
                                 tracing::warn!("Failed to create attachments dir: {:?}", e);
                             } else {
-                                for attachment in parsed.attachments() {
-                                    let filename = attachment
+                                let mut used_filenames = HashSet::new();
+                                for (index, attachment) in parsed.attachments().enumerate() {
+                                    let raw_filename = attachment
                                         .attachment_name()
                                         .unwrap_or("unnamed")
                                         .to_string();
+                                    let filename = unique_attachment_filename(
+                                        &raw_filename,
+                                        index + 1,
+                                        &mut used_filenames,
+                                    );
                                     let content_type = attachment
                                         .content_type()
                                         .map(|ct: &mail_parser::ContentType| ct.ctype().to_string())

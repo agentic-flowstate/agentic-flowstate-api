@@ -10,6 +10,7 @@ use ticketing_system::{
 };
 
 use crate::auth_middleware::AuthenticatedUser;
+use crate::email_attachment_safety::sanitize_attachment_filename;
 
 /// Sanitize HTML email body to prevent XSS
 fn sanitize_email_html(html: &str) -> String {
@@ -100,6 +101,33 @@ fn sanitize_email(mut email: Email) -> Email {
 
 fn sanitize_emails(emails: Vec<Email>) -> Vec<Email> {
     emails.into_iter().map(sanitize_email).collect()
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmailAttachmentResponse {
+    pub id: i64,
+    pub email_id: i64,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub stored_path_redacted: bool,
+    pub content_boundary: &'static str,
+    pub raw_content_access: &'static str,
+}
+
+impl From<EmailAttachment> for EmailAttachmentResponse {
+    fn from(attachment: EmailAttachment) -> Self {
+        Self {
+            id: attachment.id,
+            email_id: attachment.email_id,
+            filename: attachment.filename,
+            content_type: attachment.content_type,
+            size_bytes: attachment.size_bytes,
+            stored_path_redacted: attachment.stored_path.is_some(),
+            content_boundary: "metadata_only_untrusted_external_attachment",
+            raw_content_access: "Download requires the authenticated attachment download endpoint; stored filesystem paths are never returned.",
+        }
+    }
 }
 
 // ============================================================================
@@ -692,7 +720,7 @@ pub async fn list_attachments(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(email_id): Path<i64>,
-) -> Result<Json<Vec<EmailAttachment>>, (StatusCode, String)> {
+) -> Result<Json<Vec<EmailAttachmentResponse>>, (StatusCode, String)> {
     // Verify access to the parent email
     get_email_with_access_check(&pool, &user.user_id, email_id).await?;
 
@@ -700,7 +728,12 @@ pub async fn list_attachments(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(attachments))
+    Ok(Json(
+        attachments
+            .into_iter()
+            .map(EmailAttachmentResponse::from)
+            .collect(),
+    ))
 }
 
 /// Download an attachment (GET /api/emails/attachments/:attachment_id)
@@ -724,7 +757,8 @@ pub async fn download_attachment(
         "Attachment file not stored".to_string(),
     ))?;
 
-    let file_bytes = tokio::fs::read(&stored_path)
+    let safe_path = validate_email_attachment_path(&stored_path).await?;
+    let file_bytes = tokio::fs::read(&safe_path)
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, format!("File not found: {}", e)))?;
 
@@ -732,13 +766,47 @@ pub async fn download_attachment(
         .header("Content-Type", &attachment.content_type)
         .header(
             "Content-Disposition",
-            format!("attachment; filename=\"{}\"", attachment.filename),
+            format!(
+                "attachment; filename=\"{}\"",
+                sanitize_attachment_filename(&attachment.filename, attachment.id as usize)
+            ),
         )
         .header("Content-Length", file_bytes.len().to_string())
         .body(Body::from(file_bytes))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(response)
+}
+
+async fn validate_email_attachment_path(
+    stored_path: &str,
+) -> Result<std::path::PathBuf, (StatusCode, String)> {
+    let root = dirs::home_dir()
+        .ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Home directory unavailable".to_string(),
+        ))?
+        .join(".agentic-flowstate")
+        .join("attachments");
+    let canonical_root = tokio::fs::canonicalize(&root).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Attachment root unavailable: {}", e),
+        )
+    })?;
+    let canonical_path = tokio::fs::canonicalize(stored_path).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Attachment file not found: {}", e),
+        )
+    })?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Attachment path is outside the allowed storage root".to_string(),
+        ));
+    }
+    Ok(canonical_path)
 }
 
 // ============================================================================

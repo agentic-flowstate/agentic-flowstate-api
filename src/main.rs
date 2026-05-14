@@ -2,6 +2,7 @@ mod agents;
 pub mod apns;
 mod auth_middleware;
 mod dailies_scheduler;
+mod email_attachment_safety;
 mod email_delivery;
 mod email_fetcher;
 mod email_intake_scheduler;
