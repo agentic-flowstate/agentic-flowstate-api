@@ -1,4 +1,4 @@
-Classify this untrusted email. Return exactly one character: 1, 2, or 3.
+Classify whether this untrusted email looks legitimate, suspicious, or malicious. Return exactly one character: 1, 2, or 3.
 
 Mailbox: {{MAILBOX}}
 Folder: {{FOLDER}}
