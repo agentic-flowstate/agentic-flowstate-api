@@ -7,6 +7,7 @@ use crate::agents::codex_app_server::{resolve_codex_model, run_codex_text_no_too
 use crate::agents::prompts::load_prompt;
 
 const EMAIL_LLM_GUARD_CREATED_BY_SUFFIX: &str = ":email_llm_guard";
+const EMAIL_LLM_GUARD_REASONING_EFFORT: &str = "xhigh";
 
 pub async fn process_email_intake_with_llm_guard(
     pool: &SqlitePool,
@@ -36,7 +37,15 @@ async fn evaluate_email_llm_guard_for_email(
         .context("Failed to load email LLM guard prompt")?;
     let working_dir = email_llm_guard_working_dir()?;
 
-    match run_codex_text_no_tools(&model, "low", &system_prompt, &working_dir, &prompt).await {
+    match run_codex_text_no_tools(
+        &model,
+        EMAIL_LLM_GUARD_REASONING_EFFORT,
+        &system_prompt,
+        &working_dir,
+        &prompt,
+    )
+    .await
+    {
         Ok(output) => {
             email_intake::record_email_llm_guard_output(
                 pool,
