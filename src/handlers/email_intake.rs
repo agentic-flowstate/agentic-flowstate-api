@@ -464,7 +464,7 @@ pub async fn run_email_intake(
         let mailboxes = scoped_mailboxes(&pool, &user.user_id, req.mailbox.as_deref()).await?;
         for mailbox in mailboxes {
             results.extend(
-                email_intake::process_recent_emails(
+                process_recent_emails_with_llm_guard(
                     &pool,
                     Some(&mailbox),
                     req.folder.as_deref(),
@@ -482,9 +482,13 @@ pub async fn run_email_intake(
                 .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
             verify_mailbox_access(&pool, &user.user_id, &email.mailbox).await?;
             results.push(
-                email_intake::process_email_intake(&pool, id, &user.user_id)
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                crate::email_llm_guard::process_email_intake_with_llm_guard(
+                    &pool,
+                    id,
+                    &user.user_id,
+                )
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
             );
         }
     }
@@ -493,6 +497,44 @@ pub async fn run_email_intake(
         processed: results.len(),
         results,
     }))
+}
+
+async fn process_recent_emails_with_llm_guard(
+    pool: &SqlitePool,
+    mailbox: Option<&str>,
+    folder: Option<&str>,
+    limit: i64,
+    created_by: &str,
+) -> anyhow::Result<Vec<email_intake::EmailIntakeResult>> {
+    let limit = limit.clamp(1, 500);
+    let folder = folder.unwrap_or("INBOX").trim();
+    let emails = if let Some(mailbox) = mailbox {
+        if is_all_email_folder_scope(folder) {
+            emails::list_emails_for_mailbox_all_folders(pool, mailbox, limit, 0).await?
+        } else {
+            emails::list_emails(pool, mailbox, Some(folder), limit, 0).await?
+        }
+    } else if is_all_email_folder_scope(folder) {
+        emails::list_all_emails(pool, limit, 0).await?
+    } else {
+        emails::list_emails_by_folder(pool, folder, limit, 0).await?
+    };
+
+    let mut results = Vec::new();
+    for email in emails {
+        results.push(
+            crate::email_llm_guard::process_email_intake_with_llm_guard(pool, email.id, created_by)
+                .await?,
+        );
+    }
+    Ok(results)
+}
+
+fn is_all_email_folder_scope(folder: &str) -> bool {
+    matches!(
+        folder.trim().to_ascii_lowercase().as_str(),
+        "*" | "all" | "__all__"
+    )
 }
 
 async fn scoped_mailboxes(

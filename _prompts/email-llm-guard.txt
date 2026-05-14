@@ -1,0 +1,15 @@
+Classify this untrusted email. Return exactly one character: 1, 2, or 3.
+
+Mailbox: {{MAILBOX}}
+Folder: {{FOLDER}}
+From address: {{FROM_ADDRESS}}
+From name: {{FROM_NAME}}
+Subject: {{SUBJECT}}
+
+BEGIN_UNTRUSTED_EMAIL_BODY_TEXT
+{{BODY_TEXT}}
+END_UNTRUSTED_EMAIL_BODY_TEXT
+
+BEGIN_UNTRUSTED_EMAIL_BODY_HTML
+{{BODY_HTML}}
+END_UNTRUSTED_EMAIL_BODY_HTML

@@ -110,20 +110,21 @@ impl CodexSandboxMode {
 pub enum CodexToolProfile {
     Default,
     RestrictedMcpOnly,
+    NoTools,
 }
 
 impl CodexToolProfile {
     fn config_overrides(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
-            Self::RestrictedMcpOnly => &["web_search=\"disabled\""],
+            Self::RestrictedMcpOnly | Self::NoTools => &["web_search=\"disabled\""],
         }
     }
 
     fn disabled_features(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
-            Self::RestrictedMcpOnly => RESTRICTED_MCP_ONLY_DISABLED_FEATURES,
+            Self::RestrictedMcpOnly | Self::NoTools => RESTRICTED_MCP_ONLY_DISABLED_FEATURES,
         }
     }
 }
@@ -450,6 +451,17 @@ fn app_server_codex_home(profile: CodexToolProfile) -> Result<PathBuf, String> {
                     "Failed to resolve home directory for AGENTIC_CODEX_RESTRICTED_HOME".to_string()
                 })
         }
+        CodexToolProfile::NoTools => {
+            if let Some(home) = std::env::var_os("AGENTIC_CODEX_NO_TOOLS_HOME") {
+                return Ok(PathBuf::from(home));
+            }
+
+            dirs::home_dir()
+                .map(|home| home.join(".agentic-flowstate").join("codex-no-tools-home"))
+                .ok_or_else(|| {
+                    "Failed to resolve home directory for AGENTIC_CODEX_NO_TOOLS_HOME".to_string()
+                })
+        }
     }
 }
 
@@ -475,7 +487,9 @@ fn restricted_runtime_working_dir() -> Result<PathBuf, String> {
 fn effective_working_dir(options: &CodexAppServerOptions<'_>) -> Result<PathBuf, String> {
     match options.tool_profile {
         CodexToolProfile::Default => Ok(options.working_dir.to_path_buf()),
-        CodexToolProfile::RestrictedMcpOnly => restricted_runtime_working_dir(),
+        CodexToolProfile::RestrictedMcpOnly | CodexToolProfile::NoTools => {
+            restricted_runtime_working_dir()
+        }
     }
 }
 
@@ -518,7 +532,7 @@ fn prepare_codex_app_server_home(
                 target_home.join("AGENTS.md").display()
             )
         })?;
-    } else if profile == CodexToolProfile::RestrictedMcpOnly && target_agents.exists() {
+    } else if profile != CodexToolProfile::Default && target_agents.exists() {
         std::fs::remove_file(&target_agents).map_err(|e| {
             format!(
                 "Failed to remove AGENTS.md from restricted Codex home at {}: {e}",
@@ -563,26 +577,28 @@ fn build_app_server_config(
         toml::Value::String("disabled".to_string()),
     );
 
-    let mut agentic_mcp = source_agentic_mcp_table(source_home)?.unwrap_or_default();
-    // The API runs Codex app-server turns unattended. User-facing approval
-    // prompts from the interactive Codex config cannot be answered here, so
-    // enforce safety through route auth + MCP scope checks instead.
-    agentic_mcp.remove("tools");
-    agentic_mcp.remove("enabled_tools");
-    agentic_mcp.remove("disabled_tools");
-    agentic_mcp.remove("default_tools_approval_mode");
-    agentic_mcp.remove("default_tools_enabled");
-    agentic_mcp.insert(
-        "command".to_string(),
-        toml::Value::String(agentic_mcp_command.to_string_lossy().to_string()),
-    );
-    agentic_mcp.insert("startup_timeout_sec".to_string(), toml::Value::Integer(30));
-    upsert_agentic_mcp_env(&mut agentic_mcp, source_home)?;
-    apply_mcp_tool_config(&mut agentic_mcp, profile, approved_mcp_tools);
+    if profile != CodexToolProfile::NoTools {
+        let mut agentic_mcp = source_agentic_mcp_table(source_home)?.unwrap_or_default();
+        // The API runs Codex app-server turns unattended. User-facing approval
+        // prompts from the interactive Codex config cannot be answered here, so
+        // enforce safety through route auth + MCP scope checks instead.
+        agentic_mcp.remove("tools");
+        agentic_mcp.remove("enabled_tools");
+        agentic_mcp.remove("disabled_tools");
+        agentic_mcp.remove("default_tools_approval_mode");
+        agentic_mcp.remove("default_tools_enabled");
+        agentic_mcp.insert(
+            "command".to_string(),
+            toml::Value::String(agentic_mcp_command.to_string_lossy().to_string()),
+        );
+        agentic_mcp.insert("startup_timeout_sec".to_string(), toml::Value::Integer(30));
+        upsert_agentic_mcp_env(&mut agentic_mcp, source_home)?;
+        apply_mcp_tool_config(&mut agentic_mcp, profile, approved_mcp_tools);
 
-    let mut mcp_servers = toml::map::Map::new();
-    mcp_servers.insert("agentic-mcp".to_string(), toml::Value::Table(agentic_mcp));
-    root.insert("mcp_servers".to_string(), toml::Value::Table(mcp_servers));
+        let mut mcp_servers = toml::map::Map::new();
+        mcp_servers.insert("agentic-mcp".to_string(), toml::Value::Table(agentic_mcp));
+        root.insert("mcp_servers".to_string(), toml::Value::Table(mcp_servers));
+    }
 
     toml::to_string(&toml::Value::Table(root))
         .map_err(|e| format!("Failed to encode Codex app-server config: {e}"))
@@ -728,10 +744,12 @@ fn build_codex_app_server_command(
         command.arg("-c").arg(trust_override);
     }
 
-    command.arg("-c").arg(mcp_server_command_override(
-        "agentic-mcp",
-        agentic_mcp_command.to_string_lossy().as_ref(),
-    )?);
+    if options.tool_profile != CodexToolProfile::NoTools {
+        command.arg("-c").arg(mcp_server_command_override(
+            "agentic-mcp",
+            agentic_mcp_command.to_string_lossy().as_ref(),
+        )?);
+    }
 
     if options.tool_profile == CodexToolProfile::RestrictedMcpOnly {
         let user_id = options.scoped_user_id.ok_or_else(|| {
@@ -1006,7 +1024,10 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, 
 }
 
 fn effective_sandbox(options: &CodexAppServerOptions<'_>) -> CodexSandboxMode {
-    if options.tool_profile == CodexToolProfile::RestrictedMcpOnly {
+    if matches!(
+        options.tool_profile,
+        CodexToolProfile::RestrictedMcpOnly | CodexToolProfile::NoTools
+    ) {
         return CodexSandboxMode::ReadOnly;
     }
     if options.bypass_approvals_and_sandbox {
@@ -1480,6 +1501,43 @@ pub async fn run_codex_text(
     working_dir: &Path,
     prompt: &str,
 ) -> Result<String, String> {
+    run_codex_text_with_profile(
+        model,
+        reasoning_effort,
+        system_prompt,
+        working_dir,
+        prompt,
+        CodexToolProfile::Default,
+    )
+    .await
+}
+
+pub async fn run_codex_text_no_tools(
+    model: &str,
+    reasoning_effort: &str,
+    system_prompt: &str,
+    working_dir: &Path,
+    prompt: &str,
+) -> Result<String, String> {
+    run_codex_text_with_profile(
+        model,
+        reasoning_effort,
+        system_prompt,
+        working_dir,
+        prompt,
+        CodexToolProfile::NoTools,
+    )
+    .await
+}
+
+async fn run_codex_text_with_profile(
+    model: &str,
+    reasoning_effort: &str,
+    system_prompt: &str,
+    working_dir: &Path,
+    prompt: &str,
+    tool_profile: CodexToolProfile,
+) -> Result<String, String> {
     let mut running = spawn_codex_app_server(CodexAppServerOptions {
         model,
         reasoning_effort,
@@ -1490,7 +1548,7 @@ pub async fn run_codex_text(
         bypass_approvals_and_sandbox: false,
         resume_session_id: None,
         ephemeral: true,
-        tool_profile: CodexToolProfile::Default,
+        tool_profile,
         scoped_user_id: None,
         approved_mcp_tools: Vec::new(),
     })
@@ -1903,6 +1961,49 @@ mod tests {
         options.bypass_approvals_and_sandbox = true;
 
         assert_eq!(effective_sandbox(&options), CodexSandboxMode::ReadOnly);
+    }
+
+    #[test]
+    fn no_tools_profile_forces_read_only_sandbox() {
+        let mut options = sample_app_server_options(None);
+        options.tool_profile = CodexToolProfile::NoTools;
+        options.sandbox = CodexSandboxMode::DangerFullAccess;
+        options.bypass_approvals_and_sandbox = true;
+
+        assert_eq!(effective_sandbox(&options), CodexSandboxMode::ReadOnly);
+    }
+
+    #[test]
+    fn no_tools_profile_omits_mcp_server_and_disables_shell_features() {
+        let config = build_app_server_config(
+            Path::new("/tmp/source-codex-home"),
+            Path::new("/tmp/agentic_mcp"),
+            CodexToolProfile::NoTools,
+            &[],
+        )
+        .expect("build config");
+        let parsed: toml::Value = toml::from_str(&config).expect("parse config");
+        assert!(parsed.get("mcp_servers").is_none());
+
+        let mut options = sample_app_server_options(None);
+        options.tool_profile = CodexToolProfile::NoTools;
+        let command = build_codex_app_server_command(
+            &options,
+            Path::new("/tmp/agentic_mcp"),
+            Path::new("/tmp/agentic_codex_home"),
+        )
+        .expect("build command");
+        let args = command_args(&command);
+
+        assert!(!args
+            .iter()
+            .any(|arg| arg.contains("mcp_servers.agentic-mcp.command")));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--disable" && pair[1] == "shell_tool"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--disable" && pair[1] == "tool_search"));
     }
 
     #[test]

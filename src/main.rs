@@ -6,6 +6,7 @@ mod email_attachment_safety;
 mod email_delivery;
 mod email_fetcher;
 mod email_intake_scheduler;
+mod email_llm_guard;
 mod handlers;
 mod health_monitor;
 mod mcp_wrapper;
