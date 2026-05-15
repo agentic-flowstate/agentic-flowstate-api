@@ -109,6 +109,7 @@ impl CodexSandboxMode {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CodexToolProfile {
     Default,
+    ConfiguredMcpOnly,
     RestrictedMcpOnly,
     NoTools,
 }
@@ -117,14 +118,18 @@ impl CodexToolProfile {
     fn config_overrides(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
-            Self::RestrictedMcpOnly | Self::NoTools => &["web_search=\"disabled\""],
+            Self::ConfiguredMcpOnly | Self::RestrictedMcpOnly | Self::NoTools => {
+                &["web_search=\"disabled\""]
+            }
         }
     }
 
     fn disabled_features(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
-            Self::RestrictedMcpOnly | Self::NoTools => RESTRICTED_MCP_ONLY_DISABLED_FEATURES,
+            Self::ConfiguredMcpOnly | Self::RestrictedMcpOnly | Self::NoTools => {
+                RESTRICTED_MCP_ONLY_DISABLED_FEATURES
+            }
         }
     }
 }
@@ -437,6 +442,21 @@ fn app_server_codex_home(profile: CodexToolProfile) -> Result<PathBuf, String> {
                     "Failed to resolve home directory for AGENTIC_CODEX_HOME".to_string()
                 })
         }
+        CodexToolProfile::ConfiguredMcpOnly => {
+            if let Some(home) = std::env::var_os("AGENTIC_CODEX_CONFIGURED_MCP_HOME") {
+                return Ok(PathBuf::from(home));
+            }
+
+            dirs::home_dir()
+                .map(|home| {
+                    home.join(".agentic-flowstate")
+                        .join("codex-configured-mcp-home")
+                })
+                .ok_or_else(|| {
+                    "Failed to resolve home directory for AGENTIC_CODEX_CONFIGURED_MCP_HOME"
+                        .to_string()
+                })
+        }
         CodexToolProfile::RestrictedMcpOnly => {
             if let Some(home) = std::env::var_os("AGENTIC_CODEX_RESTRICTED_HOME") {
                 return Ok(PathBuf::from(home));
@@ -487,9 +507,9 @@ fn restricted_runtime_working_dir() -> Result<PathBuf, String> {
 fn effective_working_dir(options: &CodexAppServerOptions<'_>) -> Result<PathBuf, String> {
     match options.tool_profile {
         CodexToolProfile::Default => Ok(options.working_dir.to_path_buf()),
-        CodexToolProfile::RestrictedMcpOnly | CodexToolProfile::NoTools => {
-            restricted_runtime_working_dir()
-        }
+        CodexToolProfile::ConfiguredMcpOnly
+        | CodexToolProfile::RestrictedMcpOnly
+        | CodexToolProfile::NoTools => restricted_runtime_working_dir(),
     }
 }
 
@@ -2138,6 +2158,48 @@ approval_mode = "approve"
                 .and_then(|value| value.as_str()),
             Some("approve")
         );
+    }
+
+    #[test]
+    fn configured_mcp_profile_uses_explicit_tools_without_scoped_workspace_filter() {
+        let approved = vec![
+            "prepare_email_for_agent_intake".to_string(),
+            "read_guarded_email_content".to_string(),
+        ];
+        let config = build_app_server_config(
+            Path::new("/tmp/source-codex-home"),
+            Path::new("/tmp/agentic_mcp"),
+            CodexToolProfile::ConfiguredMcpOnly,
+            &approved,
+        )
+        .expect("config");
+        let parsed: toml::Value = toml::from_str(&config).expect("parse config");
+        let agentic_mcp = parsed
+            .get("mcp_servers")
+            .and_then(|servers| servers.get("agentic-mcp"))
+            .expect("agentic-mcp config");
+        let tools = agentic_mcp
+            .get("tools")
+            .and_then(|value| value.as_table())
+            .expect("tools table");
+        assert!(tools.get("prepare_email_for_agent_intake").is_some());
+        assert!(tools.get("read_guarded_email_content").is_some());
+
+        let mut options = sample_app_server_options(None);
+        options.tool_profile = CodexToolProfile::ConfiguredMcpOnly;
+        options.approved_mcp_tools = approved;
+        let command = build_codex_app_server_command(
+            &options,
+            Path::new("/tmp/agentic_mcp"),
+            Path::new("/tmp/agentic_codex_home"),
+        )
+        .expect("build command");
+        let args = command_args(&command);
+
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--disable" && pair[1] == "shell_tool"));
+        assert!(!args.iter().any(|arg| arg.contains("AGENTIC_MCP_PROFILE")));
     }
 
     #[test]

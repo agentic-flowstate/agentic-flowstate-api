@@ -41,10 +41,10 @@ const PROMPT_HISTORY_MESSAGE_LIMIT: usize = 30;
 
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
     match agent_type {
-        AgentType::ScopedWorkspace
-        | AgentType::HomePlanner
-        | AgentType::MeetingAgent
-        | AgentType::WorkspaceManager => CodexToolProfile::RestrictedMcpOnly,
+        AgentType::HomePlanner | AgentType::MeetingAgent => CodexToolProfile::ConfiguredMcpOnly,
+        AgentType::ScopedWorkspace | AgentType::WorkspaceManager => {
+            CodexToolProfile::RestrictedMcpOnly
+        }
         _ => CodexToolProfile::Default,
     }
 }
@@ -53,12 +53,11 @@ fn codex_sandbox_policy_for_chat_agent(
     agent_type: &AgentType,
 ) -> (CodexSandboxMode, bool, CodexToolProfile) {
     let tool_profile = codex_tool_profile_for_chat_agent(agent_type);
-    if tool_profile == CodexToolProfile::RestrictedMcpOnly {
-        (
-            CodexSandboxMode::ReadOnly,
-            false,
-            CodexToolProfile::RestrictedMcpOnly,
-        )
+    if matches!(
+        tool_profile,
+        CodexToolProfile::ConfiguredMcpOnly | CodexToolProfile::RestrictedMcpOnly
+    ) {
+        (CodexSandboxMode::ReadOnly, false, tool_profile)
     } else {
         (
             CodexSandboxMode::DangerFullAccess,
