@@ -14,6 +14,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::email_attachment_safety::unique_attachment_filename;
+use crate::email_threading::resolve_email_thread_id;
 
 type ImapSession = async_imap::Session<async_native_tls::TlsStream<TcpStream>>;
 const EMAIL_FETCH_WINDOW: u32 = 500;
@@ -481,12 +482,25 @@ async fn fetch_folder(
                     .map(|d| d.to_timestamp())
                     .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-                let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
-
-                let thread_id = parsed
-                    .thread_name()
+                let references: Vec<String> = parsed
+                    .references()
+                    .as_text_list()
+                    .unwrap_or_default()
+                    .into_iter()
                     .map(|s| s.to_string())
-                    .or_else(|| in_reply_to.clone());
+                    .collect();
+                let in_reply_to = parsed.in_reply_to().as_text().map(|s| s.to_string());
+                let thread_id = resolve_email_thread_id(
+                    db_pool,
+                    &account.email,
+                    db_folder,
+                    &from_addr,
+                    subject.as_deref(),
+                    received_at,
+                    &references,
+                    in_reply_to.as_deref(),
+                )
+                .await?;
 
                 let req = CreateEmailRequest {
                     message_id,

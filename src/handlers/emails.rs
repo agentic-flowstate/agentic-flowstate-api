@@ -460,6 +460,7 @@ pub async fn send_email(
 
     let message_id = delivery.message_id;
     let source_mailbox = delivery.source_mailbox;
+    let thread_id = req.thread_id.clone().or_else(|| Some(message_id.clone()));
     tracing::info!("Email sent successfully, message_id: {}", message_id);
 
     // Store in Sent folder
@@ -480,7 +481,7 @@ pub async fn send_email(
         body_text: req.body_text.clone(),
         body_html: req.body_html.clone(),
         received_at: now,
-        thread_id: req.thread_id.clone(),
+        thread_id: thread_id.clone(),
         in_reply_to: req.in_reply_to.clone(),
     };
 
@@ -512,7 +513,7 @@ pub async fn send_email(
             &email_intake::CreateExpectedResponseRequest {
                 sent_email_id: Some(stored_email.id),
                 context_id: None,
-                thread_id: None,
+                thread_id: thread_id.clone(),
                 mailbox: None,
                 correspondent_email: req.to.first().cloned(),
                 subject: Some(req.subject.clone()),

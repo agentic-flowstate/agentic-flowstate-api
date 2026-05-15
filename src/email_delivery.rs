@@ -85,7 +85,15 @@ async fn send_ses_raw(
         .await
         .context("SES send failed")?;
 
-    Ok(result.message_id().unwrap_or(message_id).to_string())
+    if let Some(provider_message_id) = result.message_id() {
+        tracing::debug!(
+            "SES accepted email with provider message id {} for RFC Message-ID {}",
+            provider_message_id,
+            message_id
+        );
+    }
+
+    Ok(message_id.to_string())
 }
 
 async fn send_purelymail_smtp(
