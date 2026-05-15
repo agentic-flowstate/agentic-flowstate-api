@@ -528,12 +528,14 @@ async fn fetch_folder(
 
                         let mut was_auto_junked = false;
                         if let Some(rule) = matching_block_rule(&stored_email, &spam_rules) {
-                            match move_blocked_email_to_junk(
+                            match move_email_to_junk(
                                 session,
                                 db_pool,
                                 &stored_email,
                                 uid,
-                                rule,
+                                "rule_applied_auto",
+                                Some(rule.id),
+                                &format!("{} rule {}", rule.rule_type, rule.id),
                             )
                             .await
                             {
@@ -545,6 +547,31 @@ async fn fetch_folder(
                                         stored_email.from_address,
                                         e
                                     );
+                                }
+                            }
+                        } else if db_folder == "INBOX" {
+                            if let Some(decision) = auto_junk_marketing_solicitation(&stored_email)
+                            {
+                                match move_email_to_junk(
+                                    session,
+                                    db_pool,
+                                    &stored_email,
+                                    uid,
+                                    "marketing_filter_auto",
+                                    None,
+                                    decision.reason,
+                                )
+                                .await
+                                {
+                                    Ok(()) => was_auto_junked = true,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to auto-move marketing solicitation email {} from {} to Junk: {:?}",
+                                            stored_email.id,
+                                            stored_email.from_address,
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -609,18 +636,21 @@ async fn fetch_folder(
                             }
                         }
 
-                        if let Err(e) = crate::email_llm_guard::process_email_intake_with_llm_guard(
-                            db_pool,
-                            stored_email.id,
-                            "email_fetcher",
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                "Failed to run email intake for email {}: {:?}",
-                                stored_email.id,
-                                e
-                            );
+                        if !was_auto_junked {
+                            if let Err(e) =
+                                crate::email_llm_guard::process_email_intake_with_llm_guard(
+                                    db_pool,
+                                    stored_email.id,
+                                    "email_fetcher",
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    "Failed to run email intake for email {}: {:?}",
+                                    stored_email.id,
+                                    e
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -746,12 +776,155 @@ fn matching_block_rule<'a>(
     })
 }
 
-async fn move_blocked_email_to_junk(
+#[derive(Debug, Clone, Copy)]
+struct AutoJunkDecision {
+    reason: &'static str,
+}
+
+fn auto_junk_marketing_solicitation(email: &Email) -> Option<AutoJunkDecision> {
+    let subject = email.subject.as_deref().unwrap_or_default();
+    let text = email_filter_text(email);
+    let normalized = normalize_marketing_text(&text);
+    let compact = compact_marketing_text(&text);
+    let normalized_subject = normalize_marketing_text(subject);
+    let compact_subject = compact_marketing_text(subject);
+
+    let seo_topic = compact.contains("seo")
+        || normalized.contains("search engine optimization")
+        || normalized.contains("organic traffic")
+        || normalized.contains("backlink")
+        || normalized.contains("domain authority");
+    let google_ranking_topic = contains_any(
+        &normalized,
+        &[
+            "google ranking",
+            "google rank",
+            "rank on google",
+            "ranking on google",
+            "top on google",
+            "google organically",
+            "organic search",
+        ],
+    );
+    let website_design_topic = contains_any(
+        &normalized,
+        &[
+            "website design",
+            "web design",
+            "website redesign",
+            "site redesign",
+            "website upgrade",
+            "web development",
+        ],
+    );
+    let general_website_pitch = normalized.contains("your website")
+        && contains_any(
+            &normalized,
+            &[
+                "audit",
+                "boost",
+                "improve",
+                "increase",
+                "marketing",
+                "redesign",
+                "upgrade",
+            ],
+        );
+    let cold_pitch = contains_any(
+        &normalized,
+        &[
+            "proposal",
+            "cost",
+            "price",
+            "pricing",
+            "quote",
+            "offer",
+            "service",
+            "services",
+            "we can",
+            "we provide",
+            "i can",
+            "improve your",
+            "boost your",
+        ],
+    );
+    let direct_subject_pitch = compact_subject.contains("seoproposal")
+        || (compact_subject.contains("seo") && normalized_subject.contains("proposal"))
+        || contains_any(
+            &normalized_subject,
+            &[
+                "website design",
+                "web design",
+                "website redesign",
+                "website upgrade",
+                "google ranking",
+                "ranking on top",
+            ],
+        );
+
+    if direct_subject_pitch
+        || ((seo_topic || google_ranking_topic || website_design_topic || general_website_pitch)
+            && cold_pitch)
+    {
+        Some(AutoJunkDecision {
+            reason: "high-confidence SEO or website marketing solicitation",
+        })
+    } else {
+        None
+    }
+}
+
+fn email_filter_text(email: &Email) -> String {
+    [
+        email.subject.as_deref(),
+        email.body_text.as_deref(),
+        email.body_html.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn normalize_marketing_text(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut previous_space = true;
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            previous_space = false;
+        } else if !previous_space {
+            normalized.push(' ');
+            previous_space = true;
+        }
+    }
+
+    normalized.trim().to_string()
+}
+
+fn compact_marketing_text(value: &str) -> String {
+    let mut compact = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            compact.push(ch.to_ascii_lowercase());
+        }
+    }
+    compact
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+async fn move_email_to_junk(
     session: &mut ImapSession,
     pool: &SqlitePool,
     email: &Email,
     uid: u32,
-    rule: &EmailBlockRule,
+    action: &str,
+    rule_id: Option<i64>,
+    log_context: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
     let mut provider_action = None;
@@ -782,7 +955,7 @@ async fn move_blocked_email_to_junk(
         INSERT INTO email_spam_actions
             (email_id, mailbox, message_id, from_address, subject, action, rule_id,
              provider_action, status, error, created_by, created_at)
-        VALUES (?, ?, ?, ?, ?, 'rule_applied_auto', ?, ?, ?, ?, 'email_fetcher', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'email_fetcher', ?)
         "#,
     )
     .bind(email.id)
@@ -790,7 +963,8 @@ async fn move_blocked_email_to_junk(
     .bind(&email.message_id)
     .bind(&email.from_address)
     .bind(&email.subject)
-    .bind(rule.id)
+    .bind(action)
+    .bind(rule_id)
     .bind(&provider_action)
     .bind(status)
     .bind(&error)
@@ -801,11 +975,10 @@ async fn move_blocked_email_to_junk(
 
     if status == "success" {
         tracing::info!(
-            "Auto-moved blocked email {} from {} to Junk via {} rule {}",
+            "Auto-moved email {} from {} to Junk via {}",
             email.id,
             email.from_address,
-            rule.rule_type,
-            rule.id
+            log_context
         );
         Ok(())
     } else {
@@ -897,5 +1070,74 @@ fn folder_candidates(db_folder: &str) -> Vec<&'static str> {
             "INBOX.Sent",
         ],
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_email(subject: &str, body_text: &str) -> Email {
+        Email {
+            id: 1,
+            message_id: "admin@example.org:INBOX:1".to_string(),
+            mailbox: "admin@example.org".to_string(),
+            folder: "INBOX".to_string(),
+            from_address: "sender@example.com".to_string(),
+            from_name: None,
+            to_addresses: vec!["admin@example.org".to_string()],
+            cc_addresses: None,
+            subject: Some(subject.to_string()),
+            body_text: Some(body_text.to_string()),
+            body_html: None,
+            received_at: 0,
+            is_read: false,
+            is_starred: false,
+            thread_id: Some(subject.to_string()),
+            in_reply_to: None,
+            labels: None,
+            received_at_iso: String::new(),
+            created_at_iso: String::new(),
+        }
+    }
+
+    #[test]
+    fn auto_junks_obfuscated_seo_proposal_subject() {
+        let email = test_email(
+            "S-E-O Proposal !!",
+            "We can improve your Google ranking and organic traffic.",
+        );
+
+        assert!(auto_junk_marketing_solicitation(&email).is_some());
+    }
+
+    #[test]
+    fn auto_junks_website_design_pitch() {
+        let email = test_email(
+            "Website design/redesign/ Upgrade ?",
+            "We provide web design services and can improve your website.",
+        );
+
+        assert!(auto_junk_marketing_solicitation(&email).is_some());
+    }
+
+    #[test]
+    fn leaves_normal_vendor_quote_in_inbox() {
+        let email = test_email(
+            "Re: Quote guidance for one assembled prototype PCBA",
+            "Here is the fabrication cost and lead time for your assembled board.",
+        );
+
+        assert!(auto_junk_marketing_solicitation(&email).is_none());
+    }
+
+    #[test]
+    fn leaves_regular_website_notification_in_inbox() {
+        let email = test_email(
+            "Switch to passkeys",
+            "You can now use passkeys to sign in to the website.",
+        );
+
+        assert!(auto_junk_marketing_solicitation(&email).is_none());
     }
 }
