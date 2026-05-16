@@ -811,6 +811,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/telemetry/events",
             post(handlers::client_telemetry::ingest_events),
+        )
+        .route(
+            "/api/leitner/sync",
+            post(handlers::leitner_sync::ingest_sync),
+        )
+        .route(
+            "/api/leitner/progress",
+            get(handlers::leitner_sync::latest_progress),
         );
 
     // Org-scoped routes (require valid session + org membership)

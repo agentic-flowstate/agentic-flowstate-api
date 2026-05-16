@@ -29,6 +29,7 @@ pub mod focus;
 pub mod full_access_chat;
 pub mod health;
 pub mod home_planner;
+pub mod leitner_sync;
 pub mod library;
 pub mod meeting_agent;
 pub mod meeting_transcription;
