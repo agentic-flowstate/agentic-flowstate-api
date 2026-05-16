@@ -9,8 +9,8 @@ use crate::agents::codex_app_server::{
 };
 use crate::agents::prompts::load_prompt;
 
-const EMAIL_LLM_GUARD_CREATED_BY_SUFFIX: &str = ":email_llm_guard";
-const EMAIL_LLM_GUARD_REASONING_EFFORT: &str = "xhigh";
+const EMAIL_QUARANTINE_AGENT_CREATED_BY_SUFFIX: &str = ":email_quarantine_agent";
+const EMAIL_QUARANTINE_AGENT_REASONING_EFFORT: &str = "xhigh";
 const EMAIL_QUARANTINE_TOOLS: &[&str] = &[
     "inspect_email_for_quarantine",
     "submit_quarantine_verdict",
@@ -18,38 +18,40 @@ const EMAIL_QUARANTINE_TOOLS: &[&str] = &[
     "exa_get_contents",
 ];
 
-pub async fn process_email_intake_with_llm_guard(
+pub async fn process_email_intake_with_quarantine_agent(
     pool: &SqlitePool,
     email_id: i64,
     created_by: &str,
 ) -> Result<email_intake::EmailIntakeResult> {
     let email = emails::get_email_by_id(pool, email_id).await?;
     if email.folder != "Sent" {
-        evaluate_email_llm_guard_for_email(pool, &email, created_by).await?;
+        evaluate_email_quarantine_agent_for_email(pool, &email, created_by).await?;
     }
 
     email_intake::process_email_intake(pool, email_id, created_by).await
 }
 
-async fn evaluate_email_llm_guard_for_email(
+async fn evaluate_email_quarantine_agent_for_email(
     pool: &SqlitePool,
     email: &Email,
     created_by: &str,
-) -> Result<email_intake::EmailLlmGuardEvaluation> {
+) -> Result<email_intake::EmailQuarantineEvaluation> {
     let model = resolve_codex_model("").to_string();
-    let prompt_version = email_intake::EMAIL_LLM_GUARD_PROMPT_VERSION;
-    let actor = format!("{created_by}{EMAIL_LLM_GUARD_CREATED_BY_SUFFIX}");
+    let actor = format!("{created_by}{EMAIL_QUARANTINE_AGENT_CREATED_BY_SUFFIX}");
     let evaluation_run_id = Uuid::new_v4().to_string();
 
-    let system_prompt = load_prompt("email-llm-guard-system", Default::default())
-        .context("Failed to load email LLM guard system prompt")?;
-    let prompt = load_prompt("email-llm-guard", prompt_vars(email, &evaluation_run_id))
-        .context("Failed to load email LLM guard prompt")?;
-    let working_dir = email_llm_guard_working_dir()?;
+    let system_prompt = load_prompt("email-quarantine-agent-system", Default::default())
+        .context("Failed to load email quarantine agent system prompt")?;
+    let prompt = load_prompt(
+        "email-quarantine-agent",
+        prompt_vars(email, &evaluation_run_id),
+    )
+    .context("Failed to load email quarantine agent prompt")?;
+    let working_dir = email_quarantine_agent_working_dir()?;
 
     match run_quarantine_agent(
         &model,
-        EMAIL_LLM_GUARD_REASONING_EFFORT,
+        EMAIL_QUARANTINE_AGENT_REASONING_EFFORT,
         &system_prompt,
         &working_dir,
         &prompt,
@@ -59,25 +61,16 @@ async fn evaluate_email_llm_guard_for_email(
     )
     .await
     {
-        Ok(evaluation) => {
-            email_intake::record_email_llm_guard_output(
-                pool,
-                email.id,
-                &model,
-                prompt_version,
-                &evaluation.verdict,
-                &actor,
-            )
-            .await
-        }
+        Ok(evaluation) => Ok(evaluation),
         Err(error) => {
-            let reason = format!("codex_no_tools_guard_failed: {}", compact_failure(&error));
-            email_intake::record_email_llm_guard_failure(
+            let reason = format!("quarantine agent failed: {}", compact_failure(&error));
+            email_intake::record_email_quarantine_evaluation(
                 pool,
                 email.id,
-                &model,
-                prompt_version,
-                &reason,
+                &evaluation_run_id,
+                "3",
+                vec![reason],
+                &format!("email://message/{}", email.id),
                 &actor,
             )
             .await
@@ -167,13 +160,14 @@ fn prompt_vars(
     vars
 }
 
-fn email_llm_guard_working_dir() -> Result<PathBuf> {
+fn email_quarantine_agent_working_dir() -> Result<PathBuf> {
     let dir = dirs::home_dir()
-        .context("Failed to resolve home directory for email LLM guard working dir")?
+        .context("Failed to resolve home directory for email quarantine agent working dir")?
         .join(".agentic-flowstate")
-        .join("email-llm-guard-workspace");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create email LLM guard working dir at {dir:?}"))?;
+        .join("email-quarantine-agent-workspace");
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!("Failed to create email quarantine agent working dir at {dir:?}")
+    })?;
     Ok(dir)
 }
 

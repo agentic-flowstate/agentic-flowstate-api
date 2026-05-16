@@ -638,7 +638,7 @@ async fn fetch_folder(
 
                         if !was_auto_junked {
                             if let Err(e) =
-                                crate::email_llm_guard::process_email_intake_with_llm_guard(
+                                crate::email_quarantine_agent::process_email_intake_with_quarantine_agent(
                                     db_pool,
                                     stored_email.id,
                                     "email_fetcher",

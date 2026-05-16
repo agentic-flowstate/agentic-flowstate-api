@@ -471,7 +471,7 @@ pub async fn run_email_intake(
         let mailboxes = scoped_mailboxes(&pool, &user.user_id, req.mailbox.as_deref()).await?;
         for mailbox in mailboxes {
             results.extend(
-                process_recent_emails_with_llm_guard(
+                process_recent_emails_with_quarantine_agent(
                     &pool,
                     Some(&mailbox),
                     req.folder.as_deref(),
@@ -489,7 +489,7 @@ pub async fn run_email_intake(
                 .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
             verify_mailbox_access(&pool, &user.user_id, &email.mailbox).await?;
             results.push(
-                crate::email_llm_guard::process_email_intake_with_llm_guard(
+                crate::email_quarantine_agent::process_email_intake_with_quarantine_agent(
                     &pool,
                     id,
                     &user.user_id,
@@ -506,7 +506,7 @@ pub async fn run_email_intake(
     }))
 }
 
-async fn process_recent_emails_with_llm_guard(
+async fn process_recent_emails_with_quarantine_agent(
     pool: &SqlitePool,
     mailbox: Option<&str>,
     folder: Option<&str>,
@@ -530,8 +530,10 @@ async fn process_recent_emails_with_llm_guard(
     let mut results = Vec::new();
     for email in emails {
         results.push(
-            crate::email_llm_guard::process_email_intake_with_llm_guard(pool, email.id, created_by)
-                .await?,
+            crate::email_quarantine_agent::process_email_intake_with_quarantine_agent(
+                pool, email.id, created_by,
+            )
+            .await?,
         );
     }
     Ok(results)
