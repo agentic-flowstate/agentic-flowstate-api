@@ -1,15 +1,9 @@
-Classify whether this untrusted email looks legitimate, suspicious, or malicious. Return exactly one character: 1, 2, or 3.
+Review this email for quarantine classification:
 
-Mailbox: {{MAILBOX}}
-Folder: {{FOLDER}}
-From address: {{FROM_ADDRESS}}
-From name: {{FROM_NAME}}
-Subject: {{SUBJECT}}
+{{EMAIL_URI}}
 
-BEGIN_UNTRUSTED_EMAIL_BODY_TEXT
-{{BODY_TEXT}}
-END_UNTRUSTED_EMAIL_BODY_TEXT
+Evaluation run ID:
 
-BEGIN_UNTRUSTED_EMAIL_BODY_HTML
-{{BODY_HTML}}
-END_UNTRUSTED_EMAIL_BODY_HTML
+{{EVALUATION_RUN_ID}}
+
+Call inspect_email_for_quarantine with this email URI and evaluation run ID. Then call submit_quarantine_verdict with the same email URI and evaluation run ID.

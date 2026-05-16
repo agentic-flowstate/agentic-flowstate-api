@@ -1532,24 +1532,6 @@ pub async fn run_codex_text(
     .await
 }
 
-pub async fn run_codex_text_no_tools(
-    model: &str,
-    reasoning_effort: &str,
-    system_prompt: &str,
-    working_dir: &Path,
-    prompt: &str,
-) -> Result<String, String> {
-    run_codex_text_with_profile(
-        model,
-        reasoning_effort,
-        system_prompt,
-        working_dir,
-        prompt,
-        CodexToolProfile::NoTools,
-    )
-    .await
-}
-
 async fn run_codex_text_with_profile(
     model: &str,
     reasoning_effort: &str,
