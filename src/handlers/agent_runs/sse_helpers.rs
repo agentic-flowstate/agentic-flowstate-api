@@ -41,7 +41,7 @@ pub fn spawn_event_persister(
                 event_index += 1;
             }
 
-            // Forward to SSE stream — OK if frontend disconnected (send fails silently)
+            // Forward to SSE stream — OK if the client disconnected (send fails silently)
             let _ = sse_tx.send(event).await;
         }
 

@@ -18,7 +18,7 @@ use crate::auth_middleware::AuthenticatedUser;
 #[derive(Debug, Deserialize)]
 pub struct WorkspaceManagerRequest {
     pub message: String,
-    /// Accepted from frontend but not used server-side (agent works cross-org)
+    /// Accepted from clients but not used server-side (agent works cross-org)
     #[allow(dead_code)]
     pub organization: Option<String>,
     pub conversation_id: Option<String>,

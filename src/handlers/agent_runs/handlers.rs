@@ -479,7 +479,7 @@ pub async fn stream_agent_run(
         }
     });
 
-    // Events are stored by the persister even if the frontend disconnects
+    // Events are stored by the persister even if the client disconnects
     let sse_rx = spawn_event_persister((*db).clone(), session_id, rx, 0);
     let stream = create_sse_stream(sse_rx);
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -751,7 +751,7 @@ pub async fn send_message_to_agent(
         Err(_) => 0,
     };
 
-    // Events are stored by the persister even if the frontend disconnects
+    // Events are stored by the persister even if the client disconnects
     let sse_rx = spawn_event_persister((*db).clone(), session_id, rx, initial_index);
     let stream = create_sse_stream(sse_rx);
     Sse::new(stream).keep_alive(KeepAlive::default())

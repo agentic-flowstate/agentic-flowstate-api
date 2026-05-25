@@ -107,7 +107,7 @@ const CODE_SIGN_IDENTITY: &str = "Apple Distribution: Alexander Lewis (M3C97KFGK
 const PROVISIONING_PROFILE: &str = "Agentic Flowstate App Store";
 const APPLE_ID: &str = "atlewisftw@gmail.com";
 
-/// POST /api/admin/ios-install — build and install the iOS app only (no MCP/API/frontend rebuild).
+/// POST /api/admin/ios-install — build and install the iOS app only (no MCP/API rebuild).
 /// Spawns xcodegen + xcodebuild + devicectl install as a detached process.
 /// Much faster than a full reload — typically 15-30 seconds.
 pub async fn ios_install() -> Response {

@@ -15,7 +15,7 @@ fn make_session_cookie(session_id: &str) -> Cookie<'static> {
     cookie.set_path("/");
     cookie.set_http_only(true);
     cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
-    cookie.set_secure(false); // Internal HTTP on Tailscale
+    cookie.set_secure(false); // Internal HTTP over WireGuard.
     cookie.set_max_age(tower_cookies::cookie::time::Duration::seconds(MAX_AGE_SECS));
     cookie
 }
@@ -175,8 +175,8 @@ pub async fn logout(State(pool): State<Arc<SqlitePool>>, cookies: Cookies) -> St
 ///
 /// Returns a public list of every user in the system. Used by the iOS login
 /// screen to populate a dropdown so users pick their account instead of
-/// typing it. Intentionally unauthenticated — this is an internal tool on a
-/// Tailscale network, and user_id + display name are not sensitive.
+/// typing it. Intentionally unauthenticated — this is an internal tool on the
+/// private WireGuard network, and user_id + display name are not sensitive.
 pub async fn list_public_users(
     State(pool): State<Arc<SqlitePool>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {

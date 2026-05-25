@@ -24,12 +24,10 @@ use axum::{
     routing::{delete, get, patch, post},
     Router,
 };
-use http::{header, Method};
 use std::sync::Arc;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tower_cookies::CookieManagerLayer;
-use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use handlers::chat_client_manager::ChatClientManager;
@@ -131,9 +129,6 @@ exec bash -l '{home}/projects/agentic-flowstate/agentic-flowstate-setup/setup.sh
         }
         if matches!(service, "agent-runner" | "all") {
             commands.push(launchd_reload_command(&uid, &home, "com.agentic.runner"));
-        }
-        if matches!(service, "frontend" | "all") {
-            commands.push(launchd_reload_command(&uid, &home, "com.agentic.frontend"));
         }
         if matches!(service, "mcp-server" | "all") {
             commands.push(launchd_reload_command(&uid, &home, "com.agentic.mcp"));
@@ -1432,36 +1427,9 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         ))
-        .layer(CookieManagerLayer::new())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(AllowOrigin::list([
-                    "http://localhost:3000".parse().unwrap(),
-                    "http://100.119.87.128:3000".parse().unwrap(),
-                    "https://jarviss-mac-mini-1.tail3da916.ts.net"
-                        .parse()
-                        .unwrap(),
-                ]))
-                .allow_credentials(true)
-                .allow_methods([
-                    Method::GET,
-                    Method::POST,
-                    Method::PUT,
-                    Method::PATCH,
-                    Method::DELETE,
-                    Method::OPTIONS,
-                ])
-                .allow_headers([
-                    header::CONTENT_TYPE,
-                    header::ACCEPT,
-                    header::AUTHORIZATION,
-                    header::COOKIE,
-                    header::HeaderName::from_static("x-organization"),
-                ])
-                .expose_headers([header::SET_COOKIE, header::CONTENT_TYPE]),
-        );
+        .layer(CookieManagerLayer::new());
 
-    // Start the server - bind to 0.0.0.0 to allow access from other devices (mobile via Tailscale)
+    // Bind to 0.0.0.0 so native clients can reach the API over WireGuard.
     let addr = "0.0.0.0:8001";
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Server running on http://{}", addr);

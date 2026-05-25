@@ -131,7 +131,7 @@ src/
 - Epic CRUD operations (list, get, create, delete)
 - Basic slice and ticket listing
 - DynamoDB connection pooling
-- CORS support for frontend integration
+- Native-client API integration
 
 🚧 **In Progress**:
 - Slice CRUD operations
@@ -156,5 +156,4 @@ curl -X POST http://localhost:8001/api/epics \
 ## Related Projects
 
 - `agentic-flowstate-mcp`: MCP server for agent tooling
-- `agentic-flowstate-frontend`: Next.js web interface
 - `agentic-flowstate-ticketing-system`: DynamoDB infrastructure
