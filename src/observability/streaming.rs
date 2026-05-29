@@ -144,8 +144,8 @@ pub enum PushResult {
     /// soft-deleted server-side. The same row will never be attempted
     /// again until the client re-registers.
     Unregistered,
-    /// The device token was rejected as malformed (wrong length,
-    /// wrong environment, etc.). Soft-deleted like `Unregistered`.
+    /// The device token was rejected as malformed, wrong-environment, etc.
+    /// This is not enough evidence to soft-delete the token.
     BadToken,
     /// APNs told us we sent too many pushes — backpressure. Caller MUST
     /// NOT retry immediately; the apns-collapse-id already ensures at

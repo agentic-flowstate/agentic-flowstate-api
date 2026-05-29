@@ -50,7 +50,7 @@ use serde::{ser::SerializeStruct, Serialize};
 /// The `DeviceUnregistered` variant is the load-bearing one: the caller
 /// MUST soft-delete the offending device token when this is returned so
 /// the backend stops pushing to invalid tokens. APNs reports this via
-/// HTTP 410 with `reason: "Unregistered"` (also `BadDeviceToken`).
+/// HTTP 410 with `reason: "Unregistered"`.
 #[derive(Debug, thiserror::Error)]
 pub enum ApnsSilentError {
     /// A required env var was missing or empty at [`ApnsClient::init`].
@@ -77,7 +77,7 @@ pub enum ApnsSilentError {
 
     /// The device token is no longer valid for this topic. Caller MUST
     /// soft-delete the token. Corresponds to APNs HTTP 410 with
-    /// `Unregistered` or `BadDeviceToken`.
+    /// `Unregistered`.
     #[error("Device token unregistered: {0}")]
     DeviceUnregistered(String),
 
@@ -205,6 +205,9 @@ pub struct ApnsClient {
 
 struct ClientInner {
     client: Client,
+    primary_endpoint: Endpoint,
+    alternate_client: Client,
+    alternate_endpoint: Endpoint,
     config: ApnsSilentConfig,
 }
 
@@ -246,16 +249,15 @@ impl ApnsClient {
             return Ok(());
         }
 
-        let endpoint = if use_sandbox {
+        let primary_endpoint = if use_sandbox {
             Endpoint::Sandbox
         } else {
             Endpoint::Production
         };
-        let config = ClientConfig::new(endpoint);
-
-        let mut key_reader = std::io::Cursor::new(p8_key_bytes);
-        let client = Client::token(&mut key_reader, key_id.clone(), team_id.clone(), config)
-            .map_err(ApnsSilentError::ClientBuild)?;
+        let alternate_endpoint = alternate_endpoint(&primary_endpoint);
+        let client = build_client(&p8_key_bytes, &key_id, &team_id, primary_endpoint.clone())?;
+        let alternate_client =
+            build_client(&p8_key_bytes, &key_id, &team_id, alternate_endpoint.clone())?;
 
         let resolved = ApnsSilentConfig {
             key_id,
@@ -267,6 +269,9 @@ impl ApnsClient {
 
         let inner = Arc::new(ClientInner {
             client,
+            primary_endpoint,
+            alternate_client,
+            alternate_endpoint,
             config: resolved,
         });
 
@@ -310,6 +315,59 @@ impl ApnsClient {
             .ok_or(ApnsSilentError::NotInitialized)?
             .clone();
 
+        match self
+            .send_silent_push_once(
+                &inner.client,
+                &inner.config.bundle_id,
+                device_token,
+                conversation_id,
+                last_message_id,
+            )
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(ApnsSilentError::Rejected { code, reason }) if reason == "BadDeviceToken" => {
+                tracing::warn!(
+                    "[APNS_SILENT] BadDeviceToken from {} APNs (HTTP {}) for {}; retrying {} endpoint",
+                    endpoint_label(&inner.primary_endpoint),
+                    code,
+                    short_token(device_token),
+                    endpoint_label(&inner.alternate_endpoint)
+                );
+            }
+            Err(err) => return Err(err),
+        }
+
+        match self
+            .send_silent_push_once(
+                &inner.alternate_client,
+                &inner.config.bundle_id,
+                device_token,
+                conversation_id,
+                last_message_id,
+            )
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    "[APNS_SILENT] Push delivered via alternate {} endpoint for {}",
+                    endpoint_label(&inner.alternate_endpoint),
+                    short_token(device_token)
+                );
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn send_silent_push_once(
+        &self,
+        client: &Client,
+        bundle_id: &str,
+        device_token: &str,
+        conversation_id: &str,
+        last_message_id: &str,
+    ) -> Result<(), ApnsSilentError> {
         // Collapse id cap: APNs enforces a 64-byte ceiling. apns_h2's
         // CollapseId constructor checks this for us.
         let collapse = CollapseId::new(conversation_id).map_err(|e| ApnsSilentError::Rejected {
@@ -321,7 +379,7 @@ impl ApnsClient {
             apns_push_type: Some(PushType::Background),
             apns_priority: Some(Priority::Normal),
             apns_expiration: Some(0),
-            apns_topic: Some(inner.config.bundle_id.as_str()),
+            apns_topic: Some(bundle_id),
             apns_collapse_id: Some(collapse),
             apns_id: None,
         };
@@ -333,22 +391,13 @@ impl ApnsClient {
             options,
         };
 
-        match inner.client.send(payload).await {
+        match client.send(payload).await {
             Ok(_resp) => Ok(()),
             Err(apns_h2::Error::ResponseError(resp)) => {
-                let reason_str = resp
-                    .error
-                    .as_ref()
-                    .map(|e| format!("{:?}", e.reason))
-                    .unwrap_or_else(|| format!("HTTP {}", resp.code));
+                let reason = resp.error.as_ref().map(|e| &e.reason);
+                let reason_str = apns_reason_string(resp.code, reason);
 
-                let is_unregistered = resp.code == 410
-                    || matches!(
-                        resp.error.as_ref().map(|e| &e.reason),
-                        Some(ErrorReason::Unregistered) | Some(ErrorReason::BadDeviceToken)
-                    );
-
-                if is_unregistered {
+                if classify_apns_response(resp.code, reason) == ApnsResponseKind::Unregistered {
                     Err(ApnsSilentError::DeviceUnregistered(reason_str))
                 } else {
                     Err(ApnsSilentError::Rejected {
@@ -366,6 +415,64 @@ impl ApnsClient {
     pub fn config(&self) -> Option<ApnsSilentConfig> {
         self.inner.get().map(|i| i.config.clone())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApnsResponseKind {
+    Unregistered,
+    BadDeviceToken,
+    Other,
+}
+
+fn build_client(
+    p8_key_bytes: &[u8],
+    key_id: &str,
+    team_id: &str,
+    endpoint: Endpoint,
+) -> Result<Client, ApnsSilentError> {
+    let config = ClientConfig::new(endpoint);
+    let mut key_reader = std::io::Cursor::new(p8_key_bytes);
+    Client::token(
+        &mut key_reader,
+        key_id.to_string(),
+        team_id.to_string(),
+        config,
+    )
+    .map_err(ApnsSilentError::ClientBuild)
+}
+
+fn alternate_endpoint(endpoint: &Endpoint) -> Endpoint {
+    match endpoint {
+        Endpoint::Production => Endpoint::Sandbox,
+        Endpoint::Sandbox => Endpoint::Production,
+    }
+}
+
+fn endpoint_label(endpoint: &Endpoint) -> &'static str {
+    match endpoint {
+        Endpoint::Production => "production",
+        Endpoint::Sandbox => "sandbox",
+    }
+}
+
+fn classify_apns_response(code: u16, reason: Option<&ErrorReason>) -> ApnsResponseKind {
+    if code == 410 || matches!(reason, Some(ErrorReason::Unregistered)) {
+        ApnsResponseKind::Unregistered
+    } else if matches!(reason, Some(ErrorReason::BadDeviceToken)) {
+        ApnsResponseKind::BadDeviceToken
+    } else {
+        ApnsResponseKind::Other
+    }
+}
+
+fn apns_reason_string(code: u16, reason: Option<&ErrorReason>) -> String {
+    reason
+        .map(|reason| format!("{:?}", reason))
+        .unwrap_or_else(|| format!("HTTP {}", code))
+}
+
+fn short_token(token: &str) -> &str {
+    &token[..std::cmp::min(8, token.len())]
 }
 
 #[cfg(test)]
@@ -540,6 +647,21 @@ l7266ve46Rqa6TsuX86Nd3Rtw7q8DABfg0rwX3G3B0jZ0kHe6+4F3f6phQ==
         assert_eq!(cfg.team_id, "TID1");
         assert_eq!(cfg.bundle_id, "com.example.test");
         assert!(cfg.use_sandbox);
+        let inner = client.inner.get().expect("inner");
+        assert_eq!(endpoint_label(&inner.primary_endpoint), "sandbox");
+        assert_eq!(endpoint_label(&inner.alternate_endpoint), "production");
+    }
+
+    #[test]
+    fn bad_device_token_is_not_terminal_for_soft_delete() {
+        let kind = classify_apns_response(400, Some(&ErrorReason::BadDeviceToken));
+        assert_eq!(kind, ApnsResponseKind::BadDeviceToken);
+    }
+
+    #[test]
+    fn unregistered_is_terminal_for_soft_delete() {
+        let kind = classify_apns_response(410, Some(&ErrorReason::Unregistered));
+        assert_eq!(kind, ApnsResponseKind::Unregistered);
     }
 
     #[test]

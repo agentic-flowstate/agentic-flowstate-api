@@ -14,10 +14,10 @@
 //! ## Contract (from A-C710FBCA + A-F797AFC7)
 //!
 //! * The sender returns `Err(ApnsSilentError::DeviceUnregistered)` on APNs
-//!   410 Gone / `Unregistered` / `BadDeviceToken`. That variant is
-//!   terminal for the given token — the fan-out MUST soft-delete it via
-//!   `ticketing_system::device_tokens::soft_delete_device_token` and MUST
-//!   NOT retry.
+//!   410 Gone / `Unregistered`. That variant is terminal for the given token
+//!   — the fan-out MUST soft-delete it via
+//!   `ticketing_system::device_tokens::soft_delete_device_token` and MUST NOT
+//!   retry.
 //! * All other errors (`Rejected`, `Transport`, `NotInitialized`) are
 //!   logged at the appropriate level and do not trigger soft-delete.
 //! * The fan-out counts every token it attempts — skipped, delivered,
