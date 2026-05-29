@@ -12,6 +12,80 @@ const TOKEN_REFRESH_SECS: u64 = 50 * 60; // Refresh every 50 minutes (Apple max 
 
 static APNS_INSTANCE: OnceCell<Arc<ApnsService>> = OnceCell::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApnsEndpoint {
+    Production,
+    Sandbox,
+}
+
+impl ApnsEndpoint {
+    fn from_use_sandbox(use_sandbox: bool) -> Self {
+        if use_sandbox {
+            Self::Sandbox
+        } else {
+            Self::Production
+        }
+    }
+
+    fn base_url(self) -> &'static str {
+        match self {
+            Self::Production => APNS_PRODUCTION,
+            Self::Sandbox => APNS_SANDBOX,
+        }
+    }
+
+    fn alternate(self) -> Self {
+        match self {
+            Self::Production => Self::Sandbox,
+            Self::Sandbox => Self::Production,
+        }
+    }
+}
+
+impl std::fmt::Display for ApnsEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Production => "production",
+            Self::Sandbox => "sandbox",
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ApnsDelivery {
+    endpoint: ApnsEndpoint,
+}
+
+#[derive(Debug, Clone)]
+struct ApnsSendFailure {
+    endpoint: ApnsEndpoint,
+    status: Option<u16>,
+    reason: String,
+}
+
+impl ApnsSendFailure {
+    fn should_retry_alternate_endpoint(&self) -> bool {
+        self.reason == "BadDeviceToken"
+    }
+
+    fn should_soft_delete_token(&self) -> bool {
+        self.status == Some(410) || self.reason == "Unregistered"
+    }
+}
+
+impl std::fmt::Display for ApnsSendFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(status) => write!(
+                f,
+                "{} from {} APNs (HTTP {})",
+                self.reason, self.endpoint, status
+            ),
+            None => write!(f, "{} from {} APNs", self.reason, self.endpoint),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApnsAlertError {
     #[error("APNs alert push misconfigured: {0}")]
@@ -122,7 +196,7 @@ pub struct ApnsService {
     key_id: String,
     team_id: String,
     bundle_id: String,
-    base_url: String,
+    endpoint: ApnsEndpoint,
     client: reqwest::Client,
     cached_token: RwLock<Option<CachedToken>>,
 }
@@ -149,12 +223,7 @@ impl ApnsService {
         })?;
         let encoding_key = EncodingKey::from_ec_pem(&key_data).map_err(ApnsAlertError::KeyParse)?;
 
-        let base_url = if cfg.use_sandbox {
-            APNS_SANDBOX
-        } else {
-            APNS_PRODUCTION
-        }
-        .to_string();
+        let endpoint = ApnsEndpoint::from_use_sandbox(cfg.use_sandbox);
 
         let client = reqwest::Client::builder()
             .use_rustls_tls()
@@ -165,7 +234,7 @@ impl ApnsService {
         tracing::info!(
             "[APNS] Alert push initialized (bundle_id={}, endpoint={}, team={}, key={})",
             cfg.bundle_id,
-            base_url,
+            endpoint.base_url(),
             cfg.team_id,
             cfg.key_id
         );
@@ -175,7 +244,7 @@ impl ApnsService {
             key_id: cfg.key_id,
             team_id: cfg.team_id,
             bundle_id: cfg.bundle_id,
-            base_url,
+            endpoint,
             client,
             cached_token: RwLock::new(None),
         });
@@ -235,11 +304,85 @@ impl ApnsService {
         conversation_id: Option<&str>,
         agent_name: Option<&str>,
     ) -> Result<(), String> {
+        self.send_with_endpoint_retry(device_token, title, body, conversation_id, agent_name)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn send_with_endpoint_retry(
+        &self,
+        device_token: &str,
+        title: &str,
+        body: &str,
+        conversation_id: Option<&str>,
+        agent_name: Option<&str>,
+    ) -> Result<ApnsDelivery, ApnsSendFailure> {
+        match self
+            .send_once(
+                self.endpoint,
+                device_token,
+                title,
+                body,
+                conversation_id,
+                agent_name,
+            )
+            .await
+        {
+            Ok(delivery) => Ok(delivery),
+            Err(first) if first.should_retry_alternate_endpoint() => {
+                let alternate = self.endpoint.alternate();
+                tracing::warn!(
+                    "[APNS] {} for {}; retrying {} endpoint",
+                    first,
+                    &device_token[..std::cmp::min(8, device_token.len())],
+                    alternate
+                );
+
+                match self
+                    .send_once(
+                        alternate,
+                        device_token,
+                        title,
+                        body,
+                        conversation_id,
+                        agent_name,
+                    )
+                    .await
+                {
+                    Ok(delivery) => {
+                        tracing::info!(
+                            "[APNS] Push delivered via alternate {} endpoint for {}",
+                            delivery.endpoint,
+                            &device_token[..std::cmp::min(8, device_token.len())]
+                        );
+                        Ok(delivery)
+                    }
+                    Err(second) => Err(second),
+                }
+            }
+            Err(first) => Err(first),
+        }
+    }
+
+    async fn send_once(
+        &self,
+        endpoint: ApnsEndpoint,
+        device_token: &str,
+        title: &str,
+        body: &str,
+        conversation_id: Option<&str>,
+        agent_name: Option<&str>,
+    ) -> Result<ApnsDelivery, ApnsSendFailure> {
         let token = match self.get_token().await {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!("[APNS] JWT token generation failed: {}", e);
-                return Err(e);
+                return Err(ApnsSendFailure {
+                    endpoint,
+                    status: None,
+                    reason: e,
+                });
             }
         };
 
@@ -256,11 +399,11 @@ impl ApnsService {
             agent_name: agent_name.map(|s| s.to_string()),
         };
 
-        let url = format!("{}/3/device/{}", self.base_url, device_token);
+        let url = format!("{}/3/device/{}", endpoint.base_url(), device_token);
         tracing::info!(
             "[APNS] Sending to {} via {}",
             &device_token[..std::cmp::min(8, device_token.len())],
-            self.base_url
+            endpoint.base_url()
         );
 
         let response = match self
@@ -291,19 +434,24 @@ impl ApnsService {
             Err(e) => {
                 tracing::error!("[APNS] HTTP request failed: {} | source: {:?} | is_connect: {} | is_timeout: {}",
                         e, e.source(), e.is_connect(), e.is_timeout());
-                return Err(format!("APNs request failed: {}", e));
+                return Err(ApnsSendFailure {
+                    endpoint,
+                    status: None,
+                    reason: format!("APNs request failed: {}", e),
+                });
             }
         };
 
         let status = response.status();
+        let status_code = status.as_u16();
 
         if status.is_success() {
             tracing::info!(
                 "[APNS] Push sent OK (HTTP {}) to {}",
-                status.as_u16(),
+                status_code,
                 &device_token[..std::cmp::min(8, device_token.len())]
             );
-            Ok(())
+            Ok(ApnsDelivery { endpoint })
         } else {
             let error: ApnsErrorResponse = response
                 .json()
@@ -311,16 +459,21 @@ impl ApnsService {
                 .unwrap_or(ApnsErrorResponse { reason: None });
             let reason = error.reason.unwrap_or_else(|| format!("HTTP {}", status));
             tracing::warn!(
-                "[APNS] Push failed for {}: {}",
+                "[APNS] Push failed for {} via {} APNs: {}",
                 &device_token[..std::cmp::min(8, device_token.len())],
+                endpoint,
                 reason
             );
-            Err(reason)
+            Err(ApnsSendFailure {
+                endpoint,
+                status: Some(status_code),
+                reason,
+            })
         }
     }
 
     /// Send a push notification to all of a user's devices.
-    /// Removes invalid tokens automatically.
+    /// Removes APNs-unregistered tokens automatically.
     pub async fn send_to_user(
         &self,
         db: &sqlx::SqlitePool,
@@ -355,27 +508,73 @@ impl ApnsService {
 
         for token in &tokens {
             match self
-                .send(token, title, body, conversation_id, agent_name)
+                .send_with_endpoint_retry(token, title, body, conversation_id, agent_name)
                 .await
             {
-                Ok(()) => {}
-                Err(reason) => {
-                    tracing::warn!("[APNS] Send failed for user {}: {}", user_id, reason);
-                    // Soft-delete invalid tokens so they stop being pushed to.
-                    if reason == "BadDeviceToken"
-                        || reason == "Unregistered"
-                        || reason == "DeviceTokenNotForTopic"
-                    {
+                Ok(delivery) => {
+                    if delivery.endpoint != self.endpoint {
+                        tracing::warn!(
+                            "[APNS] Token for user {} delivered via {} APNs while configured endpoint is {}",
+                            user_id,
+                            delivery.endpoint,
+                            self.endpoint
+                        );
+                    }
+                }
+                Err(failure) => {
+                    tracing::warn!("[APNS] Send failed for user {}: {}", user_id, failure);
+                    if failure.should_soft_delete_token() {
                         tracing::info!("[APNS] Soft-deleting invalid token for user {}", user_id);
                         let _ = ticketing_system::device_tokens::soft_delete_device_token(
                             db, user_id, token,
                         )
                         .await;
+                    } else {
+                        tracing::warn!(
+                            "[APNS] Keeping token for user {} after non-terminal APNs rejection: {}",
+                            user_id,
+                            failure
+                        );
                     }
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bad_device_token_retries_alternate_endpoint_but_does_not_soft_delete() {
+        let failure = ApnsSendFailure {
+            endpoint: ApnsEndpoint::Production,
+            status: Some(400),
+            reason: "BadDeviceToken".to_string(),
+        };
+
+        assert!(failure.should_retry_alternate_endpoint());
+        assert!(!failure.should_soft_delete_token());
+    }
+
+    #[test]
+    fn unregistered_soft_deletes_without_endpoint_retry() {
+        let failure = ApnsSendFailure {
+            endpoint: ApnsEndpoint::Production,
+            status: Some(410),
+            reason: "Unregistered".to_string(),
+        };
+
+        assert!(!failure.should_retry_alternate_endpoint());
+        assert!(failure.should_soft_delete_token());
+    }
+
+    #[test]
+    fn endpoints_have_expected_alternates() {
+        assert_eq!(ApnsEndpoint::Production.alternate(), ApnsEndpoint::Sandbox);
+        assert_eq!(ApnsEndpoint::Sandbox.alternate(), ApnsEndpoint::Production);
     }
 }
