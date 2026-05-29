@@ -495,12 +495,7 @@ fn restricted_runtime_working_dir() -> Result<PathBuf, String> {
             "Failed to resolve home directory for scoped Codex runtime working directory"
                 .to_string()
         })?;
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        format!(
-            "Failed to create scoped Codex runtime working directory at {}: {e}",
-            dir.display()
-        )
-    })?;
+    ensure_directory(&dir, "scoped Codex runtime working directory")?;
     Ok(dir)
 }
 
@@ -520,12 +515,7 @@ fn prepare_codex_app_server_home(
 ) -> Result<PathBuf, String> {
     let source_home = default_codex_home()?;
     let target_home = app_server_codex_home(profile)?;
-    std::fs::create_dir_all(&target_home).map_err(|e| {
-        format!(
-            "Failed to create Codex app-server home at {}: {e}",
-            target_home.display()
-        )
-    })?;
+    ensure_directory(&target_home, "Codex app-server home")?;
 
     let source_auth = source_home.join("auth.json");
     if !source_auth.is_file() {
@@ -575,6 +565,51 @@ fn prepare_codex_app_server_home(
     })?;
 
     Ok(target_home)
+}
+
+fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = std::fs::read_link(path).map_err(|e| {
+                format!("Failed to read {label} symlink at {}: {e}", path.display())
+            })?;
+            let resolved_target = if target.is_absolute() {
+                target
+            } else {
+                path.parent().unwrap_or_else(|| Path::new(".")).join(target)
+            };
+
+            match std::fs::metadata(&resolved_target) {
+                Ok(target_metadata) if target_metadata.is_dir() => Ok(()),
+                Ok(_) => Err(format!(
+                    "{label} at {} points to non-directory target {}",
+                    path.display(),
+                    resolved_target.display()
+                )),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                    "{label} at {} is a broken symlink to missing target {}",
+                    path.display(),
+                    resolved_target.display()
+                )),
+                Err(e) => Err(format!(
+                    "Failed to inspect {label} symlink target {} from {}: {e}",
+                    resolved_target.display(),
+                    path.display()
+                )),
+            }
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(format!(
+            "{label} path exists but is not a directory: {}",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(path)
+            .map_err(|e| format!("Failed to create {label} at {}: {e}", path.display())),
+        Err(e) => Err(format!(
+            "Failed to inspect {label} at {}: {e}",
+            path.display()
+        )),
+    }
 }
 
 fn build_app_server_config(
@@ -1865,6 +1900,45 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "agentic-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn ensure_directory_accepts_symlink_to_directory() {
+        let root = unique_temp_path("codex-home-symlink-ok");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir_all(&target).expect("create target");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        ensure_directory(&link, "Codex app-server home").expect("valid symlink");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ensure_directory_reports_broken_symlink_target() {
+        let root = unique_temp_path("codex-home-broken-symlink");
+        let target = root.join("missing-target");
+        let link = root.join("link");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let error = ensure_directory(&link, "Codex app-server home").expect_err("broken symlink");
+
+        assert!(error.contains("broken symlink"));
+        assert!(error.contains(&target.display().to_string()));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
