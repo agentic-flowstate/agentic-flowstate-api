@@ -6,7 +6,6 @@ pub mod email_attachment_safety;
 pub mod email_delivery;
 pub mod email_fetcher;
 pub mod email_intake_scheduler;
-pub mod email_quarantine_agent;
 pub mod email_threading;
 pub mod handlers;
 pub mod health_monitor;

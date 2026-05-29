@@ -471,7 +471,7 @@ pub async fn run_email_intake(
         let mailboxes = scoped_mailboxes(&pool, &user.user_id, req.mailbox.as_deref()).await?;
         for mailbox in mailboxes {
             results.extend(
-                process_recent_emails_with_quarantine_agent(
+                process_recent_emails(
                     &pool,
                     Some(&mailbox),
                     req.folder.as_deref(),
@@ -489,13 +489,9 @@ pub async fn run_email_intake(
                 .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
             verify_mailbox_access(&pool, &user.user_id, &email.mailbox).await?;
             results.push(
-                crate::email_quarantine_agent::process_email_intake_with_quarantine_agent(
-                    &pool,
-                    id,
-                    &user.user_id,
-                )
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+                email_intake::process_email_intake(&pool, id, &user.user_id)
+                    .await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
             );
         }
     }
@@ -506,7 +502,7 @@ pub async fn run_email_intake(
     }))
 }
 
-async fn process_recent_emails_with_quarantine_agent(
+async fn process_recent_emails(
     pool: &SqlitePool,
     mailbox: Option<&str>,
     folder: Option<&str>,
@@ -529,12 +525,7 @@ async fn process_recent_emails_with_quarantine_agent(
 
     let mut results = Vec::new();
     for email in emails {
-        results.push(
-            crate::email_quarantine_agent::process_email_intake_with_quarantine_agent(
-                pool, email.id, created_by,
-            )
-            .await?,
-        );
+        results.push(email_intake::process_email_intake(pool, email.id, created_by).await?);
     }
     Ok(results)
 }

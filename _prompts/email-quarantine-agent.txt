@@ -1,9 +1,0 @@
-Review this email for quarantine classification:
-
-{{EMAIL_URI}}
-
-Evaluation run ID:
-
-{{EVALUATION_RUN_ID}}
-
-Call inspect_email_for_quarantine with this email URI and evaluation run ID. Then call submit_quarantine_verdict with the same email URI and evaluation run ID.
