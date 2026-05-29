@@ -93,13 +93,23 @@ fn env_flag_enabled(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn launchd_reload_command(uid: &str, home: &str, label: &str) -> String {
+fn launchd_restart_command(uid: &str, label: &str) -> String {
     format!(
-        "launchctl bootout gui/{uid}/{label} 2>/dev/null || true\n\
+        "echo \"[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: kickstart {label}\"\n\
+         launchctl kickstart -k gui/{uid}/{label} 2>&1\n\
+         rc=$?\n\
+         if [ \"$rc\" -ne 0 ]; then\n\
+             echo \"[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: kickstart failed for {label} rc=$rc\"\n\
+             exit \"$rc\"\n\
+         fi\n\
          sleep 1\n\
-         launchctl bootstrap gui/{uid} '{home}/Library/LaunchAgents/{label}.plist' 2>&1 || true",
+         launchctl print gui/{uid}/{label} >/dev/null 2>&1\n\
+         rc=$?\n\
+         if [ \"$rc\" -ne 0 ]; then\n\
+             echo \"[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: {label} not loaded after kickstart rc=$rc\"\n\
+             exit \"$rc\"\n\
+         fi",
         uid = uid,
-        home = home,
         label = label
     )
 }
@@ -124,13 +134,13 @@ exec bash -l '{home}/projects/agentic-flowstate/agentic-flowstate-setup/setup.sh
             .unwrap_or_else(|_| "501".to_string());
         let mut commands = Vec::new();
         if matches!(service, "api-server" | "all") {
-            commands.push(launchd_reload_command(&uid, &home, "com.agentic.api"));
+            commands.push(launchd_restart_command(&uid, "com.agentic.api"));
         }
         if matches!(service, "agent-runner" | "all") {
-            commands.push(launchd_reload_command(&uid, &home, "com.agentic.runner"));
+            commands.push(launchd_restart_command(&uid, "com.agentic.runner"));
         }
         if matches!(service, "mcp-server" | "all") {
-            commands.push(launchd_reload_command(&uid, &home, "com.agentic.mcp"));
+            commands.push(launchd_restart_command(&uid, "com.agentic.mcp"));
         }
 
         if commands.is_empty() {
@@ -198,6 +208,21 @@ async fn mark_matching_pending_restarts_executed(
 
 fn restart_watcher_should_exit_after_spawn(service: &str, action: &str) -> bool {
     action == "setup" || matches!(service, "api-server" | "all")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_command_uses_kickstart_without_deregistering_service() {
+        let command = launchd_restart_command("501", "com.agentic.api");
+
+        assert!(command.contains("launchctl kickstart -k gui/501/com.agentic.api"));
+        assert!(command.contains("launchctl print gui/501/com.agentic.api"));
+        assert!(!command.contains("launchctl bootout"));
+        assert!(!command.contains("launchctl bootstrap"));
+    }
 }
 
 #[tokio::main]
