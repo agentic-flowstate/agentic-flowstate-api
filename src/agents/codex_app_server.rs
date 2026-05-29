@@ -2144,10 +2144,7 @@ approval_mode = "approve"
 
     #[test]
     fn configured_mcp_profile_uses_explicit_tools_without_scoped_workspace_filter() {
-        let approved = vec![
-            "prepare_email_for_agent_intake".to_string(),
-            "read_guarded_email_content".to_string(),
-        ];
+        let approved = vec!["read_email_content".to_string()];
         let config = build_app_server_config(
             Path::new("/tmp/source-codex-home"),
             Path::new("/tmp/agentic_mcp"),
@@ -2164,8 +2161,7 @@ approval_mode = "approve"
             .get("tools")
             .and_then(|value| value.as_table())
             .expect("tools table");
-        assert!(tools.get("prepare_email_for_agent_intake").is_some());
-        assert!(tools.get("read_guarded_email_content").is_some());
+        assert!(tools.get("read_email_content").is_some());
 
         let mut options = sample_app_server_options(None);
         options.tool_profile = CodexToolProfile::ConfiguredMcpOnly;

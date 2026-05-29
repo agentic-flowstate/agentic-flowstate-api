@@ -1043,22 +1043,6 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::list_email_security_scans),
         )
         .route(
-            "/api/email-intake/guardrails",
-            get(handlers::list_email_agent_guardrails),
-        )
-        .route(
-            "/api/email-intake/guardrails/:email_id",
-            get(handlers::get_email_agent_guardrail).post(handlers::evaluate_email_agent_guardrail),
-        )
-        .route(
-            "/api/email-intake/guardrails/:email_id/action-gate",
-            post(handlers::check_email_agent_action_gate),
-        )
-        .route(
-            "/api/email-intake/agent-payload",
-            post(handlers::build_safe_agent_email_payload),
-        )
-        .route(
             "/api/email-intake/contexts",
             get(handlers::list_email_contexts).post(handlers::create_email_context),
         )
