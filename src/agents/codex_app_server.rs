@@ -2,6 +2,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::fs::OpenOptions;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -416,6 +420,56 @@ fn mcp_server_env_override(server_name: &str, key: &str, value: &str) -> Result<
     ))
 }
 
+fn mcp_tool_config_overrides(
+    profile: CodexToolProfile,
+    approved_mcp_tools: &[String],
+) -> Result<Vec<String>, String> {
+    if profile == CodexToolProfile::NoTools {
+        return Ok(Vec::new());
+    }
+
+    let mut tools: Vec<&str> = approved_mcp_tools
+        .iter()
+        .map(String::as_str)
+        .filter(|tool| !tool.trim().is_empty())
+        .collect();
+    if tools.is_empty() && profile == CodexToolProfile::RestrictedMcpOnly {
+        tools = SCOPED_MCP_ALLOWED_TOOLS.to_vec();
+    }
+
+    let quoted_name = config_key_literal("agentic-mcp")?;
+    if tools.iter().any(|tool| *tool == "*") {
+        return Ok(vec![
+            format!("mcp_servers.{quoted_name}.default_tools_enabled=true"),
+            format!("mcp_servers.{quoted_name}.default_tools_approval_mode=\"approve\""),
+        ]);
+    }
+
+    tools.sort_unstable();
+    tools.dedup();
+
+    let enabled_tools = tools
+        .iter()
+        .map(|tool| config_string_literal(tool))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    let mut overrides = vec![format!(
+        "mcp_servers.{quoted_name}.enabled_tools=[{enabled_tools}]"
+    )];
+
+    for tool in tools {
+        let quoted_tool = config_key_literal(tool)?;
+        overrides.push(format!(
+            "mcp_servers.{quoted_name}.tools.{quoted_tool}.enabled=true"
+        ));
+        overrides.push(format!(
+            "mcp_servers.{quoted_name}.tools.{quoted_tool}.approval_mode=\"approve\""
+        ));
+    }
+
+    Ok(overrides)
+}
+
 fn default_codex_home() -> Result<PathBuf, String> {
     if let Some(home) = std::env::var_os("CODEX_HOME") {
         return Ok(PathBuf::from(home));
@@ -511,7 +565,6 @@ fn effective_working_dir(options: &CodexAppServerOptions<'_>) -> Result<PathBuf,
 fn prepare_codex_app_server_home(
     agentic_mcp_command: &Path,
     profile: CodexToolProfile,
-    approved_mcp_tools: &[String],
 ) -> Result<PathBuf, String> {
     let source_home = default_codex_home()?;
     let target_home = app_server_codex_home(profile)?;
@@ -551,20 +604,89 @@ fn prepare_codex_app_server_home(
         })?;
     }
 
-    let config = build_app_server_config(
-        &source_home,
-        agentic_mcp_command,
-        profile,
-        approved_mcp_tools,
+    let config = build_app_server_config(&source_home, agentic_mcp_command, profile)?;
+    write_file_atomically(
+        &target_home.join("config.toml"),
+        &config,
+        "Codex app-server config",
     )?;
-    std::fs::write(target_home.join("config.toml"), config).map_err(|e| {
-        format!(
-            "Failed to write Codex app-server config at {}: {e}",
-            target_home.join("config.toml").display()
-        )
-    })?;
 
     Ok(target_home)
+}
+
+fn write_file_atomically(path: &Path, contents: &str, label: &str) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "Failed to resolve parent directory for {label} at {}",
+            path.display()
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "Failed to resolve file name for {label} at {}",
+                path.display()
+            )
+        })?;
+    let temp_path = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("Failed to build temporary {label} path: {e}"))?
+            .as_nanos()
+    ));
+
+    let write_result = (|| -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| {
+                format!(
+                    "Failed to create temporary {label} at {}: {e}",
+                    temp_path.display()
+                )
+            })?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600)).map_err(
+            |e| {
+                format!(
+                    "Failed to set permissions on temporary {label} at {}: {e}",
+                    temp_path.display()
+                )
+            },
+        )?;
+        file.write_all(contents.as_bytes()).map_err(|e| {
+            format!(
+                "Failed to write temporary {label} at {}: {e}",
+                temp_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            format!(
+                "Failed to sync temporary {label} at {}: {e}",
+                temp_path.display()
+            )
+        })?;
+        drop(file);
+        std::fs::rename(&temp_path, path).map_err(|e| {
+            format!(
+                "Failed to replace {label} at {} from {}: {e}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    write_result
 }
 
 fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
@@ -616,7 +738,6 @@ fn build_app_server_config(
     source_home: &Path,
     agentic_mcp_command: &Path,
     profile: CodexToolProfile,
-    approved_mcp_tools: &[String],
 ) -> Result<String, String> {
     let mut root = toml::map::Map::new();
     root.insert(
@@ -648,7 +769,6 @@ fn build_app_server_config(
         );
         agentic_mcp.insert("startup_timeout_sec".to_string(), toml::Value::Integer(30));
         upsert_agentic_mcp_env(&mut agentic_mcp, source_home)?;
-        apply_mcp_tool_config(&mut agentic_mcp, profile, approved_mcp_tools);
 
         let mut mcp_servers = toml::map::Map::new();
         mcp_servers.insert("agentic-mcp".to_string(), toml::Value::Table(agentic_mcp));
@@ -657,66 +777,6 @@ fn build_app_server_config(
 
     toml::to_string(&toml::Value::Table(root))
         .map_err(|e| format!("Failed to encode Codex app-server config: {e}"))
-}
-
-fn approved_mcp_tool_approval_config<'a>(
-    tool_names: impl IntoIterator<Item = &'a str>,
-) -> toml::map::Map<String, toml::Value> {
-    let mut tools = toml::map::Map::new();
-    for tool_name in tool_names {
-        let mut config = toml::map::Map::new();
-        config.insert("enabled".to_string(), toml::Value::Boolean(true));
-        config.insert(
-            "approval_mode".to_string(),
-            toml::Value::String("approve".to_string()),
-        );
-        tools.insert(tool_name.to_string(), toml::Value::Table(config));
-    }
-    tools
-}
-
-fn apply_mcp_tool_config(
-    agentic_mcp: &mut toml::map::Map<String, toml::Value>,
-    profile: CodexToolProfile,
-    approved_mcp_tools: &[String],
-) {
-    let mut tools: Vec<&str> = approved_mcp_tools
-        .iter()
-        .map(String::as_str)
-        .filter(|tool| !tool.trim().is_empty())
-        .collect();
-    if tools.is_empty() && profile == CodexToolProfile::RestrictedMcpOnly {
-        tools = SCOPED_MCP_ALLOWED_TOOLS.to_vec();
-    }
-
-    if tools.iter().any(|tool| *tool == "*") {
-        agentic_mcp.insert(
-            "default_tools_enabled".to_string(),
-            toml::Value::Boolean(true),
-        );
-        agentic_mcp.insert(
-            "default_tools_approval_mode".to_string(),
-            toml::Value::String("approve".to_string()),
-        );
-        return;
-    }
-
-    tools.sort_unstable();
-    tools.dedup();
-
-    agentic_mcp.insert(
-        "enabled_tools".to_string(),
-        toml::Value::Array(
-            tools
-                .iter()
-                .map(|tool| toml::Value::String((*tool).to_string()))
-                .collect(),
-        ),
-    );
-    agentic_mcp.insert(
-        "tools".to_string(),
-        toml::Value::Table(approved_mcp_tool_approval_config(tools)),
-    );
 }
 
 fn upsert_agentic_mcp_env(
@@ -804,6 +864,11 @@ fn build_codex_app_server_command(
             "agentic-mcp",
             agentic_mcp_command.to_string_lossy().as_ref(),
         )?);
+        for override_arg in
+            mcp_tool_config_overrides(options.tool_profile, &options.approved_mcp_tools)?
+        {
+            command.arg("-c").arg(override_arg);
+        }
     }
 
     if options.tool_profile == CodexToolProfile::RestrictedMcpOnly {
@@ -850,11 +915,7 @@ pub async fn spawn_codex_app_server(
 ) -> Result<RunningCodexAppServer, String> {
     let normalized_effort = normalize_reasoning_effort(options.reasoning_effort).to_string();
     let agentic_mcp_command = agentic_mcp_binary()?;
-    let codex_home = prepare_codex_app_server_home(
-        &agentic_mcp_command,
-        options.tool_profile,
-        &options.approved_mcp_tools,
-    )?;
+    let codex_home = prepare_codex_app_server_home(&agentic_mcp_command, options.tool_profile)?;
     let working_dir = effective_working_dir(&options)?;
     let mut command = Command::from(build_codex_app_server_command(
         &options,
@@ -951,7 +1012,7 @@ pub async fn spawn_codex_app_server(
 pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, String> {
     let agentic_mcp_command = agentic_mcp_binary()?;
     let codex_home =
-        prepare_codex_app_server_home(&agentic_mcp_command, CodexToolProfile::Default, &[])?;
+        prepare_codex_app_server_home(&agentic_mcp_command, CodexToolProfile::Default)?;
     let options = CodexAppServerOptions {
         model: DEFAULT_CODEX_MODEL,
         reasoning_effort: "medium",
@@ -1875,6 +1936,9 @@ fn extract_dynamic_tool_result_text(item: &Value) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use std::thread;
 
     fn sample_app_server_options<'a>(
         resume_session_id: Option<&'a str>,
@@ -2055,7 +2119,6 @@ mod tests {
             Path::new("/tmp/source-codex-home"),
             Path::new("/tmp/agentic_mcp"),
             CodexToolProfile::NoTools,
-            &[],
         )
         .expect("build config");
         let parsed: toml::Value = toml::from_str(&config).expect("parse config");
@@ -2088,7 +2151,6 @@ mod tests {
             Path::new("/tmp/source-codex-home"),
             Path::new("/tmp/agentic_mcp"),
             CodexToolProfile::Default,
-            &[],
         )
         .expect("build config");
         let parsed: toml::Value = toml::from_str(&config).expect("parse config");
@@ -2111,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_app_server_config_replaces_source_tool_approvals() {
+    fn app_server_config_strips_source_tool_policy() {
         let source_home = std::env::temp_dir().join(format!(
             "agentic-codex-config-test-{}-{}",
             std::process::id(),
@@ -2140,7 +2202,6 @@ approval_mode = "approve"
             &source_home,
             Path::new("/tmp/agentic_mcp"),
             CodexToolProfile::RestrictedMcpOnly,
-            &["list_tickets".to_string()],
         )
         .expect("config");
         let parsed: toml::Value = toml::from_str(&config).expect("parse config");
@@ -2153,25 +2214,10 @@ approval_mode = "approve"
             agentic_mcp.get("command").and_then(|value| value.as_str()),
             Some("/tmp/agentic_mcp")
         );
-        let tools = agentic_mcp
-            .get("tools")
-            .and_then(|value| value.as_table())
-            .expect("restricted tools table");
-        assert_eq!(
-            tools
-                .get("list_tickets")
-                .and_then(|tool| tool.get("approval_mode"))
-                .and_then(|value| value.as_str()),
-            Some("approve")
-        );
-        assert_eq!(
-            tools
-                .get("list_tickets")
-                .and_then(|tool| tool.get("enabled"))
-                .and_then(|value| value.as_bool()),
-            Some(true)
-        );
-        assert!(tools.get("manage_service").is_none());
+        assert!(agentic_mcp.get("tools").is_none());
+        assert!(agentic_mcp.get("enabled_tools").is_none());
+        assert!(agentic_mcp.get("default_tools_enabled").is_none());
+        assert!(agentic_mcp.get("default_tools_approval_mode").is_none());
         assert_eq!(
             agentic_mcp
                 .get("env")
@@ -2184,59 +2230,32 @@ approval_mode = "approve"
     }
 
     #[test]
-    fn app_server_config_approves_requested_mcp_tools() {
+    fn app_server_command_approves_requested_mcp_tools() {
         let approved = vec!["exa_search".to_string(), "exa_get_contents".to_string()];
-        let config = build_app_server_config(
-            Path::new("/tmp/source-codex-home"),
+        let mut options = sample_app_server_options(None);
+        options.approved_mcp_tools = approved;
+        let command = build_codex_app_server_command(
+            &options,
             Path::new("/tmp/agentic_mcp"),
-            CodexToolProfile::Default,
-            &approved,
+            Path::new("/tmp/agentic_codex_home"),
         )
-        .expect("config");
-        let parsed: toml::Value = toml::from_str(&config).expect("parse config");
-        let agentic_mcp = parsed
-            .get("mcp_servers")
-            .and_then(|servers| servers.get("agentic-mcp"))
-            .expect("agentic-mcp config");
-        let enabled = agentic_mcp
-            .get("enabled_tools")
-            .and_then(|value| value.as_array())
-            .expect("enabled tools");
-        assert_eq!(enabled.len(), 2);
-        let tools = agentic_mcp
-            .get("tools")
-            .and_then(|value| value.as_table())
-            .expect("tools table");
-        assert_eq!(
-            tools
-                .get("exa_search")
-                .and_then(|tool| tool.get("approval_mode"))
-                .and_then(|value| value.as_str()),
-            Some("approve")
-        );
+        .expect("build command");
+        let args = command_args(&command);
+
+        assert!(args.iter().any(|arg| {
+            arg == "mcp_servers.agentic-mcp.enabled_tools=[\"exa_get_contents\", \"exa_search\"]"
+        }));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "mcp_servers.agentic-mcp.tools.exa_search.enabled=true"));
+        assert!(args.iter().any(|arg| {
+            arg == "mcp_servers.agentic-mcp.tools.exa_search.approval_mode=\"approve\""
+        }));
     }
 
     #[test]
     fn configured_mcp_profile_uses_explicit_tools_without_scoped_workspace_filter() {
         let approved = vec!["read_email_content".to_string()];
-        let config = build_app_server_config(
-            Path::new("/tmp/source-codex-home"),
-            Path::new("/tmp/agentic_mcp"),
-            CodexToolProfile::ConfiguredMcpOnly,
-            &approved,
-        )
-        .expect("config");
-        let parsed: toml::Value = toml::from_str(&config).expect("parse config");
-        let agentic_mcp = parsed
-            .get("mcp_servers")
-            .and_then(|servers| servers.get("agentic-mcp"))
-            .expect("agentic-mcp config");
-        let tools = agentic_mcp
-            .get("tools")
-            .and_then(|value| value.as_table())
-            .expect("tools table");
-        assert!(tools.get("read_email_content").is_some());
-
         let mut options = sample_app_server_options(None);
         options.tool_profile = CodexToolProfile::ConfiguredMcpOnly;
         options.approved_mcp_tools = approved;
@@ -2252,31 +2271,91 @@ approval_mode = "approve"
             .windows(2)
             .any(|pair| pair[0] == "--disable" && pair[1] == "shell_tool"));
         assert!(!args.iter().any(|arg| arg.contains("AGENTIC_MCP_PROFILE")));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "mcp_servers.agentic-mcp.enabled_tools=[\"read_email_content\"]"));
+        assert!(args.iter().any(|arg| {
+            arg == "mcp_servers.agentic-mcp.tools.read_email_content.approval_mode=\"approve\""
+        }));
     }
 
     #[test]
-    fn app_server_config_wildcard_approves_all_mcp_tools() {
+    fn app_server_command_wildcard_approves_all_mcp_tools() {
         let approved = vec!["*".to_string()];
-        let config = build_app_server_config(
-            Path::new("/tmp/source-codex-home"),
+        let mut options = sample_app_server_options(None);
+        options.approved_mcp_tools = approved;
+        let command = build_codex_app_server_command(
+            &options,
             Path::new("/tmp/agentic_mcp"),
-            CodexToolProfile::Default,
-            &approved,
-        )
-        .expect("config");
-        let parsed: toml::Value = toml::from_str(&config).expect("parse config");
-        let agentic_mcp = parsed
-            .get("mcp_servers")
-            .and_then(|servers| servers.get("agentic-mcp"))
-            .expect("agentic-mcp config");
-
-        assert_eq!(
-            agentic_mcp
-                .get("default_tools_approval_mode")
-                .and_then(|value| value.as_str()),
-            Some("approve")
+            Path::new("/tmp/agentic_codex_home"),
         );
-        assert!(agentic_mcp.get("enabled_tools").is_none());
+        let args = command_args(&command.expect("build command"));
+
+        assert!(args
+            .iter()
+            .any(|arg| arg == "mcp_servers.agentic-mcp.default_tools_enabled=true"));
+        assert!(args.iter().any(|arg| {
+            arg == "mcp_servers.agentic-mcp.default_tools_approval_mode=\"approve\""
+        }));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.contains("mcp_servers.agentic-mcp.enabled_tools")));
+    }
+
+    #[test]
+    fn atomic_config_write_keeps_concurrent_readers_on_valid_toml() {
+        let root = unique_temp_path("codex-config-atomic-write");
+        std::fs::create_dir_all(&root).expect("create root");
+        let config_path = root.join("config.toml");
+        write_file_atomically(
+            &config_path,
+            "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"medium\"\n",
+            "test config",
+        )
+        .expect("write initial config");
+
+        let done = StdArc::new(AtomicBool::new(false));
+        let failure = StdArc::new(StdMutex::new(None::<String>));
+        let reader_done = done.clone();
+        let reader_failure = failure.clone();
+        let reader_path = config_path.clone();
+        let reader = thread::spawn(move || {
+            while !reader_done.load(Ordering::SeqCst) {
+                let text = match std::fs::read_to_string(&reader_path) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        *reader_failure.lock().expect("failure lock") =
+                            Some(format!("read failed: {e}"));
+                        break;
+                    }
+                };
+                if let Err(e) = toml::from_str::<toml::Value>(&text) {
+                    *reader_failure.lock().expect("failure lock") =
+                        Some(format!("parse failed: {e}: {text:?}"));
+                    break;
+                }
+            }
+        });
+
+        for index in 0..200 {
+            let config = format!(
+                "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"medium\"\n\n[mcp_servers.agentic-mcp]\ncommand = \"/tmp/agentic_mcp_{index}\"\nstartup_timeout_sec = 30\n\n[mcp_servers.agentic-mcp.env]\nCODEX_HOME = \"/tmp/source-{index}\"\n"
+            );
+            write_file_atomically(&config_path, &config, "test config")
+                .expect("atomic config write");
+        }
+
+        done.store(true, Ordering::SeqCst);
+        reader.join().expect("reader join");
+        assert_eq!(*failure.lock().expect("failure lock"), None);
+
+        let temp_files = std::fs::read_dir(&root)
+            .expect("read root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temp_files, 0);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
