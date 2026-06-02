@@ -3,14 +3,17 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    Arc,
+};
 use ticketing_system::token_usage::TokenUsageBreakdown;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
@@ -31,6 +34,9 @@ const REQUIRED_CODEX_PATH_ENTRIES: &[&str] = &[
     "/usr/sbin",
     "/sbin",
 ];
+const ATOMIC_WRITE_MAX_TEMP_ATTEMPTS: usize = 32;
+
+static ATOMIC_WRITE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // Scoped workspace and ticket-router turns are MCP-only surfaces. Disable
 // shell, plugin, and tool-discovery features so Codex cannot widen itself
@@ -630,26 +636,27 @@ fn write_file_atomically(path: &Path, contents: &str, label: &str) -> Result<(),
                 path.display()
             )
         })?;
-    let temp_path = parent.join(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("Failed to build temporary {label} path: {e}"))?
-            .as_nanos()
-    ));
+    write_file_atomically_with_temp_candidates(
+        path,
+        contents,
+        label,
+        atomic_temp_path_candidates(parent, file_name, label),
+    )
+}
 
+fn write_file_atomically_with_temp_candidates<I>(
+    path: &Path,
+    contents: &str,
+    label: &str,
+    temp_paths: I,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = Result<PathBuf, String>>,
+{
+    let mut cleanup_temp_path: Option<PathBuf> = None;
     let write_result = (|| -> Result<(), String> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .map_err(|e| {
-                format!(
-                    "Failed to create temporary {label} at {}: {e}",
-                    temp_path.display()
-                )
-            })?;
+        let (temp_path, mut file) = create_atomic_temp_file_from_candidates(temp_paths, label)?;
+        cleanup_temp_path = Some(temp_path.clone());
         #[cfg(unix)]
         std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600)).map_err(
             |e| {
@@ -683,10 +690,84 @@ fn write_file_atomically(path: &Path, contents: &str, label: &str) -> Result<(),
     })();
 
     if write_result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
+        if let Some(temp_path) = cleanup_temp_path {
+            let _ = std::fs::remove_file(&temp_path);
+        }
     }
 
     write_result
+}
+
+fn atomic_temp_path_candidates<'a>(
+    parent: &'a Path,
+    file_name: &'a str,
+    label: &'a str,
+) -> impl Iterator<Item = Result<PathBuf, String>> + 'a {
+    (0..ATOMIC_WRITE_MAX_TEMP_ATTEMPTS).map(move |_| {
+        let counter = ATOMIC_WRITE_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        atomic_temp_path(parent, file_name, label, counter)
+    })
+}
+
+fn atomic_temp_path(
+    parent: &Path,
+    file_name: &str,
+    label: &str,
+    counter: u64,
+) -> Result<PathBuf, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("Failed to build temporary {label} path: {e}"))?
+        .as_nanos();
+
+    Ok(parent.join(format!(
+        ".{file_name}.{}.{}.{}.tmp",
+        std::process::id(),
+        nanos,
+        counter
+    )))
+}
+
+fn create_atomic_temp_file_from_candidates<I>(
+    temp_paths: I,
+    label: &str,
+) -> Result<(PathBuf, std::fs::File), String>
+where
+    I: IntoIterator<Item = Result<PathBuf, String>>,
+{
+    let mut attempted = 0usize;
+    let mut last_collision: Option<PathBuf> = None;
+
+    for temp_path in temp_paths {
+        attempted += 1;
+        let temp_path = temp_path?;
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                last_collision = Some(temp_path);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to create temporary {label} at {}: {e}",
+                    temp_path.display()
+                ));
+            }
+        }
+    }
+
+    match last_collision {
+        Some(path) => Err(format!(
+            "Failed to create temporary {label} after {attempted} attempts; last collision at {}",
+            path.display()
+        )),
+        None => Err(format!(
+            "Failed to create temporary {label}: no temporary paths generated"
+        )),
+    }
 }
 
 fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
@@ -2355,6 +2436,33 @@ approval_mode = "approve"
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .count();
         assert_eq!(temp_files, 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn atomic_config_write_retries_when_temp_candidate_exists() {
+        let root = unique_temp_path("codex-config-temp-collision");
+        std::fs::create_dir_all(&root).expect("create root");
+        let config_path = root.join("config.toml");
+        let collision_path = root.join(".config.toml.collision.tmp");
+        let retry_path = root.join(".config.toml.retry.tmp");
+        let config = "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"medium\"\n";
+
+        std::fs::write(&collision_path, "leftover temp file").expect("write collision file");
+        write_file_atomically_with_temp_candidates(
+            &config_path,
+            config,
+            "test config",
+            vec![Ok(collision_path.clone()), Ok(retry_path.clone())],
+        )
+        .expect("write after collision");
+
+        assert_eq!(
+            std::fs::read_to_string(&config_path).expect("read config"),
+            config
+        );
+        assert!(collision_path.exists());
+        assert!(!retry_path.exists());
         std::fs::remove_dir_all(root).ok();
     }
 
