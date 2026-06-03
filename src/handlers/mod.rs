@@ -7,6 +7,7 @@ pub mod cad;
 pub mod chat_client_manager;
 pub mod chat_stream;
 pub mod client_telemetry;
+pub mod conversation_evaluations;
 pub mod conversation_next_actions;
 pub mod conversation_worker;
 pub mod conversation_worker_manager;
@@ -53,6 +54,7 @@ pub mod voice_transcribe;
 pub mod workspace_manager;
 
 pub use agent_runs::*;
+pub use conversation_evaluations::*;
 pub use conversation_next_actions::*;
 pub use conversations::*;
 pub use dailies::*;

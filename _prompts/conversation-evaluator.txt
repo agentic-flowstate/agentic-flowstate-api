@@ -1,0 +1,19 @@
+Evaluate this chat conversation.
+
+Conversation title: {{CONVERSATION_TITLE}}
+Conversation agent: {{CONVERSATION_AGENT}}
+
+Transcript:
+<transcript>
+{{TRANSCRIPT}}
+</transcript>
+
+Return Markdown only, with exactly these sections:
+
+**Verdict:** CLOSE, KEEP_OPEN, NEEDS_USER, or UNCLEAR
+
+**Why:** One short paragraph explaining the state of the work.
+
+**Outstanding Work:** Bullet list of concrete remaining work, or `None apparent.`
+
+**Next Action:** One sentence saying what should happen next.

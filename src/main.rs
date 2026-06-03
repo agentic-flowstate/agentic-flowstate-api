@@ -1219,6 +1219,11 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::list_conversation_next_actions),
         )
         .route(
+            "/api/conversations/:id/evaluations",
+            get(handlers::list_conversation_evaluations)
+                .post(handlers::create_conversation_evaluation),
+        )
+        .route(
             "/api/conversations/:id/agent-status",
             get(handlers::get_conversation_run_status),
         )
