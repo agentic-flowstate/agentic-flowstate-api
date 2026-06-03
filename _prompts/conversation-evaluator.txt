@@ -1,7 +1,16 @@
 Evaluate this chat conversation.
 
-Conversation title: {{CONVERSATION_TITLE}}
-Conversation agent: {{CONVERSATION_AGENT}}
+Evaluated at: {{EVALUATED_AT}}
+
+Target conversation metadata:
+<metadata>
+{{CONVERSATION_METADATA}}
+</metadata>
+
+Other open/waiting conversations visible to the user:
+<related_conversations>
+{{RELATED_CONVERSATIONS}}
+</related_conversations>
 
 Transcript:
 <transcript>
@@ -10,10 +19,12 @@ Transcript:
 
 Return Markdown only, with exactly these sections:
 
-**Verdict:** CLOSE, KEEP_OPEN, NEEDS_USER, or UNCLEAR
+**Recommendation:** KEEP_OPEN, MOVE_TO_WAITING, or ARCHIVE
 
-**Why:** One short paragraph explaining the state of the work.
+**Conversation Facts:** One compact sentence with the message count, last-message recency, and current list status.
 
-**Outstanding Work:** Bullet list of concrete remaining work, or `None apparent.`
+**Why:** One short paragraph explaining whether active work still appears to be happening here.
 
-**Next Action:** One sentence saying what should happen next.
+**Overlap Check:** One sentence saying whether another open/waiting conversation may supersede or duplicate this one. Use `None apparent.` if not.
+
+**Next Action:** One sentence saying what the user should do with this row.
