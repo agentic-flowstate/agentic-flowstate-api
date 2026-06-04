@@ -753,6 +753,7 @@ mod tests {
                 session_id TEXT,
                 organization TEXT,
                 agent TEXT,
+                conversation_type TEXT,
                 title TEXT,
                 started_at TEXT,
                 updated_at TEXT,

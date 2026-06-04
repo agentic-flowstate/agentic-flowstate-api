@@ -1,15 +1,20 @@
 //! Generate conversation titles and auto-detect organization using Codex.
 
+use std::collections::HashMap;
+
 use sqlx::SqlitePool;
 use ticketing_system::{conversations, organizations, UpdateConversationRequest};
 
 use crate::agents::codex_app_server::{resolve_codex_model, run_codex_text};
+use crate::agents::prompts::load_prompt;
 
 /// Result of title + org generation
 pub struct TitleAndOrg {
     pub title: String,
     pub organization: Option<String>,
 }
+
+const VALID_CONVERSATION_TYPES: &[&str] = &["bug", "build", "research", "support", "general"];
 
 /// Generate a concise conversation title and auto-detect the organization.
 /// Called as a fire-and-forget background task after the first user message.
@@ -37,7 +42,7 @@ pub async fn generate_title_and_org(
 
     // Build rich org context for the classifier
     let org_context = if orgs_with_descriptions.is_empty() {
-        "No organizations available. Use \"general\" for all conversations.".to_string()
+        "### general\nGeneric conversations not tied to a listed organization.".to_string()
     } else {
         let mut parts = Vec::new();
         for org in &orgs_with_descriptions {
@@ -50,32 +55,34 @@ pub async fn generate_title_and_org(
                 ));
             }
         }
-        parts.push("### general\nUse this ONLY when the conversation genuinely does not belong to any of the organizations above. If the topic is even tangentially related to a specific organization, pick that organization instead. Err on the side of specificity.".to_string());
+        parts.push(
+            "### general\nGeneric conversations not tied to a listed organization.".to_string(),
+        );
         parts.join("\n\n")
     };
 
-    let system_prompt = format!(
-        "You are a conversation classifier. Given a user's first message, you must:\n\
-         1. Generate a concise conversation title (3-7 words)\n\
-         2. Determine which organization this conversation belongs to\n\n\
-         ## Organizations\n\n\
-         {org_context}\n\n\
-         ## Rules\n\
-         - Pick the MOST SPECIFIC organization that matches. Do not default to \"general\" unless the message truly has nothing to do with any listed organization.\n\
-         - If the message mentions specific technologies, repos, or topics described in an organization, pick that organization.\n\
-         - If the message could plausibly belong to multiple organizations, pick the one it most strongly relates to.\n\
-         - \"general\" is for truly generic topics: casual chat, questions about the weather, personal errands, etc.\n\n\
-         ## Output Format\n\
-         Output EXACTLY two lines, nothing else:\n\
-         Line 1: A concise 3-7 word title (no quotes, no trailing punctuation)\n\
-         Line 2: The organization name (must be one of: {org_list}, general)\n\n\
-         No labels, no explanation, no markdown, just the two lines.",
-        org_context = org_context,
-        org_list = org_names.join(", "),
-    );
+    let mut system_vars = HashMap::new();
+    system_vars.insert("org_context".to_string(), org_context);
+    let mut valid_org_names = org_names.clone();
+    valid_org_names.push("general".to_string());
+    system_vars.insert("org_list".to_string(), valid_org_names.join(", "));
+    let system_prompt = match load_prompt("conversation-classifier-system", system_vars) {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            tracing::error!("[TITLE] Failed to load classifier system prompt: {}", e);
+            return None;
+        }
+    };
 
-    let prompt =
-        format!("Classify this conversation based on the user's message:\n\n{user_message}");
+    let mut user_vars = HashMap::new();
+    user_vars.insert("user_message".to_string(), user_message);
+    let prompt = match load_prompt("conversation-classifier-user", user_vars) {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            tracing::error!("[TITLE] Failed to load classifier user prompt: {}", e);
+            return None;
+        }
+    };
 
     let raw_output = match run_codex_text(
         resolve_codex_model(""),
@@ -98,13 +105,23 @@ pub async fn generate_title_and_org(
         return None;
     }
 
-    // Parse two-line response: title on line 1, org on line 2
+    // Parse three-line response: title, organization, conversation type.
     let lines: Vec<&str> = raw_output.lines().collect();
     let title = lines
         .first()
         .map(|l| l.trim().to_string())
         .unwrap_or_default();
     let detected_org = lines.get(1).map(|l| l.trim().to_lowercase());
+    let conversation_type = match lines.get(2).and_then(|l| normalize_conversation_type(l)) {
+        Some(value) => value,
+        None => {
+            tracing::warn!(
+                "[TITLE] Invalid conversation type from response: {:?}",
+                raw_output
+            );
+            return None;
+        }
+    };
 
     if title.is_empty() {
         tracing::warn!("[TITLE] Empty title from response: {:?}", raw_output);
@@ -131,10 +148,11 @@ pub async fn generate_title_and_org(
     let final_org = valid_org.filter(|o| o != &current_org);
 
     tracing::info!(
-        "[TITLE] Generated for {}: title={:?}, org={:?} (current={:?})",
+        "[TITLE] Generated for {}: title={:?}, org={:?}, type={:?} (current={:?})",
         conversation_id,
         title,
         final_org,
+        conversation_type,
         current_org
     );
 
@@ -147,6 +165,7 @@ pub async fn generate_title_and_org(
             title: Some(title.clone()),
             session_id: None,
             organization: final_org.clone(),
+            conversation_type: Some(conversation_type.clone()),
         },
     )
     .await
@@ -159,4 +178,11 @@ pub async fn generate_title_and_org(
         title,
         organization: final_org,
     })
+}
+
+fn normalize_conversation_type(raw: &str) -> Option<String> {
+    let value = raw.trim().to_lowercase();
+    VALID_CONVERSATION_TYPES
+        .contains(&value.as_str())
+        .then_some(value)
 }

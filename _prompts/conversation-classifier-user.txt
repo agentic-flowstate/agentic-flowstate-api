@@ -1,0 +1,3 @@
+Classify this conversation based on the user's message:
+
+{{USER_MESSAGE}}

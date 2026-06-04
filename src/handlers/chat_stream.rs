@@ -794,6 +794,7 @@ mod conversation_authorization_tests {
                 session_id TEXT,
                 organization TEXT NOT NULL,
                 agent TEXT,
+                conversation_type TEXT,
                 title TEXT NOT NULL,
                 started_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,

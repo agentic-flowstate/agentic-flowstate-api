@@ -1422,6 +1422,7 @@ mod tests {
             session_id: None,
             organization: "agentic-flowstate".to_string(),
             agent: Some("full-access".to_string()),
+            conversation_type: Some("bug".to_string()),
             title: "Conversation Error Investigation".to_string(),
             started_at: "2026-05-11T22:22:17Z".to_string(),
             updated_at: "2026-05-11T22:39:19Z".to_string(),

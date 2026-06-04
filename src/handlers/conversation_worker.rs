@@ -1317,6 +1317,7 @@ impl ConversationWorker {
                         title: None,
                         session_id: Some(session_id.clone()),
                         organization: None,
+                        conversation_type: None,
                     },
                 )
                 .await;
@@ -1826,6 +1827,7 @@ mod streaming_persistence_tests {
                 session_id TEXT,
                 organization TEXT,
                 agent TEXT,
+                conversation_type TEXT,
                 title TEXT,
                 started_at TEXT,
                 updated_at TEXT,
