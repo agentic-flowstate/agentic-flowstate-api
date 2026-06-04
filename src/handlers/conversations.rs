@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use ticketing_system::{
     agent_runners, checkpoints, conversation_turn_jobs, conversations, AddMessageRequest,
-    Conversation, ConversationMessage, CreateConversationRequest, SqlitePool,
+    Conversation, ConversationHierarchyScope, ConversationMessage, CreateChildConversationRequest,
+    CreateConversationRequest, SqlitePool,
     UpdateConversationRequest,
 };
 
@@ -39,6 +40,10 @@ static CONVERSATION_STATUS_BROADCASTER: Lazy<
 pub struct ListConversationsQuery {
     pub organization: Option<String>,
     pub agent: Option<String>,
+    /// roots (default), children, or all
+    pub hierarchy_scope: Option<String>,
+    /// Direct parent id. When supplied, returns children for that parent.
+    pub parent_conversation_id: Option<String>,
     /// Comma-separated status filter (e.g., "open,waiting"). Default: "open,waiting"
     pub status: Option<String>,
     pub limit: Option<i64>,
@@ -73,6 +78,31 @@ pub struct ConversationRunStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tool_call_started_at: Option<String>,
     pub server_time: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateChildConversationsBody {
+    pub children: Vec<CreateChildConversationRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMultiAgentConversationRequest {
+    pub organization: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_type: Option<String>,
+    #[serde(default)]
+    pub children: Vec<CreateChildConversationRequest>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MultiAgentConversationResponse {
+    pub parent: Conversation,
+    pub children: Vec<Conversation>,
 }
 
 const ACTIVE_CHECKPOINT_STALE_SECONDS: i64 = 60;
@@ -323,6 +353,45 @@ fn apply_run_status_to_conversation(
     conv
 }
 
+async fn ensure_agent_allowed(
+    pool: &SqlitePool,
+    user_id: &str,
+    agent: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    if agent != Some("full-access") {
+        return Ok(());
+    }
+
+    let is_admin = ticketing_system::system_logs::is_admin(pool, user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if !is_admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Admin access required for full-access conversations".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn require_user_conversation(
+    pool: &SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+) -> Result<Conversation, (StatusCode, String)> {
+    let conversation = conversations::get_conversation(pool, conversation_id, false)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+
+    if conversation.user_id != user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
+
+    Ok(conversation)
+}
+
 async fn get_status_sender(
     conversation_id: &str,
 ) -> broadcast::Sender<ConversationRunStatusResponse> {
@@ -372,7 +441,11 @@ pub async fn list_conversations(
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListConversationsQuery>,
 ) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
-    let mut list = conversations::list_conversations(
+    let hierarchy_scope =
+        ConversationHierarchyScope::parse(params.hierarchy_scope.as_deref())
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    let mut list = conversations::list_conversations_with_hierarchy(
         &pool,
         params.organization.as_deref(),
         Some(&user.user_id),
@@ -380,6 +453,8 @@ pub async fn list_conversations(
         params.status.as_deref(),
         params.limit,
         params.updated_since.as_deref(),
+        hierarchy_scope,
+        params.parent_conversation_id.as_deref(),
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -444,16 +519,18 @@ pub async fn create_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Json(mut req): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, Json<Conversation>), (StatusCode, String)> {
-    if req.agent.as_deref() == Some("full-access") {
-        let is_admin = ticketing_system::system_logs::is_admin(&pool, &user.user_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        if !is_admin {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "Admin access required for full-access conversations".to_string(),
-            ));
-        }
+    ensure_agent_allowed(&pool, &user.user_id, req.agent.as_deref()).await?;
+    if req.parent_conversation_id.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Use POST /api/conversations/:id/children to create child conversations".to_string(),
+        ));
+    }
+    if req.conversation_role.as_deref() == Some("sub_agent") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Root conversations cannot use conversation_role=sub_agent".to_string(),
+        ));
     }
 
     req.user_id = user.user_id;
@@ -462,6 +539,121 @@ pub async fn create_conversation(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok((StatusCode::CREATED, Json(conv)))
+}
+
+/// Create a multi-agent parent conversation and optional child conversations.
+/// POST /api/conversations/multi-agent
+pub async fn create_multi_agent_conversation(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(req): Json<CreateMultiAgentConversationRequest>,
+) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), (StatusCode, String)> {
+    ensure_agent_allowed(&pool, &user.user_id, req.agent.as_deref()).await?;
+    for child in &req.children {
+        ensure_agent_allowed(&pool, &user.user_id, child.agent.as_deref()).await?;
+    }
+
+    let parent = CreateConversationRequest {
+        user_id: user.user_id,
+        organization: req.organization,
+        title: req.title,
+        session_id: req.session_id,
+        agent: req.agent,
+        conversation_type: req.conversation_type,
+        parent_conversation_id: None,
+        conversation_role: Some("multi_agent_parent".to_string()),
+        child_sort_order: None,
+    };
+    let (parent, children) = conversations::create_multi_agent_conversation(
+        &pool,
+        parent,
+        req.children,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MultiAgentConversationResponse { parent, children }),
+    ))
+}
+
+/// List direct child conversations for a parent.
+/// GET /api/conversations/:id/children
+pub async fn list_child_conversations(
+    State(pool): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+    Query(params): Query<ListConversationsQuery>,
+) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
+    let parent = require_user_conversation(&pool, &user.user_id, &id).await?;
+
+    let mut list = conversations::list_conversations_with_hierarchy(
+        &pool,
+        params.organization.as_deref().or(Some(parent.organization.as_str())),
+        Some(&user.user_id),
+        params.agent.as_deref(),
+        params.status.as_deref(),
+        params.limit,
+        params.updated_since.as_deref(),
+        ConversationHierarchyScope::Children,
+        Some(&id),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    for conv in &mut list {
+        if conv.is_active == Some(true) {
+            let status = conversation_run_status_snapshot(&pool, &conv.id, Some(manager.as_ref()))
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            conv.is_active = Some(status.is_processing);
+        }
+    }
+
+    let total = list.len() as i64;
+    let conversations = conversation_summaries(&pool, list)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json(ConversationListResponse {
+        conversations,
+        total,
+    }))
+}
+
+/// Create child conversations under an existing parent.
+/// POST /api/conversations/:id/children
+pub async fn create_child_conversations(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateChildConversationsBody>,
+) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), (StatusCode, String)> {
+    for child in &req.children {
+        ensure_agent_allowed(&pool, &user.user_id, child.agent.as_deref()).await?;
+    }
+
+    conversations::promote_conversation_to_multi_agent_parent(&pool, &user.user_id, &id)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let children = conversations::create_child_conversations(
+        &pool,
+        &user.user_id,
+        &id,
+        req.children,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let parent = require_user_conversation(&pool, &user.user_id, &id).await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MultiAgentConversationResponse { parent, children }),
+    ))
 }
 
 /// Update a conversation (PATCH /api/conversations/:id)
@@ -1340,6 +1532,9 @@ pub async fn subscribe_conversations(
                     for summary in &summaries {
                         summary.conversation.updated_at.hash(&mut hasher);
                         summary.conversation.id.hash(&mut hasher);
+                        summary.conversation.parent_conversation_id.hash(&mut hasher);
+                        summary.conversation.conversation_role.hash(&mut hasher);
+                        summary.conversation.child_conversation_count.hash(&mut hasher);
                         summary.last_tool_call_started_at.hash(&mut hasher);
                     }
                     summaries.len().hash(&mut hasher);
@@ -1423,6 +1618,10 @@ mod tests {
             organization: "agentic-flowstate".to_string(),
             agent: Some("full-access".to_string()),
             conversation_type: Some("bug".to_string()),
+            parent_conversation_id: None,
+            conversation_role: "standard".to_string(),
+            child_conversation_count: Some(0),
+            child_sort_order: None,
             title: "Conversation Error Investigation".to_string(),
             started_at: "2026-05-11T22:22:17Z".to_string(),
             updated_at: "2026-05-11T22:39:19Z".to_string(),

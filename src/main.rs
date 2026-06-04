@@ -1189,8 +1189,16 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::list_conversations).post(handlers::create_conversation),
         )
         .route(
+            "/api/conversations/multi-agent",
+            post(handlers::create_multi_agent_conversation),
+        )
+        .route(
             "/api/conversations/subscribe",
             get(handlers::subscribe_conversations),
+        )
+        .route(
+            "/api/conversations/:id/children",
+            get(handlers::list_child_conversations).post(handlers::create_child_conversations),
         )
         .route(
             "/api/conversations/:id",
