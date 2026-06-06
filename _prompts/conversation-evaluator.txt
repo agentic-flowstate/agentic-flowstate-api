@@ -23,8 +23,8 @@ Return Markdown only, with exactly these sections:
 
 **Conversation Facts:** One compact sentence with the message count, last-message recency, and current list status.
 
-**Why:** One short paragraph explaining whether active work still appears to be happening here.
+**Why:** One short paragraph explaining whether active work, a user decision, or an external blocker still appears in the visible transcript. Do not cite completion, deployment, ticket updates, saved artifacts, or external facts unless they appear in the transcript.
 
 **Overlap Check:** One sentence saying whether another open/waiting conversation may supersede or duplicate this one. Use `None apparent.` if not.
 
-**Next Action:** One sentence saying what the user should do with this row.
+**Next Action:** One direct sentence saying what the user should do with this row. For ARCHIVE, do not add conditional reopen language such as "unless..." or "reopen only if..."; simply say to archive it.
