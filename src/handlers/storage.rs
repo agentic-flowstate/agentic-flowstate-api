@@ -25,6 +25,9 @@ const ORICO_ROOT: &str = "/Volumes/ORICO";
 const CARGO_AUTO: &str = "/Volumes/ORICO/MacMiniBuilds/cargo-auto";
 const XCODE_DERIVED_DATA: &str = "/Users/jarvisgpt/Library/Developer/Xcode/DerivedData";
 const XCODE_DEVICE_SUPPORT: &str = "/Users/jarvisgpt/Library/Developer/Xcode/iOS DeviceSupport";
+const USER_CORE_SIMULATOR: &str = "/Users/jarvisgpt/Library/Developer/CoreSimulator";
+const USER_SIMULATOR_DEVICES: &str = "/Users/jarvisgpt/Library/Developer/CoreSimulator/Devices";
+const SYSTEM_CORE_SIMULATOR: &str = "/Library/Developer/CoreSimulator";
 const HOMEBREW_CACHE: &str = "/Users/jarvisgpt/Library/Caches/Homebrew";
 const PLAYWRIGHT_CACHE: &str = "/Users/jarvisgpt/Library/Caches/ms-playwright";
 
@@ -76,6 +79,7 @@ pub struct StorageActionSummary {
 pub enum RiskLevel {
     Low,
     Medium,
+    High,
     ReviewOnly,
 }
 
@@ -115,6 +119,7 @@ enum StorageActionKind {
     PurgeXcodeDerivedData,
     PurgeXcodeDeviceSupport,
     DeleteUnavailableSimulators,
+    DeleteAllSimulatorDevices,
     HomebrewCleanup,
     PurgePlaywrightCache,
 }
@@ -126,6 +131,7 @@ impl StorageActionKind {
             "purge_xcode_derived_data" => Some(Self::PurgeXcodeDerivedData),
             "purge_xcode_device_support" => Some(Self::PurgeXcodeDeviceSupport),
             "delete_unavailable_simulators" => Some(Self::DeleteUnavailableSimulators),
+            "delete_all_simulator_devices" => Some(Self::DeleteAllSimulatorDevices),
             "homebrew_cleanup" => Some(Self::HomebrewCleanup),
             "purge_playwright_cache" => Some(Self::PurgePlaywrightCache),
             _ => None,
@@ -138,6 +144,7 @@ impl StorageActionKind {
             Self::PurgeXcodeDerivedData => "purge_xcode_derived_data",
             Self::PurgeXcodeDeviceSupport => "purge_xcode_device_support",
             Self::DeleteUnavailableSimulators => "delete_unavailable_simulators",
+            Self::DeleteAllSimulatorDevices => "delete_all_simulator_devices",
             Self::HomebrewCleanup => "homebrew_cleanup",
             Self::PurgePlaywrightCache => "purge_playwright_cache",
         }
@@ -149,6 +156,7 @@ impl StorageActionKind {
             Self::PurgeXcodeDerivedData => "Clear Xcode DerivedData",
             Self::PurgeXcodeDeviceSupport => "Clear iOS DeviceSupport",
             Self::DeleteUnavailableSimulators => "Delete unavailable simulators",
+            Self::DeleteAllSimulatorDevices => "Delete all simulator devices",
             Self::HomebrewCleanup => "Run Homebrew cleanup",
             Self::PurgePlaywrightCache => "Clear Playwright browser cache",
         }
@@ -264,19 +272,64 @@ fn build_scan() -> anyhow::Result<StorageScanResponse> {
             "user_simulators",
             "user simulator devices",
             "Xcode",
-            "/Users/jarvisgpt/Library/Developer/CoreSimulator",
+            USER_CORE_SIMULATOR,
             RiskLevel::Medium,
             Some(StorageActionKind::DeleteUnavailableSimulators),
             "Simulator devices and caches. The action removes only devices Xcode marks unavailable.",
         ),
         (
+            "user_simulator_devices",
+            "all simulator device data",
+            "Xcode",
+            USER_SIMULATOR_DEVICES,
+            RiskLevel::High,
+            Some(StorageActionKind::DeleteAllSimulatorDevices),
+            "Installed apps, test data, and state for every simulator device. The action deletes all simulator devices; Xcode recreates devices later, but simulator app/data state is lost.",
+        ),
+        (
             "system_simulators",
             "installed simulator runtimes",
             "Xcode",
-            "/Library/Developer/CoreSimulator",
+            SYSTEM_CORE_SIMULATOR,
             RiskLevel::ReviewOnly,
             None,
             "Installed simulator runtimes and dyld caches. Remove specific runtimes from Xcode when they are no longer needed.",
+        ),
+        (
+            "xcode_app_external",
+            "Xcode on ORICO",
+            "Applications",
+            "/Volumes/ORICO/Applications/Xcode.app",
+            RiskLevel::ReviewOnly,
+            None,
+            "Xcode.app has been moved off the internal disk. Command-line tooling still resolves through /Applications/Xcode.app.",
+        ),
+        (
+            "xcode_app_launcher",
+            "Xcode launcher symlink",
+            "Applications",
+            "/Applications/Xcode.app",
+            RiskLevel::ReviewOnly,
+            None,
+            "Internal /Applications entry points at the ORICO Xcode bundle so xcode-select remains stable.",
+        ),
+        (
+            "docker_app_external",
+            "Docker Desktop on ORICO",
+            "Applications",
+            "/Volumes/ORICO/Applications/Docker.app",
+            RiskLevel::ReviewOnly,
+            None,
+            "Docker Desktop.app has been moved off the internal disk. Docker's container/image disk should still be managed from Docker settings, not by moving files directly.",
+        ),
+        (
+            "docker_app_launcher",
+            "Docker launcher symlink",
+            "Applications",
+            "/Applications/Docker.app",
+            RiskLevel::ReviewOnly,
+            None,
+            "Internal /Applications entry points at the ORICO Docker bundle.",
         ),
         (
             "xcode_derived_data",
@@ -380,6 +433,8 @@ fn build_scan() -> anyhow::Result<StorageScanResponse> {
             "Finder System Data includes Xcode simulators, device support, caches, package-manager data, logs, and developer runtime state.".to_string(),
             "No automatic cleanup is scheduled here. Every cleanup must be started manually from this tab.".to_string(),
             "League of Legends now lives on ORICO with an /Applications symlink. Expect slower launch/patch/load phases than the internal SSD, but not a meaningful frame-rate hit after loading.".to_string(),
+            "Xcode.app and Docker.app now live on ORICO. The large remaining Xcode space is simulator devices/runtimes, not the app bundle.".to_string(),
+            "CoreSimulator runtimes are intentionally not symlinked by this tool. Use Xcode's component manager for runtimes, and use the explicit simulator-device cleanup action when you want to reclaim device state.".to_string(),
         ],
     })
 }
@@ -407,6 +462,11 @@ fn actions_from_buckets(buckets: &[StorageBucket]) -> Vec<StorageActionSummary> 
             "Runs xcrun simctl delete unavailable; keeps currently available simulators.",
         ),
         (
+            StorageActionKind::DeleteAllSimulatorDevices,
+            RiskLevel::High,
+            "Runs xcrun simctl shutdown all and xcrun simctl delete all. Removes simulator devices, apps, and simulator-local data; runtimes stay installed.",
+        ),
+        (
             StorageActionKind::HomebrewCleanup,
             RiskLevel::Low,
             "Runs brew cleanup --prune=all for stale package cache and old versions.",
@@ -422,13 +482,30 @@ fn actions_from_buckets(buckets: &[StorageBucket]) -> Vec<StorageActionSummary> 
         id: kind.id().to_string(),
         title: kind.title().to_string(),
         risk_level,
-        estimated_reclaim_bytes: buckets
-            .iter()
-            .find(|bucket| bucket.action_id.as_deref() == Some(kind.id()))
-            .map(|bucket| bucket.bytes),
+        estimated_reclaim_bytes: estimated_reclaim_bytes_for_action(kind, buckets),
         detail: detail.to_string(),
     })
     .collect()
+}
+
+fn estimated_reclaim_bytes_for_action(
+    kind: StorageActionKind,
+    buckets: &[StorageBucket],
+) -> Option<u64> {
+    let bucket_id = match kind {
+        StorageActionKind::PurgeCargoAuto => Some("cargo_auto"),
+        StorageActionKind::PurgeXcodeDerivedData => Some("xcode_derived_data"),
+        StorageActionKind::PurgeXcodeDeviceSupport => Some("xcode_device_support"),
+        StorageActionKind::DeleteUnavailableSimulators => None,
+        StorageActionKind::DeleteAllSimulatorDevices => Some("user_simulator_devices"),
+        StorageActionKind::HomebrewCleanup => Some("homebrew_cache"),
+        StorageActionKind::PurgePlaywrightCache => Some("playwright_cache"),
+    }?;
+
+    buckets
+        .iter()
+        .find(|bucket| bucket.id == bucket_id)
+        .map(|bucket| bucket.bytes)
 }
 
 fn volume_stats(
@@ -514,6 +591,7 @@ fn run_storage_action(job_id: String, action: StorageActionKind) {
             purge_directory_children_job(&job_id, XCODE_DEVICE_SUPPORT)
         }
         StorageActionKind::DeleteUnavailableSimulators => delete_unavailable_simulators(&job_id),
+        StorageActionKind::DeleteAllSimulatorDevices => delete_all_simulator_devices(&job_id),
         StorageActionKind::HomebrewCleanup => homebrew_cleanup(&job_id),
         StorageActionKind::PurgePlaywrightCache => {
             purge_directory_children_job(&job_id, PLAYWRIGHT_CACHE)
@@ -583,10 +661,8 @@ fn purge_directory_children_job(job_id: &str, path: &str) -> anyhow::Result<u64>
 }
 
 fn delete_unavailable_simulators(job_id: &str) -> anyhow::Result<u64> {
-    let before_user = directory_size(FsPath::new(
-        "/Users/jarvisgpt/Library/Developer/CoreSimulator",
-    ))?;
-    let before_system = directory_size(FsPath::new("/Library/Developer/CoreSimulator"))?;
+    let before_user = directory_size(FsPath::new(USER_CORE_SIMULATOR))?;
+    let before_system = directory_size(FsPath::new(SYSTEM_CORE_SIMULATOR))?;
     update_job(job_id, |job| {
         job.steps.push(StorageJobStep::new(
             "info",
@@ -599,13 +675,27 @@ fn delete_unavailable_simulators(job_id: &str) -> anyhow::Result<u64> {
         "/usr/bin/xcrun",
         &["simctl", "delete", "unavailable"],
     )?;
-    let after_user = directory_size(FsPath::new(
-        "/Users/jarvisgpt/Library/Developer/CoreSimulator",
-    ))?;
-    let after_system = directory_size(FsPath::new("/Library/Developer/CoreSimulator"))?;
+    let after_user = directory_size(FsPath::new(USER_CORE_SIMULATOR))?;
+    let after_system = directory_size(FsPath::new(SYSTEM_CORE_SIMULATOR))?;
     Ok(before_user
         .saturating_add(before_system)
         .saturating_sub(after_user.saturating_add(after_system)))
+}
+
+fn delete_all_simulator_devices(job_id: &str) -> anyhow::Result<u64> {
+    let root = FsPath::new(USER_SIMULATOR_DEVICES);
+    let before = directory_size(root)?;
+    update_job(job_id, |job| {
+        job.steps.push(StorageJobStep::new(
+            "warning",
+            "Deleting simulator devices",
+            "This removes all simulator devices, installed simulator apps, and simulator-local data. Installed runtimes remain in place.",
+        ));
+    });
+    run_fixed_command(job_id, "/usr/bin/xcrun", &["simctl", "shutdown", "all"])?;
+    run_fixed_command(job_id, "/usr/bin/xcrun", &["simctl", "delete", "all"])?;
+    let after = directory_size(root)?;
+    Ok(before.saturating_sub(after))
 }
 
 fn homebrew_cleanup(job_id: &str) -> anyhow::Result<u64> {
@@ -705,6 +795,7 @@ mod tests {
             "purge_xcode_derived_data",
             "purge_xcode_device_support",
             "delete_unavailable_simulators",
+            "delete_all_simulator_devices",
             "homebrew_cleanup",
             "purge_playwright_cache",
         ] {
