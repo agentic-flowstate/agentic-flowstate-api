@@ -19,8 +19,7 @@ use std::time::Duration;
 use ticketing_system::{
     agent_runners, checkpoints, conversation_turn_jobs, conversations, AddMessageRequest,
     Conversation, ConversationHierarchyScope, ConversationMessage, CreateChildConversationRequest,
-    CreateConversationRequest, SqlitePool,
-    UpdateConversationRequest,
+    CreateConversationRequest, SqlitePool, UpdateConversationRequest,
 };
 
 use super::chat_client_manager::ChatClientManager;
@@ -75,9 +74,36 @@ pub struct ConversationRunStatusResponse {
     pub should_fetch: bool,
     pub updated_at: i64,
     pub last_event_index: i32,
+    pub queued_message_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tool_call_started_at: Option<String>,
     pub server_time: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationQueuedMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub message: String,
+    pub agent_type: String,
+    pub status: String,
+    pub client_id: Option<String>,
+    pub image_count: usize,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct ConversationQueuedMessageRow {
+    id: String,
+    conversation_id: String,
+    message: String,
+    agent_type: String,
+    status: String,
+    client_id: Option<String>,
+    images: Option<String>,
+    created_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +207,75 @@ async fn last_tool_call_started_at_map(
                 row.conversation_id,
                 format_central_tool_call_time(row.last_started_at?)?,
             ))
+        })
+        .collect())
+}
+
+fn queued_message_image_count(images_json: Option<&str>) -> usize {
+    let Some(images_json) = images_json else {
+        return 0;
+    };
+    serde_json::from_str::<Vec<serde_json::Value>>(images_json)
+        .map(|images| images.len())
+        .unwrap_or(0)
+}
+
+async fn pending_queued_message_count(
+    pool: &SqlitePool,
+    conversation_id: &str,
+) -> anyhow::Result<i64> {
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM conversation_turn_jobs
+        WHERE conversation_id = ?
+          AND status = 'pending'
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await
+    .map_err(Into::into)
+}
+
+async fn list_pending_queued_messages(
+    pool: &SqlitePool,
+    conversation_id: &str,
+) -> anyhow::Result<Vec<ConversationQueuedMessage>> {
+    let rows = sqlx::query_as::<_, ConversationQueuedMessageRow>(
+        r#"
+        SELECT
+            id,
+            conversation_id,
+            message,
+            agent_type,
+            status,
+            client_id,
+            images,
+            created_at,
+            updated_at
+        FROM conversation_turn_jobs
+        WHERE conversation_id = ?
+          AND status = 'pending'
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ConversationQueuedMessage {
+            id: row.id,
+            conversation_id: row.conversation_id,
+            message: row.message,
+            agent_type: row.agent_type,
+            status: row.status,
+            client_id: row.client_id,
+            image_count: queued_message_image_count(row.images.as_deref()),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
         })
         .collect())
 }
@@ -328,6 +423,7 @@ async fn conversation_run_status_snapshot(
     let last_event_index = conversations::get_max_event_index(pool, conversation_id)
         .await
         .unwrap_or(-1);
+    let queued_message_count = pending_queued_message_count(pool, conversation_id).await?;
     let mut last_tool_calls =
         last_tool_call_started_at_map(pool, &[conversation_id.to_string()]).await?;
     let last_tool_call_started_at = last_tool_calls.remove(conversation_id);
@@ -340,6 +436,7 @@ async fn conversation_run_status_snapshot(
         should_fetch: !is_processing,
         updated_at: checkpoint.map(|cp| cp.updated_at).unwrap_or(0),
         last_event_index,
+        queued_message_count,
         last_tool_call_started_at,
         server_time: chrono::Utc::now().timestamp(),
     })
@@ -441,9 +538,8 @@ pub async fn list_conversations(
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListConversationsQuery>,
 ) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
-    let hierarchy_scope =
-        ConversationHierarchyScope::parse(params.hierarchy_scope.as_deref())
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let hierarchy_scope = ConversationHierarchyScope::parse(params.hierarchy_scope.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     let mut list = conversations::list_conversations_with_hierarchy(
         &pool,
@@ -564,13 +660,10 @@ pub async fn create_multi_agent_conversation(
         conversation_role: Some("multi_agent_parent".to_string()),
         child_sort_order: None,
     };
-    let (parent, children) = conversations::create_multi_agent_conversation(
-        &pool,
-        parent,
-        req.children,
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let (parent, children) =
+        conversations::create_multi_agent_conversation(&pool, parent, req.children)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok((
         StatusCode::CREATED,
@@ -591,7 +684,10 @@ pub async fn list_child_conversations(
 
     let mut list = conversations::list_conversations_with_hierarchy(
         &pool,
-        params.organization.as_deref().or(Some(parent.organization.as_str())),
+        params
+            .organization
+            .as_deref()
+            .or(Some(parent.organization.as_str())),
         Some(&user.user_id),
         params.agent.as_deref(),
         params.status.as_deref(),
@@ -639,14 +735,10 @@ pub async fn create_child_conversations(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let children = conversations::create_child_conversations(
-        &pool,
-        &user.user_id,
-        &id,
-        req.children,
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let children =
+        conversations::create_child_conversations(&pool, &user.user_id, &id, req.children)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let parent = require_user_conversation(&pool, &user.user_id, &id).await?;
 
@@ -809,6 +901,98 @@ pub async fn cancel_conversation(
     }
 
     Ok(StatusCode::OK)
+}
+
+/// List queued user messages waiting behind a running conversation turn.
+/// These are durable `conversation_turn_jobs` rows with `status='pending'`.
+pub async fn list_queued_messages(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ConversationQueuedMessage>>, (StatusCode, String)> {
+    require_user_conversation(&pool, &user.user_id, &id).await?;
+
+    let queued = list_pending_queued_messages(&pool, &id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(queued))
+}
+
+/// Cancel one queued message before the runner claims it.
+pub async fn cancel_queued_message(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((id, job_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_user_conversation(&pool, &user.user_id, &id).await?;
+
+    let status: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT status
+        FROM conversation_turn_jobs
+        WHERE id = ?
+          AND conversation_id = ?
+        "#,
+    )
+    .bind(&job_id)
+    .bind(&id)
+    .fetch_optional(&*pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    match status.as_deref() {
+        Some("pending") => {}
+        Some(_) => {
+            return Err((
+                StatusCode::CONFLICT,
+                "Queued message is no longer pending".to_string(),
+            ));
+        }
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "Queued message not found".to_string(),
+            ));
+        }
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let result = sqlx::query(
+        r#"
+        UPDATE conversation_turn_jobs
+        SET status = 'cancelled',
+            updated_at = ?,
+            completed_at = ?,
+            error_message = 'Cancelled by user from chat queue'
+        WHERE id = ?
+          AND conversation_id = ?
+          AND status = 'pending'
+        "#,
+    )
+    .bind(now)
+    .bind(now)
+    .bind(&job_id)
+    .bind(&id)
+    .execute(&*pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if result.rows_affected() == 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            "Queued message was already claimed".to_string(),
+        ));
+    }
+
+    if let Err(e) = publish_conversation_run_status(&pool, &id).await {
+        tracing::warn!(
+            "[QUEUE] Failed to publish queue cancellation status for {}: {}",
+            id,
+            e
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Add a message to a conversation (POST /api/conversations/:id/messages)

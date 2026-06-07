@@ -1219,6 +1219,14 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::cancel_conversation),
         )
         .route(
+            "/api/conversations/:id/queued-messages",
+            get(handlers::list_queued_messages),
+        )
+        .route(
+            "/api/conversations/:id/queued-messages/:job_id",
+            delete(handlers::cancel_queued_message),
+        )
+        .route(
             "/api/conversations/:id/checkpoint",
             get(handlers::get_conversation_checkpoint),
         )
