@@ -1409,6 +1409,18 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::admin_reload::restart_api),
         )
         .route(
+            "/api/admin/storage/scan",
+            get(handlers::storage::scan_storage),
+        )
+        .route(
+            "/api/admin/storage/actions/:action_id/start",
+            post(handlers::storage::start_storage_action),
+        )
+        .route(
+            "/api/admin/storage/jobs/:job_id",
+            get(handlers::storage::get_storage_job),
+        )
+        .route(
             "/api/admin/client-events",
             get(handlers::client_telemetry::list_client_events),
         )
