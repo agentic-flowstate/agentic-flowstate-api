@@ -173,7 +173,10 @@ pub async fn scan_storage() -> Response {
 /// POST /api/admin/storage/actions/:action_id/start
 pub async fn start_storage_action(Path(action_id): Path<String>) -> Response {
     let Some(action) = StorageActionKind::from_id(&action_id) else {
-        return json_error(StatusCode::NOT_FOUND, format!("Unknown action: {action_id}"));
+        return json_error(
+            StatusCode::NOT_FOUND,
+            format!("Unknown action: {action_id}"),
+        );
     };
 
     let job = StorageJob {
@@ -208,13 +211,21 @@ pub async fn get_storage_job(Path(job_id): Path<String>) -> Response {
     let jobs = STORAGE_JOBS.lock().expect("storage jobs lock poisoned");
     match jobs.get(&job_id) {
         Some(job) => (StatusCode::OK, Json(job.clone())).into_response(),
-        None => json_error(StatusCode::NOT_FOUND, format!("Storage job not found: {job_id}")),
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            format!("Storage job not found: {job_id}"),
+        ),
     }
 }
 
 fn build_scan() -> anyhow::Result<StorageScanResponse> {
     let mut volumes = Vec::new();
-    if let Some(volume) = volume_stats("macintosh_data", "Macintosh HD Data", "/System/Volumes/Data", false)? {
+    if let Some(volume) = volume_stats(
+        "macintosh_data",
+        "Macintosh HD Data",
+        "/System/Volumes/Data",
+        false,
+    )? {
         volumes.push(volume);
     }
     if let Some(volume) = volume_stats("orico", "ORICO", ORICO_ROOT, true)? {
@@ -314,12 +325,21 @@ fn build_scan() -> anyhow::Result<StorageScanResponse> {
         ),
         (
             "league_app",
-            "League of Legends app bundle",
+            "League of Legends on ORICO",
+            "Applications",
+            "/Volumes/ORICO/Applications/League of Legends.app",
+            RiskLevel::ReviewOnly,
+            None,
+            "Large app bundle moved off the internal disk. Launch and patching may be slower than internal SSD, but gameplay is usually CPU/GPU/network-bound after load.",
+        ),
+        (
+            "league_app_launcher",
+            "League launcher symlink",
             "Applications",
             "/Applications/League of Legends.app",
             RiskLevel::ReviewOnly,
             None,
-            "Large app bundle. Moving it to ORICO can recover internal space but should be done when the launcher is closed.",
+            "Internal /Applications entry points at the ORICO app bundle so normal launch paths keep working.",
         ),
         (
             "external_apps",
@@ -359,19 +379,43 @@ fn build_scan() -> anyhow::Result<StorageScanResponse> {
         notes: vec![
             "Finder System Data includes Xcode simulators, device support, caches, package-manager data, logs, and developer runtime state.".to_string(),
             "No automatic cleanup is scheduled here. Every cleanup must be started manually from this tab.".to_string(),
-            "League of Legends on ORICO should mostly affect launch, patching, and load times; frame rate is usually CPU/GPU/network-bound after launch.".to_string(),
+            "League of Legends now lives on ORICO with an /Applications symlink. Expect slower launch/patch/load phases than the internal SSD, but not a meaningful frame-rate hit after loading.".to_string(),
         ],
     })
 }
 
 fn actions_from_buckets(buckets: &[StorageBucket]) -> Vec<StorageActionSummary> {
     [
-        (StorageActionKind::PurgeCargoAuto, RiskLevel::Low, "Deletes generated cargo-auto target directories on ORICO."),
-        (StorageActionKind::PurgeXcodeDerivedData, RiskLevel::Low, "Deletes Xcode DerivedData for rebuildable build products."),
-        (StorageActionKind::PurgeXcodeDeviceSupport, RiskLevel::Medium, "Deletes copied iOS DeviceSupport symbols; Xcode may recreate them."),
-        (StorageActionKind::DeleteUnavailableSimulators, RiskLevel::Medium, "Runs xcrun simctl delete unavailable; keeps currently available simulators."),
-        (StorageActionKind::HomebrewCleanup, RiskLevel::Low, "Runs brew cleanup --prune=all for stale package cache and old versions."),
-        (StorageActionKind::PurgePlaywrightCache, RiskLevel::Low, "Deletes downloaded Playwright browsers; tests can re-download them."),
+        (
+            StorageActionKind::PurgeCargoAuto,
+            RiskLevel::Low,
+            "Deletes generated cargo-auto target directories on ORICO.",
+        ),
+        (
+            StorageActionKind::PurgeXcodeDerivedData,
+            RiskLevel::Low,
+            "Deletes Xcode DerivedData for rebuildable build products.",
+        ),
+        (
+            StorageActionKind::PurgeXcodeDeviceSupport,
+            RiskLevel::Medium,
+            "Deletes copied iOS DeviceSupport symbols; Xcode may recreate them.",
+        ),
+        (
+            StorageActionKind::DeleteUnavailableSimulators,
+            RiskLevel::Medium,
+            "Runs xcrun simctl delete unavailable; keeps currently available simulators.",
+        ),
+        (
+            StorageActionKind::HomebrewCleanup,
+            RiskLevel::Low,
+            "Runs brew cleanup --prune=all for stale package cache and old versions.",
+        ),
+        (
+            StorageActionKind::PurgePlaywrightCache,
+            RiskLevel::Low,
+            "Deletes downloaded Playwright browsers; tests can re-download them.",
+        ),
     ]
     .into_iter()
     .map(|(kind, risk_level, detail)| StorageActionSummary {
@@ -491,7 +535,8 @@ fn run_storage_action(job_id: String, action: StorageActionKind) {
             job.status = StorageJobStatus::Failed;
             job.completed_at = Some(Utc::now().to_rfc3339());
             job.error = Some(e.to_string());
-            job.steps.push(StorageJobStep::new("error", "Failed", &e.to_string()));
+            job.steps
+                .push(StorageJobStep::new("error", "Failed", &e.to_string()));
         }),
     }
 }
@@ -538,7 +583,9 @@ fn purge_directory_children_job(job_id: &str, path: &str) -> anyhow::Result<u64>
 }
 
 fn delete_unavailable_simulators(job_id: &str) -> anyhow::Result<u64> {
-    let before_user = directory_size(FsPath::new("/Users/jarvisgpt/Library/Developer/CoreSimulator"))?;
+    let before_user = directory_size(FsPath::new(
+        "/Users/jarvisgpt/Library/Developer/CoreSimulator",
+    ))?;
     let before_system = directory_size(FsPath::new("/Library/Developer/CoreSimulator"))?;
     update_job(job_id, |job| {
         job.steps.push(StorageJobStep::new(
@@ -547,8 +594,14 @@ fn delete_unavailable_simulators(job_id: &str) -> anyhow::Result<u64> {
             "Executing xcrun simctl delete unavailable.",
         ));
     });
-    run_fixed_command(job_id, "/usr/bin/xcrun", &["simctl", "delete", "unavailable"])?;
-    let after_user = directory_size(FsPath::new("/Users/jarvisgpt/Library/Developer/CoreSimulator"))?;
+    run_fixed_command(
+        job_id,
+        "/usr/bin/xcrun",
+        &["simctl", "delete", "unavailable"],
+    )?;
+    let after_user = directory_size(FsPath::new(
+        "/Users/jarvisgpt/Library/Developer/CoreSimulator",
+    ))?;
     let after_system = directory_size(FsPath::new("/Library/Developer/CoreSimulator"))?;
     Ok(before_user
         .saturating_add(before_system)
@@ -565,7 +618,11 @@ fn homebrew_cleanup(job_id: &str) -> anyhow::Result<u64> {
             "Executing brew cleanup --prune=all.",
         ));
     });
-    run_fixed_command(job_id, "/opt/homebrew/bin/brew", &["cleanup", "--prune=all"])?;
+    run_fixed_command(
+        job_id,
+        "/opt/homebrew/bin/brew",
+        &["cleanup", "--prune=all"],
+    )?;
     let after_cache = directory_size(FsPath::new(HOMEBREW_CACHE))?;
     let after_prefix = directory_size(FsPath::new("/opt/homebrew"))?;
     Ok(before_cache
@@ -586,7 +643,11 @@ fn run_fixed_command(job_id: &str, program: &str, args: &[&str]) -> anyhow::Resu
     );
     update_job(job_id, |job| {
         job.steps.push(StorageJobStep::new(
-            if output.status.success() { "info" } else { "error" },
+            if output.status.success() {
+                "info"
+            } else {
+                "error"
+            },
             "Command output",
             &detail,
         ));
