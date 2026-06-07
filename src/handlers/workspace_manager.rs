@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::chat_client_manager::ChatClientManager;
-use super::chat_stream::{self, ChatConfig, ChatImageData, ChatRuntime};
+use super::chat_stream::{self, ChatCodexOptions, ChatConfig, ChatImageData, ChatRuntime};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -23,15 +23,18 @@ pub struct WorkspaceManagerRequest {
     pub organization: Option<String>,
     pub conversation_id: Option<String>,
     pub images: Option<Vec<ChatImageData>>,
+    pub codex_options: Option<ChatCodexOptions>,
 }
 
 fn config() -> ChatConfig {
+    let agent_type = AgentType::WorkspaceManager;
     ChatConfig {
-        agent_type: AgentType::WorkspaceManager,
+        agent_type: agent_type.clone(),
         runtime: ChatRuntime::CodexAppServer,
         prompt_name: "workspace-manager",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars: HashMap::new(),
+        codex_options: ChatCodexOptions::default_for_agent(&agent_type),
     }
 }
 
@@ -48,12 +51,16 @@ pub async fn workspace_manager_chat(
         Ok(v) => v,
         Err(e) => return chat_stream::malformed_idempotency_key_response(e),
     };
+    let config = match chat_stream::apply_codex_options(config(), req.codex_options.clone()) {
+        Ok(config) => config,
+        Err(response) => return response,
+    };
     chat_stream::chat(
         db,
         manager,
         req.message,
         req.conversation_id,
-        config(),
+        config,
         user.user_id,
         req.images,
         client_id,
@@ -74,12 +81,16 @@ pub async fn workspace_manager_chat_submit(
         Ok(v) => v,
         Err(e) => return chat_stream::malformed_idempotency_key_response(e),
     };
+    let config = match chat_stream::apply_codex_options(config(), req.codex_options.clone()) {
+        Ok(config) => config,
+        Err(response) => return response,
+    };
     chat_stream::submit(
         db,
         manager,
         req.message,
         req.conversation_id,
-        config(),
+        config,
         user.user_id,
         req.images,
         client_id,

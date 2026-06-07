@@ -1,12 +1,15 @@
 use async_stream::stream;
+use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream::Stream;
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -17,13 +20,12 @@ use ticketing_system::conversations;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 
-use serde::{Deserialize, Serialize};
-
 use super::chat_client_manager::ChatClientManager;
 use super::conversation_worker::WorkerMessage;
 use super::conversation_worker_manager::WORKER_MANAGER;
 use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
-use crate::agents::{AgentType, StreamEvent};
+use crate::agents::codex_app_server::normalize_reasoning_effort;
+use crate::agents::{AgentType, AgentsConfig, StreamEvent};
 use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
 use crate::rate_limiting::{self, RateLimitDecision, StreamPermit};
 use ticketing_system::{checkpoints, conversation_turn_jobs};
@@ -35,6 +37,37 @@ pub struct ChatImageData {
     pub data: String,
     /// MIME type (e.g., "image/jpeg")
     pub mime_type: String,
+}
+
+const SUPPORTED_CODEX_REASONING_EFFORTS: &[&str] =
+    &["minimal", "low", "medium", "high", "xhigh"];
+const JOB_CODEX_MODEL_KEY: &str = "__agentic_codex_model";
+const JOB_CODEX_REASONING_EFFORT_KEY: &str = "__agentic_codex_reasoning_effort";
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatCodexOptions {
+    pub model: String,
+    pub reasoning_effort: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatCodexOptionItem {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatCodexOptionsResponse {
+    pub agent: String,
+    pub default_model: String,
+    pub default_reasoning_effort: String,
+    pub models: Vec<ChatCodexOptionItem>,
+    pub reasoning_efforts: Vec<ChatCodexOptionItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChatCodexOptionsQuery {
+    pub agent: Option<String>,
 }
 
 /// Global broadcaster for live conversation events.
@@ -89,6 +122,133 @@ pub struct ChatConfig {
     pub prompt_name: &'static str,
     pub working_dir: PathBuf,
     pub prompt_vars: HashMap<String, String>,
+    pub codex_options: ChatCodexOptions,
+}
+
+impl ChatCodexOptions {
+    pub fn default_for_agent(agent_type: &AgentType) -> Self {
+        Self {
+            model: agent_type.model().to_string(),
+            reasoning_effort: normalize_reasoning_effort(agent_type.effort()).to_string(),
+        }
+    }
+}
+
+pub fn configured_codex_models() -> BTreeSet<String> {
+    let mut models = BTreeSet::new();
+    let config = AgentsConfig::get();
+    for model in config.models.values() {
+        models.insert(config.resolve_model(model).to_string());
+    }
+    for agent in config.agents.values() {
+        models.insert(config.resolve_model(&agent.model).to_string());
+    }
+    models
+}
+
+fn validate_codex_options(
+    agent_type: &AgentType,
+    requested: Option<ChatCodexOptions>,
+) -> Result<ChatCodexOptions, Response> {
+    let Some(requested) = requested else {
+        return Ok(ChatCodexOptions::default_for_agent(agent_type));
+    };
+
+    let model = requested.model.trim();
+    let resolved_model = AgentsConfig::get().resolve_model(model).to_string();
+    if model.is_empty() || !configured_codex_models().contains(&resolved_model) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unsupported Codex model: {}", requested.model)})),
+        )
+            .into_response());
+    }
+
+    let effort = requested.reasoning_effort.trim().to_lowercase();
+    if !SUPPORTED_CODEX_REASONING_EFFORTS.contains(&effort.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unsupported Codex reasoning effort: {}", requested.reasoning_effort)})),
+        )
+            .into_response());
+    }
+
+    Ok(ChatCodexOptions {
+        model: resolved_model,
+        reasoning_effort: effort,
+    })
+}
+
+pub fn apply_codex_options(
+    mut config: ChatConfig,
+    requested: Option<ChatCodexOptions>,
+) -> Result<ChatConfig, Response> {
+    config.codex_options = validate_codex_options(&config.agent_type, requested)?;
+    Ok(config)
+}
+
+pub fn encode_codex_options_for_job(
+    mut prompt_vars: HashMap<String, String>,
+    options: &ChatCodexOptions,
+) -> HashMap<String, String> {
+    prompt_vars.insert(JOB_CODEX_MODEL_KEY.to_string(), options.model.clone());
+    prompt_vars.insert(
+        JOB_CODEX_REASONING_EFFORT_KEY.to_string(),
+        options.reasoning_effort.clone(),
+    );
+    prompt_vars
+}
+
+pub fn take_codex_options_from_job(
+    agent_type: &AgentType,
+    prompt_vars: &mut HashMap<String, String>,
+) -> ChatCodexOptions {
+    let model = prompt_vars.remove(JOB_CODEX_MODEL_KEY);
+    let reasoning_effort = prompt_vars.remove(JOB_CODEX_REASONING_EFFORT_KEY);
+    match (model, reasoning_effort) {
+        (Some(model), Some(reasoning_effort)) => ChatCodexOptions {
+            model,
+            reasoning_effort,
+        },
+        _ => ChatCodexOptions::default_for_agent(agent_type),
+    }
+}
+
+pub async fn codex_chat_options(
+    Query(params): Query<ChatCodexOptionsQuery>,
+) -> Result<Json<ChatCodexOptionsResponse>, Response> {
+    let agent_key = params.agent.as_deref().unwrap_or("full-access");
+    let Some(agent_type) = AgentType::from_chat_agent_key(agent_key) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unsupported chat agent: {}", agent_key)})),
+        )
+            .into_response());
+    };
+
+    let defaults = ChatCodexOptions::default_for_agent(&agent_type);
+    let models = configured_codex_models()
+        .into_iter()
+        .map(|id| ChatCodexOptionItem {
+            label: id.clone(),
+            id,
+        })
+        .collect();
+    let reasoning_efforts = SUPPORTED_CODEX_REASONING_EFFORTS
+        .iter()
+        .map(|effort| ChatCodexOptionItem {
+            id: (*effort).to_string(),
+            label: effort.to_uppercase(),
+        })
+        .collect();
+
+    Ok(Json(ChatCodexOptionsResponse {
+        agent: agent_type.as_str().to_string(),
+        default_model: defaults.model,
+        default_reasoning_effort: defaults.reasoning_effort,
+        models,
+        reasoning_efforts,
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -194,7 +354,7 @@ pub async fn submit(
         runtime: config.runtime.as_job_runtime().to_string(),
         prompt_name: config.prompt_name.to_string(),
         working_dir: config.working_dir.to_string_lossy().to_string(),
-        prompt_vars: config.prompt_vars,
+        prompt_vars: encode_codex_options_for_job(config.prompt_vars, &config.codex_options),
         images_json,
         client_id,
     };

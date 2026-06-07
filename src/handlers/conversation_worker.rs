@@ -907,8 +907,8 @@ impl ConversationWorker {
             codex_sandbox_policy_for_chat_agent(&msg.config.agent_type);
 
         let mut turn = match spawn_codex_app_server(CodexAppServerOptions {
-            model: msg.config.agent_type.model(),
-            reasoning_effort: msg.config.agent_type.effort(),
+            model: &msg.config.codex_options.model,
+            reasoning_effort: &msg.config.codex_options.reasoning_effort,
             system_prompt: &system_prompt,
             working_dir: &msg.config.working_dir,
             prompt: final_message,

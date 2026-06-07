@@ -1130,6 +1130,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/home-planner/chat/submit",
             post(handlers::home_planner_chat_submit),
         )
+        .route(
+            "/api/chat/codex-options",
+            get(handlers::codex_chat_options),
+        )
         // Scoped Workspace Chat routes (restricted agent for external collaborators)
         .route(
             "/api/scoped-workspace/chat",

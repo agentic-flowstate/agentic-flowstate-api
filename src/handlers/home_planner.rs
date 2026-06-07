@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::chat_client_manager::ChatClientManager;
-use super::chat_stream::{self, ChatConfig, ChatImageData, ChatRuntime};
+use super::chat_stream::{self, ChatCodexOptions, ChatConfig, ChatImageData, ChatRuntime};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -20,6 +20,7 @@ pub struct HomePlannerRequest {
     pub message: String,
     pub conversation_id: Option<String>,
     pub images: Option<Vec<ChatImageData>>,
+    pub codex_options: Option<ChatCodexOptions>,
 }
 
 /// Build config (no data in system prompt) and load home context separately
@@ -61,12 +62,18 @@ pub async fn home_planner_chat(
     prompt_vars.insert("USER_NAME".to_string(), user_name);
     prompt_vars.insert("USER_ID".to_string(), user.user_id.clone());
 
+    let agent_type = AgentType::HomePlanner;
     let config = ChatConfig {
-        agent_type: AgentType::HomePlanner,
+        agent_type: agent_type.clone(),
         runtime: ChatRuntime::CodexAppServer,
         prompt_name: "home-planner",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,
+        codex_options: ChatCodexOptions::default_for_agent(&agent_type),
+    };
+    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()) {
+        Ok(config) => config,
+        Err(response) => return response,
     };
 
     // For new conversations (no existing session), prepend home context to user message.
@@ -133,12 +140,18 @@ pub async fn home_planner_chat_submit(
     prompt_vars.insert("USER_NAME".to_string(), user_name);
     prompt_vars.insert("USER_ID".to_string(), user.user_id.clone());
 
+    let agent_type = AgentType::HomePlanner;
     let config = ChatConfig {
-        agent_type: AgentType::HomePlanner,
+        agent_type: agent_type.clone(),
         runtime: ChatRuntime::CodexAppServer,
         prompt_name: "home-planner",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,
+        codex_options: ChatCodexOptions::default_for_agent(&agent_type),
+    };
+    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()) {
+        Ok(config) => config,
+        Err(response) => return response,
     };
 
     let message = if let Some(ref conv_id) = req.conversation_id {

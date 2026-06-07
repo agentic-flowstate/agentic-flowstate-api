@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::chat_client_manager::ChatClientManager;
-use super::chat_stream::{self, ChatConfig, ChatImageData, ChatRuntime};
+use super::chat_stream::{self, ChatCodexOptions, ChatConfig, ChatImageData, ChatRuntime};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -21,6 +21,7 @@ pub struct FullAccessChatRequest {
     pub message: String,
     pub conversation_id: Option<String>,
     pub images: Option<Vec<ChatImageData>>,
+    pub codex_options: Option<ChatCodexOptions>,
 }
 
 async fn reject_unless_admin(db: &SqlitePool, user_id: &str) -> Option<Response> {
@@ -72,12 +73,18 @@ pub async fn full_access_chat(
     prompt_vars.insert("USER_ID".to_string(), user.user_id.clone());
     prompt_vars.insert("AGENTS_MD".to_string(), agents_md);
 
+    let agent_type = AgentType::FullAccess;
     let config = ChatConfig {
-        agent_type: AgentType::FullAccess,
+        agent_type: agent_type.clone(),
         runtime: ChatRuntime::CodexAppServer,
         prompt_name: "full-access",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,
+        codex_options: ChatCodexOptions::default_for_agent(&agent_type),
+    };
+    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()) {
+        Ok(config) => config,
+        Err(response) => return response,
     };
 
     chat_stream::chat(
@@ -122,12 +129,18 @@ pub async fn full_access_chat_submit(
     prompt_vars.insert("USER_ID".to_string(), user.user_id.clone());
     prompt_vars.insert("AGENTS_MD".to_string(), agents_md);
 
+    let agent_type = AgentType::FullAccess;
     let config = ChatConfig {
-        agent_type: AgentType::FullAccess,
+        agent_type: agent_type.clone(),
         runtime: ChatRuntime::CodexAppServer,
         prompt_name: "full-access",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,
+        codex_options: ChatCodexOptions::default_for_agent(&agent_type),
+    };
+    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()) {
+        Ok(config) => config,
+        Err(response) => return response,
     };
 
     chat_stream::submit(

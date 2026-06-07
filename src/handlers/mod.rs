@@ -55,6 +55,7 @@ pub mod voice_transcribe;
 pub mod workspace_manager;
 
 pub use agent_runs::*;
+pub use chat_stream::codex_chat_options;
 pub use conversation_evaluations::*;
 pub use conversation_next_actions::*;
 pub use conversations::*;

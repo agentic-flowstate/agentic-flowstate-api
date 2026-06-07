@@ -91,6 +91,17 @@ pub enum AgentType {
 }
 
 impl AgentType {
+    pub fn from_chat_agent_key(key: &str) -> Option<Self> {
+        match key {
+            "full-access" => Some(AgentType::FullAccess),
+            "home-planner" => Some(AgentType::HomePlanner),
+            "workspace-manager" => Some(AgentType::WorkspaceManager),
+            "meeting-agent" => Some(AgentType::MeetingAgent),
+            "scoped-workspace" => Some(AgentType::ScopedWorkspace),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentType::Planning => "planning",

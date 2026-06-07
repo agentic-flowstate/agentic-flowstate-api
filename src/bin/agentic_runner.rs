@@ -1,7 +1,7 @@
 use agentic_api::agents::AgentType;
 use agentic_api::apns;
 use agentic_api::handlers::chat_client_manager::ChatClientManager;
-use agentic_api::handlers::chat_stream::{ChatConfig, ChatImageData, ChatRuntime};
+use agentic_api::handlers::chat_stream::{self, ChatConfig, ChatImageData, ChatRuntime};
 use agentic_api::handlers::conversation_worker::{ConversationWorker, WorkerMessage};
 use anyhow::{bail, Context, Result};
 use futures::FutureExt;
@@ -404,6 +404,9 @@ fn worker_message_from_job(
         None => None,
     };
 
+    let mut prompt_vars = payload.prompt_vars.clone();
+    let codex_options = chat_stream::take_codex_options_from_job(&agent_type, &mut prompt_vars);
+
     Ok(WorkerMessage {
         user_id: payload.user_id.clone(),
         message: payload.message.clone(),
@@ -412,7 +415,8 @@ fn worker_message_from_job(
             runtime: ChatRuntime::CodexAppServer,
             prompt_name: prompt_name_static(&payload.prompt_name)?,
             working_dir: PathBuf::from(&payload.working_dir),
-            prompt_vars: payload.prompt_vars.clone(),
+            prompt_vars,
+            codex_options,
         },
         images,
         completion_tx: None,

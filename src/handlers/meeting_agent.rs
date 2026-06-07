@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::chat_client_manager::ChatClientManager;
-use super::chat_stream::{self, ChatConfig, ChatImageData, ChatRuntime};
+use super::chat_stream::{self, ChatCodexOptions, ChatConfig, ChatImageData, ChatRuntime};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -21,6 +21,7 @@ pub struct MeetingAgentRequest {
     pub conversation_id: Option<String>,
     pub room_id: String,
     pub images: Option<Vec<ChatImageData>>,
+    pub codex_options: Option<ChatCodexOptions>,
 }
 
 /// Load meeting context (notes + transcript) for a given room
@@ -98,12 +99,18 @@ pub async fn meeting_agent_chat(
     let mut prompt_vars = HashMap::new();
     prompt_vars.insert("USER_NAME".to_string(), user_name);
 
+    let agent_type = AgentType::MeetingAgent;
     let config = ChatConfig {
-        agent_type: AgentType::MeetingAgent,
+        agent_type: agent_type.clone(),
         runtime: ChatRuntime::CodexAppServer,
         prompt_name: "meeting-agent",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,
+        codex_options: ChatCodexOptions::default_for_agent(&agent_type),
+    };
+    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()) {
+        Ok(config) => config,
+        Err(response) => return response,
     };
 
     // For new conversations, prepend meeting context.
@@ -169,12 +176,18 @@ pub async fn meeting_agent_chat_submit(
     let mut prompt_vars = HashMap::new();
     prompt_vars.insert("USER_NAME".to_string(), user_name);
 
+    let agent_type = AgentType::MeetingAgent;
     let config = ChatConfig {
-        agent_type: AgentType::MeetingAgent,
+        agent_type: agent_type.clone(),
         runtime: ChatRuntime::CodexAppServer,
         prompt_name: "meeting-agent",
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
         prompt_vars,
+        codex_options: ChatCodexOptions::default_for_agent(&agent_type),
+    };
+    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()) {
+        Ok(config) => config,
+        Err(response) => return response,
     };
 
     let message = if let Some(ref conv_id) = req.conversation_id {
