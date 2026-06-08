@@ -1,7 +1,7 @@
 use async_stream::stream;
 use axum::{
     extract::{Extension, Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -25,6 +25,7 @@ use ticketing_system::{
 use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::get_broadcast_sender;
 use super::conversation_worker_manager::WORKER_MANAGER;
+use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
 use crate::auth_middleware::AuthenticatedUser;
 use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_opened, DisconnectReason,
@@ -1657,21 +1658,16 @@ pub async fn list_conversation_events_page(
     }))
 }
 
-/// Query parameters for the reconnect SSE endpoint.
-#[derive(Debug, Deserialize)]
-pub struct ReconnectQuery {
-    /// If provided, only replay events after this index (cursor-based resume).
-    pub starting_after: Option<i32>,
-}
-
-/// GET /api/conversations/:id/stream?starting_after=N
-/// SSE reconnection endpoint: replays stored events (optionally from cursor), then tails live events while agent is running.
+/// GET /api/v1/conversations/:id/events
+/// SSE reconnection endpoint: replays stored events after the supplied cursor, then tails live events while an agent is running.
 pub async fn reconnect_conversation_stream(
     Path(id): Path<String>,
-    Query(query): Query<ReconnectQuery>,
+    headers: HeaderMap,
+    Query(query): Query<ResumeQuery>,
     State(db): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-) -> Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+) -> Result<Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>>, (StatusCode, String)>
+{
     // Verify the authenticated user owns this conversation
     let conv = conversations::get_conversation(&db, &id, false).await;
     match conv {
@@ -1679,14 +1675,14 @@ pub async fn reconnect_conversation_stream(
         _ => {
             // Not found or not owned — return an empty stream that closes immediately
             let empty = futures::stream::empty();
-            return Sse::new(
+            return Ok(Sse::new(
                 Box::pin(empty) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>
             )
             .keep_alive(
                 KeepAlive::new()
                     .interval(Duration::from_secs(30))
                     .text("ping"),
-            );
+            ));
         }
     }
 
@@ -1695,12 +1691,25 @@ pub async fn reconnect_conversation_stream(
         _ => "none".to_string(),
     };
 
-    // Resume vs cold-start: a reconnect with `starting_after=N` is the
-    // resume arm of the stream-open metric; a reconnect without it is a
-    // cold start (the client is re-subscribing from the top).
-    let resume = query.starting_after.is_some();
+    let cursor = match extract_cursor(&headers, &query) {
+        Ok(cursor) => cursor,
+        Err(CursorError::Malformed(detail)) => return Err((StatusCode::BAD_REQUEST, detail)),
+        Err(CursorError::Retention { .. }) => {
+            unreachable!("extract_cursor never produces CursorError::Retention")
+        }
+    };
+    let after = i32::try_from(cursor.event_index).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "resume cursor is outside the supported event index range: {}",
+                cursor.event_index
+            ),
+        )
+    })?;
+    let resume = cursor.is_resume();
 
-    let events = if let Some(after) = query.starting_after {
+    let events = if resume {
         conversations::get_events_after(&db, &id, after)
             .await
             .unwrap_or_default()
@@ -1710,29 +1719,25 @@ pub async fn reconnect_conversation_stream(
             .unwrap_or_default()
     };
 
-    // Cursor-expired 410 detection: the client passed `starting_after=N`
+    // Cursor-expired detection: the client supplied a resume cursor
     // but either (a) the allocator has already moved past N and no event
     // at index N+1 is retained in the log (first returned event has an
-    // index well above N+1), or (b) the client's cursor is negative.
+    // index well above N+1).
     // We fold this into the normal SSE response (no 410 frame on the
     // wire — iOS re-syncs via full message fetch) and only emit the
     // metric so operators can chart the rate. Feature retention work
     // (T-future) will convert this into an actual HTTP 410.
     let mut cursor_expired = false;
-    if let Some(after) = query.starting_after {
+    if resume {
         let oldest_retained = match conversations::get_events(&db, &id).await {
             Ok(ref all) if !all.is_empty() => Some(all[0].event_index),
             _ => None,
         };
         if let Some(oldest) = oldest_retained {
-            if after < 0 || oldest > after + 1 {
+            if oldest > after + 1 {
                 record_cursor_expired(&id, after, oldest);
                 cursor_expired = true;
             }
-        } else if after < 0 {
-            // No events retained AND negative cursor — still expired.
-            record_cursor_expired(&id, after, 0);
-            cursor_expired = true;
         }
     }
 
@@ -1766,12 +1771,12 @@ pub async fn reconnect_conversation_stream(
         guarded.reason = DisconnectReason::CursorExpired;
     }
 
-    Sse::new(Box::pin(guarded) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
+    Ok(Sse::new(Box::pin(guarded) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
         .keep_alive(
             KeepAlive::new()
                 .interval(Duration::from_secs(30))
                 .text("ping"),
-        )
+        ))
 }
 
 /// RAII stream wrapper that records the matching `stream_closed_total`
