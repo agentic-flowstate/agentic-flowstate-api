@@ -255,6 +255,40 @@ async fn last_tool_call_started_at_epoch(
     Ok(value)
 }
 
+async fn active_run_tool_call_count(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    earliest_started_at: Option<i64>,
+) -> anyhow::Result<i32> {
+    let value: i64 = if let Some(earliest_started_at) = earliest_started_at {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM conversation_tool_calls
+            WHERE conversation_id = ?
+              AND created_at >= ?
+            "#,
+        )
+        .bind(conversation_id)
+        .bind(earliest_started_at)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM conversation_tool_calls
+            WHERE conversation_id = ?
+            "#,
+        )
+        .bind(conversation_id)
+        .fetch_one(pool)
+        .await?
+    };
+
+    Ok(value.min(i64::from(i32::MAX)) as i32)
+}
+
 async fn active_run_started_at(
     pool: &SqlitePool,
     conversation_id: &str,
@@ -516,9 +550,6 @@ async fn conversation_run_status_snapshot(
         .await
         .unwrap_or(-1);
     let queued_message_count = pending_queued_message_count(pool, conversation_id).await?;
-    let mut last_tool_calls =
-        last_tool_call_started_at_map(pool, &[conversation_id.to_string()]).await?;
-    let last_tool_call_started_at = last_tool_calls.remove(conversation_id);
     let run_started_at = if is_processing {
         active_run_started_at(pool, conversation_id, checkpoint.as_ref()).await?
     } else {
@@ -526,6 +557,19 @@ async fn conversation_run_status_snapshot(
     };
     let last_tool_call_started_at_epoch =
         last_tool_call_started_at_epoch(pool, conversation_id, run_started_at).await?;
+    let last_tool_call_started_at =
+        last_tool_call_started_at_epoch.and_then(format_central_tool_call_time);
+    let checkpoint_tool_call_count = checkpoint
+        .as_ref()
+        .map(|cp| cp.tool_call_count)
+        .unwrap_or(0);
+    let tool_call_count = if is_processing {
+        checkpoint_tool_call_count.max(
+            active_run_tool_call_count(pool, conversation_id, run_started_at).await?,
+        )
+    } else {
+        checkpoint_tool_call_count
+    };
 
     Ok(ConversationRunStatusResponse {
         conversation_id: conversation_id.to_string(),
@@ -535,10 +579,7 @@ async fn conversation_run_status_snapshot(
         should_fetch: !is_processing,
         updated_at: checkpoint.as_ref().map(|cp| cp.updated_at).unwrap_or(0),
         last_event_index,
-        tool_call_count: checkpoint
-            .as_ref()
-            .map(|cp| cp.tool_call_count)
-            .unwrap_or(0),
+        tool_call_count,
         queued_message_count,
         run_started_at,
         last_tool_call_started_at,
