@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
@@ -173,6 +174,10 @@ pub struct ConversationWorker {
     /// and consumed by `emit_event` to fan out silent pushes on
     /// `message_stop` (T-90C7FAC4). `None` outside a turn.
     current_user_id: Option<String>,
+    /// Client trace/idempotency id for the currently processed turn.
+    current_client_id: Option<String>,
+    first_message_start_logged: bool,
+    first_content_delta_logged: bool,
 }
 
 impl ConversationWorker {
@@ -194,6 +199,9 @@ impl ConversationWorker {
             last_router_organization: None,
             encoder,
             current_user_id: None,
+            current_client_id: None,
+            first_message_start_logged: false,
+            first_content_delta_logged: false,
         }
     }
 
@@ -372,10 +380,25 @@ impl ConversationWorker {
     async fn process_message(&mut self, mut msg: WorkerMessage) {
         // RAII guard: fires completion signal when this function exits (normal or early return)
         let _completion = CompletionGuard(msg.completion_tx.take());
+        self.current_client_id = msg.client_id.clone();
+        self.first_message_start_logged = false;
+        self.first_content_delta_logged = false;
         // Cache the turn's owner so `emit_event` can fan out silent
         // pushes on `message_stop` without plumbing user_id through
         // every call site (T-90C7FAC4).
         self.current_user_id = Some(msg.user_id.clone());
+        tracing::info!(
+            "[CHAT_LATENCY] phase=worker_process_message_start conv={} client_id={} agent={} runtime={} model={} effort={} message_chars={} images={} started_at_ms={}",
+            self.conversation_id,
+            msg.client_id.as_deref().unwrap_or("none"),
+            msg.config.agent_type.as_str(),
+            msg.config.runtime.as_job_runtime(),
+            msg.config.codex_options.model,
+            msg.config.codex_options.reasoning_effort,
+            msg.message.chars().count(),
+            msg.images.as_ref().map_or(0, Vec::len),
+            Utc::now().timestamp_millis()
+        );
         // Stage the inbound Idempotency-Key (T-A819D36B) onto the
         // encoder BEFORE any StreamEvent is encoded. The encoder
         // consumes it on the first `open_message_if_needed` call (i.e.,
@@ -950,6 +973,17 @@ impl ConversationWorker {
             .map(generated_image_snapshot)
             .unwrap_or_default();
 
+        let codex_spawn_start_ms = Utc::now().timestamp_millis();
+        tracing::info!(
+            "[CHAT_LATENCY] phase=codex_spawn_start conv={} client_id={} runner_turn_id={} model={} effort={} started_at_ms={}",
+            self.conversation_id,
+            self.current_client_id.as_deref().unwrap_or("none"),
+            runner_turn_id,
+            msg.config.codex_options.model,
+            msg.config.codex_options.reasoning_effort,
+            codex_spawn_start_ms
+        );
+
         let mut turn = match spawn_codex_app_server(CodexAppServerOptions {
             model: &msg.config.codex_options.model,
             reasoning_effort: &msg.config.codex_options.reasoning_effort,
@@ -997,6 +1031,15 @@ impl ConversationWorker {
                 return;
             }
         };
+        let codex_spawn_ready_ms = Utc::now().timestamp_millis();
+        tracing::info!(
+            "[CHAT_LATENCY] phase=codex_spawn_ready conv={} client_id={} runner_turn_id={} ready_at_ms={} spawn_duration_ms={}",
+            self.conversation_id,
+            self.current_client_id.as_deref().unwrap_or("none"),
+            runner_turn_id,
+            codex_spawn_ready_ms,
+            codex_spawn_ready_ms.saturating_sub(codex_spawn_start_ms)
+        );
 
         self.manager
             .insert_app_server_turn(self.conversation_id.clone(), turn.child())
@@ -1035,6 +1078,14 @@ impl ConversationWorker {
                 maybe_event = turn.events.recv() => {
                     match maybe_event {
                         Some(CodexAppServerEvent::ThreadStarted { thread_id: tid }) => {
+                            tracing::info!(
+                                "[CHAT_LATENCY] phase=codex_thread_started conv={} client_id={} runner_turn_id={} thread_id={} started_at_ms={}",
+                                self.conversation_id,
+                                self.current_client_id.as_deref().unwrap_or("none"),
+                                runner_turn_id,
+                                tid,
+                                Utc::now().timestamp_millis()
+                            );
                             if let Err(e) = agent_runners::set_turn_session(
                                 &self.db,
                                 &runner_turn_id,
@@ -1610,6 +1661,29 @@ impl ConversationWorker {
                     let _ = broadcast_tx.send((allocated_index, ae_json));
                     self.event_index = allocated_index + 1;
                     record_stream_event_emitted(&self.conversation_id, bytes);
+                    let persisted_at_ms = Utc::now().timestamp_millis();
+                    if ae_type == "message_start" && !self.first_message_start_logged {
+                        self.first_message_start_logged = true;
+                        tracing::info!(
+                            "[CHAT_LATENCY] phase=message_start_persisted conv={} client_id={} event_index={} bytes={} persisted_at_ms={}",
+                            self.conversation_id,
+                            self.current_client_id.as_deref().unwrap_or("none"),
+                            allocated_index,
+                            bytes,
+                            persisted_at_ms
+                        );
+                    }
+                    if ae_type == "content_block_delta" && !self.first_content_delta_logged {
+                        self.first_content_delta_logged = true;
+                        tracing::info!(
+                            "[CHAT_LATENCY] phase=first_assistant_delta_persisted conv={} client_id={} event_index={} bytes={} persisted_at_ms={}",
+                            self.conversation_id,
+                            self.current_client_id.as_deref().unwrap_or("none"),
+                            allocated_index,
+                            bytes,
+                            persisted_at_ms
+                        );
+                    }
                     if ae_type == "message_stop" {
                         message_stop_persisted = true;
                     }

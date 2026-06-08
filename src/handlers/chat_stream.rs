@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use chrono::Utc;
 use futures::stream::Stream;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -396,6 +397,8 @@ pub async fn codex_chat_options(
 pub struct ChatSubmitResponse {
     pub conversation_id: String,
     pub status: &'static str,
+    pub job_id: String,
+    pub accepted_at_ms: i64,
 }
 
 async fn authorize_conversation_turn(
@@ -441,6 +444,7 @@ pub async fn submit(
     images: Option<Vec<ChatImageData>>,
     client_id: Option<String>,
 ) -> Response {
+    let received_at_ms = Utc::now().timestamp_millis();
     let conv_id = match conversation_id {
         Some(id) => id,
         None => {
@@ -451,6 +455,19 @@ pub async fn submit(
                 .into_response();
         }
     };
+    let image_count = images.as_ref().map_or(0, Vec::len);
+    tracing::info!(
+        "[CHAT_LATENCY] phase=submit_received conv={} client_id={} agent={} runtime={} model={} effort={} message_chars={} images={} received_at_ms={}",
+        conv_id,
+        client_id.as_deref().unwrap_or("none"),
+        config.agent_type.as_str(),
+        config.runtime.as_job_runtime(),
+        config.codex_options.model,
+        config.codex_options.reasoning_effort,
+        message.chars().count(),
+        image_count,
+        received_at_ms
+    );
 
     if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
         return response;
@@ -487,6 +504,7 @@ pub async fn submit(
         },
         None => None,
     };
+    let client_id_for_log = client_id.clone();
 
     let payload = conversation_turn_jobs::ConversationTurnJobPayload {
         user_id,
@@ -500,32 +518,47 @@ pub async fn submit(
         client_id,
     };
 
-    if let Err(e) = conversation_turn_jobs::enqueue_job(&db, &conv_id, payload).await {
-        tracing::error!(
-            "[CHAT] Failed to enqueue durable non-streaming submit {}: {}",
-            conv_id,
-            e
-        );
-        if let Err(e) = checkpoints::mark_interrupted(&db, &conv_id).await {
-            tracing::warn!(
-                "[CHAT] Failed to mark run status interrupted after enqueue failure {}: {}",
+    let job_id = match conversation_turn_jobs::enqueue_job(&db, &conv_id, payload).await {
+        Ok(job_id) => job_id,
+        Err(e) => {
+            tracing::error!(
+                "[CHAT] Failed to enqueue durable non-streaming submit {}: {}",
                 conv_id,
                 e
             );
+            if let Err(e) = checkpoints::mark_interrupted(&db, &conv_id).await {
+                tracing::warn!(
+                    "[CHAT] Failed to mark run status interrupted after enqueue failure {}: {}",
+                    conv_id,
+                    e
+                );
+            }
+            if let Err(e) =
+                super::conversations::publish_conversation_run_status(&db, &conv_id).await
+            {
+                tracing::warn!(
+                    "[CHAT] Failed to publish interrupted run status after enqueue failure {}: {}",
+                    conv_id,
+                    e
+                );
+            }
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Runner queue unavailable for conversation",
+            )
+                .into_response();
         }
-        if let Err(e) = super::conversations::publish_conversation_run_status(&db, &conv_id).await {
-            tracing::warn!(
-                "[CHAT] Failed to publish interrupted run status after enqueue failure {}: {}",
-                conv_id,
-                e
-            );
-        }
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Runner queue unavailable for conversation",
-        )
-            .into_response();
-    }
+    };
+    let accepted_at_ms = Utc::now().timestamp_millis();
+    tracing::info!(
+        "[CHAT_LATENCY] phase=submit_enqueued conv={} client_id={} job_id={} received_at_ms={} accepted_at_ms={} submit_duration_ms={}",
+        conv_id,
+        client_id_for_log.as_deref().unwrap_or("none"),
+        job_id,
+        received_at_ms,
+        accepted_at_ms,
+        accepted_at_ms.saturating_sub(received_at_ms)
+    );
     if let Err(e) = super::conversations::publish_conversation_run_status(&db, &conv_id).await {
         tracing::warn!(
             "[CHAT] Failed to publish run status for non-streaming submit {}: {}",
@@ -539,6 +572,8 @@ pub async fn submit(
         Json(ChatSubmitResponse {
             conversation_id: conv_id,
             status: "running",
+            job_id,
+            accepted_at_ms,
         }),
     )
         .into_response()

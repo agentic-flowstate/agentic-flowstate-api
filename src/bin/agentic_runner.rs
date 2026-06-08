@@ -4,6 +4,7 @@ use agentic_api::handlers::chat_client_manager::ChatClientManager;
 use agentic_api::handlers::chat_stream::{self, ChatConfig, ChatImageData, ChatRuntime};
 use agentic_api::handlers::conversation_worker::{ConversationWorker, WorkerMessage};
 use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use futures::FutureExt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -94,10 +95,23 @@ async fn main() -> Result<()> {
             match conversation_turn_jobs::claim_next_job(&db, &generation_id).await? {
                 Some(job) => {
                     let job_id = job.id.clone();
+                    let claimed_at_ms = Utc::now().timestamp_millis();
+                    let queue_wait_ms = claimed_at_ms.saturating_sub(job.created_at * 1000);
                     tracing::info!(
                         "Claimed conversation job {} for conversation {}",
                         job.id,
                         job.conversation_id
+                    );
+                    tracing::info!(
+                        "[CHAT_LATENCY] phase=runner_claimed job_id={} conv={} client_id={} generation_id={} created_at={} started_at={} claimed_at_ms={} queue_wait_ms={}",
+                        job.id,
+                        job.conversation_id,
+                        job.payload.client_id.as_deref().unwrap_or("none"),
+                        generation_id,
+                        job.created_at,
+                        job.started_at.unwrap_or(job.updated_at),
+                        claimed_at_ms,
+                        queue_wait_ms
                     );
                     joins.spawn(
                         run_claimed_job(db.clone(), manager.clone(), job).map(move |r| (job_id, r)),
@@ -341,8 +355,17 @@ async fn run_claimed_job_inner(
     manager: Arc<ChatClientManager>,
     job: conversation_turn_jobs::ConversationTurnJob,
 ) -> Result<String> {
+    let worker_start_ms = Utc::now().timestamp_millis();
     verify_job_conversation_owner(&db, &job).await?;
     let worker_message = worker_message_from_job(&job)?;
+    tracing::info!(
+        "[CHAT_LATENCY] phase=worker_starting job_id={} conv={} client_id={} worker_start_ms={} queue_to_worker_ms={}",
+        job.id,
+        job.conversation_id,
+        job.payload.client_id.as_deref().unwrap_or("none"),
+        worker_start_ms,
+        worker_start_ms.saturating_sub(job.created_at * 1000)
+    );
     let (tx, rx) = mpsc::channel(1);
     tx.send(worker_message)
         .await
@@ -351,6 +374,14 @@ async fn run_claimed_job_inner(
 
     let worker = ConversationWorker::new(db.clone(), job.conversation_id.clone(), manager, rx);
     worker.run().await;
+    tracing::info!(
+        "[CHAT_LATENCY] phase=worker_finished job_id={} conv={} client_id={} finished_at_ms={} worker_duration_ms={}",
+        job.id,
+        job.conversation_id,
+        job.payload.client_id.as_deref().unwrap_or("none"),
+        Utc::now().timestamp_millis(),
+        Utc::now().timestamp_millis().saturating_sub(worker_start_ms)
+    );
 
     let checkpoint = checkpoints::get_checkpoint(&db, &job.conversation_id).await?;
     let status = match checkpoint.as_ref().map(|cp| cp.status.as_str()) {

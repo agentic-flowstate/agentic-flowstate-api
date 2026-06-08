@@ -4,6 +4,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -108,6 +109,7 @@ pub async fn full_access_chat_submit(
     headers: HeaderMap,
     Json(req): Json<FullAccessChatRequest>,
 ) -> Response {
+    let handler_received_at_ms = Utc::now().timestamp_millis();
     tracing::info!(
         "=== FULL_ACCESS_CHAT_SUBMIT START === user={}",
         user.user_id
@@ -121,6 +123,15 @@ pub async fn full_access_chat_submit(
         Ok(v) => v,
         Err(e) => return chat_stream::malformed_idempotency_key_response(e),
     };
+    tracing::info!(
+        "[CHAT_LATENCY] phase=handler_received endpoint=full-access/submit user={} conv={} client_id={} message_chars={} images={} received_at_ms={}",
+        user.user_id,
+        req.conversation_id.as_deref().unwrap_or("none"),
+        client_id.as_deref().unwrap_or("none"),
+        req.message.chars().count(),
+        req.images.as_ref().map_or(0, Vec::len),
+        handler_received_at_ms
+    );
 
     let agents_md = std::fs::read_to_string("/Users/jarvisgpt/projects/AGENTS.md")
         .unwrap_or_else(|e| format!("(Failed to read AGENTS.md: {})", e));
