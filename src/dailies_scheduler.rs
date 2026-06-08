@@ -80,6 +80,7 @@ pub async fn spawn_daily_run(
                     lookup_summary: None,
                     sources_summary: None,
                     error: Some(e.to_string()),
+                    silent: false,
                 },
             )
             .await;
@@ -203,6 +204,7 @@ async fn execute_daily_run(
                     lookup_summary: sections.lookup_summary,
                     sources_summary: sections.sources_summary,
                     error: None,
+                    silent: false,
                 },
             )
             .await?;
@@ -247,6 +249,7 @@ async fn execute_daily_run(
                     lookup_summary: None,
                     sources_summary: None,
                     error: Some(error),
+                    silent: false,
                 },
             )
             .await?;

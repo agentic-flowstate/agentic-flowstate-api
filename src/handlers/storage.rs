@@ -1,5 +1,5 @@
 use axum::{
-    extract::Path,
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
@@ -8,15 +8,23 @@ use chrono::Utc;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::{Row, SqlitePool};
 use std::{
     collections::{HashMap, VecDeque},
     ffi::CString,
     fs,
-    path::Path as FsPath,
+    path::{Path as FsPath, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
+use ticketing_system::{conversations, Conversation, CreateConversationRequest};
 use uuid::Uuid;
+
+use super::chat_client_manager::ChatClientManager;
+use super::chat_stream::{self, ChatCodexOptions, ChatConfig, ChatRuntime};
+use crate::agents::prompts::load_prompt;
+use crate::agents::AgentType;
+use crate::auth_middleware::AuthenticatedUser;
 
 static STORAGE_JOBS: Lazy<Mutex<HashMap<String, StorageJob>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -112,6 +120,12 @@ pub struct StorageJobStep {
     level: String,
     title: String,
     detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageInvestigationConversationResponse {
+    conversation: Conversation,
+    status: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -256,6 +270,90 @@ pub async fn get_storage_job(Path(job_id): Path<String>) -> Response {
             format!("Storage job not found: {job_id}"),
         ),
     }
+}
+
+/// POST /api/admin/storage/investigation/start
+pub async fn start_storage_investigation_conversation(
+    State(db): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
+    Extension(user): Extension<AuthenticatedUser>,
+) -> Response {
+    let message = match build_storage_investigation_message(&db).await {
+        Ok(message) => message,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build storage investigation context: {e}"),
+            )
+        }
+    };
+
+    let title = format!("Mac Mini storage review {}", Utc::now().format("%Y-%m-%d"));
+    let conversation = match conversations::create_conversation(
+        &db,
+        CreateConversationRequest {
+            user_id: user.user_id.clone(),
+            organization: "agentic-flowstate".to_string(),
+            title,
+            session_id: None,
+            agent: Some("scoped-workspace".to_string()),
+            conversation_type: Some("storage_investigation".to_string()),
+            parent_conversation_id: None,
+            conversation_role: None,
+            child_sort_order: None,
+        },
+    )
+    .await
+    {
+        Ok(conversation) => conversation,
+        Err(e) => {
+            tracing::error!("Failed to create storage investigation conversation: {e}");
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create storage investigation conversation".to_string(),
+            );
+        }
+    };
+
+    let display_name = lookup_display_name(&db, &user.user_id).await;
+    let mut prompt_vars = HashMap::new();
+    prompt_vars.insert("USER_ID".to_string(), user.user_id.clone());
+    prompt_vars.insert("USER_NAME".to_string(), display_name);
+
+    let agent_type = AgentType::ScopedWorkspace;
+    let config = ChatConfig {
+        agent_type: agent_type.clone(),
+        runtime: ChatRuntime::CodexAppServer,
+        prompt_name: "scoped-workspace",
+        working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
+        prompt_vars,
+        codex_options: ChatCodexOptions::default_for_agent(&agent_type),
+    };
+
+    let submit_response = chat_stream::submit(
+        db,
+        manager,
+        message,
+        Some(conversation.id.clone()),
+        config,
+        user.user_id,
+        None,
+        None,
+    )
+    .await;
+
+    if submit_response.status() != StatusCode::ACCEPTED {
+        return submit_response;
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(StorageInvestigationConversationResponse {
+            conversation,
+            status: "queued",
+        }),
+    )
+        .into_response()
 }
 
 fn build_scan_with_progress(job_id: Option<&str>) -> anyhow::Result<StorageScanResponse> {
@@ -633,6 +731,283 @@ fn volume_stats(
     }))
 }
 
+async fn build_storage_investigation_message(pool: &SqlitePool) -> anyhow::Result<String> {
+    let mut vars = HashMap::new();
+    vars.insert("GENERATED_AT".to_string(), Utc::now().to_rfc3339());
+    vars.insert(
+        "CURRENT_STORAGE_CONTEXT".to_string(),
+        build_current_storage_context()?,
+    );
+    vars.insert(
+        "LATEST_SCAN_CONTEXT".to_string(),
+        latest_completed_scan_context(),
+    );
+    vars.insert(
+        "RECENT_STORAGE_TICKETS".to_string(),
+        load_recent_storage_tickets(pool).await?,
+    );
+    vars.insert(
+        "RECENT_STORAGE_ARTIFACTS".to_string(),
+        load_recent_storage_artifacts(pool).await?,
+    );
+
+    load_prompt("storage-investigation-conversation", vars)
+}
+
+fn build_current_storage_context() -> anyhow::Result<String> {
+    let mut lines = Vec::new();
+
+    lines.push("Volumes:".to_string());
+    for (id, name, path, external) in [
+        (
+            "macintosh_data",
+            "Macintosh HD Data",
+            "/System/Volumes/Data",
+            false,
+        ),
+        ("orico", "ORICO", ORICO_ROOT, true),
+    ] {
+        match volume_stats(id, name, path, external)? {
+            Some(volume) => lines.push(format!(
+                "- {} ({}): {} free, {} used of {} ({:.0}% used)",
+                volume.name,
+                volume.mount_path,
+                format_bytes(volume.available_bytes),
+                format_bytes(volume.used_bytes),
+                format_bytes(volume.total_bytes),
+                volume.percent_used * 100.0
+            )),
+            None => lines.push(format!("- {name} ({path}): not mounted")),
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Application relocation status:".to_string());
+    for (label, path) in [
+        ("Xcode launcher", "/Applications/Xcode.app"),
+        (
+            "Xcode ORICO bundle",
+            "/Volumes/ORICO/Applications/Xcode.app",
+        ),
+        ("Docker launcher", "/Applications/Docker.app"),
+        (
+            "Docker ORICO bundle",
+            "/Volumes/ORICO/Applications/Docker.app",
+        ),
+        ("League launcher", "/Applications/League of Legends.app"),
+        (
+            "League ORICO bundle",
+            "/Volumes/ORICO/Applications/League of Legends.app",
+        ),
+        ("KiCad launcher", "/Applications/KiCad"),
+        ("FreeCAD launcher", "/Applications/FreeCAD.app"),
+        ("OpenSCAD launcher", "/Applications/OpenSCAD-2021.01.app"),
+        ("BambuStudio launcher", "/Applications/BambuStudio.app"),
+        ("OrcaSlicer launcher", "/Applications/OrcaSlicer.app"),
+        ("PrusaSlicer launcher", "/Applications/PrusaSlicer.app"),
+    ] {
+        lines.push(format!("- {label}: {}", path_status(path)));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "This handoff endpoint does not recursively scan directory sizes; use the Storage tab scan job when fresh bucket measurements are needed."
+            .to_string(),
+    );
+
+    Ok(lines.join("\n"))
+}
+
+fn latest_completed_scan_context() -> String {
+    let latest = {
+        let jobs = STORAGE_JOBS.lock().expect("storage jobs lock poisoned");
+        jobs.values()
+            .filter_map(|job| job.scan.clone())
+            .max_by(|a, b| a.generated_at.cmp(&b.generated_at))
+    };
+
+    let Some(scan) = latest else {
+        return "No completed storage scan is currently cached in API memory. Ask the user to run a Storage tab scan if exact current bucket sizes are needed.".to_string();
+    };
+
+    let mut lines = Vec::new();
+    lines.push(format!("Latest cached scan: {}", scan.generated_at));
+    lines.push("Volumes from latest scan:".to_string());
+    for volume in &scan.volumes {
+        lines.push(format!(
+            "- {}: {} free, {} used of {} ({:.0}% used)",
+            volume.name,
+            format_bytes(volume.available_bytes),
+            format_bytes(volume.used_bytes),
+            format_bytes(volume.total_bytes),
+            volume.percent_used * 100.0
+        ));
+    }
+
+    let mut buckets = scan.buckets.clone();
+    buckets.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    lines.push("Largest buckets from latest scan:".to_string());
+    for bucket in buckets.into_iter().take(10) {
+        lines.push(format!(
+            "- {} [{}]: {} at {} ({})",
+            bucket.title,
+            bucket.category,
+            format_bytes(bucket.bytes),
+            bucket.path,
+            bucket.risk_level.label()
+        ));
+    }
+
+    lines.join("\n")
+}
+
+async fn load_recent_storage_tickets(pool: &SqlitePool) -> anyhow::Result<String> {
+    let rows = sqlx::query(
+        r#"
+        SELECT ticket_id, title, status, updated_at, COALESCE(description, '') AS description
+        FROM tickets
+        WHERE organization = 'agentic-flowstate'
+          AND (
+            lower(title || ' ' || COALESCE(description, '') || ' ' || COALESCE(guidance, '') || ' ' || COALESCE(repository, '')) LIKE '%storage%'
+            OR lower(title || ' ' || COALESCE(description, '') || ' ' || COALESCE(guidance, '') || ' ' || COALESCE(repository, '')) LIKE '%orico%'
+            OR lower(title || ' ' || COALESCE(description, '') || ' ' || COALESCE(guidance, '') || ' ' || COALESCE(repository, '')) LIKE '%simulator%'
+            OR lower(title || ' ' || COALESCE(description, '') || ' ' || COALESCE(guidance, '') || ' ' || COALESCE(repository, '')) LIKE '%xcode%'
+            OR lower(title || ' ' || COALESCE(description, '') || ' ' || COALESCE(guidance, '') || ' ' || COALESCE(repository, '')) LIKE '%docker%'
+            OR lower(title || ' ' || COALESCE(description, '') || ' ' || COALESCE(guidance, '') || ' ' || COALESCE(repository, '')) LIKE '%cargo-auto%'
+            OR lower(title || ' ' || COALESCE(description, '') || ' ' || COALESCE(guidance, '') || ' ' || COALESCE(repository, '')) LIKE '%daisydisk%'
+            OR lower(title || ' ' || COALESCE(description, '') || ' ' || COALESCE(guidance, '') || ' ' || COALESCE(repository, '')) LIKE '%mac mini%'
+          )
+        ORDER BY updated_at DESC
+        LIMIT 14
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok("No recent matching storage tickets found.".to_string());
+    }
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let ticket_id: String = row.get("ticket_id");
+            let title: String = row.get("title");
+            let status: String = row.get("status");
+            let updated_at: i64 = row.get("updated_at");
+            let description: String = row.get("description");
+            format!(
+                "- {ticket_id} [{status}] updated {}: {title}\n  {}",
+                format_epoch(updated_at),
+                truncate_chars(&description, 220)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+async fn load_recent_storage_artifacts(pool: &SqlitePool) -> anyhow::Result<String> {
+    let rows = sqlx::query(
+        r#"
+        SELECT artifact_id, title, artifact_type, ticket_id, updated_at
+        FROM artifacts
+        WHERE organization = 'agentic-flowstate'
+          AND (
+            lower(title || ' ' || content) LIKE '%storage%'
+            OR lower(title || ' ' || content) LIKE '%orico%'
+            OR lower(title || ' ' || content) LIKE '%simulator%'
+            OR lower(title || ' ' || content) LIKE '%xcode%'
+            OR lower(title || ' ' || content) LIKE '%docker%'
+            OR lower(title || ' ' || content) LIKE '%cargo-auto%'
+            OR lower(title || ' ' || content) LIKE '%daisydisk%'
+            OR lower(title || ' ' || content) LIKE '%mac mini%'
+          )
+        ORDER BY updated_at DESC
+        LIMIT 10
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok("No recent matching storage artifacts found.".to_string());
+    }
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let artifact_id: String = row.get("artifact_id");
+            let title: String = row.get("title");
+            let artifact_type: String = row.get("artifact_type");
+            let ticket_id: Option<String> = row.get("ticket_id");
+            let updated_at: i64 = row.get("updated_at");
+            format!(
+                "- {artifact_id} [{artifact_type}] updated {}{}: {title}",
+                format_epoch(updated_at),
+                ticket_id
+                    .as_deref()
+                    .map(|id| format!(" ticket {id}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+async fn lookup_display_name(db: &SqlitePool, user_id: &str) -> String {
+    match ticketing_system::users::get_user(db, user_id).await {
+        Ok(Some(user)) => user.name,
+        _ => user_id.to_string(),
+    }
+}
+
+fn path_status(path: &str) -> String {
+    let path_ref = FsPath::new(path);
+    match fs::symlink_metadata(path_ref) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(path_ref) {
+            Ok(target) => format!("symlink -> {}", target.display()),
+            Err(e) => format!("symlink; read_link failed: {e}"),
+        },
+        Ok(metadata) if metadata.is_dir() => "directory present".to_string(),
+        Ok(metadata) if metadata.is_file() => "file present".to_string(),
+        Ok(_) => "present".to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
+        Err(e) => format!("unreadable: {e}"),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_epoch(timestamp: i64) -> String {
+    chrono::DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| timestamp.to_string())
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let mut truncated = trimmed.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
 fn directory_size(path: &FsPath) -> anyhow::Result<u64> {
     if !path.exists() {
         return Ok(0);
@@ -862,6 +1237,17 @@ impl StorageJobStep {
             level: level.to_string(),
             title: title.to_string(),
             detail: detail.to_string(),
+        }
+    }
+}
+
+impl RiskLevel {
+    fn label(&self) -> &'static str {
+        match self {
+            RiskLevel::Low => "low",
+            RiskLevel::Medium => "medium",
+            RiskLevel::High => "high",
+            RiskLevel::ReviewOnly => "review",
         }
     }
 }

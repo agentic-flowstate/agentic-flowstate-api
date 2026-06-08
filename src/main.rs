@@ -1434,6 +1434,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::storage::get_storage_job),
         )
         .route(
+            "/api/admin/storage/investigation/start",
+            post(handlers::storage::start_storage_investigation_conversation),
+        )
+        .route(
             "/api/admin/client-events",
             get(handlers::client_telemetry::list_client_events),
         )

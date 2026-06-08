@@ -535,7 +535,10 @@ async fn conversation_run_status_snapshot(
         should_fetch: !is_processing,
         updated_at: checkpoint.as_ref().map(|cp| cp.updated_at).unwrap_or(0),
         last_event_index,
-        tool_call_count: checkpoint.as_ref().map(|cp| cp.tool_call_count).unwrap_or(0),
+        tool_call_count: checkpoint
+            .as_ref()
+            .map(|cp| cp.tool_call_count)
+            .unwrap_or(0),
         queued_message_count,
         run_started_at,
         last_tool_call_started_at,

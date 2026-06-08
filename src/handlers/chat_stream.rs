@@ -267,11 +267,7 @@ async fn validate_codex_options(
     requested: Option<ChatCodexOptions>,
 ) -> Result<ChatCodexOptions, Response> {
     let catalog = codex_model_catalog().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        )
-            .into_response()
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
     })?;
 
     let Some(requested) = requested else {
@@ -354,11 +350,7 @@ pub async fn codex_chat_options(
     };
 
     let catalog = codex_model_catalog().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e})),
-        )
-            .into_response()
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
     })?;
     let defaults = ChatCodexOptions::default_for_agent(&agent_type);
     let default_model = resolve_catalog_model(&catalog, &defaults.model).ok_or_else(|| {
@@ -381,9 +373,12 @@ pub async fn codex_chat_options(
     let reasoning_efforts = CODEX_REASONING_EFFORT_ORDER
         .iter()
         .filter(|effort| {
-            catalog
-                .iter()
-                .any(|model| model.supported_reasoning_efforts.iter().any(|item| item.id == **effort))
+            catalog.iter().any(|model| {
+                model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|item| item.id == **effort)
+            })
         })
         .map(|effort| codex_reasoning_effort_item(effort))
         .collect();
