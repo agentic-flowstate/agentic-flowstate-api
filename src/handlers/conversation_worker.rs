@@ -1105,6 +1105,23 @@ impl ConversationWorker {
                                 tracing::error!("[WORKER] Failed to insert tool call: {}", e);
                             }
 
+                            let checkpoint_session = thread_id.as_deref().unwrap_or("running");
+                            if let Err(e) = checkpoints::upsert_checkpoint(
+                                &self.db,
+                                &self.conversation_id,
+                                checkpoint_session,
+                                tool_call_count,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "[WORKER] Failed to update tool-call checkpoint count: {}",
+                                    e
+                                );
+                            } else {
+                                self.publish_run_status().await;
+                            }
+
                             self.emit_event(&StreamEvent::ToolUse {
                                 id: scoped_tool_id,
                                 name,

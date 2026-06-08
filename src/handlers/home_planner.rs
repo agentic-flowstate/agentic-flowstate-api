@@ -71,7 +71,7 @@ pub async fn home_planner_chat(
         prompt_vars,
         codex_options: ChatCodexOptions::default_for_agent(&agent_type),
     };
-    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()) {
+    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()).await {
         Ok(config) => config,
         Err(response) => return response,
     };
@@ -149,7 +149,7 @@ pub async fn home_planner_chat_submit(
         prompt_vars,
         codex_options: ChatCodexOptions::default_for_agent(&agent_type),
     };
-    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()) {
+    let config = match chat_stream::apply_codex_options(config, req.codex_options.clone()).await {
         Ok(config) => config,
         Err(response) => return response,
     };

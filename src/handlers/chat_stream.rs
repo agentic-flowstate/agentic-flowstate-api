@@ -9,7 +9,6 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -17,7 +16,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use ticketing_system::conversations;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::process::Command;
+use tokio::sync::{broadcast, mpsc, OnceCell, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::chat_client_manager::ChatClientManager;
@@ -39,9 +39,11 @@ pub struct ChatImageData {
     pub mime_type: String,
 }
 
-const SUPPORTED_CODEX_REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+const CODEX_REASONING_EFFORT_ORDER: &[&str] =
+    &["none", "minimal", "low", "medium", "high", "xhigh"];
 const JOB_CODEX_MODEL_KEY: &str = "__agentic_codex_model";
 const JOB_CODEX_REASONING_EFFORT_KEY: &str = "__agentic_codex_reasoning_effort";
+static CODEX_MODEL_CATALOG: OnceCell<Vec<ChatCodexModelOptionItem>> = OnceCell::const_new();
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ChatCodexOptions {
@@ -49,10 +51,18 @@ pub struct ChatCodexOptions {
     pub reasoning_effort: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChatCodexOptionItem {
     pub id: String,
     pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCodexModelOptionItem {
+    pub id: String,
+    pub label: String,
+    pub default_reasoning_effort: String,
+    pub supported_reasoning_efforts: Vec<ChatCodexOptionItem>,
 }
 
 #[derive(Debug, Serialize)]
@@ -60,7 +70,7 @@ pub struct ChatCodexOptionsResponse {
     pub agent: String,
     pub default_model: String,
     pub default_reasoning_effort: String,
-    pub models: Vec<ChatCodexOptionItem>,
+    pub models: Vec<ChatCodexModelOptionItem>,
     pub reasoning_efforts: Vec<ChatCodexOptionItem>,
 }
 
@@ -133,38 +143,155 @@ impl ChatCodexOptions {
     }
 }
 
-pub fn configured_codex_models() -> BTreeSet<String> {
-    let mut models = BTreeSet::new();
-    let config = AgentsConfig::get();
-    for model in config.models.values() {
-        models.insert(config.resolve_model(model).to_string());
-    }
-    for agent in config.agents.values() {
-        models.insert(config.resolve_model(&agent.model).to_string());
-    }
-    models
+#[derive(Debug, Deserialize)]
+struct CodexDebugModelsResponse {
+    models: Vec<CodexDebugModel>,
 }
 
-fn validate_codex_options(
+#[derive(Debug, Deserialize)]
+struct CodexDebugModel {
+    slug: String,
+    display_name: String,
+    default_reasoning_level: String,
+    supported_reasoning_levels: Vec<CodexDebugReasoningLevel>,
+    visibility: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexDebugReasoningLevel {
+    effort: String,
+}
+
+fn codex_reasoning_effort_item(effort: &str) -> ChatCodexOptionItem {
+    ChatCodexOptionItem {
+        id: effort.to_string(),
+        label: effort.to_uppercase(),
+    }
+}
+
+fn ordered_codex_reasoning_efforts(efforts: impl IntoIterator<Item = String>) -> Vec<String> {
+    let available: std::collections::HashSet<String> = efforts.into_iter().collect();
+    CODEX_REASONING_EFFORT_ORDER
+        .iter()
+        .filter_map(|effort| available.contains(*effort).then(|| (*effort).to_string()))
+        .collect()
+}
+
+async fn load_codex_model_catalog() -> Result<Vec<ChatCodexModelOptionItem>, String> {
+    let output = Command::new("codex")
+        .args(["debug", "models"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to read Codex model catalog: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!(
+                "Failed to read Codex model catalog: codex debug models exited with {}",
+                output.status
+            )
+        } else {
+            format!("Failed to read Codex model catalog: {stderr}")
+        });
+    }
+
+    let response: CodexDebugModelsResponse = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Failed to parse Codex model catalog: {e}"))?;
+    let models: Vec<ChatCodexModelOptionItem> = response
+        .models
+        .into_iter()
+        .filter(|model| model.visibility == "list")
+        .filter_map(|model| {
+            let id = model.slug.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let supported = ordered_codex_reasoning_efforts(
+                model
+                    .supported_reasoning_levels
+                    .into_iter()
+                    .map(|level| normalize_reasoning_effort(&level.effort).to_string()),
+            );
+            if supported.is_empty() {
+                return None;
+            }
+            let default = normalize_reasoning_effort(&model.default_reasoning_level).to_string();
+            let default_reasoning_effort = if supported.contains(&default) {
+                default
+            } else {
+                supported[0].clone()
+            };
+
+            Some(ChatCodexModelOptionItem {
+                id,
+                label: if model.display_name.trim().is_empty() {
+                    model.slug
+                } else {
+                    model.display_name.trim().to_string()
+                },
+                default_reasoning_effort,
+                supported_reasoning_efforts: supported
+                    .iter()
+                    .map(|effort| codex_reasoning_effort_item(effort))
+                    .collect(),
+            })
+        })
+        .collect();
+
+    if models.is_empty() {
+        return Err("Codex model catalog did not expose any selectable models".to_string());
+    }
+
+    Ok(models)
+}
+
+async fn codex_model_catalog() -> Result<Vec<ChatCodexModelOptionItem>, String> {
+    CODEX_MODEL_CATALOG
+        .get_or_try_init(load_codex_model_catalog)
+        .await
+        .cloned()
+}
+
+fn resolve_catalog_model<'a>(
+    catalog: &'a [ChatCodexModelOptionItem],
+    model: &str,
+) -> Option<&'a ChatCodexModelOptionItem> {
+    let resolved_model = AgentsConfig::get().resolve_model(model).to_string();
+    catalog.iter().find(|option| option.id == resolved_model)
+}
+
+async fn validate_codex_options(
     agent_type: &AgentType,
     requested: Option<ChatCodexOptions>,
 ) -> Result<ChatCodexOptions, Response> {
+    let catalog = codex_model_catalog().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e})),
+        )
+            .into_response()
+    })?;
+
     let Some(requested) = requested else {
         return Ok(ChatCodexOptions::default_for_agent(agent_type));
     };
 
     let model = requested.model.trim();
-    let resolved_model = AgentsConfig::get().resolve_model(model).to_string();
-    if model.is_empty() || !configured_codex_models().contains(&resolved_model) {
+    let Some(model_option) = resolve_catalog_model(&catalog, model) else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("Unsupported Codex model: {}", requested.model)})),
         )
             .into_response());
-    }
+    };
 
     let effort = requested.reasoning_effort.trim().to_lowercase();
-    if !SUPPORTED_CODEX_REASONING_EFFORTS.contains(&effort.as_str()) {
+    if !model_option
+        .supported_reasoning_efforts
+        .iter()
+        .any(|option| option.id == effort)
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("Unsupported Codex reasoning effort: {}", requested.reasoning_effort)})),
@@ -173,16 +300,16 @@ fn validate_codex_options(
     }
 
     Ok(ChatCodexOptions {
-        model: resolved_model,
+        model: model_option.id.clone(),
         reasoning_effort: effort,
     })
 }
 
-pub fn apply_codex_options(
+pub async fn apply_codex_options(
     mut config: ChatConfig,
     requested: Option<ChatCodexOptions>,
 ) -> Result<ChatConfig, Response> {
-    config.codex_options = validate_codex_options(&config.agent_type, requested)?;
+    config.codex_options = validate_codex_options(&config.agent_type, requested).await?;
     Ok(config)
 }
 
@@ -225,27 +352,46 @@ pub async fn codex_chat_options(
             .into_response());
     };
 
+    let catalog = codex_model_catalog().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e})),
+        )
+            .into_response()
+    })?;
     let defaults = ChatCodexOptions::default_for_agent(&agent_type);
-    let models = configured_codex_models()
-        .into_iter()
-        .map(|id| ChatCodexOptionItem {
-            label: id.clone(),
-            id,
-        })
-        .collect();
-    let reasoning_efforts = SUPPORTED_CODEX_REASONING_EFFORTS
+    let default_model = resolve_catalog_model(&catalog, &defaults.model).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Configured Codex model is not available: {}", defaults.model)})),
+        )
+            .into_response()
+    })?;
+    let default_reasoning_effort = if default_model
+        .supported_reasoning_efforts
         .iter()
-        .map(|effort| ChatCodexOptionItem {
-            id: (*effort).to_string(),
-            label: effort.to_uppercase(),
+        .any(|option| option.id == defaults.reasoning_effort)
+    {
+        defaults.reasoning_effort
+    } else {
+        default_model.default_reasoning_effort.clone()
+    };
+
+    let reasoning_efforts = CODEX_REASONING_EFFORT_ORDER
+        .iter()
+        .filter(|effort| {
+            catalog
+                .iter()
+                .any(|model| model.supported_reasoning_efforts.iter().any(|item| item.id == **effort))
         })
+        .map(|effort| codex_reasoning_effort_item(effort))
         .collect();
 
     Ok(Json(ChatCodexOptionsResponse {
         agent: agent_type.as_str().to_string(),
-        default_model: defaults.model,
-        default_reasoning_effort: defaults.reasoning_effort,
-        models,
+        default_model: default_model.id.clone(),
+        default_reasoning_effort,
+        models: catalog,
         reasoning_efforts,
     }))
 }

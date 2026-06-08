@@ -343,6 +343,7 @@ pub fn resolve_codex_model(model: &str) -> &str {
 
 pub fn normalize_reasoning_effort(effort: &str) -> &str {
     match effort {
+        "none" => "none",
         "minimal" => "minimal",
         "low" => "low",
         "medium" => "medium",
@@ -2094,6 +2095,7 @@ mod tests {
 
     #[test]
     fn normalizes_legacy_effort_labels() {
+        assert_eq!(normalize_reasoning_effort("none"), "none");
         assert_eq!(normalize_reasoning_effort("low"), "low");
         assert_eq!(normalize_reasoning_effort("xhigh"), "xhigh");
         assert_eq!(normalize_reasoning_effort("max"), "xhigh");

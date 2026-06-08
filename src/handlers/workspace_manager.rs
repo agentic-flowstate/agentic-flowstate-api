@@ -51,7 +51,7 @@ pub async fn workspace_manager_chat(
         Ok(v) => v,
         Err(e) => return chat_stream::malformed_idempotency_key_response(e),
     };
-    let config = match chat_stream::apply_codex_options(config(), req.codex_options.clone()) {
+    let config = match chat_stream::apply_codex_options(config(), req.codex_options.clone()).await {
         Ok(config) => config,
         Err(response) => return response,
     };
@@ -81,7 +81,7 @@ pub async fn workspace_manager_chat_submit(
         Ok(v) => v,
         Err(e) => return chat_stream::malformed_idempotency_key_response(e),
     };
-    let config = match chat_stream::apply_codex_options(config(), req.codex_options.clone()) {
+    let config = match chat_stream::apply_codex_options(config(), req.codex_options.clone()).await {
         Ok(config) => config,
         Err(response) => return response,
     };

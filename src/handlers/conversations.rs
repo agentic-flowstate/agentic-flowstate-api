@@ -74,6 +74,7 @@ pub struct ConversationRunStatusResponse {
     pub should_fetch: bool,
     pub updated_at: i64,
     pub last_event_index: i32,
+    pub tool_call_count: i32,
     pub queued_message_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tool_call_started_at: Option<String>,
@@ -434,8 +435,9 @@ async fn conversation_run_status_snapshot(
         checkpoint_status,
         is_processing,
         should_fetch: !is_processing,
-        updated_at: checkpoint.map(|cp| cp.updated_at).unwrap_or(0),
+        updated_at: checkpoint.as_ref().map(|cp| cp.updated_at).unwrap_or(0),
         last_event_index,
+        tool_call_count: checkpoint.as_ref().map(|cp| cp.tool_call_count).unwrap_or(0),
         queued_message_count,
         last_tool_call_started_at,
         server_time: chrono::Utc::now().timestamp(),
@@ -1841,6 +1843,8 @@ mod tests {
             should_fetch: !is_processing,
             updated_at: 1_778_539_159,
             last_event_index: 128,
+            tool_call_count: 3,
+            queued_message_count: 0,
             last_tool_call_started_at: Some("11:38 a.m.".to_string()),
             server_time: 1_778_539_160,
         }
