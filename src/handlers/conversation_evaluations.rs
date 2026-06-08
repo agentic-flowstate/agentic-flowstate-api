@@ -321,7 +321,9 @@ async fn generate_evaluation(
     total_message_count: i64,
     related_conversations: &[ticketing_system::Conversation],
 ) -> Result<String> {
-    let system_prompt = load_prompt("conversation-evaluator-system", HashMap::new())
+    let mut system_vars = HashMap::new();
+    system_vars.insert("EVALUATION_CONTEXT".to_string(), String::new());
+    let system_prompt = load_prompt("conversation-evaluator-system", system_vars)
         .context("load conversation evaluator system prompt")?;
     let mut vars = HashMap::new();
     let evaluated_at = Utc::now();

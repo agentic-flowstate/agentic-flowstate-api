@@ -93,6 +93,22 @@ impl ChildAgentKind {
             Self::Feedback => "feedback",
         }
     }
+
+    fn seed_prompt_var(self) -> &'static str {
+        match self {
+            Self::Evaluator => "EVALUATION_CONTEXT",
+            Self::Feedback => "FEEDBACK_CONTEXT",
+        }
+    }
+
+    fn visible_initial_message(self) -> &'static str {
+        match self {
+            Self::Evaluator => "Evaluate the parent conversation using the provided context.",
+            Self::Feedback => {
+                "Start a feedback thread for the parent conversation using the provided context."
+            }
+        }
+    }
 }
 
 /// Create or reuse an evaluator/feedback child conversation and queue its first
@@ -270,7 +286,7 @@ async fn enqueue_child_turn(
     user_id: &str,
     child_id: &str,
     kind: ChildAgentKind,
-    message: String,
+    seed_context: String,
 ) -> Result<()> {
     checkpoints::upsert_checkpoint(pool, child_id, "queued", 0)
         .await
@@ -278,14 +294,16 @@ async fn enqueue_child_turn(
 
     let agent_type = kind.agent_type();
     let codex_options = ChatCodexOptions::default_for_agent(&agent_type);
+    let mut prompt_vars = HashMap::new();
+    prompt_vars.insert(kind.seed_prompt_var().to_string(), seed_context);
     let payload = conversation_turn_jobs::ConversationTurnJobPayload {
         user_id: user_id.to_string(),
-        message,
+        message: kind.visible_initial_message().to_string(),
         agent_type: agent_type.as_str().to_string(),
         runtime: ChatRuntime::CodexAppServer.as_job_runtime().to_string(),
         prompt_name: kind.prompt_name().to_string(),
         working_dir: "/Users/jarvisgpt/projects".to_string(),
-        prompt_vars: chat_stream::encode_codex_options_for_job(HashMap::new(), &codex_options),
+        prompt_vars: chat_stream::encode_codex_options_for_job(prompt_vars, &codex_options),
         images_json: None,
         client_id: None,
     };

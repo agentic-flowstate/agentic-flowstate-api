@@ -23,15 +23,33 @@ pub struct ConversationAgentChatRequest {
     pub codex_options: Option<ChatCodexOptions>,
 }
 
-fn support_agent_config(agent_type: AgentType, prompt_name: &'static str) -> ChatConfig {
+fn support_agent_config(
+    agent_type: AgentType,
+    prompt_name: &'static str,
+    prompt_vars: HashMap<String, String>,
+) -> ChatConfig {
     ChatConfig {
         agent_type: agent_type.clone(),
         runtime: ChatRuntime::CodexAppServer,
         prompt_name,
         working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
-        prompt_vars: HashMap::new(),
+        prompt_vars,
         codex_options: ChatCodexOptions::default_for_agent(&agent_type),
     }
+}
+
+fn support_agent_prompt_vars(agent_type: &AgentType) -> HashMap<String, String> {
+    let mut vars = HashMap::new();
+    match agent_type {
+        AgentType::ConversationEvaluator => {
+            vars.insert("EVALUATION_CONTEXT".to_string(), String::new());
+        }
+        AgentType::Feedback => {
+            vars.insert("FEEDBACK_CONTEXT".to_string(), String::new());
+        }
+        _ => {}
+    }
+    vars
 }
 
 async fn run_support_agent_chat(
@@ -49,7 +67,11 @@ async fn run_support_agent_chat(
         Err(e) => return chat_stream::malformed_idempotency_key_response(e),
     };
     let config = match chat_stream::apply_codex_options(
-        support_agent_config(agent_type, prompt_name),
+        support_agent_config(
+            agent_type.clone(),
+            prompt_name,
+            support_agent_prompt_vars(&agent_type),
+        ),
         req.codex_options.clone(),
     )
     .await
