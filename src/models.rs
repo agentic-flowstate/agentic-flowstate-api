@@ -31,4 +31,11 @@ pub struct UpdateTicketRequest {
     pub status: Option<String>,
     pub notes: Option<String>,
     pub due_date: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub assignee: Option<String>,
+    pub agent: Option<String>,
+    pub repository: Option<String>,
+    pub ticket_type: Option<String>,
+    pub guidance: Option<String>,
 }

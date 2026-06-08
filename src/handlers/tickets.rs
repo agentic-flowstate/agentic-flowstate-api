@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::{sync::Arc, time::Instant};
-use ticketing_system::work_ticket::EnsureWorkTicketRequest;
+use ticketing_system::{models::TicketType, work_ticket::EnsureWorkTicketRequest};
 use tracing::{error, info};
 
 use crate::{
@@ -230,7 +230,7 @@ pub async fn create_ticket(
 
 // Update ticket with full path (epic_id, slice_id, ticket_id)
 pub async fn update_ticket_nested(
-    State(_pool): State<Arc<SqlitePool>>,
+    State(pool): State<Arc<SqlitePool>>,
     headers: HeaderMap,
     Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
     Json(request): Json<UpdateTicketRequest>,
@@ -238,7 +238,7 @@ pub async fn update_ticket_nested(
     let organization = get_organization(&headers);
 
     // Determine which update operation to use based on what's being updated
-    if let Some(status) = request.status {
+    if let Some(status) = request.status.as_deref() {
         let args = json!({
             "organization": organization,
             "epic_id": epic_id,
@@ -267,7 +267,7 @@ pub async fn update_ticket_nested(
             "epic_id": epic_id,
             "slice_id": slice_id,
             "ticket_id": ticket_id,
-            "notes": request.notes
+            "notes": request.notes.as_deref()
         });
 
         match call_mcp_tool("update_ticket_notes", Some(args)).await {
@@ -284,12 +284,143 @@ pub async fn update_ticket_nested(
                     .into_response()
             }
         }
+    } else if request.has_field_updates() {
+        match update_ticket_fields(
+            &pool,
+            &organization,
+            &epic_id,
+            &slice_id,
+            &ticket_id,
+            request,
+        )
+        .await
+        {
+            Ok(ticket) => (StatusCode::OK, Json(ticket)).into_response(),
+            Err(e) => {
+                error!("Failed to update ticket fields: {:?}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("Failed to update ticket fields: {}", e) })),
+                )
+                    .into_response()
+            }
+        }
     } else {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "No fields to update" })),
         )
             .into_response()
+    }
+}
+
+impl UpdateTicketRequest {
+    fn has_field_updates(&self) -> bool {
+        self.due_date.is_some()
+            || self.title.is_some()
+            || self.description.is_some()
+            || self.assignee.is_some()
+            || self.agent.is_some()
+            || self.repository.is_some()
+            || self.ticket_type.is_some()
+            || self.guidance.is_some()
+    }
+}
+
+async fn update_ticket_fields(
+    pool: &SqlitePool,
+    organization: &str,
+    epic_id: &str,
+    slice_id: &str,
+    ticket_id: &str,
+    request: UpdateTicketRequest,
+) -> anyhow::Result<ticketing_system::models::Ticket> {
+    let mut ticket =
+        ticketing_system::tickets::get_ticket(pool, organization, epic_id, slice_id, ticket_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Ticket not found"))?;
+
+    if let Some(title) = request.title {
+        let title = title.trim();
+        if title.is_empty() {
+            anyhow::bail!("Ticket title cannot be empty");
+        }
+        ticket.title = title.to_string();
+    }
+    if let Some(description) = request.description {
+        ticket.description = non_empty_string(description);
+    }
+    if let Some(assignee) = request.assignee {
+        ticket.assignee = non_empty_string(assignee);
+    }
+    if let Some(agent) = request.agent {
+        ticket.agent = non_empty_string(agent);
+    }
+    if let Some(repository) = request.repository {
+        ticket.repository = non_empty_string(repository);
+    }
+    if let Some(guidance) = request.guidance {
+        ticket.guidance = non_empty_string(guidance);
+    }
+    if let Some(due_date) = request.due_date {
+        let due_date = due_date.trim();
+        if due_date.is_empty() {
+            anyhow::bail!("Cannot clear due_date — due dates are required on all tickets. Provide a new date instead.");
+        }
+        ticket.due_date = Some(due_date.to_string());
+    }
+    if let Some(ticket_type) = request.ticket_type {
+        ticket.ticket_type = parse_ticket_type(&ticket_type)?;
+    }
+
+    ticketing_system::tickets::update_ticket(pool, &ticket).await
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn parse_ticket_type(value: &str) -> anyhow::Result<TicketType> {
+    match value.trim() {
+        "task" => Ok(TicketType::Task),
+        "milestone" => Ok(TicketType::Milestone),
+        "bug" => Ok(TicketType::Bug),
+        other => anyhow::bail!("Invalid ticket_type '{}'", other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_ticket_request_detects_full_field_updates() {
+        let request: UpdateTicketRequest = serde_json::from_value(json!({
+            "title": "Updated title",
+            "description": "",
+            "ticket_type": "bug",
+            "guidance": "Ship the narrow fix",
+            "due_date": "2026-06-08"
+        }))
+        .expect("decode request");
+
+        assert!(request.has_field_updates());
+        assert_eq!(request.title.as_deref(), Some("Updated title"));
+        assert_eq!(request.description.as_deref(), Some(""));
+        assert_eq!(request.ticket_type.as_deref(), Some("bug"));
+        assert_eq!(request.guidance.as_deref(), Some("Ship the narrow fix"));
+        assert_eq!(request.due_date.as_deref(), Some("2026-06-08"));
+    }
+
+    #[test]
+    fn parse_ticket_type_rejects_unknown_values() {
+        assert!(matches!(parse_ticket_type("task"), Ok(TicketType::Task)));
+        assert!(parse_ticket_type("feature").is_err());
     }
 }
 
