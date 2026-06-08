@@ -546,6 +546,10 @@ fn app_server_codex_home(profile: CodexToolProfile) -> Result<PathBuf, String> {
     }
 }
 
+pub fn app_server_generated_images_dir(profile: CodexToolProfile) -> Result<PathBuf, String> {
+    Ok(app_server_codex_home(profile)?.join("generated_images"))
+}
+
 fn restricted_runtime_working_dir() -> Result<PathBuf, String> {
     let dir = dirs::home_dir()
         .map(|home| {

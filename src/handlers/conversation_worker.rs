@@ -1,9 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -14,8 +15,8 @@ use super::chat_stream::{
     get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData,
 };
 use crate::agents::codex_app_server::{
-    spawn_codex_app_server, CodexAppServerEvent, CodexAppServerOptions, CodexSandboxMode,
-    CodexToolProfile,
+    app_server_generated_images_dir, spawn_codex_app_server, CodexAppServerEvent,
+    CodexAppServerOptions, CodexSandboxMode, CodexToolProfile,
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
@@ -38,6 +39,13 @@ const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
 /// Maximum number of prior messages to load into prompt context per turn.
 const PROMPT_HISTORY_MESSAGE_LIMIT: usize = 30;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AttachmentMeta {
+    filename: String,
+    path: String,
+    mime_type: String,
+}
 
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
     match agent_type {
@@ -396,13 +404,6 @@ impl ConversationWorker {
                     .join("chat-images")
                     .join(&self.conversation_id);
                 std::fs::create_dir_all(&chat_images_dir).ok();
-
-                #[derive(Serialize)]
-                struct AttachmentMeta {
-                    filename: String,
-                    path: String,
-                    mime_type: String,
-                }
 
                 let mut attachments: Vec<AttachmentMeta> = Vec::new();
 
@@ -905,6 +906,21 @@ impl ConversationWorker {
 
         let (sandbox, bypass_approvals_and_sandbox, tool_profile) =
             codex_sandbox_policy_for_chat_agent(&msg.config.agent_type);
+        let generated_images_root = match app_server_generated_images_dir(tool_profile) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                tracing::warn!(
+                    "[WORKER] Failed to resolve Codex generated images dir for {:?}: {}",
+                    tool_profile,
+                    e
+                );
+                None
+            }
+        };
+        let generated_images_before = generated_images_root
+            .as_deref()
+            .map(generated_image_snapshot)
+            .unwrap_or_default();
 
         let mut turn = match spawn_codex_app_server(CodexAppServerOptions {
             model: &msg.config.codex_options.model,
@@ -1317,6 +1333,31 @@ impl ConversationWorker {
             }
         }
 
+        if let Some(root) = generated_images_root.as_deref() {
+            let generated_paths = new_generated_images(root, &generated_images_before);
+            if !generated_paths.is_empty() {
+                match persist_generated_image_attachments(
+                    &self.db,
+                    &self.conversation_id,
+                    &assistant_message_id,
+                    &generated_paths,
+                )
+                .await
+                {
+                    Ok(saved) => tracing::info!(
+                        "[WORKER] Attached {} generated image(s) to assistant message {}",
+                        saved,
+                        assistant_message_id
+                    ),
+                    Err(e) => tracing::error!(
+                        "[WORKER] Failed to attach generated image(s) to assistant message {}: {}",
+                        assistant_message_id,
+                        e
+                    ),
+                }
+            }
+        }
+
         match completion {
             CodexTurnCompletion::Completed { session_id } => {
                 self.emit_event(&StreamEvent::Result {
@@ -1621,6 +1662,158 @@ async fn flush_to_db(db: &SqlitePool, assistant_message_id: &str, accumulated_te
     }
 }
 
+fn chat_images_dir(conversation_id: &str) -> Result<PathBuf> {
+    let home = dirs::home_dir().context("Failed to resolve home directory for chat images")?;
+    Ok(home
+        .join(".agentic-flowstate")
+        .join("chat-images")
+        .join(conversation_id))
+}
+
+fn image_extension_for_mime(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "image/jpeg" => "jpg",
+        _ => "jpg",
+    }
+}
+
+fn mime_type_for_image_path(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "heic" => Some("image/heic"),
+        _ => None,
+    }
+}
+
+fn generated_image_snapshot(root: &Path) -> HashSet<PathBuf> {
+    let mut files = HashSet::new();
+    collect_generated_images(root, &mut files);
+    files
+}
+
+fn new_generated_images(root: &Path, before: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut images: Vec<PathBuf> = generated_image_snapshot(root)
+        .into_iter()
+        .filter(|path| !before.contains(path))
+        .collect();
+    images.sort();
+    images
+}
+
+fn collect_generated_images(dir: &Path, files: &mut HashSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_generated_images(&path, files);
+        } else if file_type.is_file() && mime_type_for_image_path(&path).is_some() {
+            files.insert(path);
+        }
+    }
+}
+
+async fn load_message_attachments(
+    db: &SqlitePool,
+    message_id: &str,
+) -> Result<Vec<AttachmentMeta>> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT attachments FROM conversation_messages WHERE id = ?")
+            .bind(message_id)
+            .fetch_optional(db)
+            .await
+            .context("Failed to load message attachments")?;
+
+    let Some((Some(raw),)) = row else {
+        return Ok(Vec::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_str(&raw).context("Failed to decode message attachments JSON")
+}
+
+async fn update_message_attachments(
+    db: &SqlitePool,
+    message_id: &str,
+    attachments: &[AttachmentMeta],
+) -> Result<()> {
+    let json =
+        serde_json::to_string(attachments).context("Failed to encode attachment metadata")?;
+    sqlx::query("UPDATE conversation_messages SET attachments = ? WHERE id = ?")
+        .bind(json)
+        .bind(message_id)
+        .execute(db)
+        .await
+        .context("Failed to update message attachments")?;
+    Ok(())
+}
+
+async fn persist_generated_image_attachments(
+    db: &SqlitePool,
+    conversation_id: &str,
+    assistant_message_id: &str,
+    generated_paths: &[PathBuf],
+) -> Result<usize> {
+    if generated_paths.is_empty() {
+        return Ok(0);
+    }
+
+    let chat_dir = chat_images_dir(conversation_id)?;
+    tokio::fs::create_dir_all(&chat_dir)
+        .await
+        .with_context(|| format!("Failed to create chat image dir {}", chat_dir.display()))?;
+
+    let mut attachments = load_message_attachments(db, assistant_message_id).await?;
+    let mut saved = 0usize;
+    for source in generated_paths {
+        let Some(mime_type) = mime_type_for_image_path(source) else {
+            continue;
+        };
+        let filename = format!(
+            "generated-{}.{}",
+            uuid::Uuid::new_v4(),
+            image_extension_for_mime(mime_type)
+        );
+        let destination = chat_dir.join(&filename);
+        tokio::fs::copy(source, &destination)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to copy generated image {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+
+        attachments.push(AttachmentMeta {
+            filename,
+            path: destination.to_string_lossy().to_string(),
+            mime_type: mime_type.to_string(),
+        });
+        saved += 1;
+    }
+
+    if saved > 0 {
+        update_message_attachments(db, assistant_message_id, &attachments).await?;
+    }
+    Ok(saved)
+}
+
 fn codex_failure_text_chunk(accumulated_text: &str, message: &str) -> String {
     let failure_notice = format!("Codex error: {message}");
     if accumulated_text.is_empty() {
@@ -1816,6 +2009,7 @@ mod streaming_persistence_tests {
     use serde_json::json;
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::ConnectOptions;
+    use std::fs;
     use std::str::FromStr;
 
     /// Allow-list of event_type strings any persisted row may carry.
@@ -2190,6 +2384,35 @@ mod streaming_persistence_tests {
         assert_eq!(first, "msg-1::item_2");
         assert_eq!(second, "msg-2::item_2");
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn generated_image_snapshot_detects_new_raster_files_only() {
+        let root = std::env::temp_dir().join(format!(
+            "agentic-generated-images-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let batch = root.join("batch");
+        fs::create_dir_all(&batch).expect("create generated images dir");
+        let old_image = batch.join("old.png");
+        let ignored_text = batch.join("notes.txt");
+        fs::write(&old_image, b"old").expect("write old image");
+        fs::write(&ignored_text, b"notes").expect("write text file");
+
+        let before = generated_image_snapshot(&root);
+        let new_image = batch.join("new.jpg");
+        let nested_dir = batch.join("nested");
+        fs::create_dir_all(&nested_dir).expect("create nested generated dir");
+        let nested_image = nested_dir.join("new.webp");
+        fs::write(&new_image, b"new").expect("write new image");
+        fs::write(&nested_image, b"webp").expect("write nested image");
+
+        let new_images = new_generated_images(&root, &before);
+        let mut expected = vec![new_image, nested_image];
+        expected.sort();
+
+        assert_eq!(new_images, expected);
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
