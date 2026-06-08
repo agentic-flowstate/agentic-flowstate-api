@@ -372,7 +372,7 @@ fn launchd_safe_path_from(existing_path: Option<&OsStr>) -> OsString {
     OsString::from(entries.join(":"))
 }
 
-fn launchd_safe_path() -> OsString {
+pub(crate) fn launchd_safe_path() -> OsString {
     launchd_safe_path_from(std::env::var_os("PATH").as_deref())
 }
 

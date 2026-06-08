@@ -24,7 +24,7 @@ use super::chat_client_manager::ChatClientManager;
 use super::conversation_worker::WorkerMessage;
 use super::conversation_worker_manager::WORKER_MANAGER;
 use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
-use crate::agents::codex_app_server::normalize_reasoning_effort;
+use crate::agents::codex_app_server::{launchd_safe_path, normalize_reasoning_effort};
 use crate::agents::{AgentType, AgentsConfig, StreamEvent};
 use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
 use crate::rate_limiting::{self, RateLimitDecision, StreamPermit};
@@ -180,6 +180,7 @@ fn ordered_codex_reasoning_efforts(efforts: impl IntoIterator<Item = String>) ->
 async fn load_codex_model_catalog() -> Result<Vec<ChatCodexModelOptionItem>, String> {
     let output = Command::new("codex")
         .args(["debug", "models"])
+        .env("PATH", launchd_safe_path())
         .output()
         .await
         .map_err(|e| format!("Failed to read Codex model catalog: {e}"))?;
