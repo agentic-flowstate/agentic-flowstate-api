@@ -43,6 +43,15 @@ struct WebauthnConfig {
     origins: Vec<String>,
 }
 
+pub async fn passkey_config() -> Json<Value> {
+    Json(passkey_config_status_from_values(
+        env::var("AGENTIC_WEBAUTHN_RP_ID").ok(),
+        env::var("AGENTIC_WEBAUTHN_RP_NAME").ok(),
+        env::var("AGENTIC_WEBAUTHN_ORIGIN").ok(),
+        env::var("AGENTIC_WEBAUTHN_EXTRA_ORIGINS").ok(),
+    ))
+}
+
 pub async fn list_passkeys(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<crate::auth_middleware::AuthenticatedUser>,
@@ -300,11 +309,9 @@ pub async fn finish_passkey_authentication(
         .map_err(internal_error("Failed to create session"))?;
     cookies.add(crate::handlers::auth::make_session_cookie(&session_id));
 
-    Ok(Json(json!({
-        "user_id": user.user_id,
-        "name": user.name,
-        "email": user.email,
-    })))
+    Ok(Json(
+        crate::handlers::auth::auth_user_json(&pool, &user).await,
+    ))
 }
 
 fn webauthn() -> Result<Webauthn, String> {
@@ -326,9 +333,18 @@ fn webauthn() -> Result<Webauthn, String> {
 }
 
 fn webauthn_config() -> Result<WebauthnConfig, String> {
-    let rp_id = required_env("AGENTIC_WEBAUTHN_RP_ID")?;
-    let rp_name = required_env("AGENTIC_WEBAUTHN_RP_NAME")?;
-    let origin = required_env("AGENTIC_WEBAUTHN_ORIGIN")?;
+    let rp_id = required_env_value(
+        "AGENTIC_WEBAUTHN_RP_ID",
+        env::var("AGENTIC_WEBAUTHN_RP_ID").ok(),
+    )?;
+    let rp_name = required_env_value(
+        "AGENTIC_WEBAUTHN_RP_NAME",
+        env::var("AGENTIC_WEBAUTHN_RP_NAME").ok(),
+    )?;
+    let origin = required_env_value(
+        "AGENTIC_WEBAUTHN_ORIGIN",
+        env::var("AGENTIC_WEBAUTHN_ORIGIN").ok(),
+    )?;
     let mut origins = vec![origin];
     if let Ok(extra) = env::var("AGENTIC_WEBAUTHN_EXTRA_ORIGINS") {
         origins.extend(
@@ -346,12 +362,62 @@ fn webauthn_config() -> Result<WebauthnConfig, String> {
     })
 }
 
-fn required_env(name: &str) -> Result<String, String> {
-    env::var(name)
+fn required_env_value(name: &str, value: Option<String>) -> Result<String, String> {
+    value
         .map(|value| value.trim().to_string())
-        .ok()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("{name} is required for passkey/WebAuthn endpoints"))
+}
+
+fn passkey_config_status_from_values(
+    rp_id: Option<String>,
+    rp_name: Option<String>,
+    origin: Option<String>,
+    extra_origins: Option<String>,
+) -> Value {
+    let rp_id = trim_optional(rp_id);
+    let rp_name = trim_optional(rp_name);
+    let origin = trim_optional(origin);
+    let extra_origins = extra_origins
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let mut missing = Vec::new();
+    if rp_id.is_none() {
+        missing.push("AGENTIC_WEBAUTHN_RP_ID");
+    }
+    if rp_name.is_none() {
+        missing.push("AGENTIC_WEBAUTHN_RP_NAME");
+    }
+    if origin.is_none() {
+        missing.push("AGENTIC_WEBAUTHN_ORIGIN");
+    }
+
+    let mut origins = Vec::new();
+    if let Some(origin) = &origin {
+        origins.push(origin.clone());
+    }
+    origins.extend(extra_origins);
+
+    json!({
+        "enabled": missing.is_empty(),
+        "rp_id": rp_id,
+        "rp_name": rp_name,
+        "origin": origin,
+        "origins": origins,
+        "missing": missing,
+        "requires_secure_origin": true,
+    })
+}
+
+fn trim_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn public_key_options<T: serde::Serialize>(options: T) -> Result<Value, (StatusCode, Json<Value>)> {
@@ -412,5 +478,57 @@ fn webauthn_error<E: Display>(
             StatusCode::BAD_REQUEST,
             Json(json!({"error": public_message})),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passkey_config_status_reports_missing_required_env() {
+        let status = passkey_config_status_from_values(None, Some("Agentic".into()), None, None);
+
+        assert_eq!(status["enabled"], false);
+        assert_eq!(
+            status["missing"].as_array().unwrap(),
+            &vec![
+                json!("AGENTIC_WEBAUTHN_RP_ID"),
+                json!("AGENTIC_WEBAUTHN_ORIGIN"),
+            ]
+        );
+        assert_eq!(status["requires_secure_origin"], true);
+    }
+
+    #[test]
+    fn passkey_config_status_reports_public_relying_party_values() {
+        let status = passkey_config_status_from_values(
+            Some("flowstate.example.com".into()),
+            Some(" Agentic Flowstate ".into()),
+            Some("https://flowstate.example.com".into()),
+            Some(" https://backup.example.com, ,https://mac.example.com ".into()),
+        );
+
+        assert_eq!(status["enabled"], true);
+        assert_eq!(status["rp_id"], "flowstate.example.com");
+        assert_eq!(status["rp_name"], "Agentic Flowstate");
+        assert_eq!(status["origin"], "https://flowstate.example.com");
+        assert_eq!(
+            status["origins"].as_array().unwrap(),
+            &vec![
+                json!("https://flowstate.example.com"),
+                json!("https://backup.example.com"),
+                json!("https://mac.example.com"),
+            ]
+        );
+        assert!(status["missing"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn required_env_value_rejects_blank_values() {
+        assert_eq!(
+            required_env_value("AGENTIC_WEBAUTHN_RP_ID", Some("   ".into())),
+            Err("AGENTIC_WEBAUTHN_RP_ID is required for passkey/WebAuthn endpoints".into())
+        );
     }
 }

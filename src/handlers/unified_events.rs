@@ -709,12 +709,18 @@ mod tests {
     #[test]
     fn conversation_only_stream_uses_fast_poll_interval() {
         let topics = HashSet::from(["conversations".to_string()]);
-        assert_eq!(unified_events_poll_interval(&topics), Duration::from_secs(2));
+        assert_eq!(
+            unified_events_poll_interval(&topics),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]
     fn mixed_topic_stream_keeps_conservative_poll_interval() {
         let topics = HashSet::from(["conversations".to_string(), "emails".to_string()]);
-        assert_eq!(unified_events_poll_interval(&topics), Duration::from_secs(15));
+        assert_eq!(
+            unified_events_poll_interval(&topics),
+            Duration::from_secs(15)
+        );
     }
 }

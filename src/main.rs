@@ -807,6 +807,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/register", post(handlers::auth::register))
         .route("/api/auth/login", post(handlers::auth::login))
         .route(
+            "/api/auth/passkeys/config",
+            get(handlers::passkeys::passkey_config),
+        )
+        .route(
             "/api/auth/passkeys/authenticate/start",
             post(handlers::passkeys::start_passkey_authentication),
         )

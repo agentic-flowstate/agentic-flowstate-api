@@ -10,6 +10,24 @@ use ticketing_system::{LoginRequest, RegisterUserRequest, SqlitePool};
 const SESSION_COOKIE: &str = "session";
 const MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
 
+pub(crate) async fn auth_user_json(pool: &SqlitePool, user: &ticketing_system::User) -> Value {
+    let organizations = ticketing_system::memberships::list_user_organizations(pool, &user.user_id)
+        .await
+        .unwrap_or_default();
+
+    let is_admin = ticketing_system::system_logs::is_admin(pool, &user.user_id)
+        .await
+        .unwrap_or(false);
+
+    json!({
+        "user_id": &user.user_id,
+        "name": &user.name,
+        "email": &user.email,
+        "organizations": organizations,
+        "is_admin": is_admin,
+    })
+}
+
 pub(crate) fn make_session_cookie(session_id: &str) -> Cookie<'static> {
     let mut cookie = Cookie::new(SESSION_COOKIE, session_id.to_string());
     cookie.set_path("/");
@@ -88,11 +106,7 @@ pub async fn register(
 
     Ok((
         StatusCode::CREATED,
-        Json(json!({
-            "user_id": user.user_id,
-            "name": user.name,
-            "email": user.email,
-        })),
+        Json(auth_user_json(&pool, &user).await),
     ))
 }
 
@@ -154,11 +168,7 @@ pub async fn login(
     )
     .await;
 
-    Ok(Json(json!({
-        "user_id": user.user_id,
-        "name": user.name,
-        "email": user.email,
-    })))
+    Ok(Json(auth_user_json(&pool, &user).await))
 }
 
 /// POST /api/auth/logout
@@ -342,20 +352,5 @@ pub async fn me(
         ));
     };
 
-    let organizations =
-        ticketing_system::memberships::list_user_organizations(&pool, &user.user_id)
-            .await
-            .unwrap_or_default();
-
-    let is_admin = ticketing_system::system_logs::is_admin(&pool, &user.user_id)
-        .await
-        .unwrap_or(false);
-
-    Ok(Json(json!({
-        "user_id": user.user_id,
-        "name": user.name,
-        "email": user.email,
-        "organizations": organizations,
-        "is_admin": is_admin,
-    })))
+    Ok(Json(auth_user_json(&pool, &user).await))
 }
