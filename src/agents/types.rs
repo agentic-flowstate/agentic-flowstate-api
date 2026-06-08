@@ -58,6 +58,8 @@ pub enum AgentType {
     Planning,
     Execution,
     Evaluation,
+    ConversationEvaluator,
+    Feedback,
     Email,
     WorkspaceManager,
     MeetingNotes,
@@ -100,6 +102,8 @@ impl AgentType {
             "workspace-manager" => Some(AgentType::WorkspaceManager),
             "meeting-agent" => Some(AgentType::MeetingAgent),
             "scoped-workspace" => Some(AgentType::ScopedWorkspace),
+            "conversation-evaluator" => Some(AgentType::ConversationEvaluator),
+            "feedback" => Some(AgentType::Feedback),
             _ => None,
         }
     }
@@ -109,6 +113,8 @@ impl AgentType {
             AgentType::Planning => "planning",
             AgentType::Execution => "execution",
             AgentType::Evaluation => "evaluation",
+            AgentType::ConversationEvaluator => "conversation-evaluator",
+            AgentType::Feedback => "feedback",
             AgentType::Email => "email",
             AgentType::WorkspaceManager => "workspace-manager",
             AgentType::MeetingNotes => "meeting-notes",

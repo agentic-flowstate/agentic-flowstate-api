@@ -115,6 +115,70 @@ pub async fn create_conversation_evaluation(
     Ok(Json(ConversationEvaluationResponse::from(evaluation)))
 }
 
+pub(crate) async fn build_conversation_evaluator_user_prompt(
+    pool: &SqlitePool,
+    user_id: &str,
+    conversation: &ticketing_system::Conversation,
+) -> Result<String> {
+    let transcript = load_evaluation_transcript(pool, &conversation.id).await?;
+    if transcript.is_empty() {
+        bail!("Conversation has no completed user/assistant messages to evaluate.");
+    }
+
+    let total_message_count = count_conversation_messages(pool, &conversation.id).await?;
+    let related_conversations = load_related_conversations(pool, user_id, &conversation.id).await?;
+    let evaluated_at = Utc::now();
+
+    let mut vars = HashMap::new();
+    vars.insert("evaluated_at".to_string(), evaluated_at.to_rfc3339());
+    vars.insert(
+        "conversation_metadata".to_string(),
+        format_conversation_metadata(conversation, &transcript, total_message_count, evaluated_at),
+    );
+    vars.insert(
+        "related_conversations".to_string(),
+        format_related_conversations(&related_conversations, evaluated_at),
+    );
+    vars.insert("transcript".to_string(), format_transcript(&transcript)?);
+
+    load_prompt("conversation-evaluator", vars).context("load conversation evaluator prompt")
+}
+
+pub(crate) async fn build_conversation_feedback_user_prompt(
+    pool: &SqlitePool,
+    user_id: &str,
+    conversation: &ticketing_system::Conversation,
+    target_message_id: Option<&str>,
+) -> Result<String> {
+    let transcript = load_evaluation_transcript(pool, &conversation.id).await?;
+    if transcript.is_empty() {
+        bail!("Conversation has no completed user/assistant messages to use for feedback.");
+    }
+
+    let total_message_count = count_conversation_messages(pool, &conversation.id).await?;
+    let related_conversations = load_related_conversations(pool, user_id, &conversation.id).await?;
+    let created_at = Utc::now();
+
+    let mut vars = HashMap::new();
+    vars.insert("created_at".to_string(), created_at.to_rfc3339());
+    vars.insert(
+        "conversation_metadata".to_string(),
+        format_conversation_metadata(conversation, &transcript, total_message_count, created_at),
+    );
+    vars.insert(
+        "related_conversations".to_string(),
+        format_related_conversations(&related_conversations, created_at),
+    );
+    vars.insert("transcript".to_string(), format_transcript(&transcript)?);
+    vars.insert(
+        "target_response".to_string(),
+        load_feedback_target(pool, &conversation.id, target_message_id).await?,
+    );
+
+    load_prompt("conversation-feedback-seed", vars)
+        .context("load conversation feedback seed prompt")
+}
+
 async fn verify_conversation_owner(
     pool: &SqlitePool,
     user_id: &str,
@@ -128,6 +192,47 @@ async fn verify_conversation_owner(
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
     Ok(conv)
+}
+
+async fn load_feedback_target(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    target_message_id: Option<&str>,
+) -> Result<String> {
+    let Some(target_message_id) = target_message_id else {
+        return Ok(
+            "Whole conversation feedback requested; no single message was selected.".to_string(),
+        );
+    };
+
+    let row = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT role, content, created_at FROM conversation_messages \
+         WHERE conversation_id = ? AND id = ?",
+    )
+    .bind(conversation_id)
+    .bind(target_message_id)
+    .fetch_optional(pool)
+    .await
+    .context("load feedback target message")?;
+
+    let Some((role, content, created_at)) = row else {
+        bail!("Feedback target message not found in parent conversation.");
+    };
+
+    let role_label = match role.as_str() {
+        "user" => "User",
+        "assistant" => "Assistant",
+        "forwarded" => "Forwarded Context",
+        other => other,
+    };
+
+    Ok(format!(
+        "{} message {} at {}:\n{}",
+        role_label,
+        target_message_id,
+        format_unix_timestamp(created_at),
+        content.trim()
+    ))
 }
 
 async fn conversation_has_active_turn(db: &SqlitePool, conversation_id: &str) -> Result<bool> {

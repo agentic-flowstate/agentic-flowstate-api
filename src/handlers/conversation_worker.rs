@@ -49,7 +49,10 @@ struct AttachmentMeta {
 
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
     match agent_type {
-        AgentType::HomePlanner | AgentType::MeetingAgent => CodexToolProfile::ConfiguredMcpOnly,
+        AgentType::HomePlanner
+        | AgentType::MeetingAgent
+        | AgentType::ConversationEvaluator
+        | AgentType::Feedback => CodexToolProfile::ConfiguredMcpOnly,
         AgentType::ScopedWorkspace | AgentType::WorkspaceManager => {
             CodexToolProfile::RestrictedMcpOnly
         }
@@ -492,47 +495,58 @@ impl ConversationWorker {
         )
         .await;
 
-        // First message → generate title + detect org in background
+        // First root message -> generate title + detect org in background.
         if let Ok(ref stored) = stored_msg {
             if stored.message_index == 0 {
                 let title_db = (*self.db).clone();
                 let title_user = msg.user_id.clone();
                 let title_conv = self.conversation_id.clone();
                 let title_msg = msg.message.clone();
-                // Look up the current org so the detector knows what's already set
-                let current_org = conversations::get_conversation(&title_db, &title_conv, false)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|c| c.organization)
-                    .unwrap_or_default();
-                tokio::spawn(async move {
-                    if let Some(result) = super::title_generator::generate_title_and_org(
-                        title_db,
-                        title_user,
-                        title_conv.clone(),
-                        title_msg,
-                        current_org,
-                    )
-                    .await
-                    {
-                        let broadcast_tx = get_broadcast_sender(&title_conv).await;
-                        // Broadcast title update
-                        let title_event = StreamEvent::TitleUpdate {
-                            title: result.title,
-                        };
-                        if let Ok(json) = serde_json::to_string(&title_event) {
-                            let _ = broadcast_tx.send((-1, json));
-                        }
-                        // Broadcast org update if it changed
-                        if let Some(org) = result.organization {
-                            let org_event = StreamEvent::OrgUpdate { organization: org };
-                            if let Ok(json) = serde_json::to_string(&org_event) {
+                let current_conversation =
+                    conversations::get_conversation(&title_db, &title_conv, false)
+                        .await
+                        .ok()
+                        .flatten();
+
+                if current_conversation
+                    .as_ref()
+                    .and_then(|c| c.parent_conversation_id.as_ref())
+                    .is_some()
+                {
+                    tracing::info!(
+                        "[WORKER] Skipping title generation for child conversation {}",
+                        title_conv
+                    );
+                } else {
+                    let current_org = current_conversation
+                        .map(|c| c.organization)
+                        .unwrap_or_default();
+                    tokio::spawn(async move {
+                        if let Some(result) = super::title_generator::generate_title_and_org(
+                            title_db,
+                            title_user,
+                            title_conv.clone(),
+                            title_msg,
+                            current_org,
+                        )
+                        .await
+                        {
+                            let broadcast_tx = get_broadcast_sender(&title_conv).await;
+                            let title_event = StreamEvent::TitleUpdate {
+                                title: result.title,
+                            };
+                            if let Ok(json) = serde_json::to_string(&title_event) {
                                 let _ = broadcast_tx.send((-1, json));
                             }
+                            if let Some(org) = result.organization {
+                                let org_event = StreamEvent::OrgUpdate { organization: org };
+                                if let Ok(json) = serde_json::to_string(&org_event) {
+                                    let _ = broadcast_tx.send((-1, json));
+                                }
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
 
@@ -656,8 +670,22 @@ impl ConversationWorker {
     /// Returns an enriched message only when an explicit or clear ticket match
     /// is found. No LLM router is invoked and chat startup never creates
     /// tickets, epics, slices, or milestones.
-    async fn run_ticket_router(&mut self, user_message: &str, _config: &ChatConfig) -> String {
+    async fn run_ticket_router(&mut self, user_message: &str, config: &ChatConfig) -> String {
         let original = user_message.to_string();
+        if matches!(
+            config.agent_type,
+            AgentType::ConversationEvaluator | AgentType::Feedback
+        ) {
+            self.has_routed = true;
+            let _ = conversations::set_router_result(
+                &self.db,
+                &self.conversation_id,
+                Some("__skipped__"),
+                None,
+            )
+            .await;
+            return original;
+        }
 
         // Truncate preview at a safe UTF-8 char boundary (floor to nearest boundary at or before 60)
         let msg_preview = if user_message.len() > 60 {

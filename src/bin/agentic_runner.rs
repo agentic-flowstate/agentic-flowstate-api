@@ -431,6 +431,8 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
         "scoped-workspace" => Ok("scoped-workspace"),
         "meeting-agent" => Ok("meeting-agent"),
         "home-planner" => Ok("home-planner"),
+        "conversation-evaluator-system" => Ok("conversation-evaluator-system"),
+        "feedback" => Ok("feedback"),
         other => anyhow::bail!("Unsupported conversation job prompt: {}", other),
     }
 }

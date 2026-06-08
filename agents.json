@@ -115,6 +115,18 @@
         "Task"
       ]
     },
+    "conversation-evaluator": {
+      "model": "codex",
+      "effort": "medium",
+      "prompt_file": "conversation-evaluator-system.txt",
+      "tools": []
+    },
+    "feedback": {
+      "model": "codex",
+      "effort": "medium",
+      "prompt_file": "feedback.txt",
+      "tools": []
+    },
     "email": {
       "model": "codex",
       "effort": "xhigh",

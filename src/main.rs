@@ -1153,6 +1153,19 @@ async fn main() -> anyhow::Result<()> {
             "/api/scoped-workspace/chat/submit",
             post(handlers::scoped_workspace_chat_submit),
         )
+        .route(
+            "/api/conversation-evaluator/chat",
+            post(handlers::conversation_evaluator_chat),
+        )
+        .route(
+            "/api/conversation-evaluator/chat/submit",
+            post(handlers::conversation_evaluator_chat_submit),
+        )
+        .route("/api/feedback/chat", post(handlers::feedback_chat))
+        .route(
+            "/api/feedback/chat/submit",
+            post(handlers::feedback_chat_submit),
+        )
         // Unified SSE (single multiplexed connection for all topics)
         .route(
             "/api/events/subscribe",
@@ -1213,6 +1226,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/conversations/:id/children",
             get(handlers::list_child_conversations).post(handlers::create_child_conversations),
+        )
+        .route(
+            "/api/conversations/:id/child-agent",
+            post(handlers::launch_conversation_child_agent),
         )
         .route(
             "/api/conversations/:id",
