@@ -77,7 +77,11 @@ pub struct ConversationRunStatusResponse {
     pub tool_call_count: i32,
     pub queued_message_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tool_call_started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tool_call_started_at_epoch: Option<i64>,
     pub server_time: i64,
 }
 
@@ -173,6 +177,11 @@ struct LastToolCallStartedAtRow {
     last_started_at: Option<i64>,
 }
 
+#[derive(sqlx::FromRow)]
+struct RunStartedAtRow {
+    started_at: Option<i64>,
+}
+
 async fn last_tool_call_started_at_map(
     pool: &SqlitePool,
     conversation_ids: &[String],
@@ -210,6 +219,88 @@ async fn last_tool_call_started_at_map(
             ))
         })
         .collect())
+}
+
+async fn last_tool_call_started_at_epoch(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    earliest_started_at: Option<i64>,
+) -> anyhow::Result<Option<i64>> {
+    let value: Option<i64> = if let Some(earliest_started_at) = earliest_started_at {
+        sqlx::query_scalar(
+            r#"
+            SELECT MAX(created_at)
+            FROM conversation_tool_calls
+            WHERE conversation_id = ?
+              AND created_at >= ?
+            "#,
+        )
+        .bind(conversation_id)
+        .bind(earliest_started_at)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            r#"
+            SELECT MAX(created_at)
+            FROM conversation_tool_calls
+            WHERE conversation_id = ?
+            "#,
+        )
+        .bind(conversation_id)
+        .fetch_one(pool)
+        .await?
+    };
+
+    Ok(value)
+}
+
+async fn active_run_started_at(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    checkpoint: Option<&ticketing_system::AgentCheckpoint>,
+) -> anyhow::Result<Option<i64>> {
+    let running_job = sqlx::query_as::<_, RunStartedAtRow>(
+        r#"
+        SELECT COALESCE(started_at, updated_at, created_at) AS started_at
+        FROM conversation_turn_jobs
+        WHERE conversation_id = ?
+          AND status = 'running'
+        ORDER BY started_at DESC, updated_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = running_job {
+        if row.started_at.is_some() {
+            return Ok(row.started_at);
+        }
+    }
+
+    let active_runner_turn = sqlx::query_as::<_, RunStartedAtRow>(
+        r#"
+        SELECT started_at
+        FROM agent_runner_turns
+        WHERE conversation_id = ?
+          AND status IN ('queued', 'running')
+        ORDER BY started_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(row) = active_runner_turn {
+        if row.started_at.is_some() {
+            return Ok(row.started_at);
+        }
+    }
+
+    Ok(checkpoint.map(|cp| cp.updated_at))
 }
 
 fn queued_message_image_count(images_json: Option<&str>) -> usize {
@@ -428,6 +519,13 @@ async fn conversation_run_status_snapshot(
     let mut last_tool_calls =
         last_tool_call_started_at_map(pool, &[conversation_id.to_string()]).await?;
     let last_tool_call_started_at = last_tool_calls.remove(conversation_id);
+    let run_started_at = if is_processing {
+        active_run_started_at(pool, conversation_id, checkpoint.as_ref()).await?
+    } else {
+        None
+    };
+    let last_tool_call_started_at_epoch =
+        last_tool_call_started_at_epoch(pool, conversation_id, run_started_at).await?;
 
     Ok(ConversationRunStatusResponse {
         conversation_id: conversation_id.to_string(),
@@ -439,7 +537,9 @@ async fn conversation_run_status_snapshot(
         last_event_index,
         tool_call_count: checkpoint.as_ref().map(|cp| cp.tool_call_count).unwrap_or(0),
         queued_message_count,
+        run_started_at,
         last_tool_call_started_at,
+        last_tool_call_started_at_epoch,
         server_time: chrono::Utc::now().timestamp(),
     })
 }
@@ -1845,7 +1945,9 @@ mod tests {
             last_event_index: 128,
             tool_call_count: 3,
             queued_message_count: 0,
+            run_started_at: Some(1_778_539_000),
             last_tool_call_started_at: Some("11:38 a.m.".to_string()),
+            last_tool_call_started_at_epoch: Some(1_778_539_100),
             server_time: 1_778_539_160,
         }
     }
