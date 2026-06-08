@@ -12,8 +12,10 @@
 
 use axum::{
     extract::{Extension, Query, State},
+    http::{HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
 };
+use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use serde::Deserialize;
 use std::collections::hash_map::DefaultHasher;
@@ -25,6 +27,8 @@ use std::time::Duration;
 use ticketing_system::SqlitePool;
 
 use crate::auth_middleware::AuthenticatedUser;
+
+use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
 
 #[derive(Debug, Deserialize)]
 pub struct UnifiedEventsQuery {
@@ -38,6 +42,16 @@ pub struct UnifiedEventsQuery {
     pub date: Option<String>,
     /// Mailbox filter for emails topic
     pub mailbox: Option<String>,
+    /// Optional resume cursor. Currently used for conversation snapshot events.
+    pub starting_after: Option<i64>,
+}
+
+impl UnifiedEventsQuery {
+    fn resume_query(&self) -> ResumeQuery {
+        ResumeQuery {
+            starting_after: self.starting_after,
+        }
+    }
 }
 
 /// GET /api/events/subscribe?topics=tickets,emails,daily_plan&organization=X
@@ -61,8 +75,17 @@ pub struct UnifiedEventsQuery {
 pub async fn subscribe_unified_events(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
+    headers: HeaderMap,
     Query(params): Query<UnifiedEventsQuery>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+    let cursor = match extract_cursor(&headers, &params.resume_query()) {
+        Ok(cursor) => cursor,
+        Err(CursorError::Malformed(detail)) => return Err((StatusCode::BAD_REQUEST, detail)),
+        Err(CursorError::Retention { .. }) => {
+            unreachable!("extract_cursor never produces CursorError::Retention")
+        }
+    };
+
     let topics: HashSet<String> = params
         .topics
         .unwrap_or_else(|| "tickets,emails,daily_plan".to_string())
@@ -75,6 +98,11 @@ pub async fn subscribe_unified_events(
     let org = params.organization;
     let date = params.date;
     let mailbox = params.mailbox;
+    let conversation_resume_after = if topics.contains("conversations") && cursor.is_resume() {
+        Some(cursor.event_index)
+    } else {
+        None
+    };
 
     tracing::info!(
         "[UNIFIED-SSE] user={} topics={:?} org={:?}",
@@ -95,6 +123,7 @@ pub async fn subscribe_unified_events(
         let mut hash_epics: u64 = 0;
         let mut hash_slices: u64 = 0;
         let mut hash_data_tickets: u64 = 0;
+        let mut conversations_caught_up = conversation_resume_after.is_none();
 
         // Cache org memberships (rarely change during session)
         let user_orgs = ticketing_system::memberships::list_user_organizations(&pool, &user_id)
@@ -241,7 +270,15 @@ pub async fn subscribe_unified_events(
                         }
                     };
                     let hash = hash_conversation_list(&summaries);
-                    if hash != hash_conversations {
+                    let event_id = conversation_snapshot_event_id(&summaries);
+                    let should_emit = should_emit_conversation_snapshot(
+                        hash,
+                        event_id,
+                        conversation_resume_after,
+                        &mut conversations_caught_up,
+                        &mut hash_conversations,
+                    );
+                    if should_emit {
                         hash_conversations = hash;
                         let payload = serde_json::json!({
                             "type": "sync",
@@ -249,7 +286,7 @@ pub async fn subscribe_unified_events(
                             "updated_at": chrono::Utc::now().timestamp(),
                         });
                         if let Ok(json) = serde_json::to_string(&payload) {
-                            yield Ok(Event::default().event("conversations").data(json));
+                            yield Ok(Event::default().id(event_id.to_string()).event("conversations").data(json));
                         }
                     }
                 }
@@ -381,11 +418,11 @@ pub async fn subscribe_unified_events(
     };
 
     // Single keepalive ping for all topics
-    Sse::new(stream).keep_alive(
+    Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(30))
             .text("ping"),
-    )
+    ))
 }
 
 // ── Hash helpers ─────────────────────────────────────────────────────────────
@@ -453,6 +490,60 @@ fn hash_conversation_list(convs: &[crate::handlers::conversations::ConversationS
     hasher.finish()
 }
 
+fn conversation_snapshot_event_id(
+    convs: &[crate::handlers::conversations::ConversationSummary],
+) -> i64 {
+    convs.iter().fold(0_i64, |max_seen, summary| {
+        let updated_at = parse_conversation_timestamp_millis(&summary.conversation.updated_at);
+        let last_event = summary
+            .conversation
+            .last_event_index
+            .map(i64::from)
+            .unwrap_or(0);
+        let run_started_at = summary
+            .run_started_at
+            .map(epoch_seconds_to_millis)
+            .unwrap_or(0);
+        let last_tool_call = summary
+            .last_tool_call_started_at_epoch
+            .map(epoch_seconds_to_millis)
+            .unwrap_or(0);
+        max_seen
+            .max(updated_at)
+            .max(last_event)
+            .max(run_started_at)
+            .max(last_tool_call)
+    })
+}
+
+fn should_emit_conversation_snapshot(
+    hash: u64,
+    event_id: i64,
+    resume_after: Option<i64>,
+    caught_up: &mut bool,
+    last_hash: &mut u64,
+) -> bool {
+    if !*caught_up {
+        *caught_up = true;
+        if resume_after.is_some_and(|cursor| event_id <= cursor) {
+            *last_hash = hash;
+            return false;
+        }
+    }
+
+    hash != *last_hash
+}
+
+fn parse_conversation_timestamp_millis(value: &str) -> i64 {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc).timestamp_millis())
+        .unwrap_or(0)
+}
+
+fn epoch_seconds_to_millis(value: i64) -> i64 {
+    value.saturating_mul(1_000)
+}
+
 fn hash_dm_list(dms: &[ticketing_system::DmConversation]) -> u64 {
     let mut hasher = DefaultHasher::new();
     for dm in dms {
@@ -484,4 +575,124 @@ fn hash_slice_list(slices: &[ticketing_system::Slice]) -> u64 {
     }
     slices.len().hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::handlers::conversations::ConversationSummary;
+    use ticketing_system::Conversation;
+
+    fn conversation_summary(
+        updated_at: &str,
+        last_event_index: Option<i32>,
+        run_started_at: Option<i64>,
+        last_tool_call_started_at_epoch: Option<i64>,
+    ) -> ConversationSummary {
+        ConversationSummary {
+            conversation: Conversation {
+                id: "conv-1".to_string(),
+                user_id: "alex".to_string(),
+                session_id: None,
+                organization: "agentic-flowstate".to_string(),
+                agent: Some("full-access".to_string()),
+                conversation_type: Some("research".to_string()),
+                parent_conversation_id: None,
+                conversation_role: "standard".to_string(),
+                child_conversation_count: Some(0),
+                child_sort_order: None,
+                title: "Conversation".to_string(),
+                started_at: "2026-06-08T21:59:00Z".to_string(),
+                updated_at: updated_at.to_string(),
+                status: "open".to_string(),
+                archived_at: None,
+                router_ticket_id: None,
+                router_organization: None,
+                message_count: Some(1),
+                last_event_index,
+                is_active: Some(false),
+                messages: Some(vec![]),
+            },
+            tool_call_count: None,
+            run_started_at,
+            last_tool_call_started_at_epoch,
+        }
+    }
+
+    #[test]
+    fn conversation_snapshot_event_id_uses_timestamp_millis() {
+        let summaries = vec![conversation_summary(
+            "2026-06-08T22:00:01.234Z",
+            Some(128),
+            None,
+            None,
+        )];
+
+        assert_eq!(
+            conversation_snapshot_event_id(&summaries),
+            1_780_956_001_234
+        );
+    }
+
+    #[test]
+    fn conversation_snapshot_event_id_includes_active_run_times() {
+        let summaries = vec![conversation_summary(
+            "2026-06-08T22:00:01Z",
+            Some(128),
+            Some(1_780_956_700),
+            Some(1_780_956_800),
+        )];
+
+        assert_eq!(
+            conversation_snapshot_event_id(&summaries),
+            1_780_956_800_000
+        );
+    }
+
+    #[test]
+    fn fresh_conversation_snapshot_emits_when_hash_changes() {
+        let mut caught_up = true;
+        let mut last_hash = 0;
+
+        assert!(should_emit_conversation_snapshot(
+            42,
+            1_780_956_001_234,
+            None,
+            &mut caught_up,
+            &mut last_hash,
+        ));
+    }
+
+    #[test]
+    fn up_to_date_resume_skips_initial_conversation_snapshot() {
+        let mut caught_up = false;
+        let mut last_hash = 0;
+
+        assert!(!should_emit_conversation_snapshot(
+            42,
+            1_780_956_001_234,
+            Some(1_780_956_001_234),
+            &mut caught_up,
+            &mut last_hash,
+        ));
+        assert!(caught_up);
+        assert_eq!(last_hash, 42);
+    }
+
+    #[test]
+    fn stale_resume_emits_current_conversation_snapshot() {
+        let mut caught_up = false;
+        let mut last_hash = 0;
+
+        assert!(should_emit_conversation_snapshot(
+            42,
+            1_780_956_001_234,
+            Some(1_780_956_001_000),
+            &mut caught_up,
+            &mut last_hash,
+        ));
+        assert!(caught_up);
+        assert_eq!(last_hash, 0);
+    }
 }
