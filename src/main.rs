@@ -806,6 +806,14 @@ async fn main() -> anyhow::Result<()> {
     let public_routes = Router::new()
         .route("/api/auth/register", post(handlers::auth::register))
         .route("/api/auth/login", post(handlers::auth::login))
+        .route(
+            "/api/auth/passkeys/authenticate/start",
+            post(handlers::passkeys::start_passkey_authentication),
+        )
+        .route(
+            "/api/auth/passkeys/authenticate/finish",
+            post(handlers::passkeys::finish_passkey_authentication),
+        )
         .route("/api/auth/logout", post(handlers::auth::logout))
         .route("/api/auth/me", get(handlers::auth::me))
         .route(
@@ -1003,6 +1011,19 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/auth/password/rotate",
             post(handlers::auth::rotate_password),
+        )
+        .route("/api/auth/passkeys", get(handlers::passkeys::list_passkeys))
+        .route(
+            "/api/auth/passkeys/:credential_id",
+            delete(handlers::passkeys::delete_passkey),
+        )
+        .route(
+            "/api/auth/passkeys/register/start",
+            post(handlers::passkeys::start_passkey_registration),
+        )
+        .route(
+            "/api/auth/passkeys/register/finish",
+            post(handlers::passkeys::finish_passkey_registration),
         )
         // Agent run routes (accessed by session_id, not org-scoped)
         .route("/api/agent-runs/:session_id", get(handlers::get_agent_run))

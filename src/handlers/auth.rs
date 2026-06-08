@@ -10,7 +10,7 @@ use ticketing_system::{LoginRequest, RegisterUserRequest, SqlitePool};
 const SESSION_COOKIE: &str = "session";
 const MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60; // 30 days
 
-fn make_session_cookie(session_id: &str) -> Cookie<'static> {
+pub(crate) fn make_session_cookie(session_id: &str) -> Cookie<'static> {
     let mut cookie = Cookie::new(SESSION_COOKIE, session_id.to_string());
     cookie.set_path("/");
     cookie.set_http_only(true);

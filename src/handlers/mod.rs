@@ -37,6 +37,7 @@ pub mod meeting_agent;
 pub mod meeting_transcription;
 pub mod meetings;
 pub mod memberships;
+pub mod passkeys;
 pub mod quick_commands;
 pub mod resume_cursor;
 pub mod resume_snapshot;
