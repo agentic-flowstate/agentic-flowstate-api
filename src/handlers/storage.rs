@@ -31,7 +31,7 @@ const SYSTEM_CORE_SIMULATOR: &str = "/Library/Developer/CoreSimulator";
 const HOMEBREW_CACHE: &str = "/Users/jarvisgpt/Library/Caches/Homebrew";
 const PLAYWRIGHT_CACHE: &str = "/Users/jarvisgpt/Library/Caches/ms-playwright";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageScanResponse {
     generated_at: String,
     volumes: Vec<StorageVolume>,
@@ -40,7 +40,7 @@ pub struct StorageScanResponse {
     notes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageVolume {
     id: String,
     name: String,
@@ -52,7 +52,7 @@ pub struct StorageVolume {
     is_external: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageBucket {
     id: String,
     title: String,
@@ -65,7 +65,7 @@ pub struct StorageBucket {
     detail: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageActionSummary {
     id: String,
     title: String,
@@ -74,7 +74,7 @@ pub struct StorageActionSummary {
     detail: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskLevel {
     Low,
@@ -103,6 +103,7 @@ pub struct StorageJob {
     reclaimed_bytes: Option<u64>,
     error: Option<String>,
     steps: Vec<StorageJobStep>,
+    scan: Option<StorageScanResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,7 +166,7 @@ impl StorageActionKind {
 
 /// GET /api/admin/storage/scan
 pub async fn scan_storage() -> Response {
-    match tokio::task::spawn_blocking(build_scan).await {
+    match tokio::task::spawn_blocking(|| build_scan_with_progress(None)).await {
         Ok(Ok(scan)) => (StatusCode::OK, Json(scan)).into_response(),
         Ok(Err(e)) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -176,6 +177,36 @@ pub async fn scan_storage() -> Response {
             format!("Storage scan task failed: {e}"),
         ),
     }
+}
+
+/// POST /api/admin/storage/scan/start
+pub async fn start_storage_scan() -> Response {
+    let job = StorageJob {
+        id: Uuid::new_v4().to_string(),
+        action_id: "scan_storage".to_string(),
+        action_title: "Scan Mac Mini storage".to_string(),
+        status: StorageJobStatus::Queued,
+        started_at: Utc::now().to_rfc3339(),
+        completed_at: None,
+        reclaimed_bytes: None,
+        error: None,
+        steps: vec![StorageJobStep::new(
+            "info",
+            "Queued",
+            "Manual storage scan queued from Agentic Flowstate.",
+        )],
+        scan: None,
+    };
+    let job_id = job.id.clone();
+
+    {
+        let mut jobs = STORAGE_JOBS.lock().expect("storage jobs lock poisoned");
+        jobs.insert(job_id.clone(), job.clone());
+    }
+
+    std::thread::spawn(move || run_storage_scan(job_id));
+
+    (StatusCode::OK, Json(job)).into_response()
 }
 
 /// POST /api/admin/storage/actions/:action_id/start
@@ -201,6 +232,7 @@ pub async fn start_storage_action(Path(action_id): Path<String>) -> Response {
             "Queued",
             "Manual storage action queued from Agentic Flowstate.",
         )],
+        scan: None,
     };
     let job_id = job.id.clone();
 
@@ -226,7 +258,12 @@ pub async fn get_storage_job(Path(job_id): Path<String>) -> Response {
     }
 }
 
-fn build_scan() -> anyhow::Result<StorageScanResponse> {
+fn build_scan_with_progress(job_id: Option<&str>) -> anyhow::Result<StorageScanResponse> {
+    push_scan_step(
+        job_id,
+        "Measuring volumes",
+        "Reading APFS volume usage for Macintosh HD Data and ORICO.",
+    );
     let mut volumes = Vec::new();
     if let Some(volume) = volume_stats(
         "macintosh_data",
@@ -407,6 +444,11 @@ fn build_scan() -> anyhow::Result<StorageScanResponse> {
 
     let mut buckets = Vec::with_capacity(bucket_defs.len());
     for (id, title, category, path, risk_level, action, detail) in bucket_defs {
+        push_scan_step(
+            job_id,
+            &format!("Measuring {title}"),
+            &format!("Scanning {path}."),
+        );
         let path_ref = FsPath::new(path);
         let exists = path_ref.exists();
         let bytes = if exists { directory_size(path_ref)? } else { 0 };
@@ -424,6 +466,11 @@ fn build_scan() -> anyhow::Result<StorageScanResponse> {
     }
 
     let actions = actions_from_buckets(&buckets);
+    push_scan_step(
+        job_id,
+        "Preparing results",
+        "Calculating manual actions and notes.",
+    );
     Ok(StorageScanResponse {
         generated_at: Utc::now().to_rfc3339(),
         volumes,
@@ -437,6 +484,45 @@ fn build_scan() -> anyhow::Result<StorageScanResponse> {
             "CoreSimulator runtimes are intentionally not symlinked by this tool. Use Xcode's component manager for runtimes, and use the explicit simulator-device cleanup action when you want to reclaim device state.".to_string(),
         ],
     })
+}
+
+fn run_storage_scan(job_id: String) {
+    update_job(&job_id, |job| {
+        job.status = StorageJobStatus::Running;
+        job.steps.push(StorageJobStep::new(
+            "info",
+            "Started",
+            "Scanning fixed Mac Mini storage buckets.",
+        ));
+    });
+
+    match build_scan_with_progress(Some(&job_id)) {
+        Ok(scan) => update_job(&job_id, |job| {
+            job.status = StorageJobStatus::Succeeded;
+            job.completed_at = Some(Utc::now().to_rfc3339());
+            job.scan = Some(scan);
+            job.steps.push(StorageJobStep::new(
+                "success",
+                "Completed",
+                "Storage scan completed and results are ready.",
+            ));
+        }),
+        Err(e) => update_job(&job_id, |job| {
+            job.status = StorageJobStatus::Failed;
+            job.completed_at = Some(Utc::now().to_rfc3339());
+            job.error = Some(e.to_string());
+            job.steps
+                .push(StorageJobStep::new("error", "Failed", &e.to_string()));
+        }),
+    }
+}
+
+fn push_scan_step(job_id: Option<&str>, title: &str, detail: &str) {
+    if let Some(job_id) = job_id {
+        update_job(job_id, |job| {
+            job.steps.push(StorageJobStep::new("info", title, detail));
+        });
+    }
 }
 
 fn actions_from_buckets(buckets: &[StorageBucket]) -> Vec<StorageActionSummary> {

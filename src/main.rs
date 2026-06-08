@@ -1130,10 +1130,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/home-planner/chat/submit",
             post(handlers::home_planner_chat_submit),
         )
-        .route(
-            "/api/chat/codex-options",
-            get(handlers::codex_chat_options),
-        )
+        .route("/api/chat/codex-options", get(handlers::codex_chat_options))
         // Scoped Workspace Chat routes (restricted agent for external collaborators)
         .route(
             "/api/scoped-workspace/chat",
@@ -1423,6 +1420,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/admin/storage/scan",
             get(handlers::storage::scan_storage),
+        )
+        .route(
+            "/api/admin/storage/scan/start",
+            post(handlers::storage::start_storage_scan),
         )
         .route(
             "/api/admin/storage/actions/:action_id/start",

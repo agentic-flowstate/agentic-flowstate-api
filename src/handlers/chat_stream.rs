@@ -39,8 +39,7 @@ pub struct ChatImageData {
     pub mime_type: String,
 }
 
-const SUPPORTED_CODEX_REASONING_EFFORTS: &[&str] =
-    &["minimal", "low", "medium", "high", "xhigh"];
+const SUPPORTED_CODEX_REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 const JOB_CODEX_MODEL_KEY: &str = "__agentic_codex_model";
 const JOB_CODEX_REASONING_EFFORT_KEY: &str = "__agentic_codex_reasoning_effort";
 

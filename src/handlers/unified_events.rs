@@ -432,9 +432,15 @@ fn hash_conversation_list(convs: &[crate::handlers::conversations::ConversationS
     for summary in convs {
         summary.conversation.updated_at.hash(&mut hasher);
         summary.conversation.id.hash(&mut hasher);
-        summary.conversation.parent_conversation_id.hash(&mut hasher);
+        summary
+            .conversation
+            .parent_conversation_id
+            .hash(&mut hasher);
         summary.conversation.conversation_role.hash(&mut hasher);
-        summary.conversation.child_conversation_count.hash(&mut hasher);
+        summary
+            .conversation
+            .child_conversation_count
+            .hash(&mut hasher);
         summary.last_tool_call_started_at.hash(&mut hasher);
     }
     convs.len().hash(&mut hasher);
