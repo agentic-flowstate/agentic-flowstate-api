@@ -60,6 +60,10 @@ pub struct ConversationSummary {
     #[serde(flatten)]
     pub conversation: Conversation,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tool_call_started_at_epoch: Option<i64>,
 }
 
@@ -397,6 +401,8 @@ pub(crate) async fn conversation_summaries(
         .map(|conv| conv.id.clone())
         .collect::<Vec<_>>();
     let mut last_tool_calls = last_tool_call_started_at_epoch_map(pool, &ids).await?;
+    let mut tool_call_counts = HashMap::new();
+    let mut run_started_times = HashMap::new();
 
     for conversation in conversations
         .iter()
@@ -405,6 +411,16 @@ pub(crate) async fn conversation_summaries(
         let checkpoint = checkpoints::get_checkpoint(pool, &conversation.id).await?;
         let run_started_at =
             active_run_started_at(pool, &conversation.id, checkpoint.as_ref()).await?;
+        let checkpoint_tool_call_count = checkpoint
+            .as_ref()
+            .map(|cp| cp.tool_call_count)
+            .unwrap_or(0);
+        let tool_call_count = checkpoint_tool_call_count
+            .max(active_run_tool_call_count(pool, &conversation.id, run_started_at).await?);
+        tool_call_counts.insert(conversation.id.clone(), tool_call_count);
+        if let Some(epoch) = run_started_at {
+            run_started_times.insert(conversation.id.clone(), epoch);
+        }
         if let Some(epoch) =
             last_tool_call_started_at_epoch(pool, &conversation.id, run_started_at).await?
         {
@@ -417,9 +433,13 @@ pub(crate) async fn conversation_summaries(
     Ok(conversations
         .into_iter()
         .map(|conversation| {
+            let tool_call_count = tool_call_counts.get(&conversation.id).copied();
+            let run_started_at = run_started_times.get(&conversation.id).copied();
             let last_tool_call_started_at_epoch = last_tool_calls.get(&conversation.id).copied();
             ConversationSummary {
                 conversation,
+                tool_call_count,
+                run_started_at,
                 last_tool_call_started_at_epoch,
             }
         })
@@ -1859,6 +1879,8 @@ pub async fn subscribe_conversations(
                         summary.conversation.parent_conversation_id.hash(&mut hasher);
                         summary.conversation.conversation_role.hash(&mut hasher);
                         summary.conversation.child_conversation_count.hash(&mut hasher);
+                        summary.tool_call_count.hash(&mut hasher);
+                        summary.run_started_at.hash(&mut hasher);
                         summary.last_tool_call_started_at_epoch.hash(&mut hasher);
                     }
                     summaries.len().hash(&mut hasher);
