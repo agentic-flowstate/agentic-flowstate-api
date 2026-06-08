@@ -42,10 +42,16 @@ fn support_agent_prompt_vars(agent_type: &AgentType) -> HashMap<String, String> 
     let mut vars = HashMap::new();
     match agent_type {
         AgentType::ConversationEvaluator => {
-            vars.insert("EVALUATION_CONTEXT".to_string(), String::new());
+            vars.insert(
+                "SUPPORT_CONTEXT_TOOL_ARGS".to_string(),
+                "No child-context tool call is available for this manual chat turn.".to_string(),
+            );
         }
         AgentType::Feedback => {
-            vars.insert("FEEDBACK_CONTEXT".to_string(), String::new());
+            vars.insert(
+                "SUPPORT_CONTEXT_TOOL_ARGS".to_string(),
+                "No child-context tool call is available for this manual chat turn.".to_string(),
+            );
         }
         _ => {}
     }

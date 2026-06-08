@@ -13,9 +13,6 @@ use ticketing_system::{
     CreateChildConversationRequest,
 };
 
-use super::conversation_evaluations::{
-    build_conversation_evaluator_user_prompt, build_conversation_feedback_user_prompt,
-};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 use crate::handlers::chat_stream::{self, ChatCodexOptions, ChatRuntime};
@@ -94,19 +91,10 @@ impl ChildAgentKind {
         }
     }
 
-    fn seed_prompt_var(self) -> &'static str {
-        match self {
-            Self::Evaluator => "EVALUATION_CONTEXT",
-            Self::Feedback => "FEEDBACK_CONTEXT",
-        }
-    }
-
     fn visible_initial_message(self) -> &'static str {
         match self {
-            Self::Evaluator => "Evaluate the parent conversation using the provided context.",
-            Self::Feedback => {
-                "Start a feedback thread for the parent conversation using the provided context."
-            }
+            Self::Evaluator => "Run the evaluator for the parent conversation.",
+            Self::Feedback => "Start a feedback review for the parent conversation.",
         }
     }
 }
@@ -266,17 +254,9 @@ async fn maybe_enqueue_initial_turn(
         return Ok(false);
     }
 
-    let message = match kind {
-        ChildAgentKind::Evaluator => {
-            build_conversation_evaluator_user_prompt(pool, user_id, parent).await?
-        }
-        ChildAgentKind::Feedback => {
-            build_conversation_feedback_user_prompt(pool, user_id, parent, target_message_id)
-                .await?
-        }
-    };
+    ensure_parent_has_transcript(pool, &parent.id, kind).await?;
 
-    enqueue_child_turn(pool, user_id, &child.id, kind, message).await?;
+    enqueue_child_turn(pool, user_id, &child.id, kind, target_message_id).await?;
     child.is_active = Some(true);
     Ok(true)
 }
@@ -286,7 +266,7 @@ async fn enqueue_child_turn(
     user_id: &str,
     child_id: &str,
     kind: ChildAgentKind,
-    seed_context: String,
+    target_message_id: Option<&str>,
 ) -> Result<()> {
     checkpoints::upsert_checkpoint(pool, child_id, "queued", 0)
         .await
@@ -295,7 +275,10 @@ async fn enqueue_child_turn(
     let agent_type = kind.agent_type();
     let codex_options = ChatCodexOptions::default_for_agent(&agent_type);
     let mut prompt_vars = HashMap::new();
-    prompt_vars.insert(kind.seed_prompt_var().to_string(), seed_context);
+    prompt_vars.insert(
+        "SUPPORT_CONTEXT_TOOL_ARGS".to_string(),
+        support_context_tool_args(child_id, user_id, target_message_id),
+    );
     let payload = conversation_turn_jobs::ConversationTurnJobPayload {
         user_id: user_id.to_string(),
         message: kind.visible_initial_message().to_string(),
@@ -315,6 +298,48 @@ async fn enqueue_child_turn(
         .await
         .context("publish child-agent run status")?;
     Ok(())
+}
+
+async fn ensure_parent_has_transcript(
+    pool: &SqlitePool,
+    parent_id: &str,
+    kind: ChildAgentKind,
+) -> Result<()> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_messages \
+         WHERE conversation_id = ? \
+           AND role IN ('user', 'assistant') \
+           AND trim(content) != ''",
+    )
+    .bind(parent_id)
+    .fetch_one(pool)
+    .await
+    .context("count parent transcript messages")?;
+
+    if count == 0 {
+        let label = match kind {
+            ChildAgentKind::Evaluator => "evaluate",
+            ChildAgentKind::Feedback => "use for feedback",
+        };
+        anyhow::bail!("Conversation has no completed user/assistant messages to {label}.");
+    }
+
+    Ok(())
+}
+
+fn support_context_tool_args(
+    child_id: &str,
+    user_id: &str,
+    target_message_id: Option<&str>,
+) -> String {
+    let mut args = serde_json::json!({
+        "child_conversation_id": child_id,
+        "user_id": user_id,
+    });
+    if let Some(target_message_id) = target_message_id {
+        args["target_message_id"] = serde_json::Value::String(target_message_id.to_string());
+    }
+    args.to_string()
 }
 
 async fn count_conversation_messages(pool: &SqlitePool, conversation_id: &str) -> Result<i64> {

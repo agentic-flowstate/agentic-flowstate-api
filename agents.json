@@ -119,13 +119,17 @@
       "model": "codex",
       "effort": "medium",
       "prompt_file": "conversation-evaluator-system.txt",
-      "tools": []
+      "tools": [
+        "mcp__agentic-mcp__get_child_agent_context"
+      ]
     },
     "feedback": {
       "model": "codex",
       "effort": "medium",
       "prompt_file": "feedback.txt",
-      "tools": []
+      "tools": [
+        "mcp__agentic-mcp__get_child_agent_context"
+      ]
     },
     "email": {
       "model": "codex",
