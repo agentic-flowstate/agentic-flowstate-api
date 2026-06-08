@@ -555,16 +555,13 @@ async fn conversation_run_status_snapshot(
     };
     let last_tool_call_started_at_epoch =
         last_tool_call_started_at_epoch(pool, conversation_id, run_started_at).await?;
-    let last_tool_call_started_at =
-        last_tool_call_started_at_epoch.and_then(format_central_tool_call_time);
     let checkpoint_tool_call_count = checkpoint
         .as_ref()
         .map(|cp| cp.tool_call_count)
         .unwrap_or(0);
     let tool_call_count = if is_processing {
-        checkpoint_tool_call_count.max(
-            active_run_tool_call_count(pool, conversation_id, run_started_at).await?,
-        )
+        checkpoint_tool_call_count
+            .max(active_run_tool_call_count(pool, conversation_id, run_started_at).await?)
     } else {
         checkpoint_tool_call_count
     };
