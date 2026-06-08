@@ -98,6 +98,7 @@ pub async fn subscribe_unified_events(
     let org = params.organization;
     let date = params.date;
     let mailbox = params.mailbox;
+    let poll_interval = unified_events_poll_interval(&topics);
     let conversation_resume_after = if topics.contains("conversations") && cursor.is_resume() {
         Some(cursor.event_index)
     } else {
@@ -412,8 +413,9 @@ pub async fn subscribe_unified_events(
                 }
             }
 
-            // Single sleep for all topics — one radio wakeup per cycle
-            tokio::time::sleep(Duration::from_secs(15)).await;
+            // Conversation-only desktop streams need to reflect cross-device
+            // agent starts quickly. Keep broad multi-topic streams conservative.
+            tokio::time::sleep(poll_interval).await;
         }
     };
 
@@ -577,6 +579,14 @@ fn hash_slice_list(slices: &[ticketing_system::Slice]) -> u64 {
     hasher.finish()
 }
 
+fn unified_events_poll_interval(topics: &HashSet<String>) -> Duration {
+    if topics.len() == 1 && topics.contains("conversations") {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(15)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +704,17 @@ mod tests {
         ));
         assert!(caught_up);
         assert_eq!(last_hash, 0);
+    }
+
+    #[test]
+    fn conversation_only_stream_uses_fast_poll_interval() {
+        let topics = HashSet::from(["conversations".to_string()]);
+        assert_eq!(unified_events_poll_interval(&topics), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn mixed_topic_stream_keeps_conservative_poll_interval() {
+        let topics = HashSet::from(["conversations".to_string(), "emails".to_string()]);
+        assert_eq!(unified_events_poll_interval(&topics), Duration::from_secs(15));
     }
 }
