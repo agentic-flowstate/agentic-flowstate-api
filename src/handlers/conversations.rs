@@ -60,7 +60,7 @@ pub struct ConversationSummary {
     #[serde(flatten)]
     pub conversation: Conversation,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_tool_call_started_at: Option<String>,
+    pub last_tool_call_started_at_epoch: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -78,8 +78,6 @@ pub struct ConversationRunStatusResponse {
     pub queued_message_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_started_at: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_tool_call_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tool_call_started_at_epoch: Option<i64>,
     pub server_time: i64,
@@ -160,17 +158,6 @@ fn normalize_checkpoint_status(status: Option<&str>) -> String {
     .to_string()
 }
 
-fn format_central_tool_call_time(timestamp: i64) -> Option<String> {
-    let utc = chrono::DateTime::from_timestamp(timestamp, 0)?;
-    let local = utc.with_timezone(&chrono_tz::America::Chicago);
-    let suffix = if local.format("%p").to_string() == "AM" {
-        "a.m."
-    } else {
-        "p.m."
-    };
-    Some(format!("{} {}", local.format("%-I:%M"), suffix))
-}
-
 #[derive(sqlx::FromRow)]
 struct LastToolCallStartedAtRow {
     conversation_id: String,
@@ -182,10 +169,10 @@ struct RunStartedAtRow {
     started_at: Option<i64>,
 }
 
-async fn last_tool_call_started_at_map(
+async fn last_tool_call_started_at_epoch_map(
     pool: &SqlitePool,
     conversation_ids: &[String],
-) -> anyhow::Result<HashMap<String, String>> {
+) -> anyhow::Result<HashMap<String, i64>> {
     if conversation_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -212,12 +199,7 @@ async fn last_tool_call_started_at_map(
     let rows = query.fetch_all(pool).await?;
     Ok(rows
         .into_iter()
-        .filter_map(|row| {
-            Some((
-                row.conversation_id,
-                format_central_tool_call_time(row.last_started_at?)?,
-            ))
-        })
+        .filter_map(|row| Some((row.conversation_id, row.last_started_at?)))
         .collect())
 }
 
@@ -414,15 +396,31 @@ pub(crate) async fn conversation_summaries(
         .iter()
         .map(|conv| conv.id.clone())
         .collect::<Vec<_>>();
-    let last_tool_calls = last_tool_call_started_at_map(pool, &ids).await?;
+    let mut last_tool_calls = last_tool_call_started_at_epoch_map(pool, &ids).await?;
+
+    for conversation in conversations
+        .iter()
+        .filter(|conv| conv.is_active.unwrap_or(false))
+    {
+        let checkpoint = checkpoints::get_checkpoint(pool, &conversation.id).await?;
+        let run_started_at =
+            active_run_started_at(pool, &conversation.id, checkpoint.as_ref()).await?;
+        if let Some(epoch) =
+            last_tool_call_started_at_epoch(pool, &conversation.id, run_started_at).await?
+        {
+            last_tool_calls.insert(conversation.id.clone(), epoch);
+        } else {
+            last_tool_calls.remove(&conversation.id);
+        }
+    }
 
     Ok(conversations
         .into_iter()
         .map(|conversation| {
-            let last_tool_call_started_at = last_tool_calls.get(&conversation.id).cloned();
+            let last_tool_call_started_at_epoch = last_tool_calls.get(&conversation.id).copied();
             ConversationSummary {
                 conversation,
-                last_tool_call_started_at,
+                last_tool_call_started_at_epoch,
             }
         })
         .collect())
@@ -582,7 +580,6 @@ async fn conversation_run_status_snapshot(
         tool_call_count,
         queued_message_count,
         run_started_at,
-        last_tool_call_started_at,
         last_tool_call_started_at_epoch,
         server_time: chrono::Utc::now().timestamp(),
     })
@@ -1865,7 +1862,7 @@ pub async fn subscribe_conversations(
                         summary.conversation.parent_conversation_id.hash(&mut hasher);
                         summary.conversation.conversation_role.hash(&mut hasher);
                         summary.conversation.child_conversation_count.hash(&mut hasher);
-                        summary.last_tool_call_started_at.hash(&mut hasher);
+                        summary.last_tool_call_started_at_epoch.hash(&mut hasher);
                     }
                     summaries.len().hash(&mut hasher);
                     let current_hash = hasher.finish();
@@ -1990,7 +1987,6 @@ mod tests {
             tool_call_count: 3,
             queued_message_count: 0,
             run_started_at: Some(1_778_539_000),
-            last_tool_call_started_at: Some("11:38 a.m.".to_string()),
             last_tool_call_started_at_epoch: Some(1_778_539_100),
             server_time: 1_778_539_160,
         }
