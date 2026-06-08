@@ -441,6 +441,10 @@ fn hash_conversation_list(convs: &[crate::handlers::conversations::ConversationS
             .conversation
             .child_conversation_count
             .hash(&mut hasher);
+        summary.conversation.status.hash(&mut hasher);
+        summary.conversation.message_count.hash(&mut hasher);
+        summary.conversation.last_event_index.hash(&mut hasher);
+        summary.conversation.is_active.hash(&mut hasher);
         summary.tool_call_count.hash(&mut hasher);
         summary.run_started_at.hash(&mut hasher);
         summary.last_tool_call_started_at_epoch.hash(&mut hasher);
