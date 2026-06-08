@@ -12,6 +12,7 @@ pub mod health_monitor;
 pub mod mcp_wrapper;
 pub mod models;
 pub mod observability;
+pub mod package_updates;
 pub mod rate_limiting;
 pub mod request_logger;
 pub mod retention;

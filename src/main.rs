@@ -12,6 +12,7 @@ mod health_monitor;
 mod mcp_wrapper;
 mod models;
 mod observability;
+mod package_updates;
 mod rate_limiting;
 mod request_logger;
 mod retention;
@@ -959,6 +960,18 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/dailies/:daily_id/runs/:run_id/read",
             post(handlers::mark_daily_run_read),
+        )
+        .route(
+            "/api/dailies/:daily_id/runs/:run_id/package-update-review",
+            get(handlers::get_package_update_review),
+        )
+        .route(
+            "/api/dailies/:daily_id/runs/:run_id/package-update-review/approve",
+            post(handlers::approve_package_update_review),
+        )
+        .route(
+            "/api/dailies/:daily_id/runs/:run_id/package-update-review/deny",
+            post(handlers::deny_package_update_review),
         )
         .route(
             "/api/library/documents",

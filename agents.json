@@ -32,6 +32,12 @@
         "mcp__agentic-mcp__get_artifact"
       ]
     },
+    "package-update-review": {
+      "model": "codex",
+      "effort": "low",
+      "prompt_file": "package-update-review.txt",
+      "tools": []
+    },
     "research-synthesis": {
       "model": "codex",
       "effort": "xhigh",

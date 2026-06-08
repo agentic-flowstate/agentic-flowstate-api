@@ -13,6 +13,7 @@ use crate::agents::executor::run_codex_agent_turn;
 use crate::agents::prompts::load_prompt;
 use crate::agents::working_dir::resolve_working_dir;
 use crate::agents::AgentType;
+use crate::package_updates::{self, PackageUpdateScanReport};
 
 const POLL_SECONDS: u64 = 60;
 
@@ -95,6 +96,10 @@ async fn execute_daily_run(
     daily: ticketing_system::Daily,
     run: ticketing_system::DailyRun,
 ) -> Result<()> {
+    if is_package_update_daily(&daily) {
+        return execute_package_update_run(pool, daily, run).await;
+    }
+
     let agent_type = agent_type_for_daily(&daily)?;
     let working_dir = resolve_daily_working_dir(&pool, &agent_type, &daily.organization).await?;
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -259,6 +264,207 @@ async fn execute_daily_run(
     Ok(())
 }
 
+async fn execute_package_update_run(
+    pool: Arc<SqlitePool>,
+    daily: ticketing_system::Daily,
+    run: ticketing_system::DailyRun,
+) -> Result<()> {
+    let report = package_updates::scan_available_updates()
+        .await
+        .context("Failed to scan package updates")?;
+    let report_json =
+        serde_json::to_string_pretty(&report).context("Failed to encode package update report")?;
+
+    if report.updates.is_empty() {
+        ticketing_system::dailies::complete_run(
+            &pool,
+            &run.run_id,
+            ticketing_system::DailyRunResult {
+                status: "completed".to_string(),
+                agent_run_id: None,
+                artifact_id: None,
+                summary: Some("No package updates available.".to_string()),
+                lookup_summary: Some(package_update_lookup_summary(&report)),
+                sources_summary: None,
+                error: None,
+                silent: true,
+            },
+        )
+        .await?;
+        tracing::info!(
+            "[DAILIES] package update run {} completed silently with no updates",
+            run.run_id
+        );
+        return Ok(());
+    }
+
+    let review = ticketing_system::package_update_reviews::create_review(
+        &pool,
+        ticketing_system::CreatePackageUpdateReviewRequest {
+            run_id: run.run_id.clone(),
+            daily_id: daily.daily_id.clone(),
+            update_count: report.updates.len() as i64,
+            scanner_report_json: report_json.clone(),
+        },
+    )
+    .await
+    .context("Failed to create package update review")?;
+
+    let agent_type = AgentType::PackageUpdateReview;
+    let working_dir = resolve_daily_working_dir(&pool, &agent_type, &daily.organization).await?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let prompt = build_package_update_prompt(&daily, &run, &review.review_id, &report_json);
+    let system_prompt = load_prompt("package-update-review", HashMap::new())
+        .context("Failed to load package update review prompt")?;
+
+    ticketing_system::agent_runs::create_agent_run(
+        &pool,
+        ticketing_system::CreateAgentRunRequest {
+            session_id: session_id.clone(),
+            organization: Some(daily.organization.clone()),
+            epic_id: None,
+            slice_id: None,
+            ticket_id: None,
+            agent_type: agent_type.as_str().to_string(),
+            input_message: prompt.clone(),
+        },
+    )
+    .await
+    .context("Failed to create package update review agent run")?;
+
+    ticketing_system::dailies::attach_agent_run(&pool, &run.run_id, &session_id)
+        .await
+        .context("Failed to attach package update daily run to agent run")?;
+
+    let turn = run_codex_agent_turn(
+        &agent_type,
+        &working_dir,
+        &system_prompt,
+        &prompt,
+        None,
+        true,
+        None,
+        &session_id,
+    )
+    .await;
+
+    match turn {
+        Ok(turn) => {
+            let summary = turn.output_summary.trim().to_string();
+            let completed_at = Utc::now().to_rfc3339();
+            ticketing_system::agent_runs::update_agent_run(
+                &pool,
+                &ticketing_system::AgentRun {
+                    session_id: session_id.clone(),
+                    organization: Some(daily.organization.clone()),
+                    epic_id: None,
+                    slice_id: None,
+                    ticket_id: None,
+                    agent_type: agent_type.as_str().to_string(),
+                    status: "completed".to_string(),
+                    started_at: run_started_at(&run),
+                    completed_at: Some(completed_at),
+                    input_message: prompt.clone(),
+                    output_summary: Some(summary.clone()),
+                    tool_call_count: turn.tool_call_count,
+                    cc_session_id: turn.runtime_session_id.clone(),
+                },
+            )
+            .await
+            .context("Failed to update completed package update agent run")?;
+
+            ticketing_system::package_update_reviews::set_agent_summary(
+                &pool,
+                &review.review_id,
+                &summary,
+            )
+            .await?;
+
+            let artifact = ticketing_system::artifacts::create_artifact(
+                &pool,
+                ticketing_system::CreateArtifactRequest {
+                    title: format!("Package update review - {}", Utc::now().format("%Y-%m-%d")),
+                    content: format!(
+                        "{}\n\n# Scanner Report\n\n```json\n{}\n```",
+                        summary, report_json
+                    ),
+                    artifact_type: "agent-output".to_string(),
+                    created_by: "package-update-review".to_string(),
+                    source_step_id: Some(run.run_id.clone()),
+                    organization: daily.organization.clone(),
+                    epic_id: None,
+                    slice_id: None,
+                    ticket_id: None,
+                    agent_run_id: Some(session_id.clone()),
+                },
+            )
+            .await
+            .context("Failed to create package update review artifact")?;
+
+            ticketing_system::dailies::complete_run(
+                &pool,
+                &run.run_id,
+                ticketing_system::DailyRunResult {
+                    status: "completed".to_string(),
+                    agent_run_id: Some(session_id),
+                    artifact_id: Some(artifact.artifact_id),
+                    summary: Some(summary),
+                    lookup_summary: Some(package_update_lookup_summary(&report)),
+                    sources_summary: None,
+                    error: None,
+                    silent: false,
+                },
+            )
+            .await?;
+        }
+        Err(e) => {
+            let completed_at = Utc::now().to_rfc3339();
+            let error = e.to_string();
+            let _ = ticketing_system::agent_runs::update_agent_run(
+                &pool,
+                &ticketing_system::AgentRun {
+                    session_id: session_id.clone(),
+                    organization: Some(daily.organization.clone()),
+                    epic_id: None,
+                    slice_id: None,
+                    ticket_id: None,
+                    agent_type: agent_type.as_str().to_string(),
+                    status: "failed".to_string(),
+                    started_at: run_started_at(&run),
+                    completed_at: Some(completed_at),
+                    input_message: prompt,
+                    output_summary: Some(error.clone()),
+                    tool_call_count: 0,
+                    cc_session_id: None,
+                },
+            )
+            .await;
+
+            ticketing_system::dailies::complete_run(
+                &pool,
+                &run.run_id,
+                ticketing_system::DailyRunResult {
+                    status: "failed".to_string(),
+                    agent_run_id: Some(session_id),
+                    artifact_id: None,
+                    summary: None,
+                    lookup_summary: Some(package_update_lookup_summary(&report)),
+                    sources_summary: None,
+                    error: Some(error),
+                    silent: false,
+                },
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_package_update_daily(daily: &ticketing_system::Daily) -> bool {
+    daily.kind == "package-updates" || daily.agent_type == "package-update-review"
+}
+
 fn agent_type_for_daily(daily: &ticketing_system::Daily) -> Result<AgentType> {
     match daily.agent_type.as_str() {
         "daily-research" => Ok(AgentType::DailyResearch),
@@ -311,6 +517,42 @@ fn build_run_prompt(
             .unwrap_or_else(|| "not set".to_string()),
         daily.prompt,
         build_prior_run_context(prior_runs)
+    )
+}
+
+fn build_package_update_prompt(
+    daily: &ticketing_system::Daily,
+    run: &ticketing_system::DailyRun,
+    review_id: &str,
+    report_json: &str,
+) -> String {
+    format!(
+        "A daily Mac Mini package-update scan found available updates.\n\nDaily ID: {}\nRun ID: {}\nReview ID: {}\nTitle: {}\n\nYour job:\n- Tell Alex concisely what updates are available and why they may matter.\n- Mention Codex/OpenAI CLI updates prominently if present.\n- Do not file tickets, do not run shell commands, do not update packages.\n- Keep it short enough to read in the Dailies tab.\n- End with one plain sentence that the app will offer Approve and Deny actions.\n\nScanner report:\n```json\n{}\n```\n\nReturn markdown only.",
+        daily.daily_id, run.run_id, review_id, daily.title, report_json
+    )
+}
+
+fn package_update_lookup_summary(report: &PackageUpdateScanReport) -> String {
+    let manager_lines = report
+        .managers
+        .iter()
+        .map(|manager| {
+            format!(
+                "- {}: {} update{}",
+                manager.manager,
+                manager.update_count,
+                if manager.update_count == 1 { "" } else { "s" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "Host: {}\nTimestamp: {}\nUpdates found: {}\n\n{}",
+        report.host,
+        report.timestamp,
+        report.updates.len(),
+        manager_lines
     )
 }
 

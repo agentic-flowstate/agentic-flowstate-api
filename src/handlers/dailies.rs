@@ -11,8 +11,10 @@ use std::sync::Arc;
 
 use crate::auth_middleware::AuthenticatedUser;
 use crate::dailies_scheduler;
+use crate::package_updates::{self, PackageUpdateScanReport};
 
 const DAILIES_STORAGE_ORGANIZATION: &str = "agentic-flowstate";
+const PACKAGE_UPDATE_OWNER_USER_ID: &str = "alex";
 
 #[derive(Debug, Deserialize)]
 pub struct RunsQuery {
@@ -23,6 +25,12 @@ pub struct RunsQuery {
 pub struct DailyDetail {
     pub daily: ticketing_system::Daily,
     pub runs: Vec<ticketing_system::DailyRun>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PackageUpdateReviewDetail {
+    pub review: ticketing_system::PackageUpdateReview,
+    pub report: PackageUpdateScanReport,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +48,10 @@ pub async fn list_dailies(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
+    if let Err(e) = ensure_package_update_daily(&pool, &user.user_id).await {
+        return server_error("Failed to ensure package update Daily", e);
+    }
+
     match ticketing_system::dailies::list_dailies(&pool, Some(&user.user_id), None).await {
         Ok(dailies) => (StatusCode::OK, Json(json!(dailies))).into_response(),
         Err(e) => server_error("Failed to list dailies", e),
@@ -164,6 +176,165 @@ pub async fn mark_daily_run_read(
     }
 }
 
+pub async fn get_package_update_review(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((daily_id, run_id)): Path<(String, String)>,
+) -> Response {
+    match user_package_update_review(&pool, &user.user_id, &daily_id, &run_id).await {
+        Ok(Some(detail)) => (StatusCode::OK, Json(json!(detail))).into_response(),
+        Ok(None) => not_found("Package update review not found"),
+        Err(e) => server_error("Failed to fetch package update review", e),
+    }
+}
+
+pub async fn deny_package_update_review(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((daily_id, run_id)): Path<(String, String)>,
+) -> Response {
+    let Some(_) = (match user_package_update_review(&pool, &user.user_id, &daily_id, &run_id).await
+    {
+        Ok(value) => value,
+        Err(e) => return server_error("Failed to fetch package update review", e),
+    }) else {
+        return not_found("Package update review not found");
+    };
+
+    match ticketing_system::package_update_reviews::deny_for_user_run(&pool, &user.user_id, &run_id)
+        .await
+    {
+        Ok(Some(review)) => (StatusCode::OK, Json(json!(review))).into_response(),
+        Ok(None) => bad_request_text("Package update review is not pending"),
+        Err(e) => server_error("Failed to deny package update review", e),
+    }
+}
+
+pub async fn approve_package_update_review(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path((daily_id, run_id)): Path<(String, String)>,
+) -> Response {
+    let detail = match user_package_update_review(&pool, &user.user_id, &daily_id, &run_id).await {
+        Ok(Some(detail)) => detail,
+        Ok(None) => return not_found("Package update review not found"),
+        Err(e) => return server_error("Failed to fetch package update review", e),
+    };
+
+    if detail.review.status != "pending" && detail.review.status != "failed" {
+        return bad_request_text("Package update review is not pending");
+    }
+
+    let review = match ticketing_system::package_update_reviews::mark_applying_for_user_run(
+        &pool,
+        &user.user_id,
+        &run_id,
+    )
+    .await
+    {
+        Ok(Some(review)) => review,
+        Ok(None) => return bad_request_text("Package update review is not pending"),
+        Err(e) => return server_error("Failed to approve package update review", e),
+    };
+
+    let pool_clone = pool.clone();
+    let review_id = review.review_id.clone();
+    let report = detail.report;
+    tokio::spawn(async move {
+        match package_updates::apply_updates(&report).await {
+            Ok(output) => {
+                if let Err(e) = ticketing_system::package_update_reviews::complete_apply(
+                    &pool_clone,
+                    &review_id,
+                    &output,
+                )
+                .await
+                {
+                    tracing::error!(
+                        "[PACKAGE_UPDATES] failed to mark review {} applied: {}",
+                        review_id,
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                if let Err(update_error) = ticketing_system::package_update_reviews::fail_apply(
+                    &pool_clone,
+                    &review_id,
+                    &e.to_string(),
+                )
+                .await
+                {
+                    tracing::error!(
+                        "[PACKAGE_UPDATES] failed to mark review {} failed: {}",
+                        review_id,
+                        update_error
+                    );
+                }
+            }
+        }
+    });
+
+    (StatusCode::ACCEPTED, Json(json!(review))).into_response()
+}
+
+async fn ensure_package_update_daily(pool: &SqlitePool, user_id: &str) -> anyhow::Result<()> {
+    if user_id != PACKAGE_UPDATE_OWNER_USER_ID {
+        return Ok(());
+    }
+
+    let dailies = ticketing_system::dailies::list_dailies(pool, Some(user_id), None).await?;
+    if dailies.iter().any(|daily| daily.kind == "package-updates") {
+        return Ok(());
+    }
+
+    ticketing_system::dailies::create_daily(
+        pool,
+        ticketing_system::CreateDailyRequest {
+            user_id: user_id.to_string(),
+            organization: DAILIES_STORAGE_ORGANIZATION.to_string(),
+            title: "Package Updates".to_string(),
+            description: "Daily Mac Mini package update check with approve or deny review."
+                .to_string(),
+            kind: "package-updates".to_string(),
+            tags: vec!["Mac Mini".to_string(), "Packages".to_string()],
+            cadence_unit: "day".to_string(),
+            cadence_interval: 1,
+            run_until: None,
+            next_run_at: Some(chrono::Utc::now().timestamp()),
+            unread_pause_threshold: 12,
+            agent_type: "package-update-review".to_string(),
+            prompt: "Scan installed package managers, summarize available updates only when updates exist, and wait for user approval before applying."
+                .to_string(),
+            search_query: "local mac mini package updates".to_string(),
+            max_age_hours: None,
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn user_package_update_review(
+    pool: &SqlitePool,
+    user_id: &str,
+    daily_id: &str,
+    run_id: &str,
+) -> anyhow::Result<Option<PackageUpdateReviewDetail>> {
+    let Some(review) =
+        ticketing_system::package_update_reviews::get_review_for_user_run(pool, user_id, run_id)
+            .await?
+    else {
+        return Ok(None);
+    };
+    if review.daily_id != daily_id {
+        return Ok(None);
+    }
+
+    let report = package_updates::parse_report(&review.scanner_report_json)?;
+    Ok(Some(PackageUpdateReviewDetail { review, report }))
+}
+
 fn not_found(message: &str) -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -176,6 +347,14 @@ fn bad_request(context: &str, error: anyhow::Error) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({ "error": format!("{context}: {error}") })),
+    )
+        .into_response()
+}
+
+fn bad_request_text(message: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": message.to_string() })),
     )
         .into_response()
 }
