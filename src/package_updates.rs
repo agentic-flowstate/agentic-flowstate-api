@@ -254,7 +254,7 @@ async fn scan_npm_global() -> Result<Vec<PackageUpdate>> {
 }
 
 async fn scan_rustup() -> Result<Vec<PackageUpdate>> {
-    let output = run_command("rustup", &["check"], &[0, 1]).await?;
+    let output = run_command("rustup", &["check"], &[0, 100]).await?;
     let mut updates = Vec::new();
 
     for line in output.stdout.lines() {
