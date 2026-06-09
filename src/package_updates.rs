@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, env};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,8 +298,14 @@ async fn run_apply_command(command: &str, args: Vec<String>) -> Result<String> {
 }
 
 async fn run_command(command: &str, args: &[&str], allowed_codes: &[i32]) -> Result<CommandOutput> {
-    let output = Command::new(command)
-        .args(args)
+    let tool_path = package_update_tool_path()?;
+    let mut env_args = Vec::with_capacity(args.len() + 2);
+    env_args.push(format!("PATH={tool_path}"));
+    env_args.push(command.to_string());
+    env_args.extend(args.iter().map(|arg| (*arg).to_string()));
+
+    let output = Command::new("/usr/bin/env")
+        .args(&env_args)
         .output()
         .await
         .with_context(|| format!("Failed to spawn package update command: {command}"))?;
@@ -325,4 +331,33 @@ async fn run_command(command: &str, args: &[&str], allowed_codes: &[i32]) -> Res
         stderr,
         status_code,
     })
+}
+
+fn package_update_tool_path() -> Result<String> {
+    let home_dir =
+        dirs::home_dir().context("Failed to resolve home directory for package update PATH")?;
+    let home = home_dir
+        .to_str()
+        .context("Home directory path is not valid UTF-8")?;
+
+    let mut entries = vec![
+        format!("{home}/.cargo/bin"),
+        format!("{home}/.local/bin"),
+        "/opt/homebrew/opt/node@20/bin".to_string(),
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        "/usr/bin".to_string(),
+        "/bin".to_string(),
+    ];
+
+    if let Ok(existing_path) = env::var("PATH") {
+        for entry in existing_path.split(':').filter(|entry| !entry.is_empty()) {
+            let candidate = entry.to_string();
+            if !entries.iter().any(|existing| existing == &candidate) {
+                entries.push(candidate);
+            }
+        }
+    }
+
+    Ok(entries.join(":"))
 }

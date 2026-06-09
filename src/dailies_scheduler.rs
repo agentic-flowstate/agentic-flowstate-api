@@ -31,7 +31,7 @@ pub fn spawn_dailies_scheduler(pool: Arc<SqlitePool>, token: CancellationToken) 
             }
 
             if let Err(e) = run_due_once(pool.clone()).await {
-                tracing::error!("[DAILIES] scheduler tick failed: {}", e);
+                tracing::error!("[DAILIES] scheduler tick failed: {:#}", e);
             }
         }
     });
@@ -52,7 +52,7 @@ pub async fn run_due_once(pool: Arc<SqlitePool>) -> Result<()> {
     let due = ticketing_system::dailies::due_dailies(&pool, now, 3).await?;
     for daily in due {
         if let Err(e) = spawn_daily_run(pool.clone(), daily, now).await {
-            tracing::error!("[DAILIES] failed to spawn daily run: {}", e);
+            tracing::error!("[DAILIES] failed to spawn daily run: {:#}", e);
         }
     }
 
@@ -110,11 +110,12 @@ pub async fn spawn_daily_run(
     let run_clone = run.clone();
     tokio::spawn(async move {
         if let Err(e) = execute_daily_run(pool.clone(), daily.clone(), run_clone.clone()).await {
+            let error = format!("{e:#}");
             tracing::error!(
                 "[DAILIES] run {} for {} failed before result update: {}",
                 run_clone.run_id,
                 daily.daily_id,
-                e
+                error
             );
             let _ = ticketing_system::dailies::complete_run(
                 &pool,
@@ -126,7 +127,7 @@ pub async fn spawn_daily_run(
                     summary: None,
                     lookup_summary: None,
                     sources_summary: None,
-                    error: Some(e.to_string()),
+                    error: Some(error),
                     silent: false,
                 },
             )
