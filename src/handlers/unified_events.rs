@@ -2,7 +2,7 @@
 //!
 //! Replaces individual SSE endpoints (data/subscribe, my-tickets/subscribe,
 //! emails/subscribe, daily-plan/subscribe, conversations/subscribe, dms/subscribe,
-//! meetings/subscribe) with ONE connection that handles all topics.
+//! meetings/subscribe, library snapshots) with ONE connection that handles all topics.
 //!
 //! Benefits:
 //! - Single TCP connection instead of 5-7 simultaneous ones
@@ -34,10 +34,10 @@ use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
 #[derive(Debug, Deserialize)]
 pub struct UnifiedEventsQuery {
     /// Comma-separated list of topics to subscribe to.
-    /// Available: tickets, emails, daily_plan, conversations, data, dms, meetings
+    /// Available: tickets, emails, daily_plan, conversations, data, dms, meetings, library
     /// Default: tickets,emails,daily_plan
     pub topics: Option<String>,
-    /// Organization for org-scoped topics (data, conversations)
+    /// Organization for org-scoped topics (data, conversations, library)
     pub organization: Option<String>,
     /// Date for daily_plan topic (defaults to today)
     pub date: Option<String>,
@@ -126,6 +126,7 @@ pub async fn subscribe_unified_events(
         let mut hash_epics: u64 = 0;
         let mut hash_slices: u64 = 0;
         let mut hash_data_tickets: u64 = 0;
+        let mut hash_library: u64 = 0;
         let mut conversations_caught_up = conversation_resume_after.is_none();
 
         // Cache org memberships (rarely change during session)
@@ -351,6 +352,31 @@ pub async fn subscribe_unified_events(
                         });
                         if let Ok(json) = serde_json::to_string(&payload) {
                             yield Ok(Event::default().event("meetings").data(json));
+                        }
+                    }
+                }
+            }
+
+            // ── LIBRARY (artifacts/documents for one org) ───────────────
+            if topics.contains("library") {
+                if let Some(ref org_name) = validated_org {
+                    let artifacts_result = ticketing_system::artifacts::list_by_org(&pool, org_name).await;
+                    let documents_result = ticketing_system::documents::list_documents(
+                        &pool, org_name, None, None, None,
+                    ).await;
+
+                    if let (Ok(artifacts), Ok(documents)) = (artifacts_result, documents_result) {
+                        let hash = hash_library_lists(&artifacts, &documents);
+                        if hash != hash_library {
+                            hash_library = hash;
+                            let payload = serde_json::json!({
+                                "type": "library",
+                                "artifacts": artifacts,
+                                "documents": documents,
+                            });
+                            if let Ok(json) = serde_json::to_string(&payload) {
+                                yield Ok(Event::default().event("library").data(json));
+                            }
                         }
                     }
                 }
@@ -601,6 +627,33 @@ fn hash_slice_list(slices: &[ticketing_system::Slice]) -> u64 {
     hasher.finish()
 }
 
+fn hash_library_lists(
+    artifacts: &[ticketing_system::ArtifactSummary],
+    documents: &[ticketing_system::DocumentSummary],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for artifact in artifacts {
+        artifact.artifact_id.hash(&mut hasher);
+        artifact.title.hash(&mut hasher);
+        artifact.artifact_type.hash(&mut hasher);
+        artifact.ticket_id.hash(&mut hasher);
+        artifact.updated_at_iso.hash(&mut hasher);
+        artifact.content_length.hash(&mut hasher);
+    }
+    artifacts.len().hash(&mut hasher);
+
+    for document in documents {
+        document.document_id.hash(&mut hasher);
+        document.filename.hash(&mut hasher);
+        document.mime_type.hash(&mut hasher);
+        document.size_bytes.hash(&mut hasher);
+        document.ticket_id.hash(&mut hasher);
+        document.updated_at_iso.hash(&mut hasher);
+    }
+    documents.len().hash(&mut hasher);
+    hasher.finish()
+}
+
 fn unified_events_poll_interval(topics: &HashSet<String>) -> Duration {
     if topics.len() == 1 && topics.contains("conversations") {
         Duration::from_secs(2)
@@ -614,7 +667,7 @@ mod tests {
     use super::*;
 
     use crate::handlers::conversations::ConversationSummary;
-    use ticketing_system::Conversation;
+    use ticketing_system::{ArtifactSummary, Conversation, DocumentSummary};
 
     fn conversation_summary(
         updated_at: &str,
@@ -649,6 +702,46 @@ mod tests {
             tool_call_count: None,
             run_started_at,
             last_tool_call_started_at_epoch,
+        }
+    }
+
+    fn artifact_summary(updated_at_iso: &str) -> ArtifactSummary {
+        ArtifactSummary {
+            artifact_id: "A-12345678".to_string(),
+            title: "Research note".to_string(),
+            artifact_type: "research".to_string(),
+            created_by: "codex".to_string(),
+            source_step_id: None,
+            organization: "agentic-flowstate".to_string(),
+            epic_id: Some("frontend".to_string()),
+            slice_id: Some("ios-app".to_string()),
+            ticket_id: Some("T-12345678".to_string()),
+            agent_run_id: None,
+            content_length: 512,
+            created_at: 1_780_956_000,
+            updated_at: 1_780_956_001,
+            created_at_iso: "2026-06-08T22:00:00Z".to_string(),
+            updated_at_iso: updated_at_iso.to_string(),
+        }
+    }
+
+    fn document_summary(size_bytes: i64) -> DocumentSummary {
+        DocumentSummary {
+            document_id: "D-12345678".to_string(),
+            filename: "brief.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            size_bytes,
+            description: Some("Brief".to_string()),
+            document_type: "pdf".to_string(),
+            organization: "agentic-flowstate".to_string(),
+            epic_id: Some("frontend".to_string()),
+            slice_id: Some("ios-app".to_string()),
+            ticket_id: Some("T-12345678".to_string()),
+            created_by: "codex".to_string(),
+            created_at: 1_780_956_000,
+            updated_at: 1_780_956_001,
+            created_at_iso: "2026-06-08T22:00:00Z".to_string(),
+            updated_at_iso: "2026-06-08T22:00:01Z".to_string(),
         }
     }
 
@@ -744,5 +837,20 @@ mod tests {
             unified_events_poll_interval(&topics),
             Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn library_hash_changes_when_artifact_or_document_metadata_changes() {
+        let artifacts = vec![artifact_summary("2026-06-08T22:00:01Z")];
+        let documents = vec![document_summary(1024)];
+
+        let first = hash_library_lists(&artifacts, &documents);
+        assert_eq!(first, hash_library_lists(&artifacts, &documents));
+
+        let changed_artifacts = vec![artifact_summary("2026-06-08T22:05:01Z")];
+        assert_ne!(first, hash_library_lists(&changed_artifacts, &documents));
+
+        let changed_documents = vec![document_summary(2048)];
+        assert_ne!(first, hash_library_lists(&artifacts, &changed_documents));
     }
 }
