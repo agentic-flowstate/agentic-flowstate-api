@@ -481,7 +481,7 @@ async fn repair_checkpoint_from_active_durable_work(
     Ok(true)
 }
 
-async fn conversation_run_status_snapshot(
+pub(crate) async fn conversation_run_status_snapshot(
     pool: &SqlitePool,
     conversation_id: &str,
     manager: Option<&ChatClientManager>,

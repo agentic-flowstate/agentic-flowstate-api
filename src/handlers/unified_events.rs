@@ -28,6 +28,7 @@ use ticketing_system::SqlitePool;
 
 use crate::auth_middleware::AuthenticatedUser;
 
+use super::chat_client_manager::ChatClientManager;
 use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +75,7 @@ impl UnifiedEventsQuery {
 ///   data: {"unread_emails":3}
 pub async fn subscribe_unified_events(
     State(pool): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     headers: HeaderMap,
     Query(params): Query<UnifiedEventsQuery>,
@@ -259,9 +261,29 @@ pub async fn subscribe_unified_events(
 
             // ── CONVERSATIONS ────────────────────────────────────────────
             if topics.contains("conversations") {
-                if let Ok(convs) = ticketing_system::conversations::list_conversations(
+                if let Ok(mut convs) = ticketing_system::conversations::list_conversations(
                     &pool, validated_org.as_deref(), Some(&user_id), None, None, None, None,
                 ).await {
+                    for conv in &mut convs {
+                        if conv.is_active == Some(true) {
+                            match crate::handlers::conversations::conversation_run_status_snapshot(
+                                &pool,
+                                &conv.id,
+                                Some(manager.as_ref()),
+                            ).await {
+                                Ok(status) => {
+                                    conv.is_active = Some(status.is_processing);
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        conversation_id = %conv.id,
+                                        "Failed to normalize conversation run status for unified SSE: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let summaries = match crate::handlers::conversations::conversation_summaries(&pool, convs).await {
                         Ok(summaries) => summaries,
                         Err(e) => {
