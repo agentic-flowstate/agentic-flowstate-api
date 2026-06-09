@@ -24,6 +24,15 @@ pub struct CreateSliceRequest {
 #[derive(Debug, Deserialize)]
 pub struct CreateTicketHttpBody {
     pub title: String,
+    pub description: Option<String>,
+    pub ticket_type: Option<String>,
+    pub milestone_id: Option<String>,
+    pub blocked_by: Option<Vec<String>>,
+    pub assignee: Option<String>,
+    pub agent: Option<String>,
+    pub repository: Option<String>,
+    pub due_date: Option<String>,
+    pub classification: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

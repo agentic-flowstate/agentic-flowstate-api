@@ -194,16 +194,12 @@ pub async fn create_ticket(
             .next()
             .unwrap_or("0")
     );
-    let args = json!({
-        "organization": organization,
-        "epic_id": epic_id,
-        "slice_id": slice_id,
-        "tickets": [{
-            "ref": ref_handle,
-            "title": request.title,
-            "ticket_type": "milestone",
-        }]
-    });
+    let args = match create_ticket_args(&organization, &epic_id, &slice_id, &ref_handle, request) {
+        Ok(args) => args,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+    };
 
     match call_mcp_tool("create_slice_tickets", Some(args)).await {
         Ok(result) => {
@@ -226,6 +222,64 @@ pub async fn create_ticket(
                 .into_response()
         }
     }
+}
+
+fn create_ticket_args(
+    organization: &str,
+    epic_id: &str,
+    slice_id: &str,
+    ref_handle: &str,
+    request: CreateTicketHttpBody,
+) -> Result<serde_json::Value, String> {
+    let title = request.title.trim();
+    if title.is_empty() {
+        return Err("Ticket title is required.".to_string());
+    }
+
+    let due_date = request.due_date.as_deref().map(str::trim).unwrap_or("");
+    if due_date.is_empty() {
+        return Err("Ticket due_date is required.".to_string());
+    }
+
+    let ticket_type = request
+        .ticket_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("task");
+    if !matches!(ticket_type, "task" | "bug" | "milestone") {
+        return Err("ticket_type must be one of: task, bug, milestone.".to_string());
+    }
+
+    let milestone_id = request
+        .milestone_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if ticket_type != "milestone" && milestone_id.is_none() {
+        return Err("milestone_id is required when creating task or bug tickets.".to_string());
+    }
+
+    let item = json!({
+        "ref": ref_handle,
+        "title": title,
+        "description": request.description,
+        "ticket_type": ticket_type,
+        "milestone_id": milestone_id,
+        "blocked_by": request.blocked_by,
+        "assignee": request.assignee,
+        "agent": request.agent,
+        "repository": request.repository,
+        "due_date": due_date,
+        "classification": request.classification,
+    });
+
+    Ok(json!({
+        "organization": organization,
+        "epic_id": epic_id,
+        "slice_id": slice_id,
+        "tickets": [item]
+    }))
 }
 
 // Update ticket with full path (epic_id, slice_id, ticket_id)
@@ -397,6 +451,78 @@ fn parse_ticket_type(value: &str) -> anyhow::Result<TicketType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_ticket_args_preserves_full_create_fields() {
+        let request: CreateTicketHttpBody = serde_json::from_value(json!({
+            "title": "Create from macOS",
+            "description": "Detailed work",
+            "ticket_type": "bug",
+            "milestone_id": "T-MILESTONE",
+            "blocked_by": ["T-BLOCKER"],
+            "assignee": "Alex",
+            "agent": "codex",
+            "repository": "agentic-flowstate-app",
+            "due_date": "2026-06-09",
+            "classification": "automated"
+        }))
+        .expect("decode request");
+
+        let args = create_ticket_args(
+            "agentic-flowstate",
+            "frontend",
+            "ios-app",
+            "api-test",
+            request,
+        )
+        .expect("create args");
+
+        assert_eq!(args["organization"], "agentic-flowstate");
+        assert_eq!(args["epic_id"], "frontend");
+        assert_eq!(args["slice_id"], "ios-app");
+        let ticket = &args["tickets"][0];
+        assert_eq!(ticket["ref"], "api-test");
+        assert_eq!(ticket["title"], "Create from macOS");
+        assert_eq!(ticket["description"], "Detailed work");
+        assert_eq!(ticket["ticket_type"], "bug");
+        assert_eq!(ticket["milestone_id"], "T-MILESTONE");
+        assert_eq!(ticket["blocked_by"][0], "T-BLOCKER");
+        assert_eq!(ticket["assignee"], "Alex");
+        assert_eq!(ticket["agent"], "codex");
+        assert_eq!(ticket["repository"], "agentic-flowstate-app");
+        assert_eq!(ticket["due_date"], "2026-06-09");
+        assert_eq!(ticket["classification"], "automated");
+    }
+
+    #[test]
+    fn create_ticket_args_requires_due_date() {
+        let request: CreateTicketHttpBody = serde_json::from_value(json!({
+            "title": "Missing due date",
+            "ticket_type": "milestone"
+        }))
+        .expect("decode request");
+
+        let error = create_ticket_args("org", "epic", "slice", "ref", request)
+            .expect_err("due date should be required");
+        assert_eq!(error, "Ticket due_date is required.");
+    }
+
+    #[test]
+    fn create_ticket_args_requires_milestone_for_task_or_bug() {
+        let request: CreateTicketHttpBody = serde_json::from_value(json!({
+            "title": "Missing milestone",
+            "ticket_type": "task",
+            "due_date": "2026-06-09"
+        }))
+        .expect("decode request");
+
+        let error = create_ticket_args("org", "epic", "slice", "ref", request)
+            .expect_err("milestone_id should be required");
+        assert_eq!(
+            error,
+            "milestone_id is required when creating task or bug tickets."
+        );
+    }
 
     #[test]
     fn update_ticket_request_detects_full_field_updates() {
