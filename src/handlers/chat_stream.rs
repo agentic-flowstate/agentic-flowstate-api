@@ -29,7 +29,7 @@ use crate::agents::codex_app_server::{launchd_safe_path, normalize_reasoning_eff
 use crate::agents::{AgentType, AgentsConfig, StreamEvent};
 use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
 use crate::rate_limiting::{self, RateLimitDecision, StreamPermit};
-use ticketing_system::{checkpoints, conversation_turn_jobs};
+use ticketing_system::{agent_runners, checkpoints, conversation_turn_jobs};
 
 /// Image data attached to a chat message (base64-encoded)
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -401,6 +401,37 @@ pub struct ChatSubmitResponse {
     pub accepted_at_ms: i64,
 }
 
+async fn has_existing_active_conversation_turn(
+    db: &SqlitePool,
+    manager: &ChatClientManager,
+    conversation_id: &str,
+) -> bool {
+    if manager.has_app_server_turn(conversation_id).await {
+        return true;
+    }
+    if WORKER_MANAGER.has_worker(conversation_id).await {
+        return true;
+    }
+    if agent_runners::has_active_turn_for_conversation(db, conversation_id)
+        .await
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if conversation_turn_jobs::has_active_job_for_conversation(db, conversation_id)
+        .await
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    checkpoints::get_checkpoint(db, conversation_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|checkpoint| matches!(checkpoint.status.as_str(), "queued" | "pending" | "running"))
+        .unwrap_or(false)
+}
+
 async fn authorize_conversation_turn(
     db: &SqlitePool,
     conversation_id: &str,
@@ -436,7 +467,7 @@ async fn authorize_conversation_turn(
 /// open.
 pub async fn submit(
     db: Arc<SqlitePool>,
-    _manager: Arc<ChatClientManager>,
+    manager: Arc<ChatClientManager>,
     message: String,
     conversation_id: Option<String>,
     config: ChatConfig,
@@ -472,6 +503,9 @@ pub async fn submit(
     if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
         return response;
     }
+
+    let queued_behind_existing_turn =
+        has_existing_active_conversation_turn(&db, &manager, &conv_id).await;
 
     if let Err(e) = checkpoints::upsert_checkpoint(&db, &conv_id, "queued", 0).await {
         tracing::error!(
@@ -571,7 +605,11 @@ pub async fn submit(
         StatusCode::ACCEPTED,
         Json(ChatSubmitResponse {
             conversation_id: conv_id,
-            status: "running",
+            status: if queued_behind_existing_turn {
+                "queued"
+            } else {
+                "running"
+            },
             job_id,
             accepted_at_ms,
         }),
