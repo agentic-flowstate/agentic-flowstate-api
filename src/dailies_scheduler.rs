@@ -15,6 +15,8 @@ use crate::agents::working_dir::resolve_working_dir;
 use crate::agents::AgentType;
 use crate::package_updates::{self, PackageUpdateScanReport};
 
+const DAILIES_STORAGE_ORGANIZATION: &str = "agentic-flowstate";
+const PACKAGE_UPDATE_OWNER_USER_ID: &str = "alex";
 const POLL_SECONDS: u64 = 60;
 
 pub fn spawn_dailies_scheduler(pool: Arc<SqlitePool>, token: CancellationToken) {
@@ -37,6 +39,8 @@ pub fn spawn_dailies_scheduler(pool: Arc<SqlitePool>, token: CancellationToken) 
 
 pub async fn run_due_once(pool: Arc<SqlitePool>) -> Result<()> {
     let now = Utc::now().timestamp();
+    ensure_package_update_daily(&pool, PACKAGE_UPDATE_OWNER_USER_ID).await?;
+
     let expired = ticketing_system::dailies::complete_expired_dailies(&pool, now).await?;
     if expired > 0 {
         tracing::info!(
@@ -51,6 +55,48 @@ pub async fn run_due_once(pool: Arc<SqlitePool>) -> Result<()> {
             tracing::error!("[DAILIES] failed to spawn daily run: {}", e);
         }
     }
+
+    Ok(())
+}
+
+pub async fn ensure_package_update_daily(pool: &SqlitePool, user_id: &str) -> Result<()> {
+    if user_id != PACKAGE_UPDATE_OWNER_USER_ID {
+        return Ok(());
+    }
+
+    let dailies = ticketing_system::dailies::list_dailies(pool, Some(user_id), None).await?;
+    if dailies.iter().any(|daily| daily.kind == "package-updates") {
+        return Ok(());
+    }
+
+    ticketing_system::dailies::create_daily(
+        pool,
+        ticketing_system::CreateDailyRequest {
+            user_id: user_id.to_string(),
+            organization: DAILIES_STORAGE_ORGANIZATION.to_string(),
+            title: "Package Updates".to_string(),
+            description: "Daily Mac Mini package update check with approve or deny review."
+                .to_string(),
+            kind: "package-updates".to_string(),
+            tags: vec!["Mac Mini".to_string(), "Packages".to_string()],
+            cadence_unit: "day".to_string(),
+            cadence_interval: 1,
+            run_until: None,
+            next_run_at: Some(Utc::now().timestamp()),
+            unread_pause_threshold: 12,
+            agent_type: "package-update-review".to_string(),
+            prompt: "Scan installed package managers, summarize available updates only when updates exist, and wait for user approval before applying."
+                .to_string(),
+            search_query: "local mac mini package updates".to_string(),
+            max_age_hours: None,
+        },
+    )
+    .await?;
+
+    tracing::info!(
+        "[DAILIES] created default package update Daily for user {}",
+        user_id
+    );
 
     Ok(())
 }

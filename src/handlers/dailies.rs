@@ -14,7 +14,6 @@ use crate::dailies_scheduler;
 use crate::package_updates::{self, PackageUpdateScanReport};
 
 const DAILIES_STORAGE_ORGANIZATION: &str = "agentic-flowstate";
-const PACKAGE_UPDATE_OWNER_USER_ID: &str = "alex";
 
 #[derive(Debug, Deserialize)]
 pub struct RunsQuery {
@@ -48,7 +47,7 @@ pub async fn list_dailies(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
-    if let Err(e) = ensure_package_update_daily(&pool, &user.user_id).await {
+    if let Err(e) = dailies_scheduler::ensure_package_update_daily(&pool, &user.user_id).await {
         return server_error("Failed to ensure package update Daily", e);
     }
 
@@ -276,43 +275,6 @@ pub async fn approve_package_update_review(
     });
 
     (StatusCode::ACCEPTED, Json(json!(review))).into_response()
-}
-
-async fn ensure_package_update_daily(pool: &SqlitePool, user_id: &str) -> anyhow::Result<()> {
-    if user_id != PACKAGE_UPDATE_OWNER_USER_ID {
-        return Ok(());
-    }
-
-    let dailies = ticketing_system::dailies::list_dailies(pool, Some(user_id), None).await?;
-    if dailies.iter().any(|daily| daily.kind == "package-updates") {
-        return Ok(());
-    }
-
-    ticketing_system::dailies::create_daily(
-        pool,
-        ticketing_system::CreateDailyRequest {
-            user_id: user_id.to_string(),
-            organization: DAILIES_STORAGE_ORGANIZATION.to_string(),
-            title: "Package Updates".to_string(),
-            description: "Daily Mac Mini package update check with approve or deny review."
-                .to_string(),
-            kind: "package-updates".to_string(),
-            tags: vec!["Mac Mini".to_string(), "Packages".to_string()],
-            cadence_unit: "day".to_string(),
-            cadence_interval: 1,
-            run_until: None,
-            next_run_at: Some(chrono::Utc::now().timestamp()),
-            unread_pause_threshold: 12,
-            agent_type: "package-update-review".to_string(),
-            prompt: "Scan installed package managers, summarize available updates only when updates exist, and wait for user approval before applying."
-                .to_string(),
-            search_query: "local mac mini package updates".to_string(),
-            max_age_hours: None,
-        },
-    )
-    .await?;
-
-    Ok(())
 }
 
 async fn user_package_update_review(
