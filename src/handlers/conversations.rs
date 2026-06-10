@@ -18,8 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use ticketing_system::{
     agent_runners, checkpoints, conversation_turn_jobs, conversations, AddMessageRequest,
-    Conversation, ConversationHierarchyScope, ConversationMessage, CreateChildConversationRequest,
-    CreateConversationRequest, SqlitePool, UpdateConversationRequest,
+    Conversation, ConversationHierarchyScope, ConversationMessage, ConversationReadState,
+    CreateChildConversationRequest, CreateConversationRequest, SqlitePool,
+    UpdateConversationRequest,
 };
 
 use super::chat_client_manager::ChatClientManager;
@@ -86,6 +87,27 @@ pub struct ConversationRunStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_tool_call_started_at_epoch: Option<i64>,
     pub server_time: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarkConversationReadBody {
+    pub last_read_event_index: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConversationReadStateUpdateBody {
+    pub conversation_id: String,
+    pub last_read_event_index: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SyncConversationReadStatesBody {
+    pub states: Vec<ConversationReadStateUpdateBody>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversationReadStatesResponse {
+    pub states: Vec<ConversationReadState>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -768,6 +790,48 @@ pub async fn get_conversation(
         ))?;
 
     Ok(Json(summary))
+}
+
+/// POST /api/conversations/:id/read
+pub async fn mark_conversation_read(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+    Json(body): Json<MarkConversationReadBody>,
+) -> Result<Json<ConversationReadState>, (StatusCode, String)> {
+    conversations::mark_conversation_read(&pool, &user.user_id, &id, body.last_read_event_index)
+        .await
+        .map(Json)
+        .map_err(conversation_read_error)
+}
+
+/// POST /api/conversations/read-states
+pub async fn sync_conversation_read_states(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Json(body): Json<SyncConversationReadStatesBody>,
+) -> Result<Json<ConversationReadStatesResponse>, (StatusCode, String)> {
+    let states = body
+        .states
+        .into_iter()
+        .map(|state| (state.conversation_id, state.last_read_event_index))
+        .collect::<Vec<_>>();
+
+    conversations::sync_conversation_read_states(&pool, &user.user_id, states)
+        .await
+        .map(|states| Json(ConversationReadStatesResponse { states }))
+        .map_err(conversation_read_error)
+}
+
+fn conversation_read_error(error: anyhow::Error) -> (StatusCode, String) {
+    let message = error.to_string();
+    if message == "Conversation not found" {
+        return (StatusCode::NOT_FOUND, message);
+    }
+    if message.contains("last_read_event_index") {
+        return (StatusCode::BAD_REQUEST, message);
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 /// Create a conversation (POST /api/conversations)
@@ -1884,6 +1948,9 @@ pub async fn subscribe_conversations(
                         summary.conversation.parent_conversation_id.hash(&mut hasher);
                         summary.conversation.conversation_role.hash(&mut hasher);
                         summary.conversation.child_conversation_count.hash(&mut hasher);
+                        summary.conversation.last_event_index.hash(&mut hasher);
+                        summary.conversation.last_read_event_index.hash(&mut hasher);
+                        summary.conversation.unread_event_count.hash(&mut hasher);
                         summary.tool_call_count.hash(&mut hasher);
                         summary.run_started_at.hash(&mut hasher);
                         summary.last_tool_call_started_at_epoch.hash(&mut hasher);
@@ -1982,6 +2049,8 @@ mod tests {
             router_organization: None,
             message_count: Some(2),
             last_event_index: Some(128),
+            last_read_event_index: None,
+            unread_event_count: None,
             is_active,
             messages: Some(vec![]),
         }

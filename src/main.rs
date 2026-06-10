@@ -1249,6 +1249,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::subscribe_conversations),
         )
         .route(
+            "/api/conversations/read-states",
+            post(handlers::sync_conversation_read_states),
+        )
+        .route(
             "/api/conversations/:id/children",
             get(handlers::list_child_conversations).post(handlers::create_child_conversations),
         )
@@ -1269,6 +1273,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/conversations/:id/activate",
             post(handlers::activate_conversation),
+        )
+        .route(
+            "/api/conversations/:id/read",
+            post(handlers::mark_conversation_read),
         )
         .route(
             "/api/conversations/:id/cancel",

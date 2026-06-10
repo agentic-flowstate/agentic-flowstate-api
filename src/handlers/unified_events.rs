@@ -531,6 +531,8 @@ fn hash_conversation_list(convs: &[crate::handlers::conversations::ConversationS
         summary.conversation.status.hash(&mut hasher);
         summary.conversation.message_count.hash(&mut hasher);
         summary.conversation.last_event_index.hash(&mut hasher);
+        summary.conversation.last_read_event_index.hash(&mut hasher);
+        summary.conversation.unread_event_count.hash(&mut hasher);
         summary.conversation.is_active.hash(&mut hasher);
         summary.tool_call_count.hash(&mut hasher);
         summary.run_started_at.hash(&mut hasher);
@@ -696,6 +698,8 @@ mod tests {
                 router_organization: None,
                 message_count: Some(1),
                 last_event_index,
+                last_read_event_index: None,
+                unread_event_count: None,
                 is_active: Some(false),
                 messages: Some(vec![]),
             },
@@ -772,6 +776,24 @@ mod tests {
         assert_eq!(
             conversation_snapshot_event_id(&summaries),
             1_780_956_800_000
+        );
+    }
+
+    #[test]
+    fn conversation_hash_includes_read_state() {
+        let unread = vec![conversation_summary(
+            "2026-06-08T22:00:01Z",
+            Some(128),
+            None,
+            None,
+        )];
+        let mut read = unread.clone();
+        read[0].conversation.last_read_event_index = Some(128);
+        read[0].conversation.unread_event_count = Some(0);
+
+        assert_ne!(
+            hash_conversation_list(&unread),
+            hash_conversation_list(&read)
         );
     }
 
