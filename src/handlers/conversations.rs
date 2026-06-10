@@ -13,6 +13,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,7 +119,7 @@ pub struct ConversationQueuedMessage {
     pub agent_type: String,
     pub status: String,
     pub client_id: Option<String>,
-    pub image_count: usize,
+    pub attachment_count: usize,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -134,6 +135,13 @@ struct ConversationQueuedMessageRow {
     images: Option<String>,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatAttachmentMeta {
+    filename: String,
+    path: String,
+    mime_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -346,12 +354,12 @@ async fn active_run_started_at(
     Ok(checkpoint.map(|cp| cp.updated_at))
 }
 
-fn queued_message_image_count(images_json: Option<&str>) -> usize {
-    let Some(images_json) = images_json else {
+fn queued_message_attachment_count(attachments_json: Option<&str>) -> usize {
+    let Some(attachments_json) = attachments_json else {
         return 0;
     };
-    serde_json::from_str::<Vec<serde_json::Value>>(images_json)
-        .map(|images| images.len())
+    serde_json::from_str::<Vec<serde_json::Value>>(attachments_json)
+        .map(|attachments| attachments.len())
         .unwrap_or(0)
 }
 
@@ -408,7 +416,7 @@ async fn list_pending_queued_messages(
             agent_type: row.agent_type,
             status: row.status,
             client_id: row.client_id,
-            image_count: queued_message_image_count(row.images.as_deref()),
+            attachment_count: queued_message_attachment_count(row.images.as_deref()),
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -1987,9 +1995,9 @@ pub async fn subscribe_conversations(
     )
 }
 
-/// GET /api/chat-images/:conversation_id/:filename
-/// Serve an image attachment from the chat-images directory.
-pub async fn get_chat_image(
+/// GET /api/chat-attachments/:conversation_id/:filename
+/// Serve a chat attachment stored for a conversation the user owns.
+pub async fn get_chat_attachment(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path((conversation_id, filename)): Path<(String, String)>,
@@ -1999,29 +2007,65 @@ pub async fn get_chat_image(
         _ => return StatusCode::NOT_FOUND.into_response(),
     }
 
-    let path = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".agentic-flowstate/chat-images")
-        .join(&conversation_id)
-        .join(&filename);
+    let Some((path, mime)) = find_chat_attachment(&pool, &conversation_id, &filename).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
 
     match tokio::fs::read(&path).await {
-        Ok(data) => {
-            let mime = if filename.ends_with(".png") {
-                "image/png"
-            } else if filename.ends_with(".gif") {
-                "image/gif"
-            } else if filename.ends_with(".webp") {
-                "image/webp"
-            } else if filename.ends_with(".heic") {
-                "image/heic"
-            } else {
-                "image/jpeg"
-            };
-            ([(header::CONTENT_TYPE, mime)], data).into_response()
-        }
+        Ok(data) => ([(header::CONTENT_TYPE, mime)], data).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn find_chat_attachment(
+    pool: &SqlitePool,
+    conversation_id: &str,
+    filename: &str,
+) -> Option<(PathBuf, String)> {
+    if filename.contains('/') || filename.contains('\\') {
+        return None;
+    }
+
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        r#"
+        SELECT attachments
+        FROM conversation_messages
+        WHERE conversation_id = ?
+          AND attachments IS NOT NULL
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(pool)
+    .await
+    .ok()?;
+
+    let home = dirs::home_dir()?;
+    let attachment_root = home
+        .join(".agentic-flowstate")
+        .join("chat-attachments")
+        .join(conversation_id);
+    let legacy_image_root = home
+        .join(".agentic-flowstate")
+        .join("chat-images")
+        .join(conversation_id);
+
+    for (raw,) in rows {
+        let Some(raw) = raw else { continue };
+        let metas: Vec<ChatAttachmentMeta> = match serde_json::from_str(&raw) {
+            Ok(metas) => metas,
+            Err(_) => continue,
+        };
+        for meta in metas {
+            if meta.filename != filename {
+                continue;
+            }
+            let path = PathBuf::from(&meta.path);
+            if path.starts_with(&attachment_root) || path.starts_with(&legacy_image_root) {
+                return Some((path, meta.mime_type));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

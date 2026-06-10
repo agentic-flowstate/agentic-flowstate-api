@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use super::anthropic_event_encoder::AnthropicEventEncoder;
 use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::{
-    get_broadcast_sender, remove_broadcast_channel, ChatConfig, ChatImageData,
+    get_broadcast_sender, remove_broadcast_channel, ChatAttachmentData, ChatConfig,
 };
 use crate::agents::codex_app_server::{
     app_server_generated_images_dir, spawn_codex_app_server, CodexAppServerEvent,
@@ -44,8 +44,10 @@ const PROMPT_HISTORY_MESSAGE_LIMIT: usize = 30;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct AttachmentMeta {
     filename: String,
+    display_name: Option<String>,
     path: String,
     mime_type: String,
+    size_bytes: Option<i64>,
 }
 
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
@@ -84,7 +86,7 @@ pub struct WorkerMessage {
     pub user_id: String,
     pub message: String,
     pub config: ChatConfig,
-    pub images: Option<Vec<ChatImageData>>,
+    pub attachments: Option<Vec<ChatAttachmentData>>,
     /// Per-request completion signal. Fired when this message is fully processed,
     /// so the SSE handler exits only when THIS message is done (not on terminal
     /// events from a prior message in the same conversation).
@@ -388,7 +390,7 @@ impl ConversationWorker {
         // every call site (T-90C7FAC4).
         self.current_user_id = Some(msg.user_id.clone());
         tracing::info!(
-            "[CHAT_LATENCY] phase=worker_process_message_start conv={} client_id={} agent={} runtime={} model={} effort={} message_chars={} images={} started_at_ms={}",
+            "[CHAT_LATENCY] phase=worker_process_message_start conv={} client_id={} agent={} runtime={} model={} effort={} message_chars={} attachments={} started_at_ms={}",
             self.conversation_id,
             msg.client_id.as_deref().unwrap_or("none"),
             msg.config.agent_type.as_str(),
@@ -396,7 +398,7 @@ impl ConversationWorker {
             msg.config.codex_options.model,
             msg.config.codex_options.reasoning_effort,
             msg.message.chars().count(),
-            msg.images.as_ref().map_or(0, Vec::len),
+            msg.attachments.as_ref().map_or(0, Vec::len),
             Utc::now().timestamp_millis()
         );
         // Stage the inbound Idempotency-Key (T-A819D36B) onto the
@@ -418,55 +420,103 @@ impl ConversationWorker {
         })
         .await;
 
-        // Process image attachments (save to disk, build metadata)
-        let mut image_paths: Vec<String> = Vec::new();
+        // Process file attachments (save to disk, build metadata)
+        let mut attachment_descriptions: Vec<String> = Vec::new();
         let mut attachments_json: Option<String> = None;
 
-        if let Some(ref images) = msg.images {
-            if !images.is_empty() {
-                let chat_images_dir = dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".agentic-flowstate")
-                    .join("chat-images")
-                    .join(&self.conversation_id);
-                std::fs::create_dir_all(&chat_images_dir).ok();
+        if let Some(ref attachments_to_save) = msg.attachments {
+            if !attachments_to_save.is_empty() {
+                let chat_attachments_dir = match chat_attachments_dir(&self.conversation_id) {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        tracing::error!("[WORKER] Failed to resolve chat attachments dir: {}", e);
+                        self.emit_event(&StreamEvent::Status {
+                            status: "failed".to_string(),
+                            message: Some("Failed to resolve attachment storage".to_string()),
+                        })
+                        .await;
+                        return;
+                    }
+                };
+                if let Err(e) = std::fs::create_dir_all(&chat_attachments_dir) {
+                    tracing::error!(
+                        "[WORKER] Failed to create chat attachments dir {}: {}",
+                        chat_attachments_dir.display(),
+                        e
+                    );
+                    self.emit_event(&StreamEvent::Status {
+                        status: "failed".to_string(),
+                        message: Some("Failed to create attachment storage".to_string()),
+                    })
+                    .await;
+                    return;
+                }
 
                 let mut attachments: Vec<AttachmentMeta> = Vec::new();
 
-                for image in images {
-                    let ext = match image.mime_type.as_str() {
-                        "image/png" => "png",
-                        "image/gif" => "gif",
-                        "image/webp" => "webp",
-                        "image/heic" => "heic",
-                        _ => "jpg",
+                for attachment in attachments_to_save {
+                    let Some(display_name) = sanitize_display_filename(&attachment.filename) else {
+                        tracing::error!(
+                            "[WORKER] Attachment filename is invalid: {}",
+                            attachment.filename
+                        );
+                        self.emit_event(&StreamEvent::Status {
+                            status: "failed".to_string(),
+                            message: Some("Attachment filename is invalid".to_string()),
+                        })
+                        .await;
+                        return;
                     };
-                    let filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
-                    let file_path = chat_images_dir.join(&filename);
-
-                    match STANDARD.decode(&image.data) {
-                        Ok(bytes) => {
-                            if let Err(e) = std::fs::write(&file_path, &bytes) {
-                                tracing::error!(
-                                    "[WORKER] Failed to write image {}: {}",
-                                    filename,
-                                    e
-                                );
-                                continue;
-                            }
-                            let path_str = file_path.to_string_lossy().to_string();
-                            image_paths.push(path_str.clone());
-                            attachments.push(AttachmentMeta {
-                                filename: filename.clone(),
-                                path: path_str,
-                                mime_type: image.mime_type.clone(),
-                            });
-                            tracing::info!("[WORKER] Saved chat image: {}", file_path.display());
-                        }
+                    let bytes = match STANDARD.decode(&attachment.data) {
+                        Ok(bytes) => bytes,
                         Err(e) => {
-                            tracing::error!("[WORKER] Failed to decode base64 image: {}", e);
+                            tracing::error!(
+                                "[WORKER] Failed to decode base64 attachment {}: {}",
+                                display_name,
+                                e
+                            );
+                            self.emit_event(&StreamEvent::Status {
+                                status: "failed".to_string(),
+                                message: Some(format!(
+                                    "Failed to decode attachment {}",
+                                    display_name
+                                )),
+                            })
+                            .await;
+                            return;
                         }
+                    };
+                    let stored_filename = format!("{}-{}", uuid::Uuid::new_v4(), display_name);
+                    let file_path = chat_attachments_dir.join(&stored_filename);
+                    if let Err(e) = std::fs::write(&file_path, &bytes) {
+                        tracing::error!(
+                            "[WORKER] Failed to write attachment {}: {}",
+                            stored_filename,
+                            e
+                        );
+                        self.emit_event(&StreamEvent::Status {
+                            status: "failed".to_string(),
+                            message: Some(format!("Failed to save attachment {}", display_name)),
+                        })
+                        .await;
+                        return;
                     }
+                    let path_str = file_path.to_string_lossy().to_string();
+                    attachment_descriptions.push(format!(
+                        "  - {} ({}; {} bytes): {}",
+                        display_name,
+                        attachment.mime_type,
+                        bytes.len(),
+                        path_str
+                    ));
+                    attachments.push(AttachmentMeta {
+                        filename: stored_filename,
+                        display_name: Some(display_name),
+                        path: path_str,
+                        mime_type: attachment.mime_type.clone(),
+                        size_bytes: Some(bytes.len() as i64),
+                    });
+                    tracing::info!("[WORKER] Saved chat attachment: {}", file_path.display());
                 }
 
                 if !attachments.is_empty() {
@@ -475,17 +525,12 @@ impl ConversationWorker {
             }
         }
 
-        // Build enhanced message for SDK (with image paths for the active runtime to read)
-        let enhanced_message = if !image_paths.is_empty() {
-            let paths_list = image_paths
-                .iter()
-                .map(|p| format!("  - {}", p))
-                .collect::<Vec<_>>()
-                .join("\n");
+        // Build enhanced message for SDK (with attachment paths for the active runtime to read)
+        let enhanced_message = if !attachment_descriptions.is_empty() {
             format!(
-                "[The user has attached {} image(s). View them using the Read tool:\n{}\n]\n\n{}",
-                image_paths.len(),
-                paths_list,
+                "[The user has attached {} file(s). Server-side copies are available at:\n{}\nUse available tools to inspect these paths directly when relevant.]\n\n{}",
+                attachment_descriptions.len(),
+                attachment_descriptions.join("\n"),
                 msg.message
             )
         } else {
@@ -1764,12 +1809,35 @@ async fn flush_to_db(db: &SqlitePool, assistant_message_id: &str, accumulated_te
     }
 }
 
-fn chat_images_dir(conversation_id: &str) -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Failed to resolve home directory for chat images")?;
+fn chat_attachments_dir(conversation_id: &str) -> Result<PathBuf> {
+    let home = dirs::home_dir().context("Failed to resolve home directory for chat attachments")?;
     Ok(home
         .join(".agentic-flowstate")
-        .join("chat-images")
+        .join("chat-attachments")
         .join(conversation_id))
+}
+
+fn sanitize_display_filename(filename: &str) -> Option<String> {
+    let name = Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(filename)
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    let sanitized: String = name
+        .chars()
+        .filter(|ch| !ch.is_control() && *ch != '/' && *ch != '\\' && *ch != ':')
+        .take(180)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
 }
 
 fn image_extension_for_mime(mime_type: &str) -> &'static str {
@@ -1875,7 +1943,7 @@ async fn persist_generated_image_attachments(
         return Ok(0);
     }
 
-    let chat_dir = chat_images_dir(conversation_id)?;
+    let chat_dir = chat_attachments_dir(conversation_id)?;
     tokio::fs::create_dir_all(&chat_dir)
         .await
         .with_context(|| format!("Failed to create chat image dir {}", chat_dir.display()))?;
@@ -1904,8 +1972,10 @@ async fn persist_generated_image_attachments(
 
         attachments.push(AttachmentMeta {
             filename,
+            display_name: None,
             path: destination.to_string_lossy().to_string(),
             mime_type: mime_type.to_string(),
+            size_bytes: None,
         });
         saved += 1;
     }

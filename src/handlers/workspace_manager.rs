@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::chat_client_manager::ChatClientManager;
-use super::chat_stream::{self, ChatCodexOptions, ChatConfig, ChatImageData, ChatRuntime};
+use super::chat_stream::{self, ChatAttachmentData, ChatCodexOptions, ChatConfig, ChatRuntime};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -22,7 +22,7 @@ pub struct WorkspaceManagerRequest {
     #[allow(dead_code)]
     pub organization: Option<String>,
     pub conversation_id: Option<String>,
-    pub images: Option<Vec<ChatImageData>>,
+    pub attachments: Option<Vec<ChatAttachmentData>>,
     pub codex_options: Option<ChatCodexOptions>,
 }
 
@@ -62,7 +62,7 @@ pub async fn workspace_manager_chat(
         req.conversation_id,
         config,
         user.user_id,
-        req.images,
+        req.attachments,
         client_id,
     )
     .await
@@ -92,7 +92,7 @@ pub async fn workspace_manager_chat_submit(
         req.conversation_id,
         config,
         user.user_id,
-        req.images,
+        req.attachments,
         client_id,
     )
     .await

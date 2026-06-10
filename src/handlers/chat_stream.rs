@@ -4,6 +4,8 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use chrono::Utc;
 use futures::stream::Stream;
 use once_cell::sync::Lazy;
@@ -31,13 +33,63 @@ use crate::observability::streaming::{record_stream_event_emitted, DisconnectRea
 use crate::rate_limiting::{self, RateLimitDecision, StreamPermit};
 use ticketing_system::{agent_runners, checkpoints, conversation_turn_jobs};
 
-/// Image data attached to a chat message (base64-encoded)
+/// File data attached to a chat message (base64-encoded).
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChatImageData {
-    /// Base64-encoded image data
+pub struct ChatAttachmentData {
+    /// Original display filename from the native picker.
+    pub filename: String,
+    /// Base64-encoded file data.
     pub data: String,
-    /// MIME type (e.g., "image/jpeg")
+    /// MIME type (e.g., "image/jpeg", "application/pdf").
     pub mime_type: String,
+}
+
+const MAX_CHAT_ATTACHMENTS: usize = 8;
+const MAX_CHAT_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_CHAT_ATTACHMENTS_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
+fn validate_chat_attachments(attachments: Option<&[ChatAttachmentData]>) -> Result<usize, String> {
+    let Some(attachments) = attachments else {
+        return Ok(0);
+    };
+    if attachments.len() > MAX_CHAT_ATTACHMENTS {
+        return Err(format!(
+            "Too many attachments: maximum is {}",
+            MAX_CHAT_ATTACHMENTS
+        ));
+    }
+
+    let mut total_bytes = 0usize;
+    for attachment in attachments {
+        let filename = attachment.filename.trim();
+        if filename.is_empty() || filename.contains('/') || filename.contains('\\') {
+            return Err("Attachment filename must be a plain file name".to_string());
+        }
+        if attachment.mime_type.trim().is_empty() {
+            return Err(format!("Attachment {} is missing a MIME type", filename));
+        }
+        let bytes = STANDARD
+            .decode(&attachment.data)
+            .map_err(|_| format!("Attachment {} is not valid base64", filename))?;
+        if bytes.is_empty() {
+            return Err(format!("Attachment {} is empty", filename));
+        }
+        if bytes.len() > MAX_CHAT_ATTACHMENT_BYTES {
+            return Err(format!(
+                "Attachment {} is too large: maximum is {} MB",
+                filename,
+                MAX_CHAT_ATTACHMENT_BYTES / 1024 / 1024
+            ));
+        }
+        total_bytes += bytes.len();
+        if total_bytes > MAX_CHAT_ATTACHMENTS_TOTAL_BYTES {
+            return Err(format!(
+                "Combined attachment size is too large: maximum is {} MB",
+                MAX_CHAT_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024
+            ));
+        }
+    }
+    Ok(attachments.len())
 }
 
 const CODEX_REASONING_EFFORT_ORDER: &[&str] =
@@ -472,7 +524,7 @@ pub async fn submit(
     conversation_id: Option<String>,
     config: ChatConfig,
     user_id: String,
-    images: Option<Vec<ChatImageData>>,
+    attachments: Option<Vec<ChatAttachmentData>>,
     client_id: Option<String>,
 ) -> Response {
     let received_at_ms = Utc::now().timestamp_millis();
@@ -486,9 +538,12 @@ pub async fn submit(
                 .into_response();
         }
     };
-    let image_count = images.as_ref().map_or(0, Vec::len);
+    let attachment_count = match validate_chat_attachments(attachments.as_deref()) {
+        Ok(count) => count,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     tracing::info!(
-        "[CHAT_LATENCY] phase=submit_received conv={} client_id={} agent={} runtime={} model={} effort={} message_chars={} images={} received_at_ms={}",
+        "[CHAT_LATENCY] phase=submit_received conv={} client_id={} agent={} runtime={} model={} effort={} message_chars={} attachments={} received_at_ms={}",
         conv_id,
         client_id.as_deref().unwrap_or("none"),
         config.agent_type.as_str(),
@@ -496,7 +551,7 @@ pub async fn submit(
         config.codex_options.model,
         config.codex_options.reasoning_effort,
         message.chars().count(),
-        image_count,
+        attachment_count,
         received_at_ms
     );
 
@@ -520,18 +575,18 @@ pub async fn submit(
             .into_response();
     }
 
-    let images_json = match images {
-        Some(images) => match serde_json::to_string(&images) {
+    let attachments_json = match attachments {
+        Some(attachments) => match serde_json::to_string(&attachments) {
             Ok(json) => Some(json),
             Err(e) => {
                 tracing::error!(
-                    "[CHAT] Failed to serialize images for non-streaming submit {}: {}",
+                    "[CHAT] Failed to serialize attachments for non-streaming submit {}: {}",
                     conv_id,
                     e
                 );
                 return (
                     StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize chat images: {}", e),
+                    format!("Failed to serialize chat attachments: {}", e),
                 )
                     .into_response();
             }
@@ -548,7 +603,7 @@ pub async fn submit(
         prompt_name: config.prompt_name.to_string(),
         working_dir: config.working_dir.to_string_lossy().to_string(),
         prompt_vars: encode_codex_options_for_job(config.prompt_vars, &config.codex_options),
-        images_json,
+        images_json: attachments_json,
         client_id,
     };
 
@@ -712,7 +767,7 @@ pub async fn chat(
     conversation_id: Option<String>,
     config: ChatConfig,
     user_id: String,
-    images: Option<Vec<ChatImageData>>,
+    attachments: Option<Vec<ChatAttachmentData>>,
     client_id: Option<String>,
 ) -> Response {
     // ---- Rate-limit admission (T-C410DD96). ----
@@ -774,6 +829,9 @@ pub async fn chat(
     if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
         return response;
     }
+    if let Err(message) = validate_chat_attachments(attachments.as_deref()) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
 
     // Subscribe before enqueue so we do not miss the worker's first frames.
     let broadcast_tx = get_broadcast_sender(&conv_id).await;
@@ -793,7 +851,7 @@ pub async fn chat(
             user_id,
             message,
             config,
-            images,
+            attachments,
             completion_tx: Some(completion_tx),
             client_id,
         })

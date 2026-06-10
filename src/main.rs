@@ -1326,10 +1326,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/conversations/:conv_id/messages/:message_id",
             patch(handlers::update_message),
         )
-        // Chat image serving route
+        // Chat attachment serving route
         .route(
-            "/api/chat-images/:conversation_id/:filename",
-            get(handlers::get_chat_image),
+            "/api/chat-attachments/:conversation_id/:filename",
+            get(handlers::get_chat_attachment),
         )
         // DM routes (user-scoped, 1:1 direct messages)
         .route(

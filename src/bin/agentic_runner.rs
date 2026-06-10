@@ -1,7 +1,7 @@
 use agentic_api::agents::AgentType;
 use agentic_api::apns;
 use agentic_api::handlers::chat_client_manager::ChatClientManager;
-use agentic_api::handlers::chat_stream::{self, ChatConfig, ChatImageData, ChatRuntime};
+use agentic_api::handlers::chat_stream::{self, ChatAttachmentData, ChatConfig, ChatRuntime};
 use agentic_api::handlers::conversation_worker::{ConversationWorker, WorkerMessage};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -428,9 +428,10 @@ fn worker_message_from_job(
             .with_context(|| {
                 format!("Unsupported conversation job agent: {}", payload.agent_type)
             })?;
-    let images: Option<Vec<ChatImageData>> = match payload.images_json.as_deref() {
+    let attachments: Option<Vec<ChatAttachmentData>> = match payload.images_json.as_deref() {
         Some(json) => Some(
-            serde_json::from_str(json).context("Failed to deserialize conversation job images")?,
+            serde_json::from_str(json)
+                .context("Failed to deserialize conversation job attachments")?,
         ),
         None => None,
     };
@@ -449,7 +450,7 @@ fn worker_message_from_job(
             prompt_vars,
             codex_options,
         },
-        images,
+        attachments,
         completion_tx: None,
         client_id: payload.client_id.clone(),
     })

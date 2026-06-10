@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::chat_client_manager::ChatClientManager;
-use super::chat_stream::{self, ChatCodexOptions, ChatConfig, ChatImageData, ChatRuntime};
+use super::chat_stream::{self, ChatAttachmentData, ChatCodexOptions, ChatConfig, ChatRuntime};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 
@@ -21,7 +21,7 @@ use crate::auth_middleware::AuthenticatedUser;
 pub struct FullAccessChatRequest {
     pub message: String,
     pub conversation_id: Option<String>,
-    pub images: Option<Vec<ChatImageData>>,
+    pub attachments: Option<Vec<ChatAttachmentData>>,
     pub codex_options: Option<ChatCodexOptions>,
 }
 
@@ -95,7 +95,7 @@ pub async fn full_access_chat(
         req.conversation_id,
         config,
         user.user_id,
-        req.images,
+        req.attachments,
         client_id,
     )
     .await
@@ -124,12 +124,12 @@ pub async fn full_access_chat_submit(
         Err(e) => return chat_stream::malformed_idempotency_key_response(e),
     };
     tracing::info!(
-        "[CHAT_LATENCY] phase=handler_received endpoint=full-access/submit user={} conv={} client_id={} message_chars={} images={} received_at_ms={}",
+        "[CHAT_LATENCY] phase=handler_received endpoint=full-access/submit user={} conv={} client_id={} message_chars={} attachments={} received_at_ms={}",
         user.user_id,
         req.conversation_id.as_deref().unwrap_or("none"),
         client_id.as_deref().unwrap_or("none"),
         req.message.chars().count(),
-        req.images.as_ref().map_or(0, Vec::len),
+        req.attachments.as_ref().map_or(0, Vec::len),
         handler_received_at_ms
     );
 
@@ -161,7 +161,7 @@ pub async fn full_access_chat_submit(
         req.conversation_id,
         config,
         user.user_id,
-        req.images,
+        req.attachments,
         client_id,
     )
     .await
