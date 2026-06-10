@@ -1013,9 +1013,9 @@ impl ConversationWorker {
                 None
             }
         };
-        let generated_images_before = generated_images_root
+        let generated_attachments_before = generated_images_root
             .as_deref()
-            .map(generated_image_snapshot)
+            .map(generated_attachment_snapshot)
             .unwrap_or_default();
 
         let codex_spawn_start_ms = Utc::now().timestamp_millis();
@@ -1458,9 +1458,9 @@ impl ConversationWorker {
         }
 
         if let Some(root) = generated_images_root.as_deref() {
-            let generated_paths = new_generated_images(root, &generated_images_before);
+            let generated_paths = new_generated_attachments(root, &generated_attachments_before);
             if !generated_paths.is_empty() {
-                match persist_generated_image_attachments(
+                match persist_generated_visual_attachments(
                     &self.db,
                     &self.conversation_id,
                     &assistant_message_id,
@@ -1469,12 +1469,12 @@ impl ConversationWorker {
                 .await
                 {
                     Ok(saved) => tracing::info!(
-                        "[WORKER] Attached {} generated image(s) to assistant message {}",
+                        "[WORKER] Attached {} generated visual file(s) to assistant message {}",
                         saved,
                         assistant_message_id
                     ),
                     Err(e) => tracing::error!(
-                        "[WORKER] Failed to attach generated image(s) to assistant message {}: {}",
+                        "[WORKER] Failed to attach generated visual file(s) to assistant message {}: {}",
                         assistant_message_id,
                         e
                     ),
@@ -1840,8 +1840,9 @@ fn sanitize_display_filename(filename: &str) -> Option<String> {
     }
 }
 
-fn image_extension_for_mime(mime_type: &str) -> &'static str {
+fn generated_attachment_extension_for_mime(mime_type: &str) -> &'static str {
     match mime_type {
+        "application/pdf" => "pdf",
         "image/png" => "png",
         "image/gif" => "gif",
         "image/webp" => "webp",
@@ -1851,9 +1852,10 @@ fn image_extension_for_mime(mime_type: &str) -> &'static str {
     }
 }
 
-fn mime_type_for_image_path(path: &Path) -> Option<&'static str> {
+fn mime_type_for_generated_attachment_path(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
+        "pdf" => Some("application/pdf"),
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
         "gif" => Some("image/gif"),
@@ -1863,22 +1865,22 @@ fn mime_type_for_image_path(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn generated_image_snapshot(root: &Path) -> HashSet<PathBuf> {
+fn generated_attachment_snapshot(root: &Path) -> HashSet<PathBuf> {
     let mut files = HashSet::new();
-    collect_generated_images(root, &mut files);
+    collect_generated_attachments(root, &mut files);
     files
 }
 
-fn new_generated_images(root: &Path, before: &HashSet<PathBuf>) -> Vec<PathBuf> {
-    let mut images: Vec<PathBuf> = generated_image_snapshot(root)
+fn new_generated_attachments(root: &Path, before: &HashSet<PathBuf>) -> Vec<PathBuf> {
+    let mut attachments: Vec<PathBuf> = generated_attachment_snapshot(root)
         .into_iter()
         .filter(|path| !before.contains(path))
         .collect();
-    images.sort();
-    images
+    attachments.sort();
+    attachments
 }
 
-fn collect_generated_images(dir: &Path, files: &mut HashSet<PathBuf>) {
+fn collect_generated_attachments(dir: &Path, files: &mut HashSet<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1889,8 +1891,10 @@ fn collect_generated_images(dir: &Path, files: &mut HashSet<PathBuf>) {
             continue;
         };
         if file_type.is_dir() {
-            collect_generated_images(&path, files);
-        } else if file_type.is_file() && mime_type_for_image_path(&path).is_some() {
+            collect_generated_attachments(&path, files);
+        } else if file_type.is_file()
+            && mime_type_for_generated_attachment_path(&path).is_some()
+        {
             files.insert(path);
         }
     }
@@ -1933,7 +1937,7 @@ async fn update_message_attachments(
     Ok(())
 }
 
-async fn persist_generated_image_attachments(
+async fn persist_generated_visual_attachments(
     db: &SqlitePool,
     conversation_id: &str,
     assistant_message_id: &str,
@@ -1946,25 +1950,25 @@ async fn persist_generated_image_attachments(
     let chat_dir = chat_attachments_dir(conversation_id)?;
     tokio::fs::create_dir_all(&chat_dir)
         .await
-        .with_context(|| format!("Failed to create chat image dir {}", chat_dir.display()))?;
+        .with_context(|| format!("Failed to create chat attachment dir {}", chat_dir.display()))?;
 
     let mut attachments = load_message_attachments(db, assistant_message_id).await?;
     let mut saved = 0usize;
     for source in generated_paths {
-        let Some(mime_type) = mime_type_for_image_path(source) else {
+        let Some(mime_type) = mime_type_for_generated_attachment_path(source) else {
             continue;
         };
         let filename = format!(
             "generated-{}.{}",
             uuid::Uuid::new_v4(),
-            image_extension_for_mime(mime_type)
+            generated_attachment_extension_for_mime(mime_type)
         );
         let destination = chat_dir.join(&filename);
         tokio::fs::copy(source, &destination)
             .await
             .with_context(|| {
                 format!(
-                    "Failed to copy generated image {} to {}",
+                    "Failed to copy generated attachment {} to {}",
                     source.display(),
                     destination.display()
                 )
@@ -2559,31 +2563,33 @@ mod streaming_persistence_tests {
     }
 
     #[test]
-    fn generated_image_snapshot_detects_new_raster_files_only() {
+    fn generated_attachment_snapshot_detects_new_previewable_files_only() {
         let root = std::env::temp_dir().join(format!(
-            "agentic-generated-images-test-{}",
+            "agentic-generated-attachments-test-{}",
             uuid::Uuid::new_v4()
         ));
         let batch = root.join("batch");
-        fs::create_dir_all(&batch).expect("create generated images dir");
+        fs::create_dir_all(&batch).expect("create generated attachments dir");
         let old_image = batch.join("old.png");
         let ignored_text = batch.join("notes.txt");
         fs::write(&old_image, b"old").expect("write old image");
         fs::write(&ignored_text, b"notes").expect("write text file");
 
-        let before = generated_image_snapshot(&root);
+        let before = generated_attachment_snapshot(&root);
         let new_image = batch.join("new.jpg");
+        let new_pdf = batch.join("diagram.pdf");
         let nested_dir = batch.join("nested");
         fs::create_dir_all(&nested_dir).expect("create nested generated dir");
         let nested_image = nested_dir.join("new.webp");
         fs::write(&new_image, b"new").expect("write new image");
+        fs::write(&new_pdf, b"%PDF").expect("write new pdf");
         fs::write(&nested_image, b"webp").expect("write nested image");
 
-        let new_images = new_generated_images(&root, &before);
-        let mut expected = vec![new_image, nested_image];
+        let new_attachments = new_generated_attachments(&root, &before);
+        let mut expected = vec![new_image, new_pdf, nested_image];
         expected.sort();
 
-        assert_eq!(new_images, expected);
+        assert_eq!(new_attachments, expected);
         fs::remove_dir_all(root).ok();
     }
 
