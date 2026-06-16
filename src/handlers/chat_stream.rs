@@ -605,6 +605,7 @@ pub async fn submit(
         prompt_vars: encode_codex_options_for_job(config.prompt_vars, &config.codex_options),
         images_json: attachments_json,
         client_id,
+        message_metadata: None,
     };
 
     let job_id = match conversation_turn_jobs::enqueue_job(&db, &conv_id, payload).await {
@@ -854,6 +855,7 @@ pub async fn chat(
             attachments,
             completion_tx: Some(completion_tx),
             client_id,
+            message_metadata: None,
         })
         .await
         .is_err()

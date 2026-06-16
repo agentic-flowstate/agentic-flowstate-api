@@ -99,6 +99,10 @@ pub struct WorkerMessage {
     /// matches on this value to lock its optimistic-echo row.
     /// `None` when the header was absent — no fallbacks.
     pub client_id: Option<String>,
+    /// JSON provenance metadata to persist on the visible user message.
+    /// Used for orchestrated child-agent kickoff prompts so clients can
+    /// style them differently from user-authored text without text heuristics.
+    pub message_metadata: Option<String>,
 }
 
 /// RAII guard that fires a oneshot completion signal on drop.
@@ -559,6 +563,7 @@ impl ConversationWorker {
                 role: "user".to_string(),
                 content: msg.message.clone(),
                 attachments: attachments_json,
+                metadata: msg.message_metadata.clone(),
             },
         )
         .await;
@@ -664,6 +669,7 @@ impl ConversationWorker {
                     role: "forwarded".to_string(),
                     content: final_message.clone(),
                     attachments: None,
+                    metadata: None,
                 },
             )
             .await
@@ -689,6 +695,7 @@ impl ConversationWorker {
                 role: "assistant".to_string(),
                 content: String::new(),
                 attachments: None,
+                metadata: None,
             },
         )
         .await

@@ -289,6 +289,10 @@ async fn enqueue_child_turn(
         prompt_vars: chat_stream::encode_codex_options_for_job(prompt_vars, &codex_options),
         images_json: None,
         client_id: None,
+        message_metadata: Some(orchestrated_message_metadata(
+            "api",
+            kind.agent_type().as_str(),
+        )?),
     };
 
     conversation_turn_jobs::enqueue_job(pool, child_id, payload)
@@ -298,6 +302,16 @@ async fn enqueue_child_turn(
         .await
         .context("publish child-agent run status")?;
     Ok(())
+}
+
+fn orchestrated_message_metadata(orchestrated_by: &str, agent: &str) -> Result<String> {
+    serde_json::to_string(&serde_json::json!({
+        "origin": "agent_orchestrated",
+        "orchestrated_by": orchestrated_by,
+        "orchestration": "child_initial_turn",
+        "agent": agent,
+    }))
+    .context("serialize child-agent kickoff metadata")
 }
 
 async fn ensure_parent_has_transcript(

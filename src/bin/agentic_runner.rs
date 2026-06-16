@@ -453,6 +453,7 @@ fn worker_message_from_job(
         attachments,
         completion_tx: None,
         client_id: payload.client_id.clone(),
+        message_metadata: payload.message_metadata.clone(),
     })
 }
 
