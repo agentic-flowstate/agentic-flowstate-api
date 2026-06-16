@@ -1041,6 +1041,7 @@ impl ConversationWorker {
             ephemeral: true,
             tool_profile,
             scoped_user_id: Some(&msg.user_id),
+            current_conversation_id: Some(&self.conversation_id),
             approved_mcp_tools: msg.config.agent_type.approved_mcp_tool_names(),
         })
         .await
@@ -1892,9 +1893,7 @@ fn collect_generated_attachments(dir: &Path, files: &mut HashSet<PathBuf>) {
         };
         if file_type.is_dir() {
             collect_generated_attachments(&path, files);
-        } else if file_type.is_file()
-            && mime_type_for_generated_attachment_path(&path).is_some()
-        {
+        } else if file_type.is_file() && mime_type_for_generated_attachment_path(&path).is_some() {
             files.insert(path);
         }
     }
@@ -1950,7 +1949,12 @@ async fn persist_generated_visual_attachments(
     let chat_dir = chat_attachments_dir(conversation_id)?;
     tokio::fs::create_dir_all(&chat_dir)
         .await
-        .with_context(|| format!("Failed to create chat attachment dir {}", chat_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "Failed to create chat attachment dir {}",
+                chat_dir.display()
+            )
+        })?;
 
     let mut attachments = load_message_attachments(db, assistant_message_id).await?;
     let mut saved = 0usize;

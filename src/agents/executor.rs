@@ -138,6 +138,7 @@ async fn run_codex_agent_turn_inner(
         ephemeral: !persist_session,
         tool_profile: CodexToolProfile::Default,
         scoped_user_id: None,
+        current_conversation_id: None,
         approved_mcp_tools: agent_type.approved_mcp_tool_names(),
     })
     .await

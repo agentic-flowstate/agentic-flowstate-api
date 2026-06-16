@@ -183,6 +183,7 @@ pub struct CodexAppServerOptions<'a> {
     pub ephemeral: bool,
     pub tool_profile: CodexToolProfile,
     pub scoped_user_id: Option<&'a str>,
+    pub current_conversation_id: Option<&'a str>,
     pub approved_mcp_tools: Vec<String>,
 }
 
@@ -955,21 +956,32 @@ fn build_codex_app_server_command(
         {
             command.arg("-c").arg(override_arg);
         }
+        if let Some(conversation_id) = options.current_conversation_id {
+            command.arg("-c").arg(mcp_server_env_override(
+                "agentic-mcp",
+                "AGENTIC_MCP_CONVERSATION_ID",
+                conversation_id,
+            )?);
+        }
+        if let Some(user_id) = options.scoped_user_id {
+            command.arg("-c").arg(mcp_server_env_override(
+                "agentic-mcp",
+                "AGENTIC_MCP_USER_ID",
+                user_id,
+            )?);
+        }
     }
 
     if options.tool_profile == CodexToolProfile::RestrictedMcpOnly {
-        let user_id = options.scoped_user_id.ok_or_else(|| {
-            "Restricted MCP profile requires scoped_user_id for tool enforcement".to_string()
-        })?;
+        if options.scoped_user_id.is_none() {
+            return Err(
+                "Restricted MCP profile requires scoped_user_id for tool enforcement".to_string(),
+            );
+        }
         command.arg("-c").arg(mcp_server_env_override(
             "agentic-mcp",
             "AGENTIC_MCP_PROFILE",
             "scoped-workspace",
-        )?);
-        command.arg("-c").arg(mcp_server_env_override(
-            "agentic-mcp",
-            "AGENTIC_MCP_USER_ID",
-            user_id,
         )?);
     }
 
@@ -1111,6 +1123,7 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, 
         ephemeral: true,
         tool_profile: CodexToolProfile::Default,
         scoped_user_id: None,
+        current_conversation_id: None,
         approved_mcp_tools: Vec::new(),
     };
     let mut command = Command::from(build_codex_app_server_command(
@@ -1734,6 +1747,7 @@ async fn run_codex_text_with_profile(
         ephemeral: true,
         tool_profile,
         scoped_user_id: None,
+        current_conversation_id: None,
         approved_mcp_tools: Vec::new(),
     })
     .await?;
@@ -2041,6 +2055,7 @@ mod tests {
             ephemeral: true,
             tool_profile: CodexToolProfile::Default,
             scoped_user_id: None,
+            current_conversation_id: None,
             approved_mcp_tools: Vec::new(),
         }
     }
@@ -2338,6 +2353,27 @@ approval_mode = "approve"
         assert!(args.iter().any(|arg| {
             arg == "mcp_servers.agentic-mcp.tools.exa_search.approval_mode=\"approve\""
         }));
+    }
+
+    #[test]
+    fn app_server_command_passes_current_conversation_context_to_mcp() {
+        let mut options = sample_app_server_options(None);
+        options.scoped_user_id = Some("alex");
+        options.current_conversation_id = Some("conv-123");
+        let command = build_codex_app_server_command(
+            &options,
+            Path::new("/tmp/agentic_mcp"),
+            Path::new("/tmp/agentic_codex_home"),
+        )
+        .expect("build command");
+        let args = command_args(&command);
+
+        assert!(args.iter().any(|arg| {
+            arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_CONVERSATION_ID=\"conv-123\""
+        }));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_USER_ID=\"alex\""));
     }
 
     #[test]
