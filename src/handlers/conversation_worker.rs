@@ -506,12 +506,11 @@ impl ConversationWorker {
                         return;
                     }
                     let path_str = file_path.to_string_lossy().to_string();
-                    attachment_descriptions.push(format!(
-                        "  - {} ({}; {} bytes): {}",
-                        display_name,
-                        attachment.mime_type,
-                        bytes.len(),
-                        path_str
+                    attachment_descriptions.push(format_attachment_prompt_line(
+                        &display_name,
+                        &attachment.mime_type,
+                        Some(bytes.len() as i64),
+                        &path_str,
                     ));
                     attachments.push(AttachmentMeta {
                         filename: stored_filename,
@@ -532,7 +531,7 @@ impl ConversationWorker {
         // Build enhanced message for SDK (with attachment paths for the active runtime to read)
         let enhanced_message = if !attachment_descriptions.is_empty() {
             format!(
-                "[The user has attached {} file(s). Server-side copies are available at:\n{}\nUse available tools to inspect these paths directly when relevant.]\n\n{}",
+                "[The user has attached {} file(s). Server-side copies are available at:\n{}\nIf an attachment is an image or screenshot, inspect it before answering any question that depends on visual content. Use available local attachment/image inspection tools or filesystem tools when relevant.]\n\n{}",
                 attachment_descriptions.len(),
                 attachment_descriptions.join("\n"),
                 msg.message
@@ -2426,7 +2425,9 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
             .tool_call_summaries
             .as_ref()
             .map_or(false, |t| !t.is_empty());
-        if !has_content && !has_tools {
+        let attachment_description = format_message_attachments_for_prompt(msg);
+        let has_attachments = attachment_description.is_some();
+        if !has_content && !has_tools && !has_attachments {
             continue;
         }
 
@@ -2447,6 +2448,11 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
 
         if !content.is_empty() {
             history.push_str(&format!("**{}**: {}\n\n", role, content));
+        }
+
+        if let Some(attachment_description) = attachment_description {
+            history.push_str(&attachment_description);
+            history.push('\n');
         }
 
         // Include tool call summaries for assistant messages — critical for context
@@ -2472,6 +2478,140 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
                 history.push('\n');
             }
         }
+    }
+}
+
+fn format_message_attachments_for_prompt(msg: &ConversationMessage) -> Option<String> {
+    let attachments_json = msg.attachments.as_deref()?.trim();
+    if attachments_json.is_empty() {
+        return None;
+    }
+
+    let attachments: Vec<AttachmentMeta> = match serde_json::from_str(attachments_json) {
+        Ok(attachments) => attachments,
+        Err(e) => {
+            return Some(format!(
+                "**Attachments:** failed to decode attachment metadata for message `{}`: {}\n",
+                msg.id, e
+            ));
+        }
+    };
+
+    if attachments.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(attachments.len() + 2);
+    lines.push("**Attachments:**".to_string());
+    for attachment in attachments {
+        let display_name = attachment
+            .display_name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&attachment.filename);
+        lines.push(format_attachment_prompt_line(
+            display_name,
+            &attachment.mime_type,
+            attachment.size_bytes,
+            &attachment.path,
+        ));
+    }
+    if lines
+        .iter()
+        .any(|line| line.contains("image attachment") || line.contains("screenshot"))
+    {
+        lines.push(
+            "  Image/screenshot attachments should be inspected before answering questions that depend on visual content."
+                .to_string(),
+        );
+    }
+
+    Some(format!("{}\n", lines.join("\n")))
+}
+
+fn format_attachment_prompt_line(
+    display_name: &str,
+    mime_type: &str,
+    size_bytes: Option<i64>,
+    path: &str,
+) -> String {
+    let attachment_kind = if mime_type.starts_with("image/") {
+        "image attachment"
+    } else {
+        "attachment"
+    };
+    let size = size_bytes
+        .map(|bytes| format!("; {} bytes", bytes))
+        .unwrap_or_default();
+    format!(
+        "  - {} `{}` ({}{}): {}",
+        attachment_kind, display_name, mime_type, size, path
+    )
+}
+
+#[cfg(test)]
+mod prompt_history_attachment_tests {
+    use super::*;
+
+    fn message_with_attachments(content: &str, attachments: Option<String>) -> ConversationMessage {
+        ConversationMessage {
+            id: "msg-attachment-test".to_string(),
+            conversation_id: "conv-attachment-test".to_string(),
+            role: "user".to_string(),
+            content: content.to_string(),
+            attachments,
+            metadata: None,
+            tool_call_summaries: None,
+            content_blocks: None,
+            assistant_turn_duration_seconds: None,
+            created_at: 1,
+            message_index: 0,
+        }
+    }
+
+    #[test]
+    fn history_includes_image_attachment_paths() {
+        let attachments = serde_json::json!([
+            {
+                "filename": "stored-image.jpg",
+                "display_name": "screenshot.jpg",
+                "path": "/tmp/chat-attachments/conv/stored-image.jpg",
+                "mime_type": "image/jpeg",
+                "size_bytes": 372713
+            }
+        ])
+        .to_string();
+        let message = message_with_attachments("Did you read the screenshot?", Some(attachments));
+
+        let history = build_codex_conversation_history(&[message]);
+
+        assert!(history.contains("Did you read the screenshot?"));
+        assert!(history.contains("**Attachments:**"));
+        assert!(history.contains("image attachment `screenshot.jpg`"));
+        assert!(history.contains("/tmp/chat-attachments/conv/stored-image.jpg"));
+        assert!(
+            history.contains("inspected before answering questions that depend on visual content")
+        );
+    }
+
+    #[test]
+    fn history_keeps_attachment_only_messages() {
+        let attachments = serde_json::json!([
+            {
+                "filename": "stored-image.png",
+                "display_name": "image.png",
+                "path": "/tmp/chat-attachments/conv/stored-image.png",
+                "mime_type": "image/png",
+                "size_bytes": 120
+            }
+        ])
+        .to_string();
+        let message = message_with_attachments("", Some(attachments));
+
+        let history = build_codex_conversation_history(&[message]);
+
+        assert!(history.contains("image attachment `image.png`"));
+        assert!(history.contains("/tmp/chat-attachments/conv/stored-image.png"));
     }
 }
 
