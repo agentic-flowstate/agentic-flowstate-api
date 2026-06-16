@@ -1357,6 +1357,11 @@ pub async fn list_messages(
         }
     }
 
+    let messages = messages
+        .into_iter()
+        .map(super::child_completion_status::sanitize_message_for_display)
+        .collect();
+
     Ok(Json(messages))
 }
 

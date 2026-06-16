@@ -2414,7 +2414,13 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
         messages
     };
 
-    for msg in recent {
+    let sanitized_recent: Vec<ConversationMessage> = recent
+        .iter()
+        .cloned()
+        .map(super::child_completion_status::sanitize_message_for_display)
+        .collect();
+
+    for msg in &sanitized_recent {
         let has_content = !msg.content.is_empty();
         let has_tools = msg
             .tool_call_summaries

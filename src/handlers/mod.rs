@@ -6,6 +6,7 @@ pub mod auth;
 pub mod cad;
 pub mod chat_client_manager;
 pub mod chat_stream;
+pub mod child_completion_status;
 pub mod client_telemetry;
 pub mod conversation_agent_chat;
 pub mod conversation_child_agents;
