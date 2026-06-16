@@ -13,21 +13,22 @@ use tokio::sync::mpsc;
 use super::anthropic_event_encoder::AnthropicEventEncoder;
 use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::{
-    get_broadcast_sender, remove_broadcast_channel, ChatAttachmentData, ChatConfig,
+    self, get_broadcast_sender, remove_broadcast_channel, ChatAttachmentData, ChatCodexOptions,
+    ChatConfig, ChatRuntime,
 };
 use crate::agents::codex_app_server::{
     app_server_generated_images_dir, spawn_codex_app_server, CodexAppServerEvent,
     CodexAppServerOptions, CodexSandboxMode, CodexToolProfile,
 };
 use crate::agents::prompts::load_prompt;
-use crate::agents::{AgentType, StreamEvent};
+use crate::agents::{resolve_working_dir, AgentType, StreamEvent};
 use crate::observability::next_actions::{record_clear, NextActionClearReason};
 use crate::observability::streaming::{
     record_gap_detected, record_stream_event_emitted, record_ticket_preflight,
     record_ticket_preflight_error,
 };
 use ticketing_system::{
-    agent_runners, checkpoints, conversations,
+    agent_runners, checkpoints, conversation_turn_jobs, conversations,
     token_usage::{self, TokenUsageBreakdown},
     AddMessageRequest, ContentBlockDesc, ConversationMessage, UpdateConversationRequest,
 };
@@ -40,6 +41,8 @@ const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
 /// Maximum number of prior messages to load into prompt context per turn.
 const PROMPT_HISTORY_MESSAGE_LIMIT: usize = 30;
+
+const CHILD_COMPLETION_RELAY_CLIENT_ID_PREFIX: &str = "child-completion-relay";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct AttachmentMeta {
@@ -1537,6 +1540,23 @@ impl ConversationWorker {
                     accumulated_text.clone(),
                 );
 
+                if let Err(e) = enqueue_child_completion_relay_to_parent(
+                    &self.db,
+                    &self.conversation_id,
+                    &assistant_message_id,
+                    "completed",
+                    accumulated_text.as_str(),
+                    None,
+                )
+                .await
+                {
+                    tracing::error!(
+                        "[WORKER] Failed to enqueue child completion relay for {}: {}",
+                        self.conversation_id,
+                        e
+                    );
+                }
+
                 if let Some(apns) = crate::apns::ApnsService::global() {
                     tracing::info!(
                         "[WORKER] Sending push notification for user={}, conv={}",
@@ -1629,6 +1649,22 @@ impl ConversationWorker {
                     is_error: false,
                 })
                 .await;
+                if let Err(e) = enqueue_child_completion_relay_to_parent(
+                    &self.db,
+                    &self.conversation_id,
+                    &assistant_message_id,
+                    "cancelled",
+                    accumulated_text.as_str(),
+                    None,
+                )
+                .await
+                {
+                    tracing::error!(
+                        "[WORKER] Failed to enqueue child cancellation relay for {}: {}",
+                        self.conversation_id,
+                        e
+                    );
+                }
             }
             CodexTurnCompletion::Failed(message) => {
                 tracing::error!(
@@ -2056,6 +2092,7 @@ async fn persist_failed_codex_message(
     content_blocks: &mut Vec<ContentBlockDesc>,
     message: String,
 ) {
+    let error_message = message.clone();
     let text_chunk = codex_failure_text_chunk(accumulated_text, &message);
     accumulated_text.push_str(&text_chunk);
     append_text_block(content_blocks, &text_chunk);
@@ -2079,6 +2116,198 @@ async fn persist_failed_codex_message(
             message: Some(message),
         })
         .await;
+
+    if let Err(e) = enqueue_child_completion_relay_to_parent(
+        &worker.db,
+        &worker.conversation_id,
+        assistant_message_id,
+        "failed",
+        accumulated_text.as_str(),
+        Some(error_message.as_str()),
+    )
+    .await
+    {
+        tracing::error!(
+            "[WORKER] Failed to enqueue child failure relay for {}: {}",
+            worker.conversation_id,
+            e
+        );
+    }
+}
+
+async fn enqueue_child_completion_relay_to_parent(
+    db: &SqlitePool,
+    child_conversation_id: &str,
+    child_assistant_message_id: &str,
+    terminal_status: &str,
+    child_output: &str,
+    error_message: Option<&str>,
+) -> Result<()> {
+    let child = match conversations::get_conversation(db, child_conversation_id, false).await? {
+        Some(child) => child,
+        None => {
+            anyhow::bail!(
+                "Child conversation not found for completion relay: {}",
+                child_conversation_id
+            );
+        }
+    };
+
+    let Some(parent_conversation_id) = child.parent_conversation_id.as_deref() else {
+        return Ok(());
+    };
+
+    if child.conversation_role != "sub_agent" {
+        anyhow::bail!(
+            "Conversation {} has parent {} but role is {}; expected sub_agent",
+            child.id,
+            parent_conversation_id,
+            child.conversation_role
+        );
+    }
+
+    let parent = conversations::get_conversation(db, parent_conversation_id, false)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Parent conversation not found for child completion relay: {}",
+                parent_conversation_id
+            )
+        })?;
+
+    let child_agent = child.agent.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Child conversation {} has no agent configured for completion relay",
+            child.id
+        )
+    })?;
+    let parent_agent = parent.agent.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Parent conversation {} has no coordinator agent configured",
+            parent.id
+        )
+    })?;
+    let parent_agent_type: AgentType = serde_json::from_value(serde_json::Value::String(
+        parent_agent.to_string(),
+    ))
+    .with_context(|| {
+        format!(
+            "Unsupported parent coordinator agent '{}' for conversation {}",
+            parent_agent, parent.id
+        )
+    })?;
+    let working_dir = resolve_working_dir(db, &parent_agent_type, &parent.organization).await?;
+    let codex_options = ChatCodexOptions::default_for_agent(&parent_agent_type);
+    let relay_message = format_child_completion_relay_message(
+        &child.title,
+        &child.id,
+        child_agent,
+        terminal_status,
+        child_assistant_message_id,
+        child_output,
+        error_message,
+    );
+    let metadata = child_completion_relay_metadata(
+        &child.id,
+        &child.title,
+        child_agent,
+        child_assistant_message_id,
+        terminal_status,
+    )?;
+
+    let payload = conversation_turn_jobs::ConversationTurnJobPayload {
+        user_id: parent.user_id.clone(),
+        message: relay_message,
+        agent_type: parent_agent_type.as_str().to_string(),
+        runtime: ChatRuntime::CodexAppServer.as_job_runtime().to_string(),
+        prompt_name: parent_agent_type.as_str().to_string(),
+        working_dir: working_dir.to_string_lossy().to_string(),
+        prompt_vars: chat_stream::encode_codex_options_for_job(HashMap::new(), &codex_options),
+        images_json: None,
+        client_id: Some(format!(
+            "{}-{}",
+            CHILD_COMPLETION_RELAY_CLIENT_ID_PREFIX, child_assistant_message_id
+        )),
+        message_metadata: Some(metadata),
+    };
+
+    let job_id = conversation_turn_jobs::enqueue_job(db, &parent.id, payload)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to enqueue parent coordinator relay job for parent {} from child {}",
+                parent.id, child.id
+            )
+        })?;
+
+    let parent_checkpoint = checkpoints::get_checkpoint(db, &parent.id).await?;
+    let parent_is_active = parent_checkpoint
+        .as_ref()
+        .map(|checkpoint| matches!(checkpoint.status.as_str(), "queued" | "pending" | "running"))
+        .unwrap_or(false);
+    if !parent_is_active {
+        checkpoints::upsert_checkpoint(db, &parent.id, "queued", 0).await?;
+    }
+
+    super::conversations::publish_conversation_run_status(db, &parent.id).await?;
+    tracing::info!(
+        "[WORKER] Enqueued child completion relay job {} parent={} child={} child_agent={} status={}",
+        job_id,
+        parent.id,
+        child.id,
+        child_agent,
+        terminal_status
+    );
+
+    Ok(())
+}
+
+fn format_child_completion_relay_message(
+    child_title: &str,
+    child_conversation_id: &str,
+    child_agent: &str,
+    terminal_status: &str,
+    child_assistant_message_id: &str,
+    child_output: &str,
+    error_message: Option<&str>,
+) -> String {
+    let output = child_output.trim();
+    let output = if output.is_empty() {
+        "(No assistant text was produced.)"
+    } else {
+        output
+    };
+
+    let mut message = format!(
+        "Child conversation finished.\n\nChild conversation: {child_title} (`{child_conversation_id}`)\nAgent: `{child_agent}`\nStatus: `{terminal_status}`\nAssistant message: `{child_assistant_message_id}`\n\nFinal output:\n\n{output}\n\nCoordinator instruction: review this child output and decide the next orchestration step. If the output is incomplete, ask for targeted follow-up. If it is sufficient, queue the next phase or report the decision back to Alex."
+    );
+
+    if let Some(error_message) = error_message.filter(|message| !message.trim().is_empty()) {
+        message.push_str("\n\nError detail:\n\n");
+        message.push_str(error_message.trim());
+    }
+
+    message
+}
+
+fn child_completion_relay_metadata(
+    child_conversation_id: &str,
+    child_title: &str,
+    child_agent: &str,
+    child_assistant_message_id: &str,
+    terminal_status: &str,
+) -> Result<String> {
+    serde_json::to_string(&serde_json::json!({
+        "origin": "agent_orchestrated",
+        "orchestrated_by": "agent-runner",
+        "orchestration": "child_completion_relay",
+        "child_conversation_id": child_conversation_id,
+        "child_title": child_title,
+        "child_agent": child_agent,
+        "child_assistant_message_id": child_assistant_message_id,
+        "child_terminal_status": terminal_status,
+    }))
+    .context("serialize child completion relay metadata")
 }
 
 async fn build_codex_system_prompt(
@@ -2670,5 +2899,45 @@ mod streaming_persistence_tests {
             }
             other => panic!("expected trailing text block, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn child_completion_relay_message_carries_final_output_and_instruction() {
+        let message = format_child_completion_relay_message(
+            "Architecture Synthesis",
+            "child-1",
+            "codebase-research",
+            "completed",
+            "assistant-1",
+            "Use a layered memory model.",
+            None,
+        );
+
+        assert!(message.contains("Child conversation: Architecture Synthesis (`child-1`)"));
+        assert!(message.contains("Agent: `codebase-research`"));
+        assert!(message.contains("Status: `completed`"));
+        assert!(message.contains("Assistant message: `assistant-1`"));
+        assert!(message.contains("Use a layered memory model."));
+        assert!(message.contains("Coordinator instruction: review this child output"));
+    }
+
+    #[test]
+    fn child_completion_relay_metadata_marks_orchestrated_origin() {
+        let metadata = child_completion_relay_metadata(
+            "child-1",
+            "Architecture Synthesis",
+            "codebase-research",
+            "assistant-1",
+            "completed",
+        )
+        .expect("serialize relay metadata");
+        let value: serde_json::Value =
+            serde_json::from_str(&metadata).expect("parse relay metadata");
+
+        assert_eq!(value["origin"], "agent_orchestrated");
+        assert_eq!(value["orchestration"], "child_completion_relay");
+        assert_eq!(value["child_conversation_id"], "child-1");
+        assert_eq!(value["child_agent"], "codebase-research");
+        assert_eq!(value["child_terminal_status"], "completed");
     }
 }
