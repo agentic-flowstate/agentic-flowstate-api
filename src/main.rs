@@ -929,6 +929,22 @@ async fn main() -> anyhow::Result<()> {
             "/api/workspace-manager/chat/submit",
             post(handlers::workspace_manager_chat_submit),
         )
+        // Artifact-memory context packet routes
+        .route("/api/context/search", post(handlers::search_context))
+        .route("/api/context/gather", post(handlers::gather_context_packet))
+        .route("/api/context-packets", get(handlers::list_context_packets))
+        .route(
+            "/api/context-packets/:packet_id",
+            get(handlers::get_context_packet),
+        )
+        .route(
+            "/api/retrievals/:retrieval_id/explain",
+            get(handlers::explain_retrieval),
+        )
+        .route(
+            "/api/retrieval-feedback",
+            post(handlers::record_retrieval_feedback),
+        )
         // Document routes (artifact-based)
         .route(
             "/api/tickets/:ticket_id/docs",

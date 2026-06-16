@@ -18,6 +18,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use serde::Deserialize;
+use sqlx::Row;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -360,7 +361,7 @@ pub async fn subscribe_unified_events(
             // ── LIBRARY (artifacts/documents for one org) ───────────────
             if topics.contains("library") {
                 if let Some(ref org_name) = validated_org {
-                    let artifacts_result = ticketing_system::artifacts::list_by_org(&pool, org_name).await;
+                    let artifacts_result = list_visible_library_artifacts(&pool, org_name).await;
                     let documents_result = ticketing_system::documents::list_documents(
                         &pool, org_name, None, None, None,
                     ).await;
@@ -654,6 +655,54 @@ fn hash_library_lists(
     }
     documents.len().hash(&mut hasher);
     hasher.finish()
+}
+
+async fn list_visible_library_artifacts(
+    pool: &SqlitePool,
+    org: &str,
+) -> anyhow::Result<Vec<ticketing_system::ArtifactSummary>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT artifact_id, title, length(content) AS content_length, artifact_type, created_by,
+               source_step_id, organization, epic_id, slice_id, ticket_id,
+               agent_run_id, created_at, updated_at
+        FROM artifacts
+        WHERE organization = ?
+          AND lifecycle_status = 'active'
+          AND visibility IN ('organization', 'system')
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(org)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ticketing_system::ArtifactSummary {
+            artifact_id: row.get("artifact_id"),
+            title: row.get("title"),
+            artifact_type: row.get("artifact_type"),
+            created_by: row.get("created_by"),
+            source_step_id: row.get("source_step_id"),
+            organization: row.get("organization"),
+            epic_id: row.get("epic_id"),
+            slice_id: row.get("slice_id"),
+            ticket_id: row.get("ticket_id"),
+            agent_run_id: row.get("agent_run_id"),
+            content_length: usize::try_from(row.get::<i64, _>("content_length")).unwrap_or(0),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+            created_at_iso: timestamp_to_iso(row.get("created_at")),
+            updated_at_iso: timestamp_to_iso(row.get("updated_at")),
+        })
+        .collect())
+}
+
+fn timestamp_to_iso(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
 }
 
 fn unified_events_poll_interval(topics: &HashSet<String>) -> Duration {
