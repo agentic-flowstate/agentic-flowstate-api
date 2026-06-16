@@ -27,7 +27,7 @@ use crate::observability::streaming::{
     record_ticket_preflight_error,
 };
 use ticketing_system::{
-    agent_runners, checkpoints, conversations,
+    agent_runners, checkpoints, conversation_turn_jobs, conversations,
     token_usage::{self, TokenUsageBreakdown},
     AddMessageRequest, ContentBlockDesc, ConversationMessage, UpdateConversationRequest,
 };
@@ -2225,7 +2225,233 @@ async fn insert_child_completion_status_to_parent(
         terminal_status
     );
 
+    if let Err(e) = enqueue_parent_coordinator_wake(
+        db,
+        &parent,
+        &child,
+        child_agent,
+        child_conversation_type,
+        terminal_status,
+        child_assistant_message_id,
+        &status_message.id,
+    )
+    .await
+    {
+        tracing::error!(
+            "[WORKER] Failed to enqueue parent coordinator wake parent={} child={} status={}: {}",
+            parent.id,
+            child.id,
+            terminal_status,
+            e
+        );
+    }
+
     Ok(())
+}
+
+async fn enqueue_parent_coordinator_wake(
+    db: &SqlitePool,
+    parent: &ticketing_system::Conversation,
+    child: &ticketing_system::Conversation,
+    child_agent: &str,
+    child_conversation_type: &str,
+    terminal_status: &str,
+    child_assistant_message_id: &str,
+    status_message_id: &str,
+) -> Result<()> {
+    if parent_has_running_turn(db, &parent.id).await? {
+        tracing::info!(
+            "[WORKER] Skipping coordinator wake; parent already running parent={} child={} status={}",
+            parent.id,
+            child.id,
+            terminal_status
+        );
+        return Ok(());
+    }
+
+    let agent_type = parent_coordinator_agent_type(parent)?;
+    let prompt_vars = parent_coordinator_prompt_vars(&agent_type, &parent.user_id)?;
+    let message = format_parent_coordinator_wake_message(
+        child,
+        child_agent,
+        child_conversation_type,
+        terminal_status,
+        child_assistant_message_id,
+        status_message_id,
+    );
+    let metadata = parent_coordinator_wake_metadata(
+        &child.id,
+        &child.title,
+        child_agent,
+        child_conversation_type,
+        terminal_status,
+        child_assistant_message_id,
+        status_message_id,
+    )?;
+
+    checkpoints::upsert_checkpoint(db, &parent.id, "queued", 0)
+        .await
+        .with_context(|| format!("queue parent coordinator checkpoint {}", parent.id))?;
+
+    let payload = conversation_turn_jobs::ConversationTurnJobPayload {
+        user_id: parent.user_id.clone(),
+        message,
+        agent_type: agent_type.as_str().to_string(),
+        runtime: super::chat_stream::ChatRuntime::CodexAppServer
+            .as_job_runtime()
+            .to_string(),
+        prompt_name: agent_type.as_str().to_string(),
+        working_dir: "/Users/jarvisgpt/projects".to_string(),
+        prompt_vars: super::chat_stream::encode_codex_options_for_job(
+            prompt_vars,
+            &super::chat_stream::ChatCodexOptions::default_for_agent(&agent_type),
+        ),
+        images_json: None,
+        client_id: Some(format!(
+            "coordinator-wake:{}:{}",
+            child.id, child_assistant_message_id
+        )),
+        message_metadata: Some(metadata),
+    };
+
+    let job_id = conversation_turn_jobs::enqueue_job(db, &parent.id, payload)
+        .await
+        .with_context(|| {
+            format!(
+                "enqueue parent coordinator wake parent={} child={}",
+                parent.id, child.id
+            )
+        })?;
+    super::conversations::publish_conversation_run_status(db, &parent.id)
+        .await
+        .with_context(|| format!("publish parent coordinator wake status {}", parent.id))?;
+    tracing::info!(
+        "[WORKER] Enqueued parent coordinator wake job={} parent={} child={} status={}",
+        job_id,
+        parent.id,
+        child.id,
+        terminal_status
+    );
+    Ok(())
+}
+
+async fn parent_has_running_turn(db: &SqlitePool, parent_conversation_id: &str) -> Result<bool> {
+    if agent_runners::has_active_turn_for_conversation(db, parent_conversation_id)
+        .await
+        .unwrap_or(false)
+    {
+        return Ok(true);
+    }
+
+    let running_job_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM conversation_turn_jobs
+        WHERE conversation_id = ?
+          AND status = 'running'
+        "#,
+    )
+    .bind(parent_conversation_id)
+    .fetch_one(db)
+    .await
+    .with_context(|| {
+        format!(
+            "inspect running coordinator turn jobs for {}",
+            parent_conversation_id
+        )
+    })?;
+    if running_job_count > 0 {
+        return Ok(true);
+    }
+
+    let checkpoint = checkpoints::get_checkpoint(db, parent_conversation_id)
+        .await
+        .with_context(|| {
+            format!(
+                "inspect parent coordinator checkpoint {}",
+                parent_conversation_id
+            )
+        })?;
+    Ok(checkpoint
+        .map(|checkpoint| {
+            matches!(checkpoint.status.as_str(), "pending" | "running")
+                && checkpoint.cc_session_id != "queued"
+        })
+        .unwrap_or(false))
+}
+
+fn parent_coordinator_agent_type(parent: &ticketing_system::Conversation) -> Result<AgentType> {
+    let raw_agent = parent.agent.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Parent conversation {} has no coordinator agent configured",
+            parent.id
+        )
+    })?;
+    AgentType::from_chat_agent_key(raw_agent)
+        .or_else(|| serde_json::from_value(serde_json::Value::String(raw_agent.to_string())).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Parent conversation {} uses unsupported coordinator agent {}",
+                parent.id,
+                raw_agent
+            )
+        })
+}
+
+fn parent_coordinator_prompt_vars(
+    agent_type: &AgentType,
+    user_id: &str,
+) -> Result<HashMap<String, String>> {
+    let mut prompt_vars = HashMap::new();
+    prompt_vars.insert("USER_ID".to_string(), user_id.to_string());
+
+    if matches!(agent_type, AgentType::FullAccess) {
+        let agents_md = std::fs::read_to_string("/Users/jarvisgpt/projects/AGENTS.md")
+            .context("read /Users/jarvisgpt/projects/AGENTS.md for full-access wake")?;
+        prompt_vars.insert("AGENTS_MD".to_string(), agents_md);
+    }
+
+    Ok(prompt_vars)
+}
+
+fn format_parent_coordinator_wake_message(
+    child: &ticketing_system::Conversation,
+    child_agent: &str,
+    child_conversation_type: &str,
+    terminal_status: &str,
+    child_assistant_message_id: &str,
+    status_message_id: &str,
+) -> String {
+    format!(
+        "Coordinator wake: child agent {terminal_status}.\n\nChild: {child_title}\nChild conversation: `{child_conversation_id}`\nChild agent: `{child_agent}`\nChild type: `{child_conversation_type}`\nCompletion card message: `{status_message_id}`\nChild assistant message: `{child_assistant_message_id}`\n\nReview the child conversation, then decide the next orchestration step. If the output is incomplete, ask for targeted follow-up. If it is sufficient, queue any unblocked dependent child agents or report the decision back to Alex. Keep the parent response concise.",
+        child_title = child.title,
+        child_conversation_id = child.id,
+    )
+}
+
+fn parent_coordinator_wake_metadata(
+    child_conversation_id: &str,
+    child_title: &str,
+    child_agent: &str,
+    child_conversation_type: &str,
+    terminal_status: &str,
+    child_assistant_message_id: &str,
+    status_message_id: &str,
+) -> Result<String> {
+    serde_json::to_string(&serde_json::json!({
+        "origin": "agent_orchestrated",
+        "orchestrated_by": "agent-runner",
+        "orchestration": "coordinator_child_completion_wake",
+        "display": "coordinator_wake_request",
+        "child_conversation_id": child_conversation_id,
+        "child_title": child_title,
+        "child_agent": child_agent,
+        "child_conversation_type": child_conversation_type,
+        "child_terminal_status": terminal_status,
+        "child_assistant_message_id": child_assistant_message_id,
+        "child_completion_message_id": status_message_id,
+    }))
+    .context("serialize parent coordinator wake metadata")
 }
 
 fn format_child_completion_status_message(
@@ -3160,6 +3386,30 @@ mod streaming_persistence_tests {
         assert_eq!(value["child_terminal_status"], "completed");
         assert_eq!(value["child_conversation_type"], "research");
         assert_eq!(value["summary"], "Use a layered memory model.");
+    }
+
+    #[test]
+    fn parent_coordinator_wake_metadata_marks_review_request() {
+        let metadata = parent_coordinator_wake_metadata(
+            "child-1",
+            "Architecture Synthesis",
+            "codebase-research",
+            "research",
+            "completed",
+            "assistant-1",
+            "status-message-1",
+        )
+        .expect("serialize wake metadata");
+        let value: serde_json::Value =
+            serde_json::from_str(&metadata).expect("parse wake metadata");
+
+        assert_eq!(value["origin"], "agent_orchestrated");
+        assert_eq!(value["orchestration"], "coordinator_child_completion_wake");
+        assert_eq!(value["display"], "coordinator_wake_request");
+        assert_eq!(value["child_conversation_id"], "child-1");
+        assert_eq!(value["child_agent"], "codebase-research");
+        assert_eq!(value["child_terminal_status"], "completed");
+        assert_eq!(value["child_completion_message_id"], "status-message-1");
     }
 
     #[test]
