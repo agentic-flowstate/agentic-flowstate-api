@@ -1644,7 +1644,10 @@ pub async fn list_messages(
             Some("running") | Some("pending") | Some("queued")
         );
         if is_processing {
-            if let Some(idx) = messages.iter().rposition(|m| m.role == "assistant") {
+            if let Some(idx) = messages.iter().rposition(|m| {
+                m.role == "assistant"
+                    && !super::child_completion_status::is_child_completion_status_message(m)
+            }) {
                 messages.remove(idx);
             }
         }

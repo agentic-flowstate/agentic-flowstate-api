@@ -2633,15 +2633,8 @@ fn build_codex_conversation_history(messages: &[ConversationMessage]) -> String 
 }
 
 fn append_conversation_history(history: &mut String, messages: &[ConversationMessage]) {
-    let recent = if messages.len() > PROMPT_HISTORY_MESSAGE_LIMIT {
-        &messages[messages.len() - PROMPT_HISTORY_MESSAGE_LIMIT..]
-    } else {
-        messages
-    };
-
-    let sanitized_recent: Vec<ConversationMessage> = recent
-        .iter()
-        .cloned()
+    let sanitized_recent: Vec<ConversationMessage> = prompt_history_recent_window(messages)
+        .into_iter()
         .map(super::child_completion_status::sanitize_message_for_display)
         .collect();
 
@@ -2705,6 +2698,29 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
             }
         }
     }
+}
+
+fn prompt_history_recent_window(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+    let mut transcript_count = 0usize;
+    let mut kept_reversed = Vec::new();
+
+    for msg in messages.iter().rev() {
+        if transcript_count >= PROMPT_HISTORY_MESSAGE_LIMIT {
+            break;
+        }
+
+        kept_reversed.push(msg.clone());
+        if counts_against_prompt_history_limit(msg) {
+            transcript_count += 1;
+        }
+    }
+
+    kept_reversed.reverse();
+    kept_reversed
+}
+
+fn counts_against_prompt_history_limit(msg: &ConversationMessage) -> bool {
+    !super::child_completion_status::is_child_completion_status_message(msg)
 }
 
 fn format_message_attachments_for_prompt(msg: &ConversationMessage) -> Option<String> {
@@ -2795,6 +2811,27 @@ mod prompt_history_attachment_tests {
         }
     }
 
+    fn history_message(
+        idx: i32,
+        role: &str,
+        content: &str,
+        metadata: Option<String>,
+    ) -> ConversationMessage {
+        ConversationMessage {
+            id: format!("msg-{idx}"),
+            conversation_id: "conv-history-window-test".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            attachments: None,
+            metadata,
+            tool_call_summaries: None,
+            content_blocks: None,
+            assistant_turn_duration_seconds: None,
+            created_at: i64::from(idx),
+            message_index: idx,
+        }
+    }
+
     #[test]
     fn history_includes_image_attachment_paths() {
         let attachments = serde_json::json!([
@@ -2838,6 +2875,44 @@ mod prompt_history_attachment_tests {
 
         assert!(history.contains("image attachment `image.png`"));
         assert!(history.contains("/tmp/chat-attachments/conv/stored-image.png"));
+    }
+
+    #[test]
+    fn history_limit_counts_transcript_turns_not_child_completion_cards() {
+        let mut messages = Vec::new();
+        for idx in 0..31 {
+            messages.push(history_message(
+                idx,
+                if idx % 2 == 0 { "user" } else { "assistant" },
+                &format!("turn-{idx:02}"),
+                None,
+            ));
+        }
+        for idx in 31..36 {
+            let metadata = serde_json::json!({
+                "origin": "agent_orchestrated",
+                "orchestration": "child_completion_status",
+                "child_conversation_id": format!("child-{idx}"),
+                "child_title": format!("child-card-{idx}"),
+                "child_agent": "full-access",
+                "child_terminal_status": "completed"
+            })
+            .to_string();
+            messages.push(history_message(
+                idx,
+                "assistant",
+                &format!("Child agent completed: child-card-{idx}"),
+                Some(metadata),
+            ));
+        }
+
+        let history = build_codex_conversation_history(&messages);
+
+        assert!(!history.contains("turn-00"));
+        assert!(history.contains("turn-01"));
+        assert!(history.contains("turn-30"));
+        assert!(history.contains("child-card-31"));
+        assert!(history.contains("child-card-35"));
     }
 }
 

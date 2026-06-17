@@ -35,6 +35,10 @@ pub fn sanitize_message_for_display(mut message: ConversationMessage) -> Convers
     message
 }
 
+pub fn is_child_completion_status_message(message: &ConversationMessage) -> bool {
+    child_completion_status_from_metadata(message.metadata.as_deref()).is_some()
+}
+
 fn child_completion_status_from_metadata(metadata: Option<&str>) -> Option<ChildCompletionStatus> {
     let metadata = metadata?;
     let value: Value = serde_json::from_str(metadata).ok()?;
