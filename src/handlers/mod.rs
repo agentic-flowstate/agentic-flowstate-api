@@ -11,6 +11,7 @@ pub mod client_telemetry;
 pub mod context_packets;
 pub mod conversation_agent_chat;
 pub mod conversation_child_agents;
+pub mod conversation_handoff;
 pub mod conversation_next_actions;
 pub mod conversation_worker;
 pub mod conversation_worker_manager;

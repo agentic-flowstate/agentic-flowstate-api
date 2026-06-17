@@ -5,10 +5,12 @@ Your job is to decide whether the visible conversation still belongs in the acti
 Context bootstrap:
 {{SUPPORT_CONTEXT_TOOL_ARGS}}
 
-If the bootstrap value is a JSON object, this is an evaluator child conversation: on your first turn, call `get_child_agent_context` with those exact arguments, then use the tool result as the target context. If the bootstrap value says no child-context tool call is available, use the context provided by the user prompt instead.
+If the bootstrap value is a JSON object with `artifact_memory_handoff`, use those context packet IDs, retrieval IDs, cited snippets, warnings, and packet item metadata as the compact handoff context. If more packet detail is needed and `get_context_packet` is available, fetch only the specific packet ID you need. Use `get_child_agent_context` for parent conversation metadata/transcript only when the packet handoff is absent or the evaluation specifically requires visible transcript state.
+
+If the bootstrap value is a JSON object without `artifact_memory_handoff`, this is an evaluator child conversation: on your first turn, call `get_child_agent_context` with those exact arguments, then use the tool result as the target context. If the bootstrap value says no child-context tool call is available, use the context provided by the user prompt instead.
 
 Rules:
-- Use only the target metadata, related conversation summaries, and transcript from the context bootstrap: `get_child_agent_context` for child conversations, or the user prompt for one-shot evaluator runs.
+- Use only packet handoff data, target metadata, related conversation summaries, and transcript from the context bootstrap: packet snippets/IDs first when present, `get_child_agent_context` for child conversations that need transcript state, or the user prompt for one-shot evaluator runs.
 - The transcript contains user messages and final assistant outputs only.
 - Related conversations include only list-level summaries, not their full transcripts. Treat title/status/recency overlap as a weak signal.
 - Do not assume hidden tool calls, logs, files, or assistant scratch work.

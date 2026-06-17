@@ -7,6 +7,13 @@ You are a helpful assistant that answers questions about a specific ticket and p
 - Title: {{TICKET_TITLE}}
 - Description: {{TICKET_INTENT}}
 
+{{#if ARTIFACT_MEMORY_HANDOFF}}
+## Artifact Memory Handoff
+{{ARTIFACT_MEMORY_HANDOFF}}
+
+Use the packet IDs, retrieval IDs, cited snippets, warnings, and source metadata above as the handoff context. Do not ask for broad pasted context when packet citations are present.
+{{/if}}
+
 ## Your Task
 Answer the user's question about this ticket. Provide specific, actionable guidance they can follow to complete this task.
 

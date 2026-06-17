@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
+use ticketing_system::retrieval::{gather_context, GatherContextRequest, RetrievalRequest};
 use ticketing_system::{
     checkpoints, conversation_turn_jobs, conversations, Conversation, ConversationHierarchyScope,
     CreateChildConversationRequest,
@@ -16,6 +17,9 @@ use ticketing_system::{
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 use crate::handlers::chat_stream::{self, ChatCodexOptions, ChatRuntime};
+use crate::handlers::conversation_handoff::{
+    resolve_context_handoff, ContextHandoffRequest, ResolvedContextHandoff,
+};
 
 #[derive(Debug, Deserialize)]
 pub struct LaunchConversationChildAgentRequest {
@@ -256,7 +260,17 @@ async fn maybe_enqueue_initial_turn(
 
     ensure_parent_has_transcript(pool, &parent.id, kind).await?;
 
-    enqueue_child_turn(pool, user_id, &child.id, kind, target_message_id).await?;
+    let handoff = gather_parent_context_handoff(pool, parent, kind).await?;
+
+    enqueue_child_turn(
+        pool,
+        user_id,
+        &child.id,
+        kind,
+        target_message_id,
+        handoff.as_ref(),
+    )
+    .await?;
     child.is_active = Some(true);
     Ok(true)
 }
@@ -267,6 +281,7 @@ async fn enqueue_child_turn(
     child_id: &str,
     kind: ChildAgentKind,
     target_message_id: Option<&str>,
+    handoff: Option<&ResolvedContextHandoff>,
 ) -> Result<()> {
     checkpoints::upsert_checkpoint(pool, child_id, "queued", 0)
         .await
@@ -277,8 +292,14 @@ async fn enqueue_child_turn(
     let mut prompt_vars = HashMap::new();
     prompt_vars.insert(
         "SUPPORT_CONTEXT_TOOL_ARGS".to_string(),
-        support_context_tool_args(child_id, user_id, target_message_id),
+        support_context_tool_args(child_id, user_id, target_message_id, handoff)?,
     );
+    if let Some(handoff) = handoff {
+        prompt_vars.insert(
+            "ARTIFACT_MEMORY_HANDOFF".to_string(),
+            handoff.prompt_json()?,
+        );
+    }
     let payload = conversation_turn_jobs::ConversationTurnJobPayload {
         user_id: user_id.to_string(),
         message: kind.visible_initial_message().to_string(),
@@ -292,6 +313,7 @@ async fn enqueue_child_turn(
         message_metadata: Some(orchestrated_message_metadata(
             "api",
             kind.agent_type().as_str(),
+            handoff,
         )?),
     };
 
@@ -304,14 +326,21 @@ async fn enqueue_child_turn(
     Ok(())
 }
 
-fn orchestrated_message_metadata(orchestrated_by: &str, agent: &str) -> Result<String> {
-    serde_json::to_string(&serde_json::json!({
+fn orchestrated_message_metadata(
+    orchestrated_by: &str,
+    agent: &str,
+    handoff: Option<&ResolvedContextHandoff>,
+) -> Result<String> {
+    let mut value = serde_json::json!({
         "origin": "agent_orchestrated",
         "orchestrated_by": orchestrated_by,
         "orchestration": "child_initial_turn",
         "agent": agent,
-    }))
-    .context("serialize child-agent kickoff metadata")
+    });
+    if let Some(handoff) = handoff {
+        value["artifact_memory_handoff"] = handoff.metadata_json();
+    }
+    serde_json::to_string(&value).context("serialize child-agent kickoff metadata")
 }
 
 async fn ensure_parent_has_transcript(
@@ -341,11 +370,79 @@ async fn ensure_parent_has_transcript(
     Ok(())
 }
 
+async fn gather_parent_context_handoff(
+    pool: &SqlitePool,
+    parent: &Conversation,
+    kind: ChildAgentKind,
+) -> Result<Option<ResolvedContextHandoff>> {
+    let Some(ticket_id) = parent.router_ticket_id.as_deref() else {
+        return Ok(None);
+    };
+    let organization = parent
+        .router_organization
+        .as_deref()
+        .unwrap_or(parent.organization.as_str());
+    let actor_id = format!("api-child-agent-handoff:{}", parent.id);
+    let query_text = format!(
+        "{} child-agent context for parent conversation `{}` linked to ticket `{}`: {}",
+        kind.conversation_type(),
+        parent.id,
+        ticket_id,
+        parent.title
+    );
+    let packet = gather_context(
+        pool,
+        GatherContextRequest {
+            retrieval: RetrievalRequest {
+                organization: organization.to_string(),
+                query_text,
+                actor_type: "agent".to_string(),
+                actor_id: actor_id.clone(),
+                tool_name: "gather_context".to_string(),
+                work_summary: Some(format!(
+                    "{} child-agent handoff for parent conversation {}",
+                    kind.conversation_type(),
+                    parent.id
+                )),
+                ticket_id: Some(ticket_id.to_string()),
+                repository: None,
+                max_results: Some(8),
+                max_selected: Some(4),
+                token_budget: Some(2_000),
+            },
+            created_by: actor_id,
+            created_by_agent: Some("conversation-child-agent".to_string()),
+            max_items: Some(4),
+            token_budget: Some(2_000),
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "assemble artifact-memory packet for {} child of parent {}",
+            kind.conversation_type(),
+            parent.id
+        )
+    })?;
+
+    resolve_context_handoff(
+        pool,
+        organization,
+        &ContextHandoffRequest {
+            context_packet_ids: vec![packet.packet_id],
+            retrieval_ids: vec![packet.retrieval_id],
+        },
+    )
+    .await
+    .context("resolve child-agent artifact-memory packet handoff")
+}
+
 fn support_context_tool_args(
     child_id: &str,
     user_id: &str,
     target_message_id: Option<&str>,
-) -> String {
+    handoff: Option<&ResolvedContextHandoff>,
+) -> Result<String> {
     let mut args = serde_json::json!({
         "child_conversation_id": child_id,
         "user_id": user_id,
@@ -353,7 +450,11 @@ fn support_context_tool_args(
     if let Some(target_message_id) = target_message_id {
         args["target_message_id"] = serde_json::Value::String(target_message_id.to_string());
     }
-    args.to_string()
+    if let Some(handoff) = handoff {
+        args["artifact_memory_handoff"] = serde_json::to_value(handoff)
+            .context("serialize child-agent artifact-memory handoff")?;
+    }
+    Ok(args.to_string())
 }
 
 async fn count_conversation_messages(pool: &SqlitePool, conversation_id: &str) -> Result<i64> {

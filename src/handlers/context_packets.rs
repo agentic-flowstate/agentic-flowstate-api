@@ -671,7 +671,7 @@ async fn list_packets_for_retrieval(
     Ok(rows.iter().map(row_to_packet_summary).collect())
 }
 
-async fn get_packet_summary(
+pub(crate) async fn get_packet_summary(
     pool: &SqlitePool,
     org: &str,
     packet_id: &str,
@@ -695,7 +695,7 @@ async fn get_packet_summary(
     Ok(row.as_ref().map(row_to_packet_summary))
 }
 
-async fn list_visible_packet_items(
+pub(crate) async fn list_visible_packet_items(
     pool: &SqlitePool,
     org: &str,
     packet_id: &str,
@@ -751,7 +751,7 @@ async fn list_visible_packet_items(
     Ok(rows.iter().map(row_to_packet_item).collect())
 }
 
-async fn get_retrieval_event(
+pub(crate) async fn get_retrieval_event(
     pool: &SqlitePool,
     org: &str,
     retrieval_id: &str,

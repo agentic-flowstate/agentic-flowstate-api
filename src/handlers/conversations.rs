@@ -20,14 +20,20 @@ use std::time::Duration;
 use ticketing_system::{
     agent_runners, checkpoints, conversation_turn_jobs, conversations, AddMessageRequest,
     Conversation, ConversationHierarchyScope, ConversationMessage, ConversationReadState,
-    CreateChildConversationRequest, CreateConversationRequest, SqlitePool,
-    UpdateConversationRequest,
+    CreateChildConversationRequest as TicketingCreateChildConversationRequest,
+    CreateConversationRequest, SqlitePool, UpdateConversationRequest,
 };
 
 use super::chat_client_manager::ChatClientManager;
-use super::chat_stream::get_broadcast_sender;
+use super::chat_stream::{
+    encode_codex_options_for_job, get_broadcast_sender, ChatCodexOptions, ChatRuntime,
+};
+use super::conversation_handoff::{
+    resolve_context_handoff, ContextHandoffRequest, ResolvedContextHandoff,
+};
 use super::conversation_worker_manager::WORKER_MANAGER;
 use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
+use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_opened, DisconnectReason,
@@ -146,7 +152,7 @@ struct ChatAttachmentMeta {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateChildConversationsBody {
-    pub children: Vec<CreateChildConversationRequest>,
+    pub children: Vec<CreateChildConversationSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,13 +166,58 @@ pub struct CreateMultiAgentConversationRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_type: Option<String>,
     #[serde(default)]
-    pub children: Vec<CreateChildConversationRequest>,
+    pub children: Vec<CreateChildConversationSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateChildConversationSpec {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_sort_order: Option<i32>,
+    #[serde(default, flatten)]
+    handoff: ContextHandoffRequest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct MultiAgentConversationResponse {
     pub parent: Conversation,
     pub children: Vec<Conversation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_turns: Vec<QueuedChildTurnResponse>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_handoffs: Vec<ChildContextHandoffResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QueuedChildTurnResponse {
+    pub child_conversation_id: String,
+    pub job_id: String,
+    pub agent: String,
+    pub prompt_name: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_packet_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrieval_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChildContextHandoffResponse {
+    pub child_conversation_id: String,
+    pub context_packet_ids: Vec<String>,
+    pub retrieval_ids: Vec<String>,
 }
 
 const ACTIVE_CHECKPOINT_STALE_SECONDS: i64 = 60;
@@ -680,6 +731,211 @@ async fn require_user_conversation(
     Ok(conversation)
 }
 
+fn child_conversation_requests(
+    specs: &[CreateChildConversationSpec],
+) -> Vec<TicketingCreateChildConversationRequest> {
+    specs
+        .iter()
+        .map(|child| TicketingCreateChildConversationRequest {
+            title: child.title.clone(),
+            agent: child.agent.clone(),
+            conversation_type: child.conversation_type.clone(),
+            child_sort_order: child.child_sort_order,
+        })
+        .collect()
+}
+
+async fn resolve_child_context_handoffs(
+    pool: &SqlitePool,
+    organization: &str,
+    children: &[CreateChildConversationSpec],
+) -> Result<Vec<Option<ResolvedContextHandoff>>, (StatusCode, String)> {
+    let mut resolved = Vec::with_capacity(children.len());
+    for child in children {
+        if child.handoff.has_handles()
+            && child
+                .initial_message
+                .as_deref()
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .is_none()
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Child '{}' provided context_packet_ids/retrieval_ids but no initial_message; packet handoff must be attached to a queued child turn.",
+                    child.title
+                ),
+            ));
+        }
+
+        let handoff = resolve_context_handoff(pool, organization, &child.handoff)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Invalid artifact-memory handoff for child '{}': {}",
+                        child.title, e
+                    ),
+                )
+            })?;
+        resolved.push(handoff);
+    }
+    Ok(resolved)
+}
+
+fn context_handoff_responses(
+    children: &[Conversation],
+    handoffs: &[Option<ResolvedContextHandoff>],
+) -> Vec<ChildContextHandoffResponse> {
+    children
+        .iter()
+        .zip(handoffs.iter())
+        .filter_map(|(child, handoff)| {
+            let handoff = handoff.as_ref()?;
+            Some(ChildContextHandoffResponse {
+                child_conversation_id: child.id.clone(),
+                context_packet_ids: handoff.packet_ids(),
+                retrieval_ids: handoff.retrieval_ids(),
+            })
+        })
+        .collect()
+}
+
+async fn enqueue_initial_child_turns(
+    pool: &SqlitePool,
+    user_id: &str,
+    children: &[CreateChildConversationSpec],
+    created_children: &[Conversation],
+    handoffs: &[Option<ResolvedContextHandoff>],
+) -> Result<Vec<QueuedChildTurnResponse>, (StatusCode, String)> {
+    let mut queued = Vec::new();
+    for ((spec, child), handoff) in children.iter().zip(created_children.iter()).zip(handoffs) {
+        let Some(initial_message) = spec
+            .initial_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        else {
+            continue;
+        };
+        let agent = child.agent.as_deref().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Child '{}' must set agent when initial_message is provided",
+                    child.title
+                ),
+            )
+        })?;
+        let agent_type = parse_child_agent_type(agent)?;
+        let prompt_name = spec
+            .prompt_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(agent);
+        let working_dir = spec
+            .working_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or("/Users/jarvisgpt/projects");
+
+        let mut prompt_vars = HashMap::new();
+        prompt_vars.insert("CHILD_CONVERSATION_ID".to_string(), child.id.clone());
+        if let Some(parent_id) = child.parent_conversation_id.as_deref() {
+            prompt_vars.insert("PARENT_CONVERSATION_ID".to_string(), parent_id.to_string());
+        }
+        if let Some(handoff) = handoff.as_ref() {
+            prompt_vars.insert(
+                "ARTIFACT_MEMORY_HANDOFF".to_string(),
+                handoff.prompt_json().map_err(internal_error)?,
+            );
+        }
+
+        let metadata = orchestrated_child_turn_metadata("api", agent, handoff.as_ref())?;
+        checkpoints::upsert_checkpoint(pool, &child.id, "queued", 0)
+            .await
+            .map_err(internal_error)?;
+        let prompt_vars = encode_codex_options_for_job(
+            prompt_vars,
+            &ChatCodexOptions::default_for_agent(&agent_type),
+        );
+        let job_id = conversation_turn_jobs::enqueue_job(
+            pool,
+            &child.id,
+            conversation_turn_jobs::ConversationTurnJobPayload {
+                user_id: user_id.to_string(),
+                message: initial_message.to_string(),
+                agent_type: agent.to_string(),
+                runtime: ChatRuntime::CodexAppServer.as_job_runtime().to_string(),
+                prompt_name: prompt_name.to_string(),
+                working_dir: working_dir.to_string(),
+                prompt_vars,
+                images_json: None,
+                client_id: spec.client_id.clone(),
+                message_metadata: Some(metadata),
+            },
+        )
+        .await
+        .map_err(internal_error)?;
+
+        queued.push(QueuedChildTurnResponse {
+            child_conversation_id: child.id.clone(),
+            job_id,
+            agent: agent.to_string(),
+            prompt_name: prompt_name.to_string(),
+            status: "queued".to_string(),
+            context_packet_ids: handoff
+                .as_ref()
+                .map(ResolvedContextHandoff::packet_ids)
+                .unwrap_or_default(),
+            retrieval_ids: handoff
+                .as_ref()
+                .map(ResolvedContextHandoff::retrieval_ids)
+                .unwrap_or_default(),
+        });
+        publish_conversation_run_status(pool, &child.id)
+            .await
+            .map_err(internal_error)?;
+    }
+    Ok(queued)
+}
+
+fn parse_child_agent_type(agent: &str) -> Result<AgentType, (StatusCode, String)> {
+    AgentType::from_chat_agent_key(agent)
+        .or_else(|| serde_json::from_value(serde_json::Value::String(agent.to_string())).ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Unsupported child agent for queued turn: {agent}"),
+            )
+        })
+}
+
+fn orchestrated_child_turn_metadata(
+    orchestrated_by: &str,
+    agent: &str,
+    handoff: Option<&ResolvedContextHandoff>,
+) -> Result<String, (StatusCode, String)> {
+    let mut value = serde_json::json!({
+        "origin": "agent_orchestrated",
+        "orchestrated_by": orchestrated_by,
+        "orchestration": "child_initial_turn",
+        "agent": agent,
+    });
+    if let Some(handoff) = handoff {
+        value["artifact_memory_handoff"] = handoff.metadata_json();
+    }
+    serde_json::to_string(&value).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
 async fn get_status_sender(
     conversation_id: &str,
 ) -> broadcast::Sender<ConversationRunStatusResponse> {
@@ -878,9 +1134,13 @@ pub async fn create_multi_agent_conversation(
     Json(req): Json<CreateMultiAgentConversationRequest>,
 ) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), (StatusCode, String)> {
     ensure_agent_allowed(&pool, &user.user_id, req.agent.as_deref()).await?;
-    for child in &req.children {
+    let children_specs = req.children;
+    for child in &children_specs {
         ensure_agent_allowed(&pool, &user.user_id, child.agent.as_deref()).await?;
     }
+    let resolved_handoffs =
+        resolve_child_context_handoffs(&pool, &req.organization, &children_specs).await?;
+    let child_requests = child_conversation_requests(&children_specs);
 
     let parent = CreateConversationRequest {
         user_id: user.user_id,
@@ -894,13 +1154,27 @@ pub async fn create_multi_agent_conversation(
         child_sort_order: None,
     };
     let (parent, children) =
-        conversations::create_multi_agent_conversation(&pool, parent, req.children)
+        conversations::create_multi_agent_conversation(&pool, parent, child_requests)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let queued_turns = enqueue_initial_child_turns(
+        &pool,
+        &parent.user_id,
+        &children_specs,
+        &children,
+        &resolved_handoffs,
+    )
+    .await?;
+    let context_handoffs = context_handoff_responses(&children, &resolved_handoffs);
 
     Ok((
         StatusCode::CREATED,
-        Json(MultiAgentConversationResponse { parent, children }),
+        Json(MultiAgentConversationResponse {
+            parent,
+            children,
+            queued_turns,
+            context_handoffs,
+        }),
     ))
 }
 
@@ -960,24 +1234,43 @@ pub async fn create_child_conversations(
     Path(id): Path<String>,
     Json(req): Json<CreateChildConversationsBody>,
 ) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), (StatusCode, String)> {
-    for child in &req.children {
+    let children_specs = req.children;
+    for child in &children_specs {
         ensure_agent_allowed(&pool, &user.user_id, child.agent.as_deref()).await?;
     }
+    let parent_before = require_user_conversation(&pool, &user.user_id, &id).await?;
+    let resolved_handoffs =
+        resolve_child_context_handoffs(&pool, &parent_before.organization, &children_specs).await?;
 
     conversations::promote_conversation_to_multi_agent_parent(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
+    let child_requests = child_conversation_requests(&children_specs);
     let children =
-        conversations::create_child_conversations(&pool, &user.user_id, &id, req.children)
+        conversations::create_child_conversations(&pool, &user.user_id, &id, child_requests)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let queued_turns = enqueue_initial_child_turns(
+        &pool,
+        &user.user_id,
+        &children_specs,
+        &children,
+        &resolved_handoffs,
+    )
+    .await?;
+    let context_handoffs = context_handoff_responses(&children, &resolved_handoffs);
 
     let parent = require_user_conversation(&pool, &user.user_id, &id).await?;
 
     Ok((
         StatusCode::CREATED,
-        Json(MultiAgentConversationResponse { parent, children }),
+        Json(MultiAgentConversationResponse {
+            parent,
+            children,
+            queued_turns,
+            context_handoffs,
+        }),
     ))
 }
 

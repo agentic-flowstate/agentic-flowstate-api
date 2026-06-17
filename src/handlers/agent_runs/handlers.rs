@@ -99,7 +99,7 @@ pub async fn run_agent(
         &epic_id,
         &slice_id,
         &ticket_id,
-        ticket.title,
+        ticket.title.clone(),
         ticket.description.clone().unwrap_or_default(),
     );
 
@@ -107,12 +107,18 @@ pub async fn run_agent(
         gather_agent_context(
             &db,
             &req.agent_type,
-            &ticket_id,
+            &ticket,
             req.previous_session_id.as_deref(),
             &req.selected_session_ids,
             ticket.assignee.as_deref(),
         )
-        .await;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to gather artifact-memory context packet: {}", e),
+            )
+        })?;
 
     // Combine blocked_by context with previous output if both exist
     let combined_previous = match (blocked_by_context, previous_output) {
@@ -287,8 +293,13 @@ pub async fn stream_agent_run(
                     ticket.description.clone().unwrap_or_default()
                 };
 
-                let context =
-                    build_ticket_context(&epic_id, &slice_id, &ticket_id, ticket.title, intent);
+                let context = build_ticket_context(
+                    &epic_id,
+                    &slice_id,
+                    &ticket_id,
+                    ticket.title.clone(),
+                    intent,
+                );
 
                 let working_dir =
                     match resolve_working_dir(&db_clone, &req.agent_type, &ticket.organization)
@@ -314,16 +325,53 @@ pub async fn stream_agent_run(
                     })
                     .await;
 
+                let agent_type_for_error = req.agent_type.clone();
                 let (previous_output, selected_context, sender_info, blocked_by_context) =
-                    gather_agent_context(
+                    match gather_agent_context(
                         &db_clone,
                         &req.agent_type,
-                        &ticket_id,
+                        &ticket,
                         req.previous_session_id.as_deref(),
                         &req.selected_session_ids,
                         ticket.assignee.as_deref(),
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(context) => context,
+                        Err(e) => {
+                            let message =
+                                format!("Failed to gather artifact-memory context packet: {e}");
+                            let _ = tx
+                                .send(StreamEvent::Status {
+                                    status: "failed".to_string(),
+                                    message: Some(message.clone()),
+                                })
+                                .await;
+                            let failed_run = AgentRun {
+                                session_id: session_id_clone.clone(),
+                                organization: Some(ticket.organization.clone()),
+                                ticket_id: Some(ticket_id.clone()),
+                                epic_id: Some(epic_id.clone()),
+                                slice_id: Some(slice_id.clone()),
+                                agent_type: agent_type_for_error.as_str().to_string(),
+                                status: crate::agents::AgentRunStatus::Failed,
+                                started_at: chrono::Utc::now().to_rfc3339(),
+                                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                                input_message: ticket.description.clone().unwrap_or_default(),
+                                output_summary: Some(message),
+                                email_output: None,
+                                tool_call_count: 0,
+                                cc_session_id: None,
+                            };
+                            if let Err(store_err) = store_agent_run(&db_clone, &failed_run).await {
+                                tracing::error!(
+                                    "Failed to store artifact-memory context failure run: {}",
+                                    store_err
+                                );
+                            }
+                            return;
+                        }
+                    };
 
                 // Combine blocked_by context with previous output if both exist
                 let combined_previous = match (blocked_by_context, previous_output) {
@@ -332,8 +380,6 @@ pub async fn stream_agent_run(
                     (None, Some(prev)) => Some(prev),
                     (None, None) => None,
                 };
-
-                let agent_type_for_error = req.agent_type.clone();
 
                 match executor
                     .execute(

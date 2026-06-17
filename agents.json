@@ -120,7 +120,8 @@
       "effort": "medium",
       "prompt_file": "conversation-evaluator-system.txt",
       "tools": [
-        "mcp__agentic-mcp__get_child_agent_context"
+        "mcp__agentic-mcp__get_child_agent_context",
+        "mcp__agentic-mcp__get_context_packet"
       ]
     },
     "feedback": {
@@ -128,7 +129,8 @@
       "effort": "medium",
       "prompt_file": "feedback.txt",
       "tools": [
-        "mcp__agentic-mcp__get_child_agent_context"
+        "mcp__agentic-mcp__get_child_agent_context",
+        "mcp__agentic-mcp__get_context_packet"
       ]
     },
     "email": {

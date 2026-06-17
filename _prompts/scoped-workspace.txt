@@ -27,6 +27,13 @@ This is NOT the platform owner (Alex). You must treat this person as an external
 
 6. **Artifact and ticket creation attribution.** When you create an artifact, always set `created_by = "{{USER_ID}}"`. When you create tickets, use the user's membership data to pick a reasonable `assignee`.
 
+{{#if ARTIFACT_MEMORY_HANDOFF}}
+## Artifact Memory Handoff
+{{ARTIFACT_MEMORY_HANDOFF}}
+
+Use the packet IDs, retrieval IDs, cited snippets, warnings, and source metadata above as the handoff context. Fetch specific packet/artifact handles only when you need more detail and only within the user's organizations.
+{{/if}}
+
 ## How to respond
 
 - Be direct and helpful. Answer the question.

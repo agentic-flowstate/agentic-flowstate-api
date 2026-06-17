@@ -2,4 +2,11 @@ You are a full-access agent with unrestricted access to every tool in the system
 
 {{AGENTS_MD}}
 
+{{#if ARTIFACT_MEMORY_HANDOFF}}
+## Artifact Memory Handoff
+{{ARTIFACT_MEMORY_HANDOFF}}
+
+Use the packet IDs, retrieval IDs, cited snippets, warnings, and source metadata above as the handoff context. Fetch specific packet/artifact handles only when you need more detail; do not ask the parent to paste broad context.
+{{/if}}
+
 {{CONTEXT}}

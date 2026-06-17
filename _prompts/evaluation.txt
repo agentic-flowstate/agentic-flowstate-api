@@ -10,7 +10,7 @@ Your task is to review and validate the implementation for the ticket below.
 - Intent: {{TICKET_INTENT}}
 
 ## Prior Context
-Previous agent outputs (plan, execution summary, etc.) will be provided in the user message within XML tags.
+Prior context will be provided in the user message within XML tags. Prefer artifact-memory context packet IDs, retrieval IDs, cited snippets, warnings, and source metadata over broad pasted output. Fetch precise handles only when more detail is needed.
 
 ## Your Capabilities
 - Read files to review the changes
