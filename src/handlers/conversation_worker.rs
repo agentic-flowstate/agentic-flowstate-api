@@ -2259,16 +2259,6 @@ async fn enqueue_parent_coordinator_wake(
     child_assistant_message_id: &str,
     status_message_id: &str,
 ) -> Result<()> {
-    if parent_has_running_turn(db, &parent.id).await? {
-        tracing::info!(
-            "[WORKER] Skipping coordinator wake; parent already running parent={} child={} status={}",
-            parent.id,
-            child.id,
-            terminal_status
-        );
-        return Ok(());
-    }
-
     let agent_type = parent_coordinator_agent_type(parent)?;
     let prompt_vars = parent_coordinator_prompt_vars(&agent_type, &parent.user_id)?;
     let message = format_parent_coordinator_wake_message(
@@ -2333,51 +2323,6 @@ async fn enqueue_parent_coordinator_wake(
         terminal_status
     );
     Ok(())
-}
-
-async fn parent_has_running_turn(db: &SqlitePool, parent_conversation_id: &str) -> Result<bool> {
-    if agent_runners::has_active_turn_for_conversation(db, parent_conversation_id)
-        .await
-        .unwrap_or(false)
-    {
-        return Ok(true);
-    }
-
-    let running_job_count: i64 = sqlx::query_scalar(
-        r#"
-        SELECT COUNT(*)
-        FROM conversation_turn_jobs
-        WHERE conversation_id = ?
-          AND status = 'running'
-        "#,
-    )
-    .bind(parent_conversation_id)
-    .fetch_one(db)
-    .await
-    .with_context(|| {
-        format!(
-            "inspect running coordinator turn jobs for {}",
-            parent_conversation_id
-        )
-    })?;
-    if running_job_count > 0 {
-        return Ok(true);
-    }
-
-    let checkpoint = checkpoints::get_checkpoint(db, parent_conversation_id)
-        .await
-        .with_context(|| {
-            format!(
-                "inspect parent coordinator checkpoint {}",
-                parent_conversation_id
-            )
-        })?;
-    Ok(checkpoint
-        .map(|checkpoint| {
-            matches!(checkpoint.status.as_str(), "pending" | "running")
-                && checkpoint.cc_session_id != "queued"
-        })
-        .unwrap_or(false))
 }
 
 fn parent_coordinator_agent_type(parent: &ticketing_system::Conversation) -> Result<AgentType> {
