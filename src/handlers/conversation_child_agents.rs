@@ -489,3 +489,152 @@ async fn conversation_has_active_turn(pool: &SqlitePool, conversation_id: &str) 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::context_packets::{
+        ContextPacketItemSummary, ContextPacketSummary, RetrievalEventSummary,
+    };
+    use crate::handlers::conversation_handoff::{ResolvedContextHandoff, ResolvedContextPacket};
+    use serde_json::{json, Value};
+
+    const PACKET_ID: &str = "CP-RUNNER1234";
+    const RETRIEVAL_ID: &str = "R-RUNNER1234";
+    const BOUNDED_SNIPPET: &str = "Bounded child-agent handoff snippet.";
+    const RAW_PARENT_TRANSCRIPT_SENTINEL: &str = "RAW_PARENT_TRANSCRIPT_SENTINEL";
+    const FULL_OUTPUT_SENTINEL: &str = "FULL_OUTPUT_SENTINEL";
+
+    fn resolved_handoff() -> ResolvedContextHandoff {
+        ResolvedContextHandoff {
+            packets: vec![ResolvedContextPacket {
+                summary: ContextPacketSummary {
+                    packet_id: PACKET_ID.to_string(),
+                    retrieval_id: Some(RETRIEVAL_ID.to_string()),
+                    ticket_id: Some("T-RUNNER12".to_string()),
+                    repository: Some("agentic-flowstate-api".to_string()),
+                    work_summary: "runner handoff smoke".to_string(),
+                    created_by: "api-child-agent-handoff:parent-1".to_string(),
+                    created_by_agent: Some("conversation-child-agent".to_string()),
+                    summary: "Context packet for runner handoff smoke.".to_string(),
+                    warnings: vec!["packet_truncated".to_string()],
+                    token_budget: Some(2_000),
+                    token_count: Some(48),
+                    created_at: 1_781_662_200,
+                    metadata: json!({"source": "api-context-gather"}),
+                },
+                items: vec![ContextPacketItemSummary {
+                    rank: 1,
+                    item_type: "chunk".to_string(),
+                    artifact_id: Some("A-RUNNER1234".to_string()),
+                    chunk_id: Some("C-RUNNER1234-1".to_string()),
+                    knowledge_id: None,
+                    ticket_id: Some("T-RUNNER12".to_string()),
+                    document_id: None,
+                    entity_id: None,
+                    citation_label: Some("A-RUNNER1234#C-RUNNER1234-1".to_string()),
+                    relevance_reason: "selected retrieval chunk".to_string(),
+                    included_text: Some(BOUNDED_SNIPPET.to_string()),
+                    token_count: Some(9),
+                    source_retrieval_rank: Some(1),
+                    metadata: json!({"matched_fields": ["content"]}),
+                }],
+            }],
+            retrievals: vec![RetrievalEventSummary {
+                retrieval_id: RETRIEVAL_ID.to_string(),
+                organization: "agentic-flowstate".to_string(),
+                actor_type: "agent".to_string(),
+                actor_id: "api-child-agent-handoff:parent-1".to_string(),
+                tool_name: "gather_context".to_string(),
+                work_summary: Some("runner handoff smoke".to_string()),
+                query_text: "child packet handoff query".to_string(),
+                normalized_query: Some("child packet handoff query".to_string()),
+                filters: json!({"ticket_id": "T-RUNNER12"}),
+                authorization_filter: json!({
+                    "organization": "agentic-flowstate",
+                    "visibility": ["organization", "system"]
+                }),
+                strategy: "fts_facets_links_v1".to_string(),
+                started_at: 1_781_662_200,
+                elapsed_ms: 19,
+                result_count: 3,
+                selected_count: 1,
+                empty_result: false,
+                context_token_count: Some(48),
+                context_truncated: true,
+                warnings: vec!["packet_truncated".to_string()],
+                metadata: json!({"query_terms": ["child", "handoff"]}),
+            }],
+        }
+    }
+
+    #[test]
+    fn child_agent_runner_args_carry_packet_snippets_and_trace_metadata_without_parent_transcript()
+    {
+        let handoff = resolved_handoff();
+        let args = support_context_tool_args("child-1", "alex", Some("message-1"), Some(&handoff))
+            .expect("support context args");
+        let value: Value = serde_json::from_str(&args).expect("support args json");
+
+        assert_eq!(value["child_conversation_id"], "child-1");
+        assert_eq!(value["user_id"], "alex");
+        assert_eq!(value["target_message_id"], "message-1");
+        assert_eq!(
+            value["artifact_memory_handoff"]["packets"][0]["packet_id"],
+            PACKET_ID
+        );
+        assert_eq!(
+            value["artifact_memory_handoff"]["packets"][0]["items"][0]["included_text"],
+            BOUNDED_SNIPPET
+        );
+        assert_eq!(
+            value["artifact_memory_handoff"]["retrievals"][0]["retrieval_id"],
+            RETRIEVAL_ID
+        );
+        assert_eq!(
+            value["artifact_memory_handoff"]["retrievals"][0]["filters"]["ticket_id"],
+            "T-RUNNER12"
+        );
+        assert_eq!(
+            value["artifact_memory_handoff"]["retrievals"][0]["warnings"][0],
+            "packet_truncated"
+        );
+
+        let serialized = value.to_string();
+        assert!(!serialized.contains(RAW_PARENT_TRANSCRIPT_SENTINEL));
+        assert!(!serialized.contains(FULL_OUTPUT_SENTINEL));
+        assert!(value.get("parent_transcript").is_none());
+        assert!(value.get("transcript").is_none());
+    }
+
+    #[test]
+    fn child_agent_runner_metadata_records_only_compact_handoff_handles() {
+        let handoff = resolved_handoff();
+        let metadata =
+            orchestrated_message_metadata("api", "conversation-evaluator", Some(&handoff))
+                .expect("runner metadata");
+        let value: Value = serde_json::from_str(&metadata).expect("metadata json");
+
+        assert_eq!(value["origin"], "agent_orchestrated");
+        assert_eq!(value["orchestration"], "child_initial_turn");
+        assert_eq!(
+            value["artifact_memory_handoff"]["context_packet_ids"],
+            json!([PACKET_ID])
+        );
+        assert_eq!(
+            value["artifact_memory_handoff"]["retrieval_ids"],
+            json!([RETRIEVAL_ID])
+        );
+        assert_eq!(value["artifact_memory_handoff"]["packet_count"], 1);
+        assert_eq!(value["artifact_memory_handoff"]["retrieval_count"], 1);
+
+        let handoff_metadata = &value["artifact_memory_handoff"];
+        assert!(handoff_metadata.get("packets").is_none());
+        assert!(handoff_metadata.get("retrievals").is_none());
+        assert!(handoff_metadata.get("items").is_none());
+        assert!(!metadata.contains(BOUNDED_SNIPPET));
+        assert!(!metadata.contains("child packet handoff query"));
+        assert!(!metadata.contains(RAW_PARENT_TRANSCRIPT_SENTINEL));
+        assert!(!metadata.contains(FULL_OUTPUT_SENTINEL));
+    }
+}
