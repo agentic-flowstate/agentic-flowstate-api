@@ -1655,6 +1655,7 @@ pub async fn list_messages(
 
     let messages = messages
         .into_iter()
+        .filter(|message| !super::child_completion_status::is_hidden_from_chat_display(message))
         .map(super::child_completion_status::sanitize_message_for_display)
         .collect();
 

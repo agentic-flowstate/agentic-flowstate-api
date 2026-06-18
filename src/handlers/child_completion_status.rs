@@ -3,6 +3,7 @@ use ticketing_system::ConversationMessage;
 
 const CHILD_COMPLETION_STATUS: &str = "child_completion_status";
 const CHILD_COMPLETION_RELAY: &str = "child_completion_relay";
+const COORDINATOR_CHILD_COMPLETION_WAKE: &str = "coordinator_child_completion_wake";
 
 #[derive(Debug, Clone)]
 struct ChildCompletionStatus {
@@ -39,14 +40,17 @@ pub fn is_child_completion_status_message(message: &ConversationMessage) -> bool
     child_completion_status_from_metadata(message.metadata.as_deref()).is_some()
 }
 
-fn child_completion_status_from_metadata(metadata: Option<&str>) -> Option<ChildCompletionStatus> {
-    let metadata = metadata?;
-    let value: Value = serde_json::from_str(metadata).ok()?;
-    let origin = value.get("origin")?.as_str()?;
-    if origin != "agent_orchestrated" {
-        return None;
-    }
+pub fn is_coordinator_wake_message(message: &ConversationMessage) -> bool {
+    orchestration_from_metadata(message.metadata.as_deref())
+        .is_some_and(|orchestration| orchestration == COORDINATOR_CHILD_COMPLETION_WAKE)
+}
 
+pub fn is_hidden_from_chat_display(message: &ConversationMessage) -> bool {
+    is_coordinator_wake_message(message)
+}
+
+fn child_completion_status_from_metadata(metadata: Option<&str>) -> Option<ChildCompletionStatus> {
+    let value = orchestrated_metadata_value(metadata)?;
     let orchestration = value.get("orchestration")?.as_str()?;
     if orchestration != CHILD_COMPLETION_STATUS && orchestration != CHILD_COMPLETION_RELAY {
         return None;
@@ -61,6 +65,21 @@ fn child_completion_status_from_metadata(metadata: Option<&str>) -> Option<Child
         conversation_type: optional_string_field(&value, "child_conversation_type"),
         summary: optional_string_field(&value, "summary"),
     })
+}
+
+fn orchestration_from_metadata(metadata: Option<&str>) -> Option<String> {
+    let value = orchestrated_metadata_value(metadata)?;
+    string_field(&value, "orchestration")
+}
+
+fn orchestrated_metadata_value(metadata: Option<&str>) -> Option<Value> {
+    let metadata = metadata?;
+    let value: Value = serde_json::from_str(metadata).ok()?;
+    let origin = value.get("origin")?.as_str()?;
+    if origin != "agent_orchestrated" {
+        return None;
+    }
+    Some(value)
 }
 
 fn string_field(value: &Value, key: &str) -> Option<String> {
@@ -271,5 +290,34 @@ mod tests {
             .metadata
             .unwrap()
             .contains(CHILD_COMPLETION_STATUS));
+    }
+
+    #[test]
+    fn coordinator_wake_messages_are_hidden_from_chat_display() {
+        let metadata = serde_json::json!({
+            "origin": "agent_orchestrated",
+            "orchestration": "coordinator_child_completion_wake",
+            "child_conversation_id": "child-1",
+            "child_title": "Queue-return behavior smoke test",
+            "child_agent": "full-access",
+            "child_terminal_status": "completed"
+        })
+        .to_string();
+        let message = ConversationMessage {
+            id: "message-1".to_string(),
+            conversation_id: "parent-1".to_string(),
+            role: "user".to_string(),
+            content: "Coordinator wake: child agent completed.".to_string(),
+            attachments: None,
+            metadata: Some(metadata),
+            tool_call_summaries: None,
+            content_blocks: None,
+            assistant_turn_duration_seconds: None,
+            created_at: 1,
+            message_index: 1,
+        };
+
+        assert!(is_coordinator_wake_message(&message));
+        assert!(is_hidden_from_chat_display(&message));
     }
 }

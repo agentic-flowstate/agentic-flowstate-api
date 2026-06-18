@@ -2666,6 +2666,7 @@ fn prompt_history_recent_window(messages: &[ConversationMessage]) -> Vec<Convers
 
 fn counts_against_prompt_history_limit(msg: &ConversationMessage) -> bool {
     !super::child_completion_status::is_child_completion_status_message(msg)
+        && !super::child_completion_status::is_coordinator_wake_message(msg)
 }
 
 fn format_message_attachments_for_prompt(msg: &ConversationMessage) -> Option<String> {
