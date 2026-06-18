@@ -29,6 +29,10 @@ use crate::observability::streaming::{
 use ticketing_system::{
     agent_runners, checkpoints, conversation_turn_jobs, conversations,
     token_usage::{self, TokenUsageBreakdown},
+    work_context::{
+        collect_work_context, CollectWorkContextRequest, CollectWorkContextResponse,
+        WorkContextHandoff,
+    },
     AddMessageRequest, ContentBlockDesc, ConversationMessage, UpdateConversationRequest,
 };
 
@@ -40,6 +44,10 @@ const IDLE_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
 /// Maximum number of prior messages to load into prompt context per turn.
 const PROMPT_HISTORY_MESSAGE_LIMIT: usize = 30;
+const ARTIFACT_MEMORY_HANDOFF_VAR: &str = "ARTIFACT_MEMORY_HANDOFF";
+const STARTUP_CONTEXT_MAX_RESULTS: usize = 8;
+const STARTUP_CONTEXT_MAX_ITEMS: usize = 4;
+const STARTUP_CONTEXT_TOKEN_BUDGET: usize = 3_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct AttachmentMeta {
@@ -48,6 +56,35 @@ struct AttachmentMeta {
     path: String,
     mime_type: String,
     size_bytes: Option<i64>,
+}
+
+struct WorkContextPreflight {
+    final_message: String,
+    artifact_memory_handoff: Option<String>,
+    forwarded_metadata: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkContextSkipReason {
+    SupportAgent,
+    ExistingArtifactHandoff,
+    AlreadyRouted,
+    TinyConversational,
+}
+
+impl WorkContextSkipReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SupportAgent => "support_agent",
+            Self::ExistingArtifactHandoff => "existing_artifact_memory_handoff",
+            Self::AlreadyRouted => "already_routed",
+            Self::TinyConversational => "tiny_conversational",
+        }
+    }
+
+    fn persist_router_skip(self) -> bool {
+        matches!(self, Self::SupportAgent | Self::ExistingArtifactHandoff)
+    }
 }
 
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
@@ -642,11 +679,26 @@ impl ConversationWorker {
             return;
         }
 
-        // === TICKET PREFLIGHT ===
-        // Use deterministic ticket lookup before agent start. It cannot invoke
-        // an LLM and does not create tickets from chat startup, so first useful
-        // work is not blocked on router-agent tool loops.
-        let final_message = self.run_ticket_router(&enhanced_message, &msg.config).await;
+        // === WORK-CONTEXT PREFLIGHT ===
+        // Use deterministic ticket lookup plus artifact-memory retrieval before
+        // agent start. It cannot invoke an LLM and does not create tickets from
+        // chat startup, so first useful work starts with bounded prior context.
+        let preflight = match self
+            .run_work_context_preflight(&enhanced_message, &msg.config)
+            .await
+        {
+            Ok(preflight) => preflight,
+            Err(e) => {
+                self.fail_startup_context_preflight(e).await;
+                return;
+            }
+        };
+        apply_artifact_memory_handoff_prompt_var(
+            &mut msg.config.prompt_vars,
+            preflight.artifact_memory_handoff.as_deref(),
+        );
+        let final_message = preflight.final_message;
+        let forwarded_metadata = preflight.forwarded_metadata;
 
         if self
             .consume_cancelled_turn_before_agent_start("after_router")
@@ -668,7 +720,7 @@ impl ConversationWorker {
                     role: "forwarded".to_string(),
                     content: final_message.clone(),
                     attachments: None,
-                    metadata: None,
+                    metadata: forwarded_metadata.clone(),
                 },
             )
             .await
@@ -740,27 +792,16 @@ impl ConversationWorker {
             .await;
     }
 
-    /// Run deterministic ticket preflight before the main agent starts.
-    /// Returns an enriched message only when an explicit or clear ticket match
-    /// is found. No LLM router is invoked and chat startup never creates
-    /// tickets, epics, slices, or milestones.
-    async fn run_ticket_router(&mut self, user_message: &str, config: &ChatConfig) -> String {
+    /// Run deterministic ticket + artifact-memory preflight before the main
+    /// agent starts. Chat startup still never creates tickets, epics, slices,
+    /// or milestones; empty retrievals are persisted as context packets and
+    /// injected as prompt handoff warnings.
+    async fn run_work_context_preflight(
+        &mut self,
+        user_message: &str,
+        config: &ChatConfig,
+    ) -> Result<WorkContextPreflight> {
         let original = user_message.to_string();
-        if matches!(
-            config.agent_type,
-            AgentType::ConversationEvaluator | AgentType::Feedback
-        ) {
-            self.has_routed = true;
-            let _ = conversations::set_router_result(
-                &self.db,
-                &self.conversation_id,
-                Some("__skipped__"),
-                None,
-            )
-            .await;
-            return original;
-        }
-
         // Truncate preview at a safe UTF-8 char boundary (floor to nearest boundary at or before 60)
         let msg_preview = if user_message.len() > 60 {
             let end = (0..=60)
@@ -779,65 +820,53 @@ impl ConversationWorker {
             msg_preview
         );
 
-        // --- Primary skip: only route the FIRST message in a conversation ---
-        // After the first message, skip entirely — no events emitted, no latency.
-        if self.has_routed {
+        if let Some(reason) = work_context_skip_reason(user_message, config, self.has_routed) {
             tracing::info!(
-                "[ROUTER] === SKIP (already routed) === conv={}",
-                self.conversation_id
-            );
-            return original;
-        }
-
-        let trimmed = user_message.trim();
-        let lowered = trimmed.to_lowercase();
-
-        // --- Skip condition: short conversational / approval messages ---
-        let is_skip_message = ROUTER_SKIP_MESSAGES.contains(&lowered.as_str());
-        let is_single_short_word = !trimmed.is_empty()
-            && !trimmed.contains(' ')
-            && trimmed.len() <= 4
-            && trimmed
-                .chars()
-                .all(|c| c.is_alphanumeric() || c.is_ascii_punctuation());
-
-        if is_skip_message || is_single_short_word {
-            tracing::info!(
-                "[ROUTER] === SKIP (short/conversational) === conv={} msg={:?}",
+                "[ROUTER] === SKIP ({}) === conv={} msg={:?}",
+                reason.as_str(),
                 self.conversation_id,
-                if trimmed.len() > 30 {
-                    &trimmed[..(0..=30)
-                        .rev()
-                        .find(|&i| trimmed.is_char_boundary(i))
-                        .unwrap_or(0)]
-                } else {
-                    trimmed
-                }
+                safe_preview(user_message, 30)
             );
-            self.has_routed = true;
-            // Persist so this survives server restarts
-            let _ = conversations::set_router_result(
-                &self.db,
-                &self.conversation_id,
-                Some("__skipped__"),
-                None,
-            )
-            .await;
-            return original;
+            if reason.persist_router_skip() {
+                self.has_routed = true;
+                let _ = conversations::set_router_result(
+                    &self.db,
+                    &self.conversation_id,
+                    Some("__skipped__"),
+                    None,
+                )
+                .await;
+            }
+            return Ok(WorkContextPreflight {
+                final_message: original,
+                artifact_memory_handoff: None,
+                forwarded_metadata: None,
+            });
         }
 
         tracing::info!(
-            "[ROUTER] === RUNNING DETERMINISTIC PREFLIGHT === conv={}",
+            "[ROUTER] === RUNNING DETERMINISTIC WORK-CONTEXT PREFLIGHT === conv={}",
             self.conversation_id
         );
 
         let started = Instant::now();
-        let result = ticketing_system::work_ticket::ensure_work_ticket(
+        let organization = self.conversation_organization().await?;
+        let actor_id = format!("api-main-agent-startup:{}", self.conversation_id);
+        let result = collect_work_context(
             &self.db,
-            ticketing_system::work_ticket::EnsureWorkTicketRequest {
+            CollectWorkContextRequest {
                 request: Some(user_message.to_string()),
+                organization,
+                conversation_id: Some(self.conversation_id.clone()),
                 create_if_missing: false,
                 mark_in_progress: false,
+                actor_type: Some("agent".to_string()),
+                actor_id: Some(actor_id.clone()),
+                created_by: Some(actor_id),
+                created_by_agent: Some(config.agent_type.as_str().to_string()),
+                max_results: Some(STARTUP_CONTEXT_MAX_RESULTS),
+                max_items: Some(STARTUP_CONTEXT_MAX_ITEMS),
+                token_budget: Some(STARTUP_CONTEXT_TOKEN_BUDGET),
                 ..Default::default()
             },
         )
@@ -847,17 +876,32 @@ impl ConversationWorker {
 
         match result {
             Ok(response) => {
-                record_ticket_preflight(&response.status, &response.action, response.elapsed_ms);
+                record_ticket_preflight(
+                    &response.ticket_result.status,
+                    &response.ticket_result.action,
+                    response.ticket_result.elapsed_ms,
+                );
                 tracing::info!(
-                    "[ROUTER] === PREFLIGHT DONE ({}ms) === conv={} status={} action={} candidates={}",
-                    response.elapsed_ms,
+                    "[ROUTER] === WORK-CONTEXT PREFLIGHT DONE ({}ms) === conv={} ticket_status={} ticket_action={} candidates={} packet={:?} snippets={} warnings={}",
+                    response.metrics.elapsed_ms,
                     self.conversation_id,
-                    response.status,
-                    response.action,
-                    response.candidate_count
+                    response.ticket_result.status,
+                    response.ticket_result.action,
+                    response.ticket_result.candidate_count,
+                    response
+                        .context_packet
+                        .as_ref()
+                        .map(|packet| packet.packet_id.as_str()),
+                    response.selected_snippets.len(),
+                    response.warnings.len()
                 );
 
-                if let Some(ticket) = response.ticket {
+                let artifact_memory_handoff = Some(
+                    serde_json::to_string(&response.prompt_ready_handoff)
+                        .context("serialize collect_work_context prompt-ready handoff")?,
+                );
+
+                if let Some(ticket) = response.ticket_result.ticket.as_ref() {
                     let enriched_message = Self::enrich_message_with_ticket(user_message, &ticket);
                     self.last_router_ticket_id = Some(ticket.ticket_id.clone());
                     self.last_router_organization = Some(ticket.organization.clone());
@@ -873,12 +917,16 @@ impl ConversationWorker {
                     }
                     self.emit_event(&StreamEvent::RouterResult {
                         enriched_message: enriched_message.clone(),
-                        ticket_id: Some(ticket.ticket_id),
-                        organization: Some(ticket.organization),
+                        ticket_id: Some(ticket.ticket_id.clone()),
+                        organization: Some(ticket.organization.clone()),
                         skipped: false,
                     })
                     .await;
-                    enriched_message
+                    Ok(WorkContextPreflight {
+                        final_message: enriched_message,
+                        artifact_memory_handoff,
+                        forwarded_metadata: Some(startup_context_forwarded_metadata(&response)?),
+                    })
                 } else {
                     let _ = conversations::set_router_result(
                         &self.db,
@@ -894,14 +942,18 @@ impl ConversationWorker {
                         skipped: true,
                     })
                     .await;
-                    original
+                    Ok(WorkContextPreflight {
+                        final_message: original,
+                        artifact_memory_handoff,
+                        forwarded_metadata: None,
+                    })
                 }
             }
             Err(e) => {
                 let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 record_ticket_preflight_error("failed", elapsed_ms);
                 tracing::warn!(
-                    "[ROUTER] === PREFLIGHT FAILED ({}ms) === conv={} error={}",
+                    "[ROUTER] === WORK-CONTEXT PREFLIGHT FAILED ({}ms) === conv={} error={}",
                     elapsed_ms,
                     self.conversation_id,
                     e
@@ -913,9 +965,49 @@ impl ConversationWorker {
                     None,
                 )
                 .await;
-                original
+                Err(e).context("collect startup work context")
             }
         }
+    }
+
+    async fn conversation_organization(&self) -> Result<Option<String>> {
+        let conversation = conversations::get_conversation(&self.db, &self.conversation_id, false)
+            .await
+            .with_context(|| format!("load conversation {}", self.conversation_id))?
+            .with_context(|| format!("conversation {} not found", self.conversation_id))?;
+        Ok(trimmed_non_empty(&conversation.organization))
+    }
+
+    async fn fail_startup_context_preflight(&mut self, error: anyhow::Error) {
+        let failure_message = format!("Startup context preflight failed: {error}");
+        tracing::error!(
+            "[WORKER] Startup context preflight failed for {}: {}",
+            self.conversation_id,
+            error
+        );
+        self.mark_checkpoint_interrupted().await;
+        if let Err(e) = conversations::add_message(
+            &self.db,
+            &self.conversation_id,
+            AddMessageRequest {
+                role: "assistant".to_string(),
+                content: failure_message.clone(),
+                attachments: None,
+                metadata: None,
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                "[WORKER] Failed to save startup preflight failure message: {}",
+                e
+            );
+        }
+        self.emit_event(&StreamEvent::Status {
+            status: "failed".to_string(),
+            message: Some(failure_message),
+        })
+        .await;
     }
 
     fn enrich_message_with_ticket(user_message: &str, ticket: &ticketing_system::Ticket) -> String {
@@ -1841,6 +1933,110 @@ impl ConversationWorker {
     }
 }
 
+fn work_context_skip_reason(
+    user_message: &str,
+    config: &ChatConfig,
+    has_routed: bool,
+) -> Option<WorkContextSkipReason> {
+    if matches!(
+        config.agent_type,
+        AgentType::ConversationEvaluator | AgentType::Feedback
+    ) {
+        return Some(WorkContextSkipReason::SupportAgent);
+    }
+    if prompt_vars_have_artifact_memory_handoff(&config.prompt_vars) {
+        return Some(WorkContextSkipReason::ExistingArtifactHandoff);
+    }
+    if has_routed {
+        return Some(WorkContextSkipReason::AlreadyRouted);
+    }
+    if is_tiny_conversational_message(user_message) {
+        return Some(WorkContextSkipReason::TinyConversational);
+    }
+    None
+}
+
+fn is_tiny_conversational_message(user_message: &str) -> bool {
+    let trimmed = user_message.trim();
+    let lowered = trimmed.to_lowercase();
+    if ROUTER_SKIP_MESSAGES.contains(&lowered.as_str()) {
+        return true;
+    }
+
+    !trimmed.is_empty()
+        && trimmed.chars().count() <= 4
+        && !trimmed.chars().any(char::is_alphanumeric)
+        && trimmed.chars().all(|c| c.is_ascii_punctuation())
+}
+
+fn prompt_vars_have_artifact_memory_handoff(vars: &HashMap<String, String>) -> bool {
+    vars.iter().any(|(key, value)| {
+        key.eq_ignore_ascii_case(ARTIFACT_MEMORY_HANDOFF_VAR) && !value.trim().is_empty()
+    })
+}
+
+fn apply_artifact_memory_handoff_prompt_var(
+    vars: &mut HashMap<String, String>,
+    handoff: Option<&str>,
+) {
+    let Some(handoff) = handoff.map(str::trim).filter(|handoff| !handoff.is_empty()) else {
+        return;
+    };
+    if prompt_vars_have_artifact_memory_handoff(vars) {
+        return;
+    }
+    vars.insert(ARTIFACT_MEMORY_HANDOFF_VAR.to_string(), handoff.to_string());
+}
+
+fn startup_context_forwarded_metadata(response: &CollectWorkContextResponse) -> Result<String> {
+    let handoff = &response.prompt_ready_handoff;
+    serde_json::to_string(&serde_json::json!({
+        "origin": "router_preflight",
+        "preflight": "collect_work_context",
+        "ticket_status": response.ticket_result.status.clone(),
+        "ticket_action": response.ticket_result.action.clone(),
+        "artifact_memory_handoff": handoff_metadata_json(handoff),
+    }))
+    .context("serialize startup context forwarded metadata")
+}
+
+fn handoff_metadata_json(handoff: &WorkContextHandoff) -> serde_json::Value {
+    serde_json::json!({
+        "contract_version": handoff.contract_version.clone(),
+        "operation": handoff.operation.clone(),
+        "organization": handoff.organization.clone(),
+        "repository": handoff.repository.clone(),
+        "ticket_id": handoff.ticket.as_ref().map(|ticket| ticket.ticket_id.clone()),
+        "context_packet_ids": handoff.context_packet_ids.clone(),
+        "retrieval_ids": handoff.retrieval_ids.clone(),
+        "packet_count": handoff.context_packet_ids.len(),
+        "retrieval_count": handoff.retrieval_ids.len(),
+        "warning_count": handoff.warnings.len(),
+        "source_metadata": handoff.source_metadata.clone(),
+    })
+}
+
+fn trimmed_non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn safe_preview(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Flush accumulated text content to the database.
 async fn flush_to_db(db: &SqlitePool, assistant_message_id: &str, accumulated_text: &str) {
     if let Err(e) = conversations::update_message(db, assistant_message_id, accumulated_text).await
@@ -2735,6 +2931,93 @@ fn format_attachment_prompt_line(
         "  - {} `{}` ({}{}): {}",
         attachment_kind, display_name, mime_type, size, path
     )
+}
+
+#[cfg(test)]
+mod work_context_preflight_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn test_config(agent_type: AgentType) -> ChatConfig {
+        ChatConfig {
+            agent_type: agent_type.clone(),
+            runtime: crate::handlers::chat_stream::ChatRuntime::CodexAppServer,
+            prompt_name: "full-access",
+            working_dir: PathBuf::from("/Users/jarvisgpt/projects"),
+            prompt_vars: HashMap::new(),
+            codex_options: crate::handlers::chat_stream::ChatCodexOptions::default_for_agent(
+                &agent_type,
+            ),
+        }
+    }
+
+    #[test]
+    fn tiny_conversational_turns_skip_without_consuming_substantive_work() {
+        let config = test_config(AgentType::FullAccess);
+
+        assert_eq!(
+            work_context_skip_reason("ok", &config, false),
+            Some(WorkContextSkipReason::TinyConversational)
+        );
+        assert_eq!(
+            work_context_skip_reason("?", &config, false),
+            Some(WorkContextSkipReason::TinyConversational)
+        );
+        assert!(!WorkContextSkipReason::TinyConversational.persist_router_skip());
+        assert_eq!(work_context_skip_reason("fix", &config, false), None);
+        assert_eq!(work_context_skip_reason("test", &config, false), None);
+    }
+
+    #[test]
+    fn support_agents_and_existing_handoffs_skip_startup_collection() {
+        let support_config = test_config(AgentType::Feedback);
+        assert_eq!(
+            work_context_skip_reason("Review this conversation", &support_config, false),
+            Some(WorkContextSkipReason::SupportAgent)
+        );
+        assert!(WorkContextSkipReason::SupportAgent.persist_router_skip());
+
+        let mut handoff_config = test_config(AgentType::FullAccess);
+        handoff_config.prompt_vars.insert(
+            "artifact_memory_handoff".to_string(),
+            "{\"contract_version\":\"artifact-memory-handoff-v1\"}".to_string(),
+        );
+        assert_eq!(
+            work_context_skip_reason("Implement the ticket", &handoff_config, false),
+            Some(WorkContextSkipReason::ExistingArtifactHandoff)
+        );
+    }
+
+    #[test]
+    fn startup_handoff_injection_preserves_existing_prompt_handoff() {
+        let mut vars = HashMap::new();
+        apply_artifact_memory_handoff_prompt_var(
+            &mut vars,
+            Some("{\"context_packet_ids\":[\"CP-1\"]}"),
+        );
+        assert_eq!(
+            vars.get(ARTIFACT_MEMORY_HANDOFF_VAR).map(String::as_str),
+            Some("{\"context_packet_ids\":[\"CP-1\"]}")
+        );
+
+        let mut existing_vars = HashMap::new();
+        existing_vars.insert(
+            "artifact_memory_handoff".to_string(),
+            "{\"context_packet_ids\":[\"CP-existing\"]}".to_string(),
+        );
+        apply_artifact_memory_handoff_prompt_var(
+            &mut existing_vars,
+            Some("{\"context_packet_ids\":[\"CP-new\"]}"),
+        );
+        assert_eq!(
+            existing_vars
+                .get("artifact_memory_handoff")
+                .map(String::as_str),
+            Some("{\"context_packet_ids\":[\"CP-existing\"]}")
+        );
+        assert!(!existing_vars.contains_key(ARTIFACT_MEMORY_HANDOFF_VAR));
+    }
 }
 
 #[cfg(test)]
