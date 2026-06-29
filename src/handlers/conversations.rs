@@ -835,7 +835,7 @@ async fn enqueue_initial_child_turns(
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .unwrap_or(agent);
+            .unwrap_or_else(|| default_child_prompt_name(agent));
         let working_dir = spec
             .working_dir
             .as_deref()
@@ -902,6 +902,13 @@ async fn enqueue_initial_child_turns(
             .map_err(internal_error)?;
     }
     Ok(queued)
+}
+
+fn default_child_prompt_name(agent: &str) -> &str {
+    match agent {
+        "conversation-evaluator" => "conversation-evaluator-system",
+        _ => agent,
+    }
 }
 
 fn parse_child_agent_type(agent: &str) -> Result<AgentType, (StatusCode, String)> {
@@ -2384,6 +2391,15 @@ mod tests {
     const BOUNDED_SNIPPET: &str = "Bounded multi-agent handoff snippet.";
     const RAW_PARENT_TRANSCRIPT_SENTINEL: &str = "RAW_PARENT_TRANSCRIPT_SENTINEL";
     const FULL_OUTPUT_SENTINEL: &str = "FULL_OUTPUT_SENTINEL";
+
+    #[test]
+    fn evaluator_child_defaults_to_context_aware_prompt() {
+        assert_eq!(
+            default_child_prompt_name("conversation-evaluator"),
+            "conversation-evaluator-system"
+        );
+        assert_eq!(default_child_prompt_name("feedback"), "feedback");
+    }
 
     fn conversation_with_activity(is_active: Option<bool>) -> Conversation {
         Conversation {
