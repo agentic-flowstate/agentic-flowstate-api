@@ -841,6 +841,14 @@ async fn enqueue_initial_child_turns(
     handoffs: &[Option<ResolvedContextHandoff>],
 ) -> Result<Vec<QueuedChildTurnResponse>, (StatusCode, String)> {
     let mut queued = Vec::new();
+    let child_batch_size = children
+        .iter()
+        .filter(|child| has_initial_child_message(child))
+        .count();
+    let child_batch_id =
+        (child_batch_size > 0).then(|| format!("child-batch-{}", uuid::Uuid::new_v4()));
+    let mut child_batch_index = 0usize;
+
     for ((spec, child), handoff) in children.iter().zip(created_children.iter()).zip(handoffs) {
         let Some(initial_message) = spec
             .initial_message
@@ -892,7 +900,15 @@ async fn enqueue_initial_child_turns(
             );
         }
 
-        let metadata = orchestrated_child_turn_metadata("api", agent, handoff.as_ref())?;
+        child_batch_index += 1;
+        let metadata = orchestrated_child_turn_metadata(
+            "api",
+            agent,
+            handoff.as_ref(),
+            child_batch_id.as_deref(),
+            child_batch_size,
+            child_batch_index,
+        )?;
         checkpoints::upsert_checkpoint(pool, &child.id, "queued", 0)
             .await
             .map_err(internal_error)?;
@@ -941,6 +957,14 @@ async fn enqueue_initial_child_turns(
     Ok(queued)
 }
 
+fn has_initial_child_message(child: &CreateChildConversationSpec) -> bool {
+    child
+        .initial_message
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|message| !message.is_empty())
+}
+
 fn default_child_prompt_name(agent: &str) -> &str {
     match agent {
         "codex" => "full-access",
@@ -971,6 +995,9 @@ fn orchestrated_child_turn_metadata(
     orchestrated_by: &str,
     agent: &str,
     handoff: Option<&ResolvedContextHandoff>,
+    child_batch_id: Option<&str>,
+    child_batch_size: usize,
+    child_batch_index: usize,
 ) -> Result<String, (StatusCode, String)> {
     let mut value = serde_json::json!({
         "origin": "agent_orchestrated",
@@ -978,6 +1005,11 @@ fn orchestrated_child_turn_metadata(
         "orchestration": "child_initial_turn",
         "agent": agent,
     });
+    if let Some(child_batch_id) = child_batch_id {
+        value["child_batch_id"] = serde_json::Value::String(child_batch_id.to_string());
+        value["child_batch_size"] = serde_json::json!(child_batch_size);
+        value["child_batch_index"] = serde_json::json!(child_batch_index);
+    }
     if agent == "conversation-evaluator" {
         value["suppress_parent_completion_relay"] = serde_json::Value::Bool(true);
     }
@@ -2649,8 +2681,15 @@ mod tests {
         assert_eq!(responses[0].retrieval_ids, vec![RETRIEVAL_ID.to_string()]);
 
         let handoff = resolved_handoff();
-        let metadata = orchestrated_child_turn_metadata("api", "workspace-manager", Some(&handoff))
-            .expect("child turn metadata");
+        let metadata = orchestrated_child_turn_metadata(
+            "api",
+            "workspace-manager",
+            Some(&handoff),
+            Some("child-batch-test"),
+            2,
+            1,
+        )
+        .expect("child turn metadata");
         let value: Value = serde_json::from_str(&metadata).expect("metadata json");
         assert_eq!(
             value["artifact_memory_handoff"]["context_packet_ids"],
@@ -2662,6 +2701,9 @@ mod tests {
         );
         assert_eq!(value["artifact_memory_handoff"]["packet_count"], 1);
         assert_eq!(value["artifact_memory_handoff"]["retrieval_count"], 1);
+        assert_eq!(value["child_batch_id"], "child-batch-test");
+        assert_eq!(value["child_batch_size"], 2);
+        assert_eq!(value["child_batch_index"], 1);
 
         let handoff_metadata = &value["artifact_memory_handoff"];
         assert!(handoff_metadata.get("packets").is_none());
@@ -2675,8 +2717,15 @@ mod tests {
 
     #[test]
     fn evaluator_child_metadata_suppresses_parent_completion_relay() {
-        let metadata = orchestrated_child_turn_metadata("api", "conversation-evaluator", None)
-            .expect("child turn metadata");
+        let metadata = orchestrated_child_turn_metadata(
+            "api",
+            "conversation-evaluator",
+            None,
+            Some("child-batch-test"),
+            1,
+            1,
+        )
+        .expect("child turn metadata");
         let value: Value = serde_json::from_str(&metadata).expect("metadata json");
 
         assert_eq!(value["agent"], "conversation-evaluator");
