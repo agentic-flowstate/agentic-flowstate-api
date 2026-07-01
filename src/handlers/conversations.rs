@@ -697,7 +697,9 @@ async fn ensure_agent_allowed(
     user_id: &str,
     agent: Option<&str>,
 ) -> Result<(), (StatusCode, String)> {
-    if agent != Some("full-access") {
+    let requires_admin =
+        agent.and_then(AgentType::from_chat_agent_key) == Some(AgentType::FullAccess);
+    if !requires_admin {
         return Ok(());
     }
 
@@ -733,16 +735,44 @@ async fn require_user_conversation(
 
 fn child_conversation_requests(
     specs: &[CreateChildConversationSpec],
-) -> Vec<TicketingCreateChildConversationRequest> {
+) -> Result<Vec<TicketingCreateChildConversationRequest>, (StatusCode, String)> {
     specs
         .iter()
-        .map(|child| TicketingCreateChildConversationRequest {
-            title: child.title.clone(),
-            agent: child.agent.clone(),
-            conversation_type: child.conversation_type.clone(),
-            child_sort_order: child.child_sort_order,
+        .map(|child| {
+            let has_initial_message = child
+                .initial_message
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|message| !message.is_empty());
+            if has_initial_message {
+                let agent = child.agent.as_deref().ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "Child '{}' must set agent when initial_message is provided",
+                            child.title
+                        ),
+                    )
+                })?;
+                let _ = parse_child_agent_type(agent)?;
+            }
+            Ok(TicketingCreateChildConversationRequest {
+                title: child.title.clone(),
+                agent: child
+                    .agent
+                    .as_deref()
+                    .map(canonical_child_agent_key_for_storage),
+                conversation_type: child.conversation_type.clone(),
+                child_sort_order: child.child_sort_order,
+            })
         })
         .collect()
+}
+
+fn canonical_child_agent_key_for_storage(agent: &str) -> String {
+    AgentType::from_chat_agent_key(agent)
+        .map(|agent_type| agent_type.as_str().to_string())
+        .unwrap_or_else(|| agent.to_string())
 }
 
 async fn resolve_child_context_handoffs(
@@ -830,11 +860,13 @@ async fn enqueue_initial_child_turns(
             )
         })?;
         let agent_type = parse_child_agent_type(agent)?;
+        let agent = agent_type.as_str();
         let prompt_name = spec
             .prompt_name
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
+            .map(canonical_child_prompt_name)
             .unwrap_or_else(|| default_child_prompt_name(agent));
         let working_dir = spec
             .working_dir
@@ -911,8 +943,16 @@ async fn enqueue_initial_child_turns(
 
 fn default_child_prompt_name(agent: &str) -> &str {
     match agent {
+        "codex" => "full-access",
         "conversation-evaluator" => "conversation-evaluator-system",
         _ => agent,
+    }
+}
+
+fn canonical_child_prompt_name(prompt_name: &str) -> &str {
+    match prompt_name {
+        "codex" => "full-access",
+        other => other,
     }
 }
 
@@ -1170,7 +1210,7 @@ pub async fn create_multi_agent_conversation(
     }
     let resolved_handoffs =
         resolve_child_context_handoffs(&pool, &req.organization, &children_specs).await?;
-    let child_requests = child_conversation_requests(&children_specs);
+    let child_requests = child_conversation_requests(&children_specs)?;
 
     let parent = CreateConversationRequest {
         user_id: user.user_id,
@@ -1276,7 +1316,7 @@ pub async fn create_child_conversations(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    let child_requests = child_conversation_requests(&children_specs);
+    let child_requests = child_conversation_requests(&children_specs)?;
     let children =
         conversations::create_child_conversations(&pool, &user.user_id, &id, child_requests)
             .await
@@ -2421,7 +2461,27 @@ mod tests {
             default_child_prompt_name("conversation-evaluator"),
             "conversation-evaluator-system"
         );
+        assert_eq!(default_child_prompt_name("codex"), "full-access");
+        assert_eq!(canonical_child_prompt_name("codex"), "full-access");
         assert_eq!(default_child_prompt_name("feedback"), "feedback");
+    }
+
+    #[test]
+    fn child_request_stores_codex_alias_as_full_access() {
+        let requests = child_conversation_requests(&[CreateChildConversationSpec {
+            title: "Child".to_string(),
+            agent: Some("codex".to_string()),
+            conversation_type: None,
+            child_sort_order: None,
+            handoff: ContextHandoffRequest::default(),
+            initial_message: Some("Do work".to_string()),
+            prompt_name: Some("codex".to_string()),
+            working_dir: None,
+            client_id: None,
+        }])
+        .expect("child request");
+
+        assert_eq!(requests[0].agent.as_deref(), Some("full-access"));
     }
 
     fn conversation_with_activity(is_active: Option<bool>) -> Conversation {

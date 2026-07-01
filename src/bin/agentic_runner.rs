@@ -423,11 +423,11 @@ fn worker_message_from_job(
         anyhow::bail!("Unsupported conversation job runtime: {}", payload.runtime);
     }
 
-    let agent_type: AgentType =
-        serde_json::from_value(serde_json::Value::String(payload.agent_type.clone()))
-            .with_context(|| {
-                format!("Unsupported conversation job agent: {}", payload.agent_type)
-            })?;
+    let agent_type: AgentType = AgentType::from_chat_agent_key(&payload.agent_type)
+        .or_else(|| {
+            serde_json::from_value(serde_json::Value::String(payload.agent_type.clone())).ok()
+        })
+        .with_context(|| format!("Unsupported conversation job agent: {}", payload.agent_type))?;
     let attachments: Option<Vec<ChatAttachmentData>> = match payload.images_json.as_deref() {
         Some(json) => Some(
             serde_json::from_str(json)
@@ -459,6 +459,7 @@ fn worker_message_from_job(
 
 fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
     match prompt_name {
+        "codex" => Ok("full-access"),
         "full-access" => Ok("full-access"),
         "workspace-manager" => Ok("workspace-manager"),
         "scoped-workspace" => Ok("scoped-workspace"),

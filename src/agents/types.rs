@@ -97,6 +97,9 @@ pub enum AgentType {
 impl AgentType {
     pub fn from_chat_agent_key(key: &str) -> Option<Self> {
         match key {
+            // "codex" is the model/runtime label users and tool agents naturally reach for
+            // during the migration, but the runnable Agentic chat agent is full-access.
+            "codex" => Some(AgentType::FullAccess),
             "full-access" => Some(AgentType::FullAccess),
             "home-planner" => Some(AgentType::HomePlanner),
             "workspace-manager" => Some(AgentType::WorkspaceManager),
