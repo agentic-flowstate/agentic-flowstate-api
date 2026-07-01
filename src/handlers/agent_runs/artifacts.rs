@@ -40,6 +40,14 @@ pub async fn write_artifact(
         slice_id: Some(ticket.slice_id.clone()),
         ticket_id: Some(ticket_id.to_string()),
         agent_run_id: agent_run_id.map(String::from),
+        owner_agent: None,
+        produced_by_agent: Some(agent_type.to_string()),
+        source_uri: None,
+        source_conversation_id: None,
+        source_message_id: None,
+        source_document_id: None,
+        repository: ticket.repository.clone(),
+        metadata: None,
     };
 
     match ticketing_system::artifacts::create_artifact(db, req).await {

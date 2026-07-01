@@ -240,6 +240,14 @@ async fn execute_daily_run(
                     slice_id: None,
                     ticket_id: None,
                     agent_run_id: Some(session_id.clone()),
+                    owner_agent: None,
+                    produced_by_agent: Some("daily-research".to_string()),
+                    source_uri: None,
+                    source_conversation_id: None,
+                    source_message_id: None,
+                    source_document_id: None,
+                    repository: None,
+                    metadata: None,
                 },
             )
             .await
@@ -443,6 +451,14 @@ async fn execute_package_update_run(
                     slice_id: None,
                     ticket_id: None,
                     agent_run_id: Some(session_id.clone()),
+                    owner_agent: None,
+                    produced_by_agent: Some("package-update-review".to_string()),
+                    source_uri: None,
+                    source_conversation_id: None,
+                    source_message_id: None,
+                    source_document_id: None,
+                    repository: None,
+                    metadata: None,
                 },
             )
             .await

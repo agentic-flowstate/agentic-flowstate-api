@@ -665,7 +665,9 @@ async fn list_visible_library_artifacts(
         r#"
         SELECT artifact_id, title, length(content) AS content_length, artifact_type, created_by,
                source_step_id, organization, epic_id, slice_id, ticket_id,
-               agent_run_id, created_at, updated_at
+               agent_run_id, owner_agent, produced_by_agent, source_uri,
+               source_conversation_id, source_message_id, source_document_id,
+               repository, metadata_json, created_at, updated_at
         FROM artifacts
         WHERE organization = ?
           AND lifecycle_status = 'active'
@@ -690,6 +692,19 @@ async fn list_visible_library_artifacts(
             slice_id: row.get("slice_id"),
             ticket_id: row.get("ticket_id"),
             agent_run_id: row.get("agent_run_id"),
+            owner_agent: row.get("owner_agent"),
+            produced_by_agent: row.get("produced_by_agent"),
+            source_uri: row.get("source_uri"),
+            source_conversation_id: row.get("source_conversation_id"),
+            source_message_id: row.get("source_message_id"),
+            source_document_id: row.get("source_document_id"),
+            repository: row.get("repository"),
+            metadata: row
+                .try_get::<String, _>("metadata_json")
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({})),
             content_length: usize::try_from(row.get::<i64, _>("content_length")).unwrap_or(0),
             created_at: row.get("created_at"),
             updated_at: row.get("updated_at"),
