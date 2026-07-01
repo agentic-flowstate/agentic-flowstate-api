@@ -1650,83 +1650,7 @@ impl ConversationWorker {
                     );
                 }
 
-                if let Some(apns) = crate::apns::ApnsService::global() {
-                    tracing::info!(
-                        "[WORKER] Sending push notification for user={}, conv={}",
-                        msg.user_id,
-                        self.conversation_id
-                    );
-                    let push_title = match conversations::get_conversation(
-                        &self.db,
-                        &self.conversation_id,
-                        false,
-                    )
-                    .await
-                    {
-                        Ok(Some(conversation)) => {
-                            let title = conversation.title.trim();
-                            if title.is_empty() {
-                                tracing::warn!(
-                                    "[WORKER] Skipping completion push for conv={} - empty conversation title",
-                                    self.conversation_id
-                                );
-                                None
-                            } else {
-                                Some(title.to_string())
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::warn!(
-                                "[WORKER] Skipping completion push for conv={} - conversation not found",
-                                self.conversation_id
-                            );
-                            None
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "[WORKER] Skipping completion push for conv={} - title lookup failed: {}",
-                                self.conversation_id,
-                                e
-                            );
-                            None
-                        }
-                    };
-
-                    if let Some(push_title) = push_title {
-                        let push_db = (*self.db).clone();
-                        let push_user = msg.user_id.clone();
-                        let push_agent = msg.config.prompt_name.to_string();
-                        let push_conv_id = self.conversation_id.clone();
-                        let apns = apns.clone();
-                        tokio::spawn(async move {
-                            match apns
-                                .send_to_user(
-                                    &push_db,
-                                    &push_user,
-                                    &push_title,
-                                    "",
-                                    Some(&push_conv_id),
-                                    Some(&push_agent),
-                                )
-                                .await
-                            {
-                                Ok(()) => {
-                                    tracing::info!(
-                                        "[WORKER] Push notification sent for user={}",
-                                        push_user
-                                    )
-                                }
-                                Err(e) => tracing::warn!(
-                                    "[WORKER] Push notification failed for user={}: {}",
-                                    push_user,
-                                    e
-                                ),
-                            }
-                        });
-                    }
-                } else {
-                    tracing::warn!("[WORKER] APNs not initialized — skipping push notification");
-                }
+                self.send_completion_alert_push_if_eligible(&msg).await;
 
                 self.emit_event(&StreamEvent::Status {
                     status: "completed".to_string(),
@@ -1937,6 +1861,119 @@ impl ConversationWorker {
                 }
             }
         }
+    }
+
+    async fn send_completion_alert_push_if_eligible(&self, msg: &WorkerMessage) {
+        let Some(apns) = crate::apns::ApnsService::global() else {
+            tracing::warn!("[WORKER] APNs not initialized — skipping push notification");
+            return;
+        };
+
+        let conversation =
+            match conversations::get_conversation(&self.db, &self.conversation_id, false).await {
+                Ok(Some(conversation)) => conversation,
+                Ok(None) => {
+                    tracing::warn!(
+                        "[WORKER] Skipping completion push for conv={} - conversation not found",
+                        self.conversation_id
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[WORKER] Skipping completion push conv={} - lookup failed: {}",
+                        self.conversation_id,
+                        e
+                    );
+                    return;
+                }
+            };
+
+        let decision = completion_alert_push_decision(&conversation);
+        let CompletionAlertPushDecision::Send { title: push_title } = decision else {
+            let reason = decision.skip_reason();
+            tracing::info!(
+                "[WORKER] Skipping completion push for conv={} - {}",
+                self.conversation_id,
+                reason.unwrap_or("not eligible")
+            );
+            return;
+        };
+
+        tracing::info!(
+            "[WORKER] Sending push notification for user={}, conv={}",
+            msg.user_id,
+            self.conversation_id
+        );
+        let push_db = (*self.db).clone();
+        let push_user = msg.user_id.clone();
+        let push_agent = msg.config.prompt_name.to_string();
+        let push_conv_id = self.conversation_id.clone();
+        let apns = apns.clone();
+        tokio::spawn(async move {
+            match apns
+                .send_to_user(
+                    &push_db,
+                    &push_user,
+                    &push_title,
+                    "",
+                    Some(&push_conv_id),
+                    Some(&push_agent),
+                )
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!("[WORKER] Push notification sent for user={}", push_user)
+                }
+                Err(e) => tracing::warn!(
+                    "[WORKER] Push notification failed for user={}: {}",
+                    push_user,
+                    e
+                ),
+            }
+        });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CompletionAlertPushDecision {
+    Send { title: String },
+    Skip { reason: &'static str },
+}
+
+impl CompletionAlertPushDecision {
+    fn skip_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Send { .. } => None,
+            Self::Skip { reason } => Some(reason),
+        }
+    }
+}
+
+fn completion_alert_push_decision(
+    conversation: &ticketing_system::Conversation,
+) -> CompletionAlertPushDecision {
+    if conversation.parent_conversation_id.is_some() {
+        return CompletionAlertPushDecision::Skip {
+            reason: "child conversation has parent",
+        };
+    }
+
+    if conversation.conversation_role == "sub_agent" {
+        return CompletionAlertPushDecision::Skip {
+            reason: "sub-agent conversation",
+        };
+    }
+
+    let title = conversation.title.trim();
+    if title.is_empty() {
+        return CompletionAlertPushDecision::Skip {
+            reason: "empty conversation title",
+        };
+    }
+
+    CompletionAlertPushDecision::Send {
+        title: title.to_string(),
     }
 }
 
@@ -3337,6 +3374,80 @@ fn format_attachment_prompt_line(
         "  - {} `{}` ({}{}): {}",
         attachment_kind, display_name, mime_type, size, path
     )
+}
+
+#[cfg(test)]
+mod completion_alert_push_tests {
+    use super::*;
+
+    fn conversation(
+        id: &str,
+        title: &str,
+        parent_conversation_id: Option<&str>,
+        conversation_role: &str,
+    ) -> ticketing_system::Conversation {
+        ticketing_system::Conversation {
+            id: id.to_string(),
+            user_id: "alex".to_string(),
+            session_id: None,
+            organization: "agentic-flowstate".to_string(),
+            agent: Some("full-access".to_string()),
+            conversation_type: Some("general".to_string()),
+            parent_conversation_id: parent_conversation_id.map(ToOwned::to_owned),
+            conversation_role: conversation_role.to_string(),
+            child_conversation_count: Some(0),
+            child_sort_order: None,
+            title: title.to_string(),
+            started_at: "2026-07-01T00:00:00Z".to_string(),
+            updated_at: "2026-07-01T00:00:00Z".to_string(),
+            status: "open".to_string(),
+            archived_at: None,
+            router_ticket_id: None,
+            router_organization: None,
+            message_count: Some(0),
+            last_event_index: Some(0),
+            last_read_event_index: None,
+            unread_event_count: None,
+            is_active: Some(true),
+            messages: None,
+        }
+    }
+
+    #[test]
+    fn root_conversations_are_eligible_for_completion_alerts() {
+        let conversation = conversation("parent-1", "  Main chat response  ", None, "standard");
+
+        assert_eq!(
+            completion_alert_push_decision(&conversation),
+            CompletionAlertPushDecision::Send {
+                title: "Main chat response".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn child_conversations_do_not_send_completion_alerts() {
+        let conversation = conversation("child-1", "Child lane", Some("parent-1"), "sub_agent");
+
+        assert_eq!(
+            completion_alert_push_decision(&conversation),
+            CompletionAlertPushDecision::Skip {
+                reason: "child conversation has parent"
+            }
+        );
+    }
+
+    #[test]
+    fn sub_agent_role_without_parent_is_not_alert_eligible() {
+        let conversation = conversation("child-legacy", "Child lane", None, "sub_agent");
+
+        assert_eq!(
+            completion_alert_push_decision(&conversation),
+            CompletionAlertPushDecision::Skip {
+                reason: "sub-agent conversation"
+            }
+        );
+    }
 }
 
 #[cfg(test)]
