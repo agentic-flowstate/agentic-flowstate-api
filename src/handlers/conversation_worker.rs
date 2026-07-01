@@ -1055,6 +1055,7 @@ impl ConversationWorker {
                         &mut accumulated_text,
                         &mut content_blocks,
                         failure_message,
+                        msg.message_metadata.as_deref(),
                     )
                     .await;
                     return;
@@ -1092,6 +1093,7 @@ impl ConversationWorker {
                     &mut accumulated_text,
                     &mut content_blocks,
                     failure_message,
+                    msg.message_metadata.as_deref(),
                 )
                 .await;
                 return;
@@ -1170,6 +1172,7 @@ impl ConversationWorker {
                     &mut accumulated_text,
                     &mut content_blocks,
                     failure_message,
+                    msg.message_metadata.as_deref(),
                 )
                 .await;
                 return;
@@ -1475,6 +1478,7 @@ impl ConversationWorker {
                     &mut accumulated_text,
                     &mut content_blocks,
                     failure_message,
+                    msg.message_metadata.as_deref(),
                 )
                 .await;
                 return;
@@ -1628,13 +1632,14 @@ impl ConversationWorker {
                     accumulated_text.clone(),
                 );
 
-                if let Err(e) = insert_child_completion_status_to_parent(
+                if let Err(e) = maybe_insert_child_completion_status_to_parent(
                     &self.db,
                     &self.conversation_id,
                     &assistant_message_id,
                     "completed",
                     accumulated_text.as_str(),
                     None,
+                    msg.message_metadata.as_deref(),
                 )
                 .await
                 {
@@ -1737,13 +1742,14 @@ impl ConversationWorker {
                     is_error: false,
                 })
                 .await;
-                if let Err(e) = insert_child_completion_status_to_parent(
+                if let Err(e) = maybe_insert_child_completion_status_to_parent(
                     &self.db,
                     &self.conversation_id,
                     &assistant_message_id,
                     "cancelled",
                     accumulated_text.as_str(),
                     None,
+                    msg.message_metadata.as_deref(),
                 )
                 .await
                 {
@@ -1767,6 +1773,7 @@ impl ConversationWorker {
                     &mut accumulated_text,
                     &mut content_blocks,
                     message,
+                    msg.message_metadata.as_deref(),
                 )
                 .await;
             }
@@ -2283,6 +2290,7 @@ async fn persist_failed_codex_message(
     accumulated_text: &mut String,
     content_blocks: &mut Vec<ContentBlockDesc>,
     message: String,
+    message_metadata: Option<&str>,
 ) {
     let error_message = message.clone();
     let text_chunk = codex_failure_text_chunk(accumulated_text, &message);
@@ -2309,13 +2317,14 @@ async fn persist_failed_codex_message(
         })
         .await;
 
-    if let Err(e) = insert_child_completion_status_to_parent(
+    if let Err(e) = maybe_insert_child_completion_status_to_parent(
         &worker.db,
         &worker.conversation_id,
         assistant_message_id,
         "failed",
         accumulated_text.as_str(),
         Some(error_message.as_str()),
+        message_metadata,
     )
     .await
     {
@@ -2325,6 +2334,48 @@ async fn persist_failed_codex_message(
             e
         );
     }
+}
+
+async fn maybe_insert_child_completion_status_to_parent(
+    db: &SqlitePool,
+    child_conversation_id: &str,
+    child_assistant_message_id: &str,
+    terminal_status: &str,
+    child_output: &str,
+    error_message: Option<&str>,
+    message_metadata: Option<&str>,
+) -> Result<()> {
+    if suppress_parent_completion_relay(message_metadata) {
+        tracing::info!(
+            "[WORKER] Suppressed parent completion relay for child={} status={}",
+            child_conversation_id,
+            terminal_status
+        );
+        return Ok(());
+    }
+
+    insert_child_completion_status_to_parent(
+        db,
+        child_conversation_id,
+        child_assistant_message_id,
+        terminal_status,
+        child_output,
+        error_message,
+    )
+    .await
+}
+
+fn suppress_parent_completion_relay(message_metadata: Option<&str>) -> bool {
+    let Some(message_metadata) = message_metadata else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(message_metadata) else {
+        return false;
+    };
+    value
+        .get("suppress_parent_completion_relay")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 async fn insert_child_completion_status_to_parent(
@@ -3690,6 +3741,21 @@ mod streaming_persistence_tests {
         assert_eq!(value["child_terminal_status"], "completed");
         assert_eq!(value["child_conversation_type"], "research");
         assert_eq!(value["summary"], "Use a layered memory model.");
+    }
+
+    #[test]
+    fn parent_completion_relay_can_be_suppressed_by_turn_metadata() {
+        let metadata = serde_json::json!({
+            "origin": "agent_orchestrated",
+            "orchestration": "child_initial_turn",
+            "agent": "conversation-evaluator",
+            "suppress_parent_completion_relay": true
+        })
+        .to_string();
+
+        assert!(suppress_parent_completion_relay(Some(&metadata)));
+        assert!(!suppress_parent_completion_relay(None));
+        assert!(!suppress_parent_completion_relay(Some("{not json")));
     }
 
     #[test]

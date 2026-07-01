@@ -848,6 +848,11 @@ async fn enqueue_initial_child_turns(
         if let Some(parent_id) = child.parent_conversation_id.as_deref() {
             prompt_vars.insert("PARENT_CONVERSATION_ID".to_string(), parent_id.to_string());
         }
+        prompt_vars.insert(
+            "SUPPORT_CONTEXT_TOOL_ARGS".to_string(),
+            child_support_context_tool_args(&child.id, user_id, handoff.as_ref())
+                .map_err(internal_error)?,
+        );
         if let Some(handoff) = handoff.as_ref() {
             prompt_vars.insert(
                 "ARTIFACT_MEMORY_HANDOFF".to_string(),
@@ -933,10 +938,28 @@ fn orchestrated_child_turn_metadata(
         "orchestration": "child_initial_turn",
         "agent": agent,
     });
+    if agent == "conversation-evaluator" {
+        value["suppress_parent_completion_relay"] = serde_json::Value::Bool(true);
+    }
     if let Some(handoff) = handoff {
         value["artifact_memory_handoff"] = handoff.metadata_json();
     }
     serde_json::to_string(&value).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn child_support_context_tool_args(
+    child_id: &str,
+    user_id: &str,
+    handoff: Option<&ResolvedContextHandoff>,
+) -> Result<String, serde_json::Error> {
+    let mut args = serde_json::json!({
+        "child_conversation_id": child_id,
+        "user_id": user_id,
+    });
+    if let Some(handoff) = handoff {
+        args["artifact_memory_handoff"] = serde_json::to_value(handoff)?;
+    }
+    serde_json::to_string(&args)
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -2588,5 +2611,34 @@ mod tests {
         assert!(!metadata.contains("multi-agent packet handoff query"));
         assert!(!metadata.contains(RAW_PARENT_TRANSCRIPT_SENTINEL));
         assert!(!metadata.contains(FULL_OUTPUT_SENTINEL));
+    }
+
+    #[test]
+    fn evaluator_child_metadata_suppresses_parent_completion_relay() {
+        let metadata = orchestrated_child_turn_metadata("api", "conversation-evaluator", None)
+            .expect("child turn metadata");
+        let value: Value = serde_json::from_str(&metadata).expect("metadata json");
+
+        assert_eq!(value["agent"], "conversation-evaluator");
+        assert_eq!(value["suppress_parent_completion_relay"], true);
+    }
+
+    #[test]
+    fn child_context_tool_args_include_child_id_user_and_handoff() {
+        let handoff = resolved_handoff();
+        let args = child_support_context_tool_args("child-1", "alex", Some(&handoff))
+            .expect("context args");
+        let value: Value = serde_json::from_str(&args).expect("context args json");
+
+        assert_eq!(value["child_conversation_id"], "child-1");
+        assert_eq!(value["user_id"], "alex");
+        assert_eq!(
+            value["artifact_memory_handoff"]["packets"][0]["packet_id"],
+            PACKET_ID
+        );
+        assert_eq!(
+            value["artifact_memory_handoff"]["retrievals"][0]["retrieval_id"],
+            RETRIEVAL_ID
+        );
     }
 }

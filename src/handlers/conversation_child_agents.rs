@@ -337,6 +337,9 @@ fn orchestrated_message_metadata(
         "orchestration": "child_initial_turn",
         "agent": agent,
     });
+    if agent == "conversation-evaluator" {
+        value["suppress_parent_completion_relay"] = serde_json::Value::Bool(true);
+    }
     if let Some(handoff) = handoff {
         value["artifact_memory_handoff"] = handoff.metadata_json();
     }
@@ -617,6 +620,7 @@ mod tests {
 
         assert_eq!(value["origin"], "agent_orchestrated");
         assert_eq!(value["orchestration"], "child_initial_turn");
+        assert_eq!(value["suppress_parent_completion_relay"], true);
         assert_eq!(
             value["artifact_memory_handoff"]["context_packet_ids"],
             json!([PACKET_ID])
