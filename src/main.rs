@@ -1323,6 +1323,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::stream_conversation_run_status),
         )
         .route(
+            "/api/agent-operations/status",
+            get(handlers::agent_operations::get_agent_operations_status),
+        )
+        .route(
             "/api/conversations/:id/stream",
             get(handlers::reconnect_conversation_stream),
         )

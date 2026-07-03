@@ -1,5 +1,6 @@
 pub mod admin_logs;
 pub mod admin_reload;
+pub mod agent_operations;
 pub mod agent_runs;
 pub mod anthropic_event_encoder;
 pub mod auth;
