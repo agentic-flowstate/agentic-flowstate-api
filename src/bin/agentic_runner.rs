@@ -383,8 +383,17 @@ async fn run_claimed_job_inner(
         Utc::now().timestamp_millis().saturating_sub(worker_start_ms)
     );
 
-    if let Some(status) = latest_terminal_event_status(&db, &job.conversation_id).await? {
-        return Ok(status);
+    if let Some(terminal) = latest_terminal_event_status(&db, &job.conversation_id).await? {
+        tracing::warn!(
+            "[RUNNER] Conversation job {} observed terminal event after worker finish: conv={} client_id={} event_index={} event_type={} status={}",
+            job.id,
+            job.conversation_id,
+            job.payload.client_id.as_deref().unwrap_or("none"),
+            terminal.event_index,
+            terminal.event_type,
+            terminal.status
+        );
+        return Ok(terminal.status.to_string());
     }
 
     let checkpoint = checkpoints::get_checkpoint(&db, &job.conversation_id).await?;
@@ -409,10 +418,10 @@ async fn run_claimed_job_inner(
 async fn latest_terminal_event_status(
     db: &ticketing_system::SqlitePool,
     conversation_id: &str,
-) -> Result<Option<String>> {
-    let rows = sqlx::query_as::<_, (String, String)>(
+) -> Result<Option<TerminalEventStatus>> {
+    let rows = sqlx::query_as::<_, (i64, String, String)>(
         r#"
-        SELECT event_type, event_data
+        SELECT event_index, event_type, event_data
         FROM conversation_events
         WHERE conversation_id = ?
         ORDER BY event_index DESC
@@ -425,9 +434,20 @@ async fn latest_terminal_event_status(
     .context("Failed to inspect conversation terminal events")?;
 
     Ok(rows
-        .iter()
-        .find_map(|(event_type, event_data)| terminal_status_from_event(event_type, event_data))
-        .map(str::to_string))
+        .into_iter()
+        .find_map(|(event_index, event_type, event_data)| {
+            terminal_status_from_event(&event_type, &event_data).map(|status| TerminalEventStatus {
+                status,
+                event_index,
+                event_type,
+            })
+        }))
+}
+
+struct TerminalEventStatus {
+    status: &'static str,
+    event_index: i64,
+    event_type: String,
 }
 
 fn terminal_status_from_event(event_type: &str, event_data: &str) -> Option<&'static str> {
