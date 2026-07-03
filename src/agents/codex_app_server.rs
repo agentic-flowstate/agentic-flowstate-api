@@ -239,6 +239,19 @@ pub struct RunningCodexAppServer {
     completion: Arc<Mutex<Option<TurnCompletion>>>,
 }
 
+#[derive(Clone)]
+pub struct CodexAppServerTurnHandle {
+    child: Arc<Mutex<Child>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+}
+
+impl CodexAppServerTurnHandle {
+    pub async fn terminate(&self) -> Result<(), String> {
+        close_stdin(&self.stdin).await;
+        terminate_child_process(&self.child).await
+    }
+}
+
 #[derive(Default)]
 struct AgentMessageTextCollector {
     delta_text: String,
@@ -1638,8 +1651,11 @@ async fn reject_server_request(
 }
 
 impl RunningCodexAppServer {
-    pub fn child(&self) -> Arc<Mutex<Child>> {
-        self.child.clone()
+    pub fn turn_handle(&self) -> CodexAppServerTurnHandle {
+        CodexAppServerTurnHandle {
+            child: self.child.clone(),
+            stdin: self.stdin.clone(),
+        }
     }
 
     pub async fn terminate(&self) -> Result<(), String> {
@@ -1689,17 +1705,39 @@ fn terminate_child_process_locked(child: &mut Child) -> Result<(), String> {
         if let Some(pid) = child.id() {
             let rc = unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
             if rc == 0 {
+                tracing::info!("[CODEX] Sent SIGKILL to app-server process group {}", pid);
                 return Ok(());
             }
 
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ESRCH) {
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                return Err(format!(
+                    "Interrupt failed: killpg({}, SIGKILL) returned {}",
+                    pid, err
+                ));
+            }
+
+            let direct_rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            if direct_rc == 0 {
+                tracing::info!(
+                    "[CODEX] App-server process group {} was unavailable; sent SIGKILL to child pid",
+                    pid
+                );
+                return Ok(());
+            }
+
+            let direct_err = std::io::Error::last_os_error();
+            if direct_err.raw_os_error() == Some(libc::ESRCH) {
+                tracing::info!(
+                    "[CODEX] App-server pid {} was already gone before SIGKILL",
+                    pid
+                );
                 return Ok(());
             }
 
             return Err(format!(
-                "Interrupt failed: killpg({}, SIGKILL) returned {}",
-                pid, err
+                "Interrupt failed: killpg({}, SIGKILL) returned {}; kill({}, SIGKILL) returned {}",
+                pid, err, pid, direct_err
             ));
         }
     }
@@ -2119,6 +2157,30 @@ mod tests {
         assert_eq!(normalize_reasoning_effort("xhigh"), "xhigh");
         assert_eq!(normalize_reasoning_effort("max"), "xhigh");
         assert_eq!(normalize_reasoning_effort("unknown"), "medium");
+    }
+
+    #[tokio::test]
+    async fn terminate_child_process_falls_back_to_child_pid_without_process_group() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep child");
+        let child = Arc::new(Mutex::new(child));
+
+        terminate_child_process(&child)
+            .await
+            .expect("terminate child");
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            child.lock().await.wait().await
+        })
+        .await
+        .expect("child should exit promptly after terminate")
+        .expect("wait for child");
+        assert!(!status.success());
     }
 
     #[test]

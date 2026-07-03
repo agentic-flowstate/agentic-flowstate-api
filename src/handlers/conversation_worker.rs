@@ -1202,8 +1202,13 @@ impl ConversationWorker {
         );
 
         self.manager
-            .insert_app_server_turn(self.conversation_id.clone(), turn.child())
+            .insert_app_server_turn(self.conversation_id.clone(), turn.turn_handle())
             .await;
+        tracing::info!(
+            "[CANCEL] Registered live Codex app-server turn for conversation {} runner_turn_id={}",
+            self.conversation_id,
+            runner_turn_id
+        );
 
         let mut accumulated_text = String::new();
         let mut thread_id: Option<String> = None;
@@ -1224,11 +1229,26 @@ impl ConversationWorker {
         // or the 15s heartbeat before killing the subprocess.
         if self.is_turn_cancelled().await {
             kill_requested = true;
+            let terminate_started_ms = Utc::now().timestamp_millis();
+            tracing::info!(
+                "[CANCEL] Worker observed cancellation for conversation {} phase=after_registration runner_turn_id={}",
+                self.conversation_id,
+                runner_turn_id
+            );
             if let Err(e) = turn.terminate().await {
                 tracing::warn!(
                     "[WORKER] Failed to terminate newly-started cancelled Codex turn for {}: {}",
                     self.conversation_id,
                     e
+                );
+            } else {
+                tracing::info!(
+                    "[CANCEL] Worker signalled cancellation for conversation {} phase=after_registration runner_turn_id={} terminate_elapsed_ms={}",
+                    self.conversation_id,
+                    runner_turn_id,
+                    Utc::now()
+                        .timestamp_millis()
+                        .saturating_sub(terminate_started_ms)
                 );
             }
         }
@@ -1432,11 +1452,26 @@ impl ConversationWorker {
 
                     if !kill_requested && self.is_turn_cancelled().await {
                         kill_requested = true;
+                        let terminate_started_ms = Utc::now().timestamp_millis();
+                        tracing::info!(
+                            "[CANCEL] Worker observed cancellation for conversation {} phase=event_loop runner_turn_id={}",
+                            self.conversation_id,
+                            runner_turn_id
+                        );
                         if let Err(e) = turn.terminate().await {
                             tracing::warn!(
                                 "[WORKER] Failed to terminate cancelled Codex turn for {}: {}",
                                 self.conversation_id,
                                 e
+                            );
+                        } else {
+                            tracing::info!(
+                                "[CANCEL] Worker signalled cancellation for conversation {} phase=event_loop runner_turn_id={} terminate_elapsed_ms={}",
+                                self.conversation_id,
+                                runner_turn_id,
+                                Utc::now()
+                                    .timestamp_millis()
+                                    .saturating_sub(terminate_started_ms)
                             );
                         }
                     }
@@ -1451,11 +1486,26 @@ impl ConversationWorker {
 
                     if !kill_requested && self.is_turn_cancelled().await {
                         kill_requested = true;
+                        let terminate_started_ms = Utc::now().timestamp_millis();
+                        tracing::info!(
+                            "[CANCEL] Worker observed cancellation for conversation {} phase=heartbeat runner_turn_id={}",
+                            self.conversation_id,
+                            runner_turn_id
+                        );
                         if let Err(e) = turn.terminate().await {
                             tracing::warn!(
                                 "[WORKER] Failed to terminate cancelled Codex turn for {}: {}",
                                 self.conversation_id,
                                 e
+                            );
+                        } else {
+                            tracing::info!(
+                                "[CANCEL] Worker signalled cancellation for conversation {} phase=heartbeat runner_turn_id={} terminate_elapsed_ms={}",
+                                self.conversation_id,
+                                runner_turn_id,
+                                Utc::now()
+                                    .timestamp_millis()
+                                    .saturating_sub(terminate_started_ms)
                             );
                         }
                     }
@@ -1466,8 +1516,20 @@ impl ConversationWorker {
         self.manager
             .remove_app_server_turn(&self.conversation_id)
             .await;
+        let wait_started_ms = Utc::now().timestamp_millis();
         let outcome = match turn.wait().await {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                if kill_requested {
+                    tracing::info!(
+                        "[CANCEL] Worker app-server wait completed for conversation {} runner_turn_id={} wait_elapsed_ms={} exit_success={}",
+                        self.conversation_id,
+                        runner_turn_id,
+                        Utc::now().timestamp_millis().saturating_sub(wait_started_ms),
+                        outcome.success()
+                    );
+                }
+                outcome
+            }
             Err(e) => {
                 let failure_message = format!("Codex turn failed: {}", e);
                 tracing::error!(
@@ -1556,6 +1618,13 @@ impl ConversationWorker {
                 runner_terminal_status,
                 self.conversation_id,
                 e
+            );
+        } else if kill_requested || matches!(&completion, CodexTurnCompletion::Cancelled { .. }) {
+            tracing::info!(
+                "[CANCEL] Worker marked turn terminal for conversation {} runner_turn_id={} status={}",
+                self.conversation_id,
+                runner_turn_id,
+                runner_terminal_status
             );
         }
 

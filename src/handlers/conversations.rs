@@ -1437,6 +1437,7 @@ pub async fn cancel_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    let cancel_requested_ms = chrono::Utc::now().timestamp_millis();
     // Verify conversation belongs to user
     let conv = conversations::get_conversation(&pool, &id, false)
         .await
@@ -1468,9 +1469,19 @@ pub async fn cancel_conversation(
         .unwrap_or(false);
 
     // Try to interrupt the running agent
+    let interrupt_started_ms = chrono::Utc::now().timestamp_millis();
     match manager.interrupt(&id).await {
         Ok(true) => {
-            tracing::info!("[CANCEL] Interrupted agent for conversation {}", id);
+            let interrupted_ms = chrono::Utc::now().timestamp_millis();
+            tracing::info!(
+                "[CANCEL] Interrupted agent for conversation {} request_to_interrupt_ms={} interrupt_elapsed_ms={} worker_exists={} runner_turn_exists={} cancelled_pending_jobs={}",
+                id,
+                interrupted_ms.saturating_sub(cancel_requested_ms),
+                interrupted_ms.saturating_sub(interrupt_started_ms),
+                worker_exists,
+                runner_turn_exists,
+                cancelled_pending_jobs
+            );
             // Broadcast cancelled status so SSE clients get notified
             let event = crate::agents::StreamEvent::Status {
                 status: "cancelled".to_string(),
@@ -1482,15 +1493,21 @@ pub async fn cancel_conversation(
             }
         }
         Ok(false) => {
+            let no_live_turn_ms = chrono::Utc::now().timestamp_millis();
             if worker_exists || runner_turn_exists {
                 tracing::info!(
-                    "[CANCEL] Marked active/queued turn cancelled for conversation {}",
-                    id
+                    "[CANCEL] Marked active/queued turn cancelled for conversation {} request_to_marker_ms={} worker_exists={} runner_turn_exists={} cancelled_pending_jobs={}",
+                    id,
+                    no_live_turn_ms.saturating_sub(cancel_requested_ms),
+                    worker_exists,
+                    runner_turn_exists,
+                    cancelled_pending_jobs
                 );
             } else {
                 tracing::info!(
-                    "[CANCEL] No active runner turn for conversation {}, cancelled {} pending job(s)",
+                    "[CANCEL] No active runner turn for conversation {} request_to_idle_ms={} cancelled_pending_jobs={}",
                     id,
+                    no_live_turn_ms.saturating_sub(cancel_requested_ms),
                     cancelled_pending_jobs
                 );
                 let _ = manager.consume_cancelled_turn(&id).await;
@@ -1523,7 +1540,14 @@ pub async fn cancel_conversation(
             }
         }
         Err(e) => {
-            tracing::warn!("[CANCEL] Interrupt failed for {}: {}", id, e);
+            tracing::warn!(
+                "[CANCEL] Interrupt failed for {} after {}ms: {}",
+                id,
+                chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_sub(interrupt_started_ms),
+                e
+            );
             // Don't fail the request — the agent might have already finished
         }
     }

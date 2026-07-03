@@ -1,14 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tokio::process::Child;
 use tokio::sync::Mutex;
 
-use crate::agents::codex_app_server::terminate_child_process;
+use crate::agents::codex_app_server::CodexAppServerTurnHandle;
 
 /// Manages live Codex app-server turns and cancellation markers.
 pub struct ChatClientManager {
     runner_generation_id: String,
-    app_server_turns: Mutex<HashMap<String, Arc<Mutex<Child>>>>,
+    app_server_turns: Mutex<HashMap<String, CodexAppServerTurnHandle>>,
     cancelled_turns: Mutex<HashSet<String>>,
 }
 
@@ -31,9 +29,13 @@ impl ChatClientManager {
 
     /// Register a live Codex app-server subprocess for a conversation turn so the
     /// cancel endpoint can kill it.
-    pub async fn insert_app_server_turn(&self, conversation_id: String, child: Arc<Mutex<Child>>) {
+    pub async fn insert_app_server_turn(
+        &self,
+        conversation_id: String,
+        turn_handle: CodexAppServerTurnHandle,
+    ) {
         let mut turns = self.app_server_turns.lock().await;
-        turns.insert(conversation_id, child);
+        turns.insert(conversation_id, turn_handle);
     }
 
     /// Remove a live Codex app-server subprocess handle after the turn ends.
@@ -71,13 +73,13 @@ impl ChatClientManager {
     /// Interrupt a running conversation's Codex app-server turn.
     /// Returns Ok(true) if interrupted, Ok(false) if no active turn found.
     pub async fn interrupt(&self, conversation_id: &str) -> Result<bool, String> {
-        let child_arc = {
+        let turn_handle = {
             let turns = self.app_server_turns.lock().await;
             turns.get(conversation_id).cloned()
         };
 
-        if let Some(child_arc) = child_arc {
-            terminate_child_process(&child_arc).await?;
+        if let Some(turn_handle) = turn_handle {
+            turn_handle.terminate().await?;
             Ok(true)
         } else {
             Ok(false)
