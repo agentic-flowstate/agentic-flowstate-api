@@ -21,6 +21,7 @@ const RUNNER_HEARTBEAT_STALE_SECONDS: i64 = 90;
 const RUNNER_HEARTBEAT_INTERVAL_SECONDS: u64 = 15;
 const RUNNER_POLL_INTERVAL_MS: u64 = 750;
 const RUNNER_RECONCILE_INTERVAL_SECONDS: u64 = 60;
+const DEFAULT_RUNNER_CONCURRENCY: usize = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -164,12 +165,12 @@ fn runner_concurrency() -> Result<Option<usize>> {
 
 fn parse_runner_concurrency(value: Option<&str>) -> Result<Option<usize>> {
     let Some(raw) = value else {
-        return Ok(None);
+        return Ok(Some(DEFAULT_RUNNER_CONCURRENCY));
     };
 
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(None);
+        return Ok(Some(DEFAULT_RUNNER_CONCURRENCY));
     }
 
     let limit = trimmed
@@ -567,14 +568,17 @@ mod tests {
     use super::{concurrency_allows_claim, parse_runner_concurrency, terminal_status_from_event};
 
     #[test]
-    fn absent_runner_concurrency_is_unlimited() {
-        assert_eq!(parse_runner_concurrency(None).unwrap(), None);
-        assert!(concurrency_allows_claim(None, usize::MAX));
+    fn absent_runner_concurrency_uses_default_limit() {
+        let concurrency = parse_runner_concurrency(None).unwrap();
+
+        assert_eq!(concurrency, Some(4));
+        assert!(concurrency_allows_claim(concurrency, 3));
+        assert!(!concurrency_allows_claim(concurrency, 4));
     }
 
     #[test]
-    fn empty_runner_concurrency_is_unlimited() {
-        assert_eq!(parse_runner_concurrency(Some("  ")).unwrap(), None);
+    fn empty_runner_concurrency_uses_default_limit() {
+        assert_eq!(parse_runner_concurrency(Some("  ")).unwrap(), Some(4));
     }
 
     #[test]
