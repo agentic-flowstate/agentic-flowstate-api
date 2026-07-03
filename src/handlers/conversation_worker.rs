@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use chrono::Utc;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -48,6 +49,8 @@ const ARTIFACT_MEMORY_HANDOFF_VAR: &str = "ARTIFACT_MEMORY_HANDOFF";
 const STARTUP_CONTEXT_MAX_RESULTS: usize = 8;
 const STARTUP_CONTEXT_MAX_ITEMS: usize = 4;
 const STARTUP_CONTEXT_TOKEN_BUDGET: usize = 3_000;
+static TICKET_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bT-[0-9A-F]{8}\b").expect("valid ticket id regex"));
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct AttachmentMeta {
@@ -850,7 +853,17 @@ impl ConversationWorker {
         );
 
         let started = Instant::now();
-        let organization = self.conversation_organization().await?;
+        let mut organization = self.conversation_organization().await?;
+        if message_references_ticket_id(user_message) {
+            if let Some(org) = organization.as_deref() {
+                tracing::info!(
+                    "[ROUTER] Explicit ticket id found; using ticket organization instead of conversation organization '{}' for conv={}",
+                    org,
+                    self.conversation_id
+                );
+            }
+            organization = None;
+        }
         let actor_id = format!("api-main-agent-startup:{}", self.conversation_id);
         let result = collect_work_context(
             &self.db,
@@ -2011,6 +2024,10 @@ fn is_tiny_conversational_message(user_message: &str) -> bool {
         && trimmed.chars().count() <= 4
         && !trimmed.chars().any(char::is_alphanumeric)
         && trimmed.chars().all(|c| c.is_ascii_punctuation())
+}
+
+fn message_references_ticket_id(user_message: &str) -> bool {
+    TICKET_ID_RE.is_match(user_message)
 }
 
 fn prompt_vars_have_artifact_memory_handoff(vars: &HashMap<String, String>) -> bool {
@@ -3504,6 +3521,16 @@ mod work_context_preflight_tests {
             work_context_skip_reason("Implement the ticket", &handoff_config, false),
             Some(WorkContextSkipReason::ExistingArtifactHandoff)
         );
+    }
+
+    #[test]
+    fn ticket_references_are_detected_for_startup_org_override() {
+        assert!(message_references_ticket_id(
+            "Implement the backend lane for ticket T-8A598325."
+        ));
+        assert!(message_references_ticket_id("please use t-deadBEEF here"));
+        assert!(!message_references_ticket_id("This is not-a-ticket."));
+        assert!(!message_references_ticket_id("T-123"));
     }
 
     #[test]

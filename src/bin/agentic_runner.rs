@@ -383,6 +383,10 @@ async fn run_claimed_job_inner(
         Utc::now().timestamp_millis().saturating_sub(worker_start_ms)
     );
 
+    if let Some(status) = latest_terminal_event_status(&db, &job.conversation_id).await? {
+        return Ok(status);
+    }
+
     let checkpoint = checkpoints::get_checkpoint(&db, &job.conversation_id).await?;
     let status = match checkpoint.as_ref().map(|cp| cp.status.as_str()) {
         Some("completed") => "completed",
@@ -400,6 +404,56 @@ async fn run_claimed_job_inner(
     };
 
     Ok(status.to_string())
+}
+
+async fn latest_terminal_event_status(
+    db: &ticketing_system::SqlitePool,
+    conversation_id: &str,
+) -> Result<Option<String>> {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        r#"
+        SELECT event_type, event_data
+        FROM conversation_events
+        WHERE conversation_id = ?
+        ORDER BY event_index DESC
+        LIMIT 20
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_all(db)
+    .await
+    .context("Failed to inspect conversation terminal events")?;
+
+    Ok(rows
+        .iter()
+        .find_map(|(event_type, event_data)| terminal_status_from_event(event_type, event_data))
+        .map(str::to_string))
+}
+
+fn terminal_status_from_event(event_type: &str, event_data: &str) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_str(event_data).ok()?;
+    if event_type == "error"
+        || value.get("type").and_then(serde_json::Value::as_str) == Some("error")
+    {
+        return Some("failed");
+    }
+
+    if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
+        return match status {
+            "failed" | "timeout" => Some("failed"),
+            "cancelled" => Some("cancelled"),
+            _ => None,
+        };
+    }
+
+    value
+        .get("delta")
+        .and_then(|delta| delta.get("stop_reason"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|stop_reason| match stop_reason {
+            "cancelled" => Some("cancelled"),
+            _ => None,
+        })
 }
 
 async fn verify_job_conversation_owner(
@@ -490,7 +544,7 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{concurrency_allows_claim, parse_runner_concurrency};
+    use super::{concurrency_allows_claim, parse_runner_concurrency, terminal_status_from_event};
 
     #[test]
     fn absent_runner_concurrency_is_unlimited() {
@@ -515,5 +569,25 @@ mod tests {
     fn invalid_runner_concurrency_fails() {
         assert!(parse_runner_concurrency(Some("0")).is_err());
         assert!(parse_runner_concurrency(Some("abc")).is_err());
+    }
+
+    #[test]
+    fn terminal_event_status_maps_startup_errors_to_failed() {
+        let event_data = r#"{"type":"error","error":{"type":"failed","message":"Startup context preflight failed"}}"#;
+
+        assert_eq!(
+            terminal_status_from_event("error", event_data),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn terminal_event_status_maps_cancelled_stop_reason() {
+        let event_data = r#"{"type":"message_delta","delta":{"stop_reason":"cancelled"}}"#;
+
+        assert_eq!(
+            terminal_status_from_event("message_delta", event_data),
+            Some("cancelled")
+        );
     }
 }
