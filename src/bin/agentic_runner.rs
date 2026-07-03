@@ -21,7 +21,50 @@ const RUNNER_HEARTBEAT_STALE_SECONDS: i64 = 90;
 const RUNNER_HEARTBEAT_INTERVAL_SECONDS: u64 = 15;
 const RUNNER_POLL_INTERVAL_MS: u64 = 750;
 const RUNNER_RECONCILE_INTERVAL_SECONDS: u64 = 60;
-const DEFAULT_RUNNER_CONCURRENCY: usize = 4;
+const DEFAULT_ADAPTIVE_MAX_CONCURRENCY: usize = 12;
+const DEFAULT_ADAPTIVE_CLAIM_BURST: usize = 1;
+const DEFAULT_ADAPTIVE_DB_IDLE_RESERVE: usize = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunnerConcurrency {
+    Fixed(usize),
+    Adaptive(AdaptiveConcurrency),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdaptiveConcurrency {
+    max_jobs: usize,
+    claim_burst: usize,
+    db_idle_reserve: usize,
+}
+
+impl Default for AdaptiveConcurrency {
+    fn default() -> Self {
+        Self {
+            max_jobs: DEFAULT_ADAPTIVE_MAX_CONCURRENCY,
+            claim_burst: DEFAULT_ADAPTIVE_CLAIM_BURST,
+            db_idle_reserve: DEFAULT_ADAPTIVE_DB_IDLE_RESERVE,
+        }
+    }
+}
+
+impl RunnerConcurrency {
+    fn allows_claim(
+        self,
+        active_jobs: usize,
+        claims_this_poll: usize,
+        db: &ticketing_system::SqlitePool,
+    ) -> bool {
+        match self {
+            RunnerConcurrency::Fixed(limit) => active_jobs < limit,
+            RunnerConcurrency::Adaptive(config) => {
+                active_jobs < config.max_jobs
+                    && claims_this_poll < config.claim_burst
+                    && db_has_capacity(db, config.db_idle_reserve)
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -80,8 +123,15 @@ async fn main() -> Result<()> {
 
     let concurrency = runner_concurrency()?;
     match concurrency {
-        Some(limit) => tracing::info!("Agentic runner concurrency limited to {}", limit),
-        None => tracing::info!("Agentic runner concurrency is unlimited"),
+        RunnerConcurrency::Fixed(limit) => {
+            tracing::info!("Agentic runner concurrency fixed at {}", limit)
+        }
+        RunnerConcurrency::Adaptive(config) => tracing::info!(
+            "Agentic runner concurrency adaptive: max_jobs={}, claim_burst={}, db_idle_reserve={}",
+            config.max_jobs,
+            config.claim_burst,
+            config.db_idle_reserve
+        ),
     }
     let mut joins = JoinSet::<(String, Result<String>)>::new();
     let mut accepting = true;
@@ -92,9 +142,11 @@ async fn main() -> Result<()> {
             let _ = agent_runners::mark_generation_draining(&db, &generation_id).await;
         }
 
-        while accepting && concurrency_allows_claim(concurrency, joins.len()) {
+        let mut claims_this_poll = 0;
+        while accepting && concurrency.allows_claim(joins.len(), claims_this_poll, &db) {
             match conversation_turn_jobs::claim_next_job(&db, &generation_id).await? {
                 Some(job) => {
+                    claims_this_poll += 1;
                     let job_id = job.id.clone();
                     let claimed_at_ms = Utc::now().timestamp_millis();
                     let queue_wait_ms = claimed_at_ms.saturating_sub(job.created_at * 1000);
@@ -159,31 +211,38 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn runner_concurrency() -> Result<Option<usize>> {
+fn runner_concurrency() -> Result<RunnerConcurrency> {
     parse_runner_concurrency(std::env::var("AGENTIC_RUNNER_CONCURRENCY").ok().as_deref())
 }
 
-fn parse_runner_concurrency(value: Option<&str>) -> Result<Option<usize>> {
+fn parse_runner_concurrency(value: Option<&str>) -> Result<RunnerConcurrency> {
     let Some(raw) = value else {
-        return Ok(Some(DEFAULT_RUNNER_CONCURRENCY));
+        return Ok(RunnerConcurrency::Adaptive(AdaptiveConcurrency::default()));
     };
 
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(Some(DEFAULT_RUNNER_CONCURRENCY));
+        return Ok(RunnerConcurrency::Adaptive(AdaptiveConcurrency::default()));
     }
 
-    let limit = trimmed
-        .parse::<usize>()
-        .with_context(|| "AGENTIC_RUNNER_CONCURRENCY must be a positive integer")?;
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "adaptive" | "unlimited"
+    ) {
+        return Ok(RunnerConcurrency::Adaptive(AdaptiveConcurrency::default()));
+    }
+
+    let limit = trimmed.parse::<usize>().with_context(|| {
+        "AGENTIC_RUNNER_CONCURRENCY must be a positive integer, 'adaptive', or 'unlimited'"
+    })?;
     if limit == 0 {
         bail!("AGENTIC_RUNNER_CONCURRENCY must be greater than zero");
     }
-    Ok(Some(limit))
+    Ok(RunnerConcurrency::Fixed(limit))
 }
 
-fn concurrency_allows_claim(concurrency: Option<usize>, active_jobs: usize) -> bool {
-    concurrency.map(|limit| active_jobs < limit).unwrap_or(true)
+fn db_has_capacity(db: &ticketing_system::SqlitePool, idle_reserve: usize) -> bool {
+    db.size() < db.options().get_max_connections() || db.num_idle() > idle_reserve
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -565,28 +624,51 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{concurrency_allows_claim, parse_runner_concurrency, terminal_status_from_event};
+    use super::{
+        parse_runner_concurrency, terminal_status_from_event, AdaptiveConcurrency,
+        RunnerConcurrency, DEFAULT_ADAPTIVE_CLAIM_BURST, DEFAULT_ADAPTIVE_DB_IDLE_RESERVE,
+        DEFAULT_ADAPTIVE_MAX_CONCURRENCY,
+    };
 
     #[test]
-    fn absent_runner_concurrency_uses_default_limit() {
+    fn absent_runner_concurrency_uses_adaptive_default() {
         let concurrency = parse_runner_concurrency(None).unwrap();
 
-        assert_eq!(concurrency, Some(4));
-        assert!(concurrency_allows_claim(concurrency, 3));
-        assert!(!concurrency_allows_claim(concurrency, 4));
+        assert_eq!(
+            concurrency,
+            RunnerConcurrency::Adaptive(AdaptiveConcurrency {
+                max_jobs: DEFAULT_ADAPTIVE_MAX_CONCURRENCY,
+                claim_burst: DEFAULT_ADAPTIVE_CLAIM_BURST,
+                db_idle_reserve: DEFAULT_ADAPTIVE_DB_IDLE_RESERVE,
+            })
+        );
     }
 
     #[test]
-    fn empty_runner_concurrency_uses_default_limit() {
-        assert_eq!(parse_runner_concurrency(Some("  ")).unwrap(), Some(4));
+    fn empty_runner_concurrency_uses_adaptive_default() {
+        assert!(matches!(
+            parse_runner_concurrency(Some("  ")).unwrap(),
+            RunnerConcurrency::Adaptive(_)
+        ));
+    }
+
+    #[test]
+    fn unlimited_runner_concurrency_uses_adaptive_backpressure() {
+        assert!(matches!(
+            parse_runner_concurrency(Some("unlimited")).unwrap(),
+            RunnerConcurrency::Adaptive(_)
+        ));
+        assert!(matches!(
+            parse_runner_concurrency(Some("adaptive")).unwrap(),
+            RunnerConcurrency::Adaptive(_)
+        ));
     }
 
     #[test]
     fn configured_runner_concurrency_limits_claims() {
         let concurrency = parse_runner_concurrency(Some("4")).unwrap();
 
-        assert!(concurrency_allows_claim(concurrency, 3));
-        assert!(!concurrency_allows_claim(concurrency, 4));
+        assert_eq!(concurrency, RunnerConcurrency::Fixed(4));
     }
 
     #[test]
