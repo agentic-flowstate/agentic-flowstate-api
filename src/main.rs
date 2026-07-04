@@ -119,6 +119,31 @@ fn launchd_restart_command(uid: &str, label: &str) -> String {
     )
 }
 
+fn launchd_runner_handoff_command(uid: &str) -> String {
+    format!(
+        r#"echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: handoff bootstrap com.agentic.runner"
+runner_plist="${{HOME:-/Users/jarvisgpt}}/Library/LaunchAgents/com.agentic.runner.plist"
+if [ ! -f "$runner_plist" ]; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: runner plist missing at $runner_plist"
+    exit 1
+fi
+handoff_label="com.agentic.runner.handoff.$(date +%s).$$"
+handoff_plist="/tmp/${{handoff_label}}.plist"
+cp "$runner_plist" "$handoff_plist"
+plutil -replace Label -string "$handoff_label" "$handoff_plist"
+plutil -replace KeepAlive -bool NO "$handoff_plist"
+plutil -replace RunAtLoad -bool true "$handoff_plist"
+launchctl bootstrap gui/{uid} "$handoff_plist" 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: runner handoff bootstrap failed rc=$rc label=$handoff_label"
+    exit "$rc"
+fi
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: runner handoff bootstrap started label=$handoff_label plist=$handoff_plist""#,
+        uid = uid
+    )
+}
+
 fn spawn_direct_restart_or_setup(service: &str, action: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
     let log = "/tmp/agentic-restart-watcher.log";
@@ -142,7 +167,7 @@ exec bash -l '{home}/projects/agentic-flowstate/agentic-flowstate-setup/setup.sh
             commands.push(launchd_restart_command(&uid, "com.agentic.api"));
         }
         if matches!(service, "agent-runner" | "all") {
-            commands.push(launchd_restart_command(&uid, "com.agentic.runner"));
+            commands.push(launchd_runner_handoff_command(&uid));
         }
         if matches!(service, "mcp-server" | "all") {
             commands.push(launchd_restart_command(&uid, "com.agentic.mcp"));
@@ -703,13 +728,14 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
-                // Pending restart found — check if any agent runs are still active
-                let active = match if pending.service == "api-server" {
-                    ticketing_system::restart_queue::count_api_restart_blocking_work(&restart_pool)
-                        .await
-                } else {
-                    ticketing_system::restart_queue::count_active_work(&restart_pool).await
-                } {
+                // Pending restart found — check only work this service restart would disrupt.
+                // Runner-owned turns are preserved by the runner handoff bootstrap path.
+                let active = match ticketing_system::restart_queue::count_restart_blocking_work(
+                    &restart_pool,
+                    &pending.service,
+                )
+                .await
+                {
                     Ok(a) => a,
                     Err(e) => {
                         tracing::warn!("[RESTART_WATCHER] Failed to count active work: {}", e);

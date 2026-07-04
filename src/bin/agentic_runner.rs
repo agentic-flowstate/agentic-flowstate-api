@@ -148,9 +148,13 @@ async fn main() -> Result<()> {
         let mut claims_this_poll = 0;
         while accepting {
             policy_cache.refresh_if_stale(&db).await?;
+            let global_active_jobs = runner_capacity::active_runner_job_count(&db)
+                .await?
+                .max(joins.len() as i64);
+            let active_jobs = usize::try_from(global_active_jobs).unwrap_or(usize::MAX);
             match runner_capacity::evaluate_claim(
                 policy_cache.policy(),
-                joins.len(),
+                active_jobs,
                 claims_this_poll,
                 last_claim_at.map(|instant| instant.elapsed()),
                 &db,
