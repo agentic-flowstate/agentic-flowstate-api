@@ -1296,6 +1296,10 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::launch_conversation_child_agent),
         )
         .route(
+            "/api/conversations/:id/branch",
+            post(handlers::branch_conversation),
+        )
+        .route(
             "/api/conversations/:id",
             get(handlers::get_conversation)
                 .patch(handlers::update_conversation)

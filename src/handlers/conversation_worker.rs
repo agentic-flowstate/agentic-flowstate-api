@@ -3333,11 +3333,7 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
             continue;
         }
 
-        let role = if msg.role == "user" {
-            "User"
-        } else {
-            "Assistant"
-        };
+        let role = prompt_history_role_label(&msg.role);
 
         // User messages: include in full (they're typically short)
         // Assistant messages: allow up to 2000 chars (was 300 — way too aggressive)
@@ -3380,6 +3376,16 @@ fn append_conversation_history(history: &mut String, messages: &[ConversationMes
                 history.push('\n');
             }
         }
+    }
+}
+
+fn prompt_history_role_label(role: &str) -> &'static str {
+    match role {
+        "user" => "User",
+        "assistant" => "Assistant",
+        "system" => "System",
+        "forwarded" => "Forwarded",
+        _ => "Message",
     }
 }
 
@@ -3768,6 +3774,21 @@ mod prompt_history_attachment_tests {
         assert!(history.contains("turn-30"));
         assert!(history.contains("child-card-31"));
         assert!(history.contains("child-card-35"));
+    }
+
+    #[test]
+    fn history_preserves_system_role_label() {
+        let message = history_message(
+            0,
+            "system",
+            "This conversation was branched from another thread.",
+            None,
+        );
+
+        let history = build_codex_conversation_history(&[message]);
+
+        assert!(history.contains("**System**: This conversation was branched from another thread."));
+        assert!(!history.contains("**Assistant**: This conversation was branched"));
     }
 }
 

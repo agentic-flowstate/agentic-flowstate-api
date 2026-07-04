@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use ticketing_system::{
     agent_runners, checkpoints, conversation_turn_jobs, conversations, AddMessageRequest,
-    Conversation, ConversationHierarchyScope, ConversationMessage, ConversationReadState,
+    BranchConversationRequest, Conversation, ConversationHierarchyScope, ConversationMessage,
+    ConversationReadState,
     CreateChildConversationRequest as TicketingCreateChildConversationRequest,
     CreateConversationRequest, SqlitePool, UpdateConversationRequest,
 };
@@ -1481,6 +1482,29 @@ pub async fn create_child_conversations(
             context_handoffs,
         }),
     ))
+}
+
+/// Create a top-level branch from an existing conversation.
+/// POST /api/conversations/:id/branch
+pub async fn branch_conversation(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(id): Path<String>,
+    Json(req): Json<BranchConversationRequest>,
+) -> Result<(StatusCode, Json<Conversation>), (StatusCode, String)> {
+    let conv = conversations::branch_conversation(&pool, &user.user_id, &id, req)
+        .await
+        .map_err(branch_conversation_error)?;
+
+    Ok((StatusCode::CREATED, Json(conv)))
+}
+
+fn branch_conversation_error(error: anyhow::Error) -> (StatusCode, String) {
+    let message = error.to_string();
+    if message.starts_with("Source conversation not found:") {
+        return (StatusCode::NOT_FOUND, "Conversation not found".to_string());
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 /// Update a conversation (PATCH /api/conversations/:id)
