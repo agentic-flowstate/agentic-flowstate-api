@@ -671,6 +671,58 @@ mod tests {
         assert_eq!(count_events(&pool, "conv-tiny-old").await, 50);
     }
 
+    /// Regression for T-9A5AE9A5: completed checkpoints older than the old
+    /// one-hour cleanup cutoff must not bypass the 90-day/10k retention
+    /// contract. A small conversation stays entirely inside the hot tail
+    /// even when every event is old and the checkpoint is terminal.
+    #[tokio::test]
+    async fn completed_checkpoint_does_not_override_hot_tail_retention() {
+        let pool = fresh_pool().await;
+        seed_conversation(&pool, "conv-completed-hot-tail").await;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE agent_checkpoints (
+                conversation_id TEXT PRIMARY KEY,
+                cc_session_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create agent_checkpoints");
+
+        let now_ts = Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO agent_checkpoints \
+             (conversation_id, cc_session_id, status, created_at, updated_at) \
+             VALUES (?, 'session-complete', 'completed', ?, ?)",
+        )
+        .bind("conv-completed-hot-tail")
+        .bind(now_ts - 7200)
+        .bind(now_ts - 7200)
+        .execute(&pool)
+        .await
+        .expect("insert completed checkpoint");
+
+        let ages: Vec<i64> = (0..50).map(|_| 120 * 86_400).collect();
+        seed_events(&pool, "conv-completed-hot-tail", now_ts, &ages).await;
+
+        let report = prune_conversation_events(&pool, &RetentionConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(report.rows_deleted, 0);
+        assert_eq!(
+            count_events(&pool, "conv-completed-hot-tail").await,
+            50,
+            "completed checkpoints do not make hot-tail events eligible for deletion"
+        );
+    }
+
     /// Test 4: idempotency. Running the prune twice in a row deletes zero
     /// rows on the second pass. Locks the contract: prune is a pure
     /// function of the current DB state, not of history.

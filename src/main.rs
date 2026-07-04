@@ -810,31 +810,6 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Periodic cleanup of old conversation events (every hour, keep 1 hour after completion)
-    {
-        let cleanup_pool = db_pool.clone();
-        let token = shutdown_token.child_token();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => break,
-                    _ = interval.tick() => {}
-                }
-                match ticketing_system::conversations::cleanup_old_events(&cleanup_pool, 3600).await
-                {
-                    Ok(deleted) if deleted > 0 => {
-                        tracing::info!("[CLEANUP] Deleted {} old conversation events", deleted);
-                    }
-                    Err(e) => {
-                        tracing::warn!("[CLEANUP] Failed to cleanup events: {}", e);
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
-
     // Deferred restart watcher: polls every 10 seconds for queued restarts.
     // When a restart is pending AND no active runner-owned work remains,
     // executes the restart. ChatLab checkpoints and Codex app-server turns
