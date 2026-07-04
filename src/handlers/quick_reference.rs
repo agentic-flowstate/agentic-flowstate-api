@@ -65,6 +65,8 @@ pub async fn list_quick_reference(
     let conversation_id = normalized_optional(query.conversation_id);
     let mut conversation_entries = Vec::new();
     let mut organization_entries = Vec::new();
+    let mut conversation_organization: Option<String> = None;
+    let mut organization_access_granted = false;
 
     if let Some(conversation_id) = conversation_id.as_deref() {
         let conversation =
@@ -72,6 +74,7 @@ pub async fn list_quick_reference(
                 Ok(conversation) => conversation,
                 Err(response) => return response,
             };
+        conversation_organization = Some(conversation.organization.clone());
 
         let entries = match ticketing_system::quick_reference::list_entries(
             &pool,
@@ -90,6 +93,7 @@ pub async fn list_quick_reference(
         if let Some(organization) = requested_organization.as_deref() {
             match has_organization_access(&pool, &user.user_id, organization).await {
                 Ok(true) => {
+                    organization_access_granted = true;
                     let entries = match ticketing_system::quick_reference::list_entries(
                         &pool,
                         organization,
@@ -107,7 +111,14 @@ pub async fn list_quick_reference(
                     };
                     organization_entries = entries.organization;
                 }
-                Ok(false) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        "[QUICK_REFERENCES] list denied organization scope: user={} requested_org={} conversation_id={}",
+                        user.user_id,
+                        organization,
+                        conversation_id
+                    );
+                }
                 Err(response) => return response,
             }
         }
@@ -125,7 +136,19 @@ pub async fn list_quick_reference(
                 Err(e) => return server_error("Failed to list quick-reference entries", e),
             };
         organization_entries = entries.organization;
+        organization_access_granted = true;
     }
+
+    tracing::info!(
+        "[QUICK_REFERENCES] list user={} requested_org={:?} conversation_id={:?} conversation_org={:?} organization_access={} conversation_count={} organization_count={}",
+        user.user_id,
+        requested_organization,
+        conversation_id,
+        conversation_organization,
+        organization_access_granted,
+        conversation_entries.len(),
+        organization_entries.len()
+    );
 
     (
         StatusCode::OK,
@@ -193,6 +216,16 @@ pub async fn upsert_quick_reference(
 
     match ticketing_system::quick_reference::upsert_entry(&pool, storage_req).await {
         Ok(result) => {
+            tracing::info!(
+                "[QUICK_REFERENCES] upsert user={} id={} key={} organization={} scope={} conversation_id={:?} created={}",
+                result.entry.updated_by,
+                result.entry.id,
+                result.entry.key,
+                result.entry.organization,
+                result.entry.scope,
+                result.entry.conversation_id,
+                result.created
+            );
             let status = if result.created {
                 StatusCode::CREATED
             } else {
@@ -240,7 +273,18 @@ pub async fn patch_quick_reference(
     )
     .await
     {
-        Ok(Some(entry)) => (StatusCode::OK, Json(json!(entry))).into_response(),
+        Ok(Some(entry)) => {
+            tracing::info!(
+                "[QUICK_REFERENCES] patch user={} id={} key={} organization={} scope={} conversation_id={:?}",
+                entry.updated_by,
+                entry.id,
+                entry.key,
+                entry.organization,
+                entry.scope,
+                entry.conversation_id
+            );
+            (StatusCode::OK, Json(json!(entry))).into_response()
+        }
         Ok(None) => not_found("Quick-reference entry not found"),
         Err(e) => bad_request_error("Failed to patch quick-reference entry", e),
     }
@@ -284,7 +328,15 @@ pub async fn reorder_quick_reference(
     )
     .await
     {
-        Ok(entries) => (StatusCode::OK, Json(json!(entries))).into_response(),
+        Ok(entries) => {
+            tracing::info!(
+                "[QUICK_REFERENCES] reorder user={} organization={} count={}",
+                user.user_id,
+                organization,
+                entries.len()
+            );
+            (StatusCode::OK, Json(json!(entries))).into_response()
+        }
         Err(e) => bad_request_error("Failed to reorder quick-reference entries", e),
     }
 }
@@ -303,7 +355,18 @@ pub async fn delete_quick_reference(
     match ticketing_system::quick_reference::delete_entry(&pool, &entry.organization, &entry.id)
         .await
     {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(true) => {
+            tracing::info!(
+                "[QUICK_REFERENCES] delete user={} id={} key={} organization={} scope={} conversation_id={:?}",
+                user.user_id,
+                entry.id,
+                entry.key,
+                entry.organization,
+                entry.scope,
+                entry.conversation_id
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(false) => not_found("Quick-reference entry not found"),
         Err(e) => server_error("Failed to delete quick-reference entry", e),
     }
