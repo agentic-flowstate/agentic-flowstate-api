@@ -835,14 +835,21 @@ fn context_handoff_responses(
         .collect()
 }
 
-async fn enqueue_initial_child_turns(
-    pool: &SqlitePool,
+#[derive(Debug, Clone)]
+struct PreparedChildTurn {
+    request: conversations::InitialChildTurnJobRequest,
+    agent: String,
+    prompt_name: String,
+    context_packet_ids: Vec<String>,
+    retrieval_ids: Vec<String>,
+}
+
+fn prepare_initial_child_turns(
     user_id: &str,
     children: &[CreateChildConversationSpec],
-    created_children: &[Conversation],
     handoffs: &[Option<ResolvedContextHandoff>],
-) -> Result<Vec<QueuedChildTurnResponse>, (StatusCode, String)> {
-    let mut queued = Vec::new();
+) -> Result<Vec<PreparedChildTurn>, (StatusCode, String)> {
+    let mut prepared = Vec::new();
     let child_batch_size = children
         .iter()
         .filter(|child| has_initial_child_message(child))
@@ -851,7 +858,7 @@ async fn enqueue_initial_child_turns(
         (child_batch_size > 0).then(|| format!("child-batch-{}", uuid::Uuid::new_v4()));
     let mut child_batch_index = 0usize;
 
-    for ((spec, child), handoff) in children.iter().zip(created_children.iter()).zip(handoffs) {
+    for (child_index, (spec, handoff)) in children.iter().zip(handoffs).enumerate() {
         let Some(initial_message) = spec
             .initial_message
             .as_deref()
@@ -860,12 +867,12 @@ async fn enqueue_initial_child_turns(
         else {
             continue;
         };
-        let agent = child.agent.as_deref().ok_or_else(|| {
+        let agent = spec.agent.as_deref().ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
                 format!(
                     "Child '{}' must set agent when initial_message is provided",
-                    child.title
+                    spec.title
                 ),
             )
         })?;
@@ -886,14 +893,22 @@ async fn enqueue_initial_child_turns(
             .unwrap_or("/Users/jarvisgpt/projects");
 
         let mut prompt_vars = HashMap::new();
-        prompt_vars.insert("CHILD_CONVERSATION_ID".to_string(), child.id.clone());
-        if let Some(parent_id) = child.parent_conversation_id.as_deref() {
-            prompt_vars.insert("PARENT_CONVERSATION_ID".to_string(), parent_id.to_string());
-        }
+        prompt_vars.insert(
+            "CHILD_CONVERSATION_ID".to_string(),
+            conversations::CHILD_CONVERSATION_ID_PLACEHOLDER.to_string(),
+        );
+        prompt_vars.insert(
+            "PARENT_CONVERSATION_ID".to_string(),
+            conversations::PARENT_CONVERSATION_ID_PLACEHOLDER.to_string(),
+        );
         prompt_vars.insert(
             "SUPPORT_CONTEXT_TOOL_ARGS".to_string(),
-            child_support_context_tool_args(&child.id, user_id, handoff.as_ref())
-                .map_err(internal_error)?,
+            child_support_context_tool_args(
+                conversations::CHILD_CONVERSATION_ID_PLACEHOLDER,
+                user_id,
+                handoff.as_ref(),
+            )
+            .map_err(internal_error)?,
         );
         if let Some(handoff) = handoff.as_ref() {
             prompt_vars.insert(
@@ -911,38 +926,28 @@ async fn enqueue_initial_child_turns(
             child_batch_size,
             child_batch_index,
         )?;
-        checkpoints::upsert_checkpoint(pool, &child.id, "queued", 0)
-            .await
-            .map_err(internal_error)?;
         let prompt_vars = encode_codex_options_for_job(
             prompt_vars,
             &ChatCodexOptions::default_for_agent(&agent_type),
         );
-        let job_id = conversation_turn_jobs::enqueue_job(
-            pool,
-            &child.id,
-            conversation_turn_jobs::ConversationTurnJobPayload {
-                user_id: user_id.to_string(),
-                message: initial_message.to_string(),
-                agent_type: agent.to_string(),
-                runtime: ChatRuntime::CodexAppServer.as_job_runtime().to_string(),
-                prompt_name: prompt_name.to_string(),
-                working_dir: working_dir.to_string(),
-                prompt_vars,
-                images_json: None,
-                client_id: spec.client_id.clone(),
-                message_metadata: Some(metadata),
+        prepared.push(PreparedChildTurn {
+            request: conversations::InitialChildTurnJobRequest {
+                child_index,
+                payload: conversation_turn_jobs::ConversationTurnJobPayload {
+                    user_id: user_id.to_string(),
+                    message: initial_message.to_string(),
+                    agent_type: agent.to_string(),
+                    runtime: ChatRuntime::CodexAppServer.as_job_runtime().to_string(),
+                    prompt_name: prompt_name.to_string(),
+                    working_dir: working_dir.to_string(),
+                    prompt_vars,
+                    images_json: None,
+                    client_id: spec.client_id.clone(),
+                    message_metadata: Some(metadata),
+                },
             },
-        )
-        .await
-        .map_err(internal_error)?;
-
-        queued.push(QueuedChildTurnResponse {
-            child_conversation_id: child.id.clone(),
-            job_id,
             agent: agent.to_string(),
             prompt_name: prompt_name.to_string(),
-            status: "queued".to_string(),
             context_packet_ids: handoff
                 .as_ref()
                 .map(ResolvedContextHandoff::packet_ids)
@@ -952,11 +957,43 @@ async fn enqueue_initial_child_turns(
                 .map(ResolvedContextHandoff::retrieval_ids)
                 .unwrap_or_default(),
         });
-        publish_conversation_run_status(pool, &child.id)
+    }
+    Ok(prepared)
+}
+
+fn queued_child_turn_responses(
+    prepared_turns: &[PreparedChildTurn],
+    queued_jobs: &[conversations::CreatedChildTurnJob],
+) -> Vec<QueuedChildTurnResponse> {
+    queued_jobs
+        .iter()
+        .filter_map(|queued| {
+            let prepared = prepared_turns
+                .iter()
+                .find(|prepared| prepared.request.child_index == queued.child_index)?;
+            Some(QueuedChildTurnResponse {
+                child_conversation_id: queued.child_conversation_id.clone(),
+                job_id: queued.job_id.clone(),
+                agent: prepared.agent.clone(),
+                prompt_name: prepared.prompt_name.clone(),
+                status: "queued".to_string(),
+                context_packet_ids: prepared.context_packet_ids.clone(),
+                retrieval_ids: prepared.retrieval_ids.clone(),
+            })
+        })
+        .collect()
+}
+
+async fn publish_queued_child_turn_statuses(
+    pool: &SqlitePool,
+    queued_jobs: &[conversations::CreatedChildTurnJob],
+) -> Result<(), (StatusCode, String)> {
+    for queued in queued_jobs {
+        publish_conversation_run_status(pool, &queued.child_conversation_id)
             .await
             .map_err(internal_error)?;
     }
-    Ok(queued)
+    Ok(())
 }
 
 fn has_initial_child_message(child: &CreateChildConversationSpec) -> bool {
@@ -1288,6 +1325,13 @@ pub async fn create_multi_agent_conversation(
     let child_requests =
         child_conversation_requests(&children_specs).map_err(text_error_response)?;
     guard_runner_queue_admission(&pool, &children_specs, "create_multi_agent_conversation").await?;
+    let prepared_turns =
+        prepare_initial_child_turns(&user.user_id, &children_specs, &resolved_handoffs)
+            .map_err(text_error_response)?;
+    let initial_turn_jobs = prepared_turns
+        .iter()
+        .map(|turn| turn.request.clone())
+        .collect::<Vec<_>>();
 
     let parent = CreateConversationRequest {
         user_id: user.user_id,
@@ -1300,19 +1344,20 @@ pub async fn create_multi_agent_conversation(
         conversation_role: Some("multi_agent_parent".to_string()),
         child_sort_order: None,
     };
-    let (parent, children) =
-        conversations::create_multi_agent_conversation(&pool, parent, child_requests)
-            .await
-            .map_err(|e| text_error_response((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())))?;
-    let queued_turns = enqueue_initial_child_turns(
+    let created = conversations::create_multi_agent_conversation_with_initial_turn_jobs(
         &pool,
-        &parent.user_id,
-        &children_specs,
-        &children,
-        &resolved_handoffs,
+        parent,
+        child_requests,
+        initial_turn_jobs,
     )
     .await
-    .map_err(text_error_response)?;
+    .map_err(|e| text_error_response((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())))?;
+    publish_queued_child_turn_statuses(&pool, &created.queued_jobs)
+        .await
+        .map_err(text_error_response)?;
+    let queued_turns = queued_child_turn_responses(&prepared_turns, &created.queued_jobs);
+    let parent = created.parent;
+    let children = created.children;
     let context_handoffs = context_handoff_responses(&children, &resolved_handoffs);
 
     Ok((
@@ -1398,24 +1443,28 @@ pub async fn create_child_conversations(
     let child_requests =
         child_conversation_requests(&children_specs).map_err(text_error_response)?;
     guard_runner_queue_admission(&pool, &children_specs, "create_child_conversations").await?;
+    let prepared_turns =
+        prepare_initial_child_turns(&user.user_id, &children_specs, &resolved_handoffs)
+            .map_err(text_error_response)?;
+    let initial_turn_jobs = prepared_turns
+        .iter()
+        .map(|turn| turn.request.clone())
+        .collect::<Vec<_>>();
 
-    conversations::promote_conversation_to_multi_agent_parent(&pool, &user.user_id, &id)
-        .await
-        .map_err(|e| text_error_response((StatusCode::BAD_REQUEST, e.to_string())))?;
-
-    let children =
-        conversations::create_child_conversations(&pool, &user.user_id, &id, child_requests)
-            .await
-            .map_err(|e| text_error_response((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())))?;
-    let queued_turns = enqueue_initial_child_turns(
+    let created = conversations::create_child_conversations_with_initial_turn_jobs(
         &pool,
         &user.user_id,
-        &children_specs,
-        &children,
-        &resolved_handoffs,
+        &id,
+        child_requests,
+        initial_turn_jobs,
     )
     .await
-    .map_err(text_error_response)?;
+    .map_err(|e| text_error_response((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())))?;
+    publish_queued_child_turn_statuses(&pool, &created.queued_jobs)
+        .await
+        .map_err(text_error_response)?;
+    let queued_turns = queued_child_turn_responses(&prepared_turns, &created.queued_jobs);
+    let children = created.children;
     let context_handoffs = context_handoff_responses(&children, &resolved_handoffs);
 
     let parent = require_user_conversation(&pool, &user.user_id, &id)

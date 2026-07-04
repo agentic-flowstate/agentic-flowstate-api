@@ -293,15 +293,6 @@ fn admit_enqueue_from_snapshot(
     let backpressure = &snapshot.backpressure;
     let reason = if requested_jobs <= 0 {
         "no_jobs_requested"
-    } else if matches!(
-        backpressure.reason,
-        "runner_unavailable"
-            | "runner_draining"
-            | "runner_heartbeat_stale"
-            | "host_load"
-            | "db_pool"
-    ) {
-        backpressure.reason
     } else if requested_jobs > snapshot.config.max_jobs {
         "batch_exceeds_capacity"
     } else if snapshot.jobs.pending.saturating_add(requested_jobs)
@@ -309,9 +300,9 @@ fn admit_enqueue_from_snapshot(
     {
         "queue_pending_cap"
     } else {
-        "capacity_available"
+        backpressure.reason
     };
-    let accepted = reason == "capacity_available" || reason == "no_jobs_requested";
+    let accepted = !matches!(reason, "batch_exceeds_capacity" | "queue_pending_cap");
 
     RunnerQueueAdmission {
         accepted,
@@ -353,44 +344,45 @@ fn classify_backpressure(
 
     let (state, reason, would_reject_new_job, message) = if runner.is_none() {
         (
-            "rejecting",
+            "deferred",
             "runner_unavailable",
-            true,
-            "No agent-runner generation is registered; refusing to add more queued work."
+            false,
+            "No agent-runner generation is registered; accepted work will stay pending."
                 .to_string(),
         )
     } else if runner.is_some_and(|runner| runner.heartbeat_stale) {
         (
-            "rejecting",
+            "deferred",
             "runner_heartbeat_stale",
-            true,
-            "Latest agent-runner heartbeat is stale; refusing to add more queued work.".to_string(),
+            false,
+            "Latest agent-runner heartbeat is stale; accepted work will stay pending.".to_string(),
         )
     } else if runner.is_some_and(|runner| runner.status != "accepting") {
         (
-            "rejecting",
+            "deferred",
             "runner_draining",
-            true,
-            "Latest agent-runner generation is not accepting new work.".to_string(),
+            false,
+            "Latest agent-runner generation is not accepting new work; accepted work will stay pending."
+                .to_string(),
         )
     } else if matches!(config, RunnerConcurrencyConfig::Adaptive { .. })
         && host.load_1m >= host.max_load
     {
         (
-            "rejecting",
+            "deferred",
             "host_load",
-            true,
+            false,
             format!(
-                "Host load is above runner threshold ({:.2} >= {:.2}); refusing more queued work.",
+                "Host load is above runner threshold ({:.2} >= {:.2}); accepted work will stay pending.",
                 host.load_1m, host.max_load
             ),
         )
     } else if matches!(config, RunnerConcurrencyConfig::Adaptive { .. }) && !db_pool.has_capacity {
         (
-            "rejecting",
+            "deferred",
             "db_pool",
-            true,
-            "SQLite pool does not have the configured idle reserve; refusing more queued work."
+            false,
+            "SQLite pool does not have the configured idle reserve; accepted work will stay pending."
                 .to_string(),
         )
     } else if pending_jobs >= max_pending_jobs {
@@ -876,6 +868,15 @@ mod tests {
         }
     }
 
+    fn host_over_limit() -> HostLoadStatus {
+        HostLoadStatus {
+            load_1m: 13.0,
+            cpu_count: 8,
+            max_load: 12.0,
+            max_load_per_core: 1.5,
+        }
+    }
+
     fn db_with_capacity() -> DbPoolStatus {
         DbPoolStatus {
             size: 1,
@@ -887,6 +888,14 @@ mod tests {
     }
 
     fn snapshot_with_pending(pending: i64) -> RunnerCapacitySnapshot {
+        snapshot_with_conditions(pending, 0, host_under_limit())
+    }
+
+    fn snapshot_with_conditions(
+        pending: i64,
+        running: i64,
+        host: HostLoadStatus,
+    ) -> RunnerCapacitySnapshot {
         let config = RunnerConcurrencyConfig::Adaptive {
             max_jobs: 12,
             claim_burst: 1,
@@ -896,11 +905,11 @@ mod tests {
         };
         let jobs = AgentJobCounts {
             pending,
+            running,
             ..AgentJobCounts::default()
         };
         let turns = AgentRunnerTurnCounts::default();
         let runner = Some(accepting_runner());
-        let host = host_under_limit();
         let db_pool = db_with_capacity();
         let backpressure = classify_backpressure(
             &config,
@@ -977,6 +986,45 @@ mod tests {
         assert!(!admission.accepted);
         assert_eq!(admission.reason, "batch_exceeds_capacity");
         assert_eq!(admission.rejected_jobs, 51);
+    }
+
+    #[test]
+    fn enqueue_admission_rejects_pending_cap_overflow() {
+        let admission = admit_enqueue_from_snapshot(snapshot_with_pending(10), 3, "child_batch");
+
+        assert!(!admission.accepted);
+        assert_eq!(admission.reason, "queue_pending_cap");
+        assert_eq!(admission.rejected_jobs, 3);
+    }
+
+    #[test]
+    fn enqueue_admission_accepts_host_load_pressure_as_deferred_execution() {
+        let admission = admit_enqueue_from_snapshot(
+            snapshot_with_conditions(0, 0, host_over_limit()),
+            2,
+            "child_batch",
+        );
+
+        assert!(admission.accepted);
+        assert_eq!(admission.reason, "host_load");
+        assert_eq!(admission.accepted_jobs, 2);
+        assert_eq!(admission.snapshot.backpressure.state, "deferred");
+        assert!(!admission.snapshot.backpressure.would_reject_new_job);
+    }
+
+    #[test]
+    fn enqueue_admission_accepts_concurrency_cap_as_deferred_execution() {
+        let admission = admit_enqueue_from_snapshot(
+            snapshot_with_conditions(0, 12, host_under_limit()),
+            2,
+            "child_batch",
+        );
+
+        assert!(admission.accepted);
+        assert_eq!(admission.reason, "concurrency_cap");
+        assert_eq!(admission.accepted_jobs, 2);
+        assert_eq!(admission.snapshot.backpressure.state, "deferred");
+        assert!(!admission.snapshot.backpressure.would_reject_new_job);
     }
 
     #[test]
