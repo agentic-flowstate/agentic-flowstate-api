@@ -213,6 +213,14 @@ async fn main() -> Result<()> {
             let _ = agent_runners::mark_generation_draining(&db, &generation_id).await;
         }
 
+        if accepting && is_generation_draining(&db, &generation_id).await? {
+            accepting = false;
+            tracing::info!(
+                "Agentic runner generation {} observed external drain request; stopping new claims",
+                generation_id
+            );
+        }
+
         let mut claims_this_poll = 0;
         while accepting {
             match concurrency.claim_admission(joins.len(), claims_this_poll, &db)? {
@@ -288,6 +296,20 @@ async fn main() -> Result<()> {
     }
     tracing::info!("Agentic runner generation {} exited cleanly", generation_id);
     Ok(())
+}
+
+async fn is_generation_draining(
+    db: &ticketing_system::SqlitePool,
+    generation_id: &str,
+) -> Result<bool> {
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM agent_runner_generations WHERE generation_id = ?")
+            .bind(generation_id)
+            .fetch_optional(db)
+            .await
+            .context("Failed to inspect agent runner generation status")?;
+
+    Ok(status.as_deref() == Some("draining"))
 }
 
 fn runner_concurrency() -> Result<RunnerConcurrency> {
