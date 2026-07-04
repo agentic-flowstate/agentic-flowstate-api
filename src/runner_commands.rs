@@ -66,6 +66,12 @@ pub fn runner_command_socket_path() -> Result<PathBuf> {
         })
 }
 
+pub fn is_live_runner_command_socket_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("already has a live listener"))
+}
+
 #[cfg(unix)]
 pub async fn start_runner_command_server(
     manager: Arc<ChatClientManager>,
@@ -407,8 +413,8 @@ async fn cleanup_socket_path(path: &Path) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        prepare_socket_path, send_cancel_conversation_command_to_path,
-        start_runner_command_server_at_path,
+        is_live_runner_command_socket_error, prepare_socket_path,
+        send_cancel_conversation_command_to_path, start_runner_command_server_at_path,
     };
     use crate::handlers::chat_client_manager::ChatClientManager;
     use std::sync::Arc;
@@ -459,5 +465,18 @@ mod tests {
         );
         assert!(path.exists());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn live_socket_error_detector_checks_context_chain() {
+        let err = anyhow::anyhow!(
+            "Runner command socket already has a live listener at /tmp/agentic.sock"
+        )
+        .context("Failed to start runner command server");
+
+        assert!(is_live_runner_command_socket_error(&err));
+
+        let err = anyhow::anyhow!("Failed to bind runner command socket");
+        assert!(!is_live_runner_command_socket_error(&err));
     }
 }

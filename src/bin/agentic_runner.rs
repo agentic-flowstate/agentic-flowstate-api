@@ -26,6 +26,7 @@ const RUNNER_POLL_INTERVAL_MS: u64 = 750;
 const RUNNER_POLICY_REFRESH_INTERVAL_SECONDS: u64 = 5;
 const RUNNER_RECONCILE_INTERVAL_SECONDS: u64 = 60;
 const RUNNER_BACKPRESSURE_LOG_INTERVAL_SECONDS: u64 = 15;
+const RUNNER_COMMAND_SERVER_RETRY_SECONDS: u64 = 10;
 
 struct RunnerPolicyCache {
     policy: runner_capacity::RunnerCapacityPolicy,
@@ -104,21 +105,15 @@ async fn main() -> Result<()> {
         generation_id.clone(),
     ));
     let shutdown = CancellationToken::new();
-    let command_server =
-        match runner_commands::start_runner_command_server(manager.clone(), shutdown.child_token())
-            .await
-        {
+    let mut command_server =
+        match start_or_defer_command_server(manager.clone(), shutdown.child_token()).await {
             Ok(server) => server,
             Err(e) => {
                 let reason = format!("runner command server startup failed: {e}");
                 let _ = agent_runners::mark_generation_failed(&db, &generation_id, &reason).await;
-                return Err(e.context("Failed to start runner command server"));
+                return Err(e);
             }
         };
-    tracing::info!(
-        "Agentic runner command socket ready at {}",
-        command_server.path().display()
-    );
     spawn_heartbeat(db.clone(), generation_id.clone(), shutdown.child_token());
     spawn_runner_generation_reconciler(db.clone(), shutdown.child_token());
     spawn_shutdown_listener(shutdown.clone());
@@ -128,10 +123,29 @@ async fn main() -> Result<()> {
     let mut joins = JoinSet::<(String, Result<String>)>::new();
     let mut accepting = true;
     let mut last_claim_at: Option<Instant> = None;
+    let mut last_command_server_attempt = Instant::now();
     let mut last_backpressure_log =
         Instant::now() - Duration::from_secs(RUNNER_BACKPRESSURE_LOG_INTERVAL_SECONDS);
 
     loop {
+        if command_server.is_none()
+            && last_command_server_attempt.elapsed()
+                >= Duration::from_secs(RUNNER_COMMAND_SERVER_RETRY_SECONDS)
+        {
+            last_command_server_attempt = Instant::now();
+            match start_or_defer_command_server(manager.clone(), shutdown.child_token()).await {
+                Ok(server) => {
+                    command_server = server;
+                }
+                Err(e) => {
+                    let reason = format!("runner command server retry failed: {e}");
+                    let _ =
+                        agent_runners::mark_generation_failed(&db, &generation_id, &reason).await;
+                    return Err(e);
+                }
+            }
+        }
+
         if shutdown.is_cancelled() {
             accepting = false;
             let _ = agent_runners::mark_generation_draining(&db, &generation_id).await;
@@ -239,7 +253,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    command_server.shutdown().await;
+    if let Some(command_server) = command_server {
+        command_server.shutdown().await;
+    }
 
     if let Err(e) = agent_runners::mark_generation_exited(&db, &generation_id).await {
         tracing::warn!(
@@ -250,6 +266,29 @@ async fn main() -> Result<()> {
     }
     tracing::info!("Agentic runner generation {} exited cleanly", generation_id);
     Ok(())
+}
+
+async fn start_or_defer_command_server(
+    manager: Arc<ChatClientManager>,
+    shutdown: CancellationToken,
+) -> Result<Option<runner_commands::RunnerCommandServer>> {
+    match runner_commands::start_runner_command_server(manager, shutdown).await {
+        Ok(server) => {
+            tracing::info!(
+                "Agentic runner command socket ready at {}",
+                server.path().display()
+            );
+            Ok(Some(server))
+        }
+        Err(e) if runner_commands::is_live_runner_command_socket_error(&e) => {
+            tracing::warn!(
+                "Agentic runner command socket is owned by another live runner; this generation will retry ownership later: {}",
+                e
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e.context("Failed to start runner command server")),
+    }
 }
 
 async fn is_generation_draining(
