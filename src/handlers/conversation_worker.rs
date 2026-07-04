@@ -22,6 +22,7 @@ use crate::agents::codex_app_server::{
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
+use crate::observability::cancellation;
 use crate::observability::next_actions::{record_clear, NextActionClearReason};
 use crate::observability::streaming::{
     record_gap_detected, record_stream_event_emitted, record_ticket_preflight,
@@ -397,7 +398,17 @@ impl ConversationWorker {
                 }
             };
 
-        memory_cancelled || persistent_cancelled
+        let cancelled = memory_cancelled || persistent_cancelled;
+        if cancelled {
+            cancellation::record_runner_cancel_consumed(
+                &self.conversation_id,
+                Utc::now().timestamp_millis(),
+                memory_cancelled,
+                persistent_cancelled,
+            );
+        }
+
+        cancelled
     }
 
     async fn consume_cancelled_turn_before_agent_start(&mut self, stage: &str) -> bool {
@@ -1230,10 +1241,11 @@ impl ConversationWorker {
         if self.is_turn_cancelled().await {
             kill_requested = true;
             let terminate_started_ms = Utc::now().timestamp_millis();
-            tracing::info!(
-                "[CANCEL] Worker observed cancellation for conversation {} phase=after_registration runner_turn_id={}",
-                self.conversation_id,
-                runner_turn_id
+            cancellation::record_runner_cancel_observed(
+                &self.conversation_id,
+                &runner_turn_id,
+                "after_registration",
+                terminate_started_ms,
             );
             if let Err(e) = turn.terminate().await {
                 tracing::warn!(
@@ -1242,13 +1254,12 @@ impl ConversationWorker {
                     e
                 );
             } else {
-                tracing::info!(
-                    "[CANCEL] Worker signalled cancellation for conversation {} phase=after_registration runner_turn_id={} terminate_elapsed_ms={}",
-                    self.conversation_id,
-                    runner_turn_id,
-                    Utc::now()
-                        .timestamp_millis()
-                        .saturating_sub(terminate_started_ms)
+                cancellation::record_process_termination_signalled(
+                    &self.conversation_id,
+                    &runner_turn_id,
+                    "after_registration",
+                    terminate_started_ms,
+                    Utc::now().timestamp_millis(),
                 );
             }
         }
@@ -1453,10 +1464,11 @@ impl ConversationWorker {
                     if !kill_requested && self.is_turn_cancelled().await {
                         kill_requested = true;
                         let terminate_started_ms = Utc::now().timestamp_millis();
-                        tracing::info!(
-                            "[CANCEL] Worker observed cancellation for conversation {} phase=event_loop runner_turn_id={}",
-                            self.conversation_id,
-                            runner_turn_id
+                        cancellation::record_runner_cancel_observed(
+                            &self.conversation_id,
+                            &runner_turn_id,
+                            "event_loop",
+                            terminate_started_ms,
                         );
                         if let Err(e) = turn.terminate().await {
                             tracing::warn!(
@@ -1465,13 +1477,12 @@ impl ConversationWorker {
                                 e
                             );
                         } else {
-                            tracing::info!(
-                                "[CANCEL] Worker signalled cancellation for conversation {} phase=event_loop runner_turn_id={} terminate_elapsed_ms={}",
-                                self.conversation_id,
-                                runner_turn_id,
-                                Utc::now()
-                                    .timestamp_millis()
-                                    .saturating_sub(terminate_started_ms)
+                            cancellation::record_process_termination_signalled(
+                                &self.conversation_id,
+                                &runner_turn_id,
+                                "event_loop",
+                                terminate_started_ms,
+                                Utc::now().timestamp_millis(),
                             );
                         }
                     }
@@ -1487,10 +1498,11 @@ impl ConversationWorker {
                     if !kill_requested && self.is_turn_cancelled().await {
                         kill_requested = true;
                         let terminate_started_ms = Utc::now().timestamp_millis();
-                        tracing::info!(
-                            "[CANCEL] Worker observed cancellation for conversation {} phase=heartbeat runner_turn_id={}",
-                            self.conversation_id,
-                            runner_turn_id
+                        cancellation::record_runner_cancel_observed(
+                            &self.conversation_id,
+                            &runner_turn_id,
+                            "heartbeat",
+                            terminate_started_ms,
                         );
                         if let Err(e) = turn.terminate().await {
                             tracing::warn!(
@@ -1499,13 +1511,12 @@ impl ConversationWorker {
                                 e
                             );
                         } else {
-                            tracing::info!(
-                                "[CANCEL] Worker signalled cancellation for conversation {} phase=heartbeat runner_turn_id={} terminate_elapsed_ms={}",
-                                self.conversation_id,
-                                runner_turn_id,
-                                Utc::now()
-                                    .timestamp_millis()
-                                    .saturating_sub(terminate_started_ms)
+                            cancellation::record_process_termination_signalled(
+                                &self.conversation_id,
+                                &runner_turn_id,
+                                "heartbeat",
+                                terminate_started_ms,
+                                Utc::now().timestamp_millis(),
                             );
                         }
                     }
@@ -1520,12 +1531,12 @@ impl ConversationWorker {
         let outcome = match turn.wait().await {
             Ok(outcome) => {
                 if kill_requested {
-                    tracing::info!(
-                        "[CANCEL] Worker app-server wait completed for conversation {} runner_turn_id={} wait_elapsed_ms={} exit_success={}",
-                        self.conversation_id,
-                        runner_turn_id,
-                        Utc::now().timestamp_millis().saturating_sub(wait_started_ms),
-                        outcome.success()
+                    cancellation::record_process_termination_elapsed(
+                        &self.conversation_id,
+                        &runner_turn_id,
+                        wait_started_ms,
+                        Utc::now().timestamp_millis(),
+                        outcome.success(),
                     );
                 }
                 outcome
@@ -1610,6 +1621,7 @@ impl ConversationWorker {
             CodexTurnCompletion::Cancelled { .. } => "cancelled",
             CodexTurnCompletion::Failed(_) => "failed",
         };
+        let terminal_db_state_started_at_ms = Utc::now().timestamp_millis();
         if let Err(e) =
             agent_runners::finish_turn(&self.db, &runner_turn_id, runner_terminal_status).await
         {
@@ -1620,11 +1632,12 @@ impl ConversationWorker {
                 e
             );
         } else if kill_requested || matches!(&completion, CodexTurnCompletion::Cancelled { .. }) {
-            tracing::info!(
-                "[CANCEL] Worker marked turn terminal for conversation {} runner_turn_id={} status={}",
-                self.conversation_id,
-                runner_turn_id,
-                runner_terminal_status
+            cancellation::record_terminal_db_state_written(
+                &self.conversation_id,
+                &runner_turn_id,
+                runner_terminal_status,
+                terminal_db_state_started_at_ms,
+                Utc::now().timestamp_millis(),
             );
         }
 

@@ -36,6 +36,7 @@ use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
 use super::runner_capacity;
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
+use crate::observability::cancellation;
 use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_opened, DisconnectReason,
 };
@@ -1503,13 +1504,26 @@ pub async fn cancel_conversation(
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
 
+    cancellation::record_request_received(&id, &user.user_id, cancel_requested_ms);
     manager.mark_cancelled_turn(&id).await;
-    if let Err(e) = agent_runners::request_cancel(&pool, &id).await {
-        tracing::warn!(
-            "[CANCEL] Failed to persist cancellation request for {}: {}",
-            id,
-            e
-        );
+    match agent_runners::request_cancel(&pool, &id).await {
+        Ok(()) => {
+            cancellation::record_durable_marker_written(
+                &id,
+                cancel_requested_ms,
+                chrono::Utc::now().timestamp_millis(),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "agentic_api::cancel",
+                cancel_phase = "durable_marker_write_failed",
+                conversation_id = %id,
+                cancel_requested_at_ms = cancel_requested_ms,
+                error = %e,
+                "[CANCEL] failed to persist cancellation request"
+            );
+        }
     }
     let cancelled_pending_jobs =
         match conversation_turn_jobs::cancel_pending_jobs_for_conversation(&pool, &id).await {
@@ -1529,14 +1543,14 @@ pub async fn cancel_conversation(
     match manager.interrupt(&id).await {
         Ok(true) => {
             let interrupted_ms = chrono::Utc::now().timestamp_millis();
-            tracing::info!(
-                "[CANCEL] Interrupted agent for conversation {} request_to_interrupt_ms={} interrupt_elapsed_ms={} worker_exists={} runner_turn_exists={} cancelled_pending_jobs={}",
-                id,
-                interrupted_ms.saturating_sub(cancel_requested_ms),
-                interrupted_ms.saturating_sub(interrupt_started_ms),
+            cancellation::record_runner_command_delivered(
+                &id,
+                cancel_requested_ms,
+                interrupt_started_ms,
+                interrupted_ms,
                 worker_exists,
                 runner_turn_exists,
-                cancelled_pending_jobs
+                cancelled_pending_jobs,
             );
             // Broadcast cancelled status so SSE clients get notified
             let event = crate::agents::StreamEvent::Status {
@@ -1550,6 +1564,14 @@ pub async fn cancel_conversation(
         }
         Ok(false) => {
             let no_live_turn_ms = chrono::Utc::now().timestamp_millis();
+            cancellation::record_runner_command_unavailable(
+                &id,
+                cancel_requested_ms,
+                no_live_turn_ms,
+                worker_exists,
+                runner_turn_exists,
+                cancelled_pending_jobs,
+            );
             if worker_exists || runner_turn_exists {
                 tracing::info!(
                     "[CANCEL] Marked active/queued turn cancelled for conversation {} request_to_marker_ms={} worker_exists={} runner_turn_exists={} cancelled_pending_jobs={}",
