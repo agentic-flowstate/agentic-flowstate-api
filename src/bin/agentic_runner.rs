@@ -25,6 +25,7 @@ const DEFAULT_ADAPTIVE_MAX_CONCURRENCY: usize = 12;
 const DEFAULT_ADAPTIVE_CLAIM_BURST: usize = 1;
 const DEFAULT_ADAPTIVE_DB_IDLE_RESERVE: usize = 1;
 const DEFAULT_ADAPTIVE_MAX_LOAD_PER_CORE_MILLIS: u32 = 1500;
+const DEFAULT_ADAPTIVE_CLAIM_INTERVAL_SECONDS: u64 = 10;
 const RUNNER_BACKPRESSURE_LOG_INTERVAL_SECONDS: u64 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,7 @@ struct AdaptiveConcurrency {
     claim_burst: usize,
     db_idle_reserve: usize,
     max_load_per_core_millis: u32,
+    claim_interval_seconds: u64,
 }
 
 impl Default for AdaptiveConcurrency {
@@ -48,6 +50,7 @@ impl Default for AdaptiveConcurrency {
             claim_burst: DEFAULT_ADAPTIVE_CLAIM_BURST,
             db_idle_reserve: DEFAULT_ADAPTIVE_DB_IDLE_RESERVE,
             max_load_per_core_millis: DEFAULT_ADAPTIVE_MAX_LOAD_PER_CORE_MILLIS,
+            claim_interval_seconds: DEFAULT_ADAPTIVE_CLAIM_INTERVAL_SECONDS,
         }
     }
 }
@@ -57,6 +60,7 @@ impl RunnerConcurrency {
         self,
         active_jobs: usize,
         claims_this_poll: usize,
+        last_claim_at: Option<Instant>,
         db: &ticketing_system::SqlitePool,
     ) -> Result<ClaimAdmission> {
         match self {
@@ -71,6 +75,16 @@ impl RunnerConcurrency {
                 }
             }
             RunnerConcurrency::Adaptive(config) => {
+                if let Some(last_claim_at) = last_claim_at {
+                    let claim_interval = Duration::from_secs(config.claim_interval_seconds);
+                    let elapsed = last_claim_at.elapsed();
+                    if elapsed < claim_interval {
+                        return Ok(ClaimAdmission::Denied(ClaimDenial::ClaimPacing {
+                            elapsed,
+                            claim_interval,
+                        }));
+                    }
+                }
                 let load = current_system_load(config)?;
                 if load.load1 >= load.max_load {
                     return Ok(ClaimAdmission::Denied(ClaimDenial::HostLoad(load)));
@@ -117,6 +131,10 @@ enum ClaimDenial {
     ClaimBurst {
         claims_this_poll: usize,
         claim_burst: usize,
+    },
+    ClaimPacing {
+        elapsed: Duration,
+        claim_interval: Duration,
     },
     DbPool {
         pool_size: u32,
@@ -195,15 +213,17 @@ async fn main() -> Result<()> {
             tracing::info!("Agentic runner concurrency fixed at {}", limit)
         }
         RunnerConcurrency::Adaptive(config) => tracing::info!(
-            "Agentic runner concurrency adaptive: max_jobs={}, claim_burst={}, db_idle_reserve={}, max_load_per_core={:.3}",
+            "Agentic runner concurrency adaptive: max_jobs={}, claim_burst={}, claim_interval_seconds={}, db_idle_reserve={}, max_load_per_core={:.3}",
             config.max_jobs,
             config.claim_burst,
+            config.claim_interval_seconds,
             config.db_idle_reserve,
             max_load_per_core(config)
         ),
     }
     let mut joins = JoinSet::<(String, Result<String>)>::new();
     let mut accepting = true;
+    let mut last_claim_at: Option<Instant> = None;
     let mut last_backpressure_log =
         Instant::now() - Duration::from_secs(RUNNER_BACKPRESSURE_LOG_INTERVAL_SECONDS);
 
@@ -223,7 +243,7 @@ async fn main() -> Result<()> {
 
         let mut claims_this_poll = 0;
         while accepting {
-            match concurrency.claim_admission(joins.len(), claims_this_poll, &db)? {
+            match concurrency.claim_admission(joins.len(), claims_this_poll, last_claim_at, &db)? {
                 ClaimAdmission::Allowed => {}
                 ClaimAdmission::Denied(denial) => {
                     log_backpressure(denial, joins.len(), &mut last_backpressure_log);
@@ -234,6 +254,7 @@ async fn main() -> Result<()> {
             match conversation_turn_jobs::claim_next_job(&db, &generation_id).await? {
                 Some(job) => {
                     claims_this_poll += 1;
+                    last_claim_at = Some(Instant::now());
                     let job_id = job.id.clone();
                     let claimed_at_ms = Utc::now().timestamp_millis();
                     let queue_wait_ms = claimed_at_ms.saturating_sub(job.created_at * 1000);
@@ -328,6 +349,10 @@ fn runner_concurrency() -> Result<RunnerConcurrency> {
             "AGENTIC_RUNNER_ADAPTIVE_MAX_LOAD_PER_CORE",
             config.max_load_per_core_millis,
         )?;
+        config.claim_interval_seconds = parse_optional_u64_env(
+            "AGENTIC_RUNNER_ADAPTIVE_CLAIM_INTERVAL_SECONDS",
+            config.claim_interval_seconds,
+        )?;
     }
 
     Ok(concurrency)
@@ -391,6 +416,20 @@ fn parse_optional_usize_env(name: &str, default: usize) -> Result<usize> {
 
     let value = raw
         .parse::<usize>()
+        .with_context(|| format!("{name} must be a positive integer"))?;
+    if value == 0 {
+        bail!("{name} must be greater than zero");
+    }
+    Ok(value)
+}
+
+fn parse_optional_u64_env(name: &str, default: u64) -> Result<u64> {
+    let Some(raw) = optional_env(name)? else {
+        return Ok(default);
+    };
+
+    let value = raw
+        .parse::<u64>()
         .with_context(|| format!("{name} must be a positive integer"))?;
     if value == 0 {
         bail!("{name} must be greater than zero");
@@ -480,6 +519,15 @@ fn log_backpressure(denial: ClaimDenial, active_jobs: usize, last_backpressure_l
             "Agentic runner claim burst reached: claims_this_poll={} claim_burst={}",
             claims_this_poll,
             claim_burst
+        ),
+        ClaimDenial::ClaimPacing {
+            elapsed,
+            claim_interval,
+        } => tracing::debug!(
+            "Agentic runner claim pacing active: active_jobs={} elapsed_ms={} claim_interval_ms={}",
+            active_jobs,
+            elapsed.as_millis(),
+            claim_interval.as_millis()
         ),
     }
 }
@@ -866,8 +914,8 @@ mod tests {
     use super::{
         parse_load_per_core_millis, parse_runner_concurrency, terminal_status_from_event,
         AdaptiveConcurrency, RunnerConcurrency, DEFAULT_ADAPTIVE_CLAIM_BURST,
-        DEFAULT_ADAPTIVE_DB_IDLE_RESERVE, DEFAULT_ADAPTIVE_MAX_CONCURRENCY,
-        DEFAULT_ADAPTIVE_MAX_LOAD_PER_CORE_MILLIS,
+        DEFAULT_ADAPTIVE_CLAIM_INTERVAL_SECONDS, DEFAULT_ADAPTIVE_DB_IDLE_RESERVE,
+        DEFAULT_ADAPTIVE_MAX_CONCURRENCY, DEFAULT_ADAPTIVE_MAX_LOAD_PER_CORE_MILLIS,
     };
 
     #[test]
@@ -881,6 +929,7 @@ mod tests {
                 claim_burst: DEFAULT_ADAPTIVE_CLAIM_BURST,
                 db_idle_reserve: DEFAULT_ADAPTIVE_DB_IDLE_RESERVE,
                 max_load_per_core_millis: DEFAULT_ADAPTIVE_MAX_LOAD_PER_CORE_MILLIS,
+                claim_interval_seconds: DEFAULT_ADAPTIVE_CLAIM_INTERVAL_SECONDS,
             })
         );
     }
