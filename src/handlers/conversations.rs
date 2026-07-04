@@ -33,6 +33,7 @@ use super::conversation_handoff::{
 };
 use super::conversation_worker_manager::WORKER_MANAGER;
 use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
+use super::runner_capacity;
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 use crate::observability::streaming::{
@@ -1038,6 +1039,41 @@ fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
+fn text_error_response((status, message): (StatusCode, String)) -> Response {
+    (status, message).into_response()
+}
+
+async fn guard_runner_queue_admission(
+    pool: &SqlitePool,
+    children: &[CreateChildConversationSpec],
+    context: &str,
+) -> Result<(), Response> {
+    let requested_jobs = children
+        .iter()
+        .filter(|child| has_initial_child_message(child))
+        .count();
+    if requested_jobs == 0 {
+        return Ok(());
+    }
+
+    let admission = runner_capacity::admit_enqueue(pool, requested_jobs, context)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to inspect runner queue capacity: {e}"),
+            )
+                .into_response()
+        })?;
+    if admission.accepted {
+        Ok(())
+    } else {
+        Err(runner_capacity::queue_admission_rejection_response(
+            admission,
+        ))
+    }
+}
+
 async fn get_status_sender(
     conversation_id: &str,
 ) -> broadcast::Sender<ConversationRunStatusResponse> {
@@ -1234,15 +1270,23 @@ pub async fn create_multi_agent_conversation(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<CreateMultiAgentConversationRequest>,
-) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), (StatusCode, String)> {
-    ensure_agent_allowed(&pool, &user.user_id, req.agent.as_deref()).await?;
+) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), Response> {
+    ensure_agent_allowed(&pool, &user.user_id, req.agent.as_deref())
+        .await
+        .map_err(text_error_response)?;
     let children_specs = req.children;
     for child in &children_specs {
-        ensure_agent_allowed(&pool, &user.user_id, child.agent.as_deref()).await?;
+        ensure_agent_allowed(&pool, &user.user_id, child.agent.as_deref())
+            .await
+            .map_err(text_error_response)?;
     }
     let resolved_handoffs =
-        resolve_child_context_handoffs(&pool, &req.organization, &children_specs).await?;
-    let child_requests = child_conversation_requests(&children_specs)?;
+        resolve_child_context_handoffs(&pool, &req.organization, &children_specs)
+            .await
+            .map_err(text_error_response)?;
+    let child_requests =
+        child_conversation_requests(&children_specs).map_err(text_error_response)?;
+    guard_runner_queue_admission(&pool, &children_specs, "create_multi_agent_conversation").await?;
 
     let parent = CreateConversationRequest {
         user_id: user.user_id,
@@ -1258,7 +1302,7 @@ pub async fn create_multi_agent_conversation(
     let (parent, children) =
         conversations::create_multi_agent_conversation(&pool, parent, child_requests)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| text_error_response((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())))?;
     let queued_turns = enqueue_initial_child_turns(
         &pool,
         &parent.user_id,
@@ -1266,7 +1310,8 @@ pub async fn create_multi_agent_conversation(
         &children,
         &resolved_handoffs,
     )
-    .await?;
+    .await
+    .map_err(text_error_response)?;
     let context_handoffs = context_handoff_responses(&children, &resolved_handoffs);
 
     Ok((
@@ -1335,24 +1380,32 @@ pub async fn create_child_conversations(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
     Json(req): Json<CreateChildConversationsBody>,
-) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), Response> {
     let children_specs = req.children;
     for child in &children_specs {
-        ensure_agent_allowed(&pool, &user.user_id, child.agent.as_deref()).await?;
+        ensure_agent_allowed(&pool, &user.user_id, child.agent.as_deref())
+            .await
+            .map_err(text_error_response)?;
     }
-    let parent_before = require_user_conversation(&pool, &user.user_id, &id).await?;
+    let parent_before = require_user_conversation(&pool, &user.user_id, &id)
+        .await
+        .map_err(text_error_response)?;
     let resolved_handoffs =
-        resolve_child_context_handoffs(&pool, &parent_before.organization, &children_specs).await?;
+        resolve_child_context_handoffs(&pool, &parent_before.organization, &children_specs)
+            .await
+            .map_err(text_error_response)?;
+    let child_requests =
+        child_conversation_requests(&children_specs).map_err(text_error_response)?;
+    guard_runner_queue_admission(&pool, &children_specs, "create_child_conversations").await?;
 
     conversations::promote_conversation_to_multi_agent_parent(&pool, &user.user_id, &id)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(|e| text_error_response((StatusCode::BAD_REQUEST, e.to_string())))?;
 
-    let child_requests = child_conversation_requests(&children_specs)?;
     let children =
         conversations::create_child_conversations(&pool, &user.user_id, &id, child_requests)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| text_error_response((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())))?;
     let queued_turns = enqueue_initial_child_turns(
         &pool,
         &user.user_id,
@@ -1360,10 +1413,13 @@ pub async fn create_child_conversations(
         &children,
         &resolved_handoffs,
     )
-    .await?;
+    .await
+    .map_err(text_error_response)?;
     let context_handoffs = context_handoff_responses(&children, &resolved_handoffs);
 
-    let parent = require_user_conversation(&pool, &user.user_id, &id).await?;
+    let parent = require_user_conversation(&pool, &user.user_id, &id)
+        .await
+        .map_err(text_error_response)?;
 
     Ok((
         StatusCode::CREATED,

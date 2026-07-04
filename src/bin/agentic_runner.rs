@@ -740,6 +740,14 @@ async fn run_claimed_job_inner(
             terminal.event_type,
             terminal.status
         );
+        if terminal.status == "failed" {
+            anyhow::bail!(
+                "{}",
+                terminal.message.unwrap_or_else(|| {
+                    "conversation worker emitted failed terminal event".to_string()
+                })
+            );
+        }
         return Ok(terminal.status.to_string());
     }
 
@@ -783,10 +791,13 @@ async fn latest_terminal_event_status(
     Ok(rows
         .into_iter()
         .find_map(|(event_index, event_type, event_data)| {
-            terminal_status_from_event(&event_type, &event_data).map(|status| TerminalEventStatus {
-                status,
-                event_index,
-                event_type,
+            terminal_event_details_from_event(&event_type, &event_data).map(|details| {
+                TerminalEventStatus {
+                    status: details.status,
+                    event_index,
+                    event_type,
+                    message: details.message,
+                }
             })
         }))
 }
@@ -795,20 +806,42 @@ struct TerminalEventStatus {
     status: &'static str,
     event_index: i64,
     event_type: String,
+    message: Option<String>,
 }
 
 fn terminal_status_from_event(event_type: &str, event_data: &str) -> Option<&'static str> {
+    terminal_event_details_from_event(event_type, event_data).map(|details| details.status)
+}
+
+struct TerminalEventDetails {
+    status: &'static str,
+    message: Option<String>,
+}
+
+fn terminal_event_details_from_event(
+    event_type: &str,
+    event_data: &str,
+) -> Option<TerminalEventDetails> {
     let value: serde_json::Value = serde_json::from_str(event_data).ok()?;
     if event_type == "error"
         || value.get("type").and_then(serde_json::Value::as_str) == Some("error")
     {
-        return Some("failed");
+        return Some(TerminalEventDetails {
+            status: "failed",
+            message: terminal_message_from_event(&value),
+        });
     }
 
     if let Some(status) = value.get("status").and_then(serde_json::Value::as_str) {
         return match status {
-            "failed" | "timeout" => Some("failed"),
-            "cancelled" => Some("cancelled"),
+            "failed" | "timeout" => Some(TerminalEventDetails {
+                status: "failed",
+                message: terminal_message_from_event(&value),
+            }),
+            "cancelled" => Some(TerminalEventDetails {
+                status: "cancelled",
+                message: terminal_message_from_event(&value),
+            }),
             _ => None,
         };
     }
@@ -818,9 +851,23 @@ fn terminal_status_from_event(event_type: &str, event_data: &str) -> Option<&'st
         .and_then(|delta| delta.get("stop_reason"))
         .and_then(serde_json::Value::as_str)
         .and_then(|stop_reason| match stop_reason {
-            "cancelled" => Some("cancelled"),
+            "cancelled" => Some(TerminalEventDetails {
+                status: "cancelled",
+                message: terminal_message_from_event(&value),
+            }),
             _ => None,
         })
+}
+
+fn terminal_message_from_event(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 async fn verify_job_conversation_owner(

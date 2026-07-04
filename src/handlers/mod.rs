@@ -47,6 +47,7 @@ pub mod quick_reference;
 pub mod resume_cursor;
 pub mod resume_snapshot;
 pub mod resume_stream;
+pub mod runner_capacity;
 pub mod scoped_workspace_chat;
 pub mod slices;
 pub mod sse_keepalive;
