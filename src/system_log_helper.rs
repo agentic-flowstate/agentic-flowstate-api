@@ -16,7 +16,15 @@ pub async fn log_event(
     )
     .await
     {
-        tracing::warn!("Failed to write system log: {:?}", e);
+        tracing::warn!(
+            target: "system_logs",
+            level,
+            component,
+            user_id = user_id.unwrap_or(""),
+            session_id = session_id.unwrap_or(""),
+            error = %e,
+            "failed to write system log"
+        );
     }
 }
 

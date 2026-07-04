@@ -175,8 +175,11 @@ exec bash -l '{home}/projects/agentic-flowstate/agentic-flowstate-setup/setup.sh
 
         if commands.is_empty() {
             tracing::error!(
-                "[RESTART_WATCHER] Refusing direct restart for unknown service '{}'",
-                service
+                target: "agentic_api::restart_watcher",
+                event = "restart_watcher.unknown_service",
+                service,
+                action,
+                "refusing direct restart for unknown service"
             );
             return;
         }
@@ -206,8 +209,51 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: direct restart complete"
         });
     }
     if let Err(e) = cmd.spawn() {
-        tracing::error!("[RESTART_WATCHER] Failed to spawn direct restart: {}", e);
+        tracing::error!(
+            target: "agentic_api::restart_watcher",
+            event = "restart_watcher.spawn_failed",
+            service,
+            action,
+            error = %e,
+            "failed to spawn direct restart"
+        );
     }
+}
+
+async fn log_ops_error(
+    pool: &Arc<sqlx::SqlitePool>,
+    component: &str,
+    event: &'static str,
+    message: &str,
+    error: impl std::fmt::Display,
+) {
+    let detail = error.to_string();
+    tracing::error!(
+        target: "agentic_api::ops",
+        event,
+        component,
+        error = %detail,
+        "{}", message
+    );
+    system_log_helper::log_error(pool, component, message, Some(&detail)).await;
+}
+
+async fn log_ops_warn(
+    pool: &Arc<sqlx::SqlitePool>,
+    component: &str,
+    event: &'static str,
+    message: &str,
+    error: impl std::fmt::Display,
+) {
+    let detail = error.to_string();
+    tracing::warn!(
+        target: "agentic_api::ops",
+        event,
+        component,
+        error = %detail,
+        "{}", message
+    );
+    system_log_helper::log_warn(pool, component, message, Some(&detail)).await;
 }
 
 async fn mark_matching_pending_restarts_executed(
@@ -305,10 +351,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::debug!("No stale agent runner generation metadata to reconcile");
         }
         Err(e) => {
-            tracing::error!(
-                "Failed to reconcile stale runner generation metadata: {}",
-                e
-            );
+            log_ops_error(
+                &db_pool,
+                "agent_runner",
+                "startup.runner_generation_reconcile_failed",
+                "Failed to reconcile stale runner generation metadata",
+                &e,
+            )
+            .await;
         }
     }
 
@@ -332,7 +382,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::debug!("No unowned interrupted agent checkpoints to clean up");
         }
         Err(e) => {
-            tracing::error!("Failed to clean up interrupted checkpoints: {}", e);
+            log_ops_error(
+                &db_pool,
+                "agent_runner",
+                "startup.checkpoint_cleanup_failed",
+                "Failed to clean up interrupted checkpoints",
+                &e,
+            )
+            .await;
         }
     }
 
@@ -348,7 +405,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::debug!("No interrupted agent runs to clean up");
         }
         Err(e) => {
-            tracing::error!("Failed to clean up interrupted agent runs: {}", e);
+            log_ops_error(
+                &db_pool,
+                "agent",
+                "startup.agent_run_cleanup_failed",
+                "Failed to clean up interrupted agent runs",
+                &e,
+            )
+            .await;
         }
     }
 
@@ -364,7 +428,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::debug!("No interrupted nightly runs to clean up");
         }
         Err(e) => {
-            tracing::error!("Failed to clean up interrupted nightly runs: {}", e);
+            log_ops_error(
+                &db_pool,
+                "nightly",
+                "startup.nightly_run_cleanup_failed",
+                "Failed to clean up interrupted nightly runs",
+                &e,
+            )
+            .await;
         }
     }
 
@@ -379,7 +450,14 @@ async fn main() -> anyhow::Result<()> {
             tracing::debug!("No interrupted daily runs to clean up");
         }
         Err(e) => {
-            tracing::error!("Failed to clean up interrupted daily runs: {}", e);
+            log_ops_error(
+                &db_pool,
+                "dailies",
+                "startup.daily_run_cleanup_failed",
+                "Failed to clean up interrupted daily runs",
+                &e,
+            )
+            .await;
         }
     }
 
@@ -397,7 +475,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Ok(None) => {}
         Err(e) => {
-            tracing::warn!("Failed to inspect pending restart queue: {}", e);
+            log_ops_warn(
+                &db_pool,
+                "restart_watcher",
+                "startup.pending_restart_inspect_failed",
+                "Failed to inspect pending restart queue",
+                &e,
+            )
+            .await;
         }
     }
 
@@ -415,10 +500,16 @@ async fn main() -> anyhow::Result<()> {
     // signature stable.
     if handlers::sse_keepalive::install_shutdown_token(shutdown_token.clone()).is_err() {
         tracing::warn!(
-            "[SSE_KEEPALIVE] shutdown token already installed — ignoring (likely a test)"
+            target: "agentic_api::sse_keepalive",
+            event = "sse_keepalive.shutdown_token_already_installed",
+            "shutdown token already installed"
         );
     } else {
-        tracing::info!("[SSE_KEEPALIVE] shutdown token registered");
+        tracing::info!(
+            target: "agentic_api::sse_keepalive",
+            event = "sse_keepalive.shutdown_token_registered",
+            "shutdown token registered"
+        );
     }
 
     spawn_runner_generation_reconciler(db_pool.clone(), shutdown_token.child_token());
@@ -495,9 +586,11 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 {
                     tracing::warn!(
-                        "[RUNNER] Failed to heartbeat generation {}: {}",
-                        heartbeat_generation_id,
-                        e
+                        target: "agentic_api::runner",
+                        event = "runner.heartbeat_failed",
+                        generation_id = %heartbeat_generation_id,
+                        error = %e,
+                        "failed to heartbeat runner generation"
                     );
                 }
             }
@@ -510,13 +603,28 @@ async fn main() -> anyhow::Result<()> {
     // is required and startup fails loudly on misconfiguration.
     let alert_enabled = env_flag_enabled("APNS_ALERT_ENABLED");
     if alert_enabled {
-        apns::ApnsService::init_from_env().map_err(|e| {
-            tracing::error!("[APNS_ALERT] init failed: {}", e);
-            anyhow::anyhow!("APNs alert push init failed: {}", e)
-        })?;
-        tracing::info!("[APNS_ALERT] initialized");
+        if let Err(e) = apns::ApnsService::init_from_env() {
+            log_ops_error(
+                &db_pool,
+                "apns",
+                "startup.apns_alert_init_failed",
+                "APNs alert push init failed",
+                &e,
+            )
+            .await;
+            return Err(anyhow::anyhow!("APNs alert push init failed: {}", e));
+        }
+        tracing::info!(
+            target: "agentic_api::apns",
+            event = "apns_alert.initialized",
+            "APNs alert push initialized"
+        );
     } else {
-        tracing::info!("[APNS_ALERT] disabled (APNS_ALERT_ENABLED not set to true)");
+        tracing::info!(
+            target: "agentic_api::apns",
+            event = "apns_alert.disabled",
+            "APNs alert push disabled"
+        );
     }
 
     // Initialize silent-push sender (durable chat streaming wake signals).
@@ -526,19 +634,35 @@ async fn main() -> anyhow::Result<()> {
     let apns_silent = Arc::new(apns::ApnsClient::new());
     let silent_enabled = env_flag_enabled("APNS_SILENT_ENABLED");
     if silent_enabled {
-        let cfg = apns_silent.init_from_env().map_err(|e| {
-            tracing::error!("[APNS_SILENT] init failed: {}", e);
-            anyhow::anyhow!("APNs silent push init failed: {}", e)
-        })?;
+        let cfg = match apns_silent.init_from_env() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                log_ops_error(
+                    &db_pool,
+                    "apns",
+                    "startup.apns_silent_init_failed",
+                    "APNs silent push init failed",
+                    &e,
+                )
+                .await;
+                return Err(anyhow::anyhow!("APNs silent push init failed: {}", e));
+            }
+        };
         tracing::info!(
-            "[APNS_SILENT] initialized (bundle_id={}, sandbox={}, team={}, key={})",
-            cfg.bundle_id,
-            cfg.use_sandbox,
-            cfg.team_id,
-            cfg.key_id
+            target: "agentic_api::apns",
+            event = "apns_silent.initialized",
+            bundle_id = %cfg.bundle_id,
+            sandbox = cfg.use_sandbox,
+            team_id = %cfg.team_id,
+            key_id = %cfg.key_id,
+            "APNs silent push initialized"
         );
     } else {
-        tracing::info!("[APNS_SILENT] disabled (APNS_SILENT_ENABLED not set to true)");
+        tracing::info!(
+            target: "agentic_api::apns",
+            event = "apns_silent.disabled",
+            "APNs silent push disabled"
+        );
     }
 
     // Register the silent-push sender in the process-wide registry so the
@@ -552,10 +676,17 @@ async fn main() -> anyhow::Result<()> {
         sender: apns_silent.clone(),
     }) {
         Ok(()) => tracing::info!(
-            "[APNS_SILENT] fan-out registry installed (enabled={})",
-            silent_enabled
+            target: "agentic_api::apns",
+            event = "apns_silent.fanout_registry_installed",
+            enabled = silent_enabled,
+            "APNs silent fan-out registry installed"
         ),
-        Err(e) => tracing::warn!("[APNS_SILENT] fan-out registry already initialized: {}", e),
+        Err(e) => tracing::warn!(
+            target: "agentic_api::apns",
+            event = "apns_silent.fanout_registry_already_initialized",
+            error = %e,
+            "APNs silent fan-out registry already initialized"
+        ),
     }
 
     // Build the per-(user, conversation) SSE rate limiter (T-C410DD96).
@@ -564,10 +695,12 @@ async fn main() -> anyhow::Result<()> {
     // immediately. Defaults: 1 concurrent stream, 10 reconnects / 60s.
     let rate_limit_config = rate_limiting::StreamRateLimitConfig::from_env();
     tracing::info!(
-        "[RATE_LIMIT] Stream limiter config: max_concurrent={}, max_reconnects_per_window={}, window={}s",
-        rate_limit_config.max_concurrent_streams,
-        rate_limit_config.max_reconnects_per_window,
-        rate_limit_config.window_duration.as_secs(),
+        target: "agentic_api::rate_limit",
+        event = "rate_limit.stream_config_loaded",
+        max_concurrent_streams = rate_limit_config.max_concurrent_streams,
+        max_reconnects_per_window = rate_limit_config.max_reconnects_per_window,
+        window_seconds = rate_limit_config.window_duration.as_secs(),
+        "stream rate limiter config loaded"
     );
     let rate_limiter = Arc::new(rate_limiting::StreamRateLimiter::new(rate_limit_config));
     // Global install so chat_stream::chat (which does not yet receive
@@ -575,7 +708,11 @@ async fn main() -> anyhow::Result<()> {
     // already have State<...> in scope still pull from AppState —
     // the global just covers the chat-handler call path.
     if rate_limiting::install_global(rate_limiter.clone()).is_err() {
-        tracing::warn!("[RATE_LIMIT] global limiter already installed — ignoring (likely a test)");
+        tracing::warn!(
+            target: "agentic_api::rate_limit",
+            event = "rate_limit.global_limiter_already_installed",
+            "global limiter already installed"
+        );
     }
     // Cleanup task: prune idle buckets every 5 minutes.
     rate_limiting::spawn_cleanup_task(rate_limiter.clone(), shutdown_token.child_token());
@@ -720,10 +857,14 @@ async fn main() -> anyhow::Result<()> {
                         Ok(Some(entry)) => entry,
                         Ok(None) => continue,
                         Err(e) => {
-                            tracing::warn!(
-                                "[RESTART_WATCHER] Failed to check restart queue: {}",
-                                e
-                            );
+                            log_ops_warn(
+                                &restart_pool,
+                                "restart_watcher",
+                                "restart_watcher.queue_check_failed",
+                                "Failed to check restart queue",
+                                &e,
+                            )
+                            .await;
                             continue;
                         }
                     };
@@ -738,26 +879,40 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Ok(a) => a,
                     Err(e) => {
-                        tracing::warn!("[RESTART_WATCHER] Failed to count active work: {}", e);
+                        log_ops_warn(
+                            &restart_pool,
+                            "restart_watcher",
+                            "restart_watcher.active_work_count_failed",
+                            "Failed to count restart-blocking active work",
+                            &e,
+                        )
+                        .await;
                         continue;
                     }
                 };
 
                 if active.total > 0 {
                     tracing::debug!(
-                        "[RESTART_WATCHER] Restart queued for '{}' but {} active work item(s) still running (agent_runs={}, runner_turns={}, checkpoints={}), waiting...",
-                        pending.service,
-                        active.total,
-                        active.agent_run_count,
-                        active.runner_turn_count,
-                        active.checkpoint_count
+                        target: "agentic_api::restart_watcher",
+                        event = "restart_watcher.waiting_for_active_work",
+                        service = %pending.service,
+                        action = %pending.action,
+                        active_total = active.total,
+                        agent_run_count = active.agent_run_count,
+                        runner_turn_count = active.runner_turn_count,
+                        checkpoint_count = active.checkpoint_count,
+                        "restart queued but active work remains"
                     );
                     continue;
                 }
 
                 tracing::info!(
-                    "[RESTART_WATCHER] Agents finished. Executing deferred {} of '{}' directly (requested by {:?})",
-                    pending.action, pending.service, pending.requested_by
+                    target: "agentic_api::restart_watcher",
+                    event = "restart_watcher.executing_deferred_restart",
+                    service = %pending.service,
+                    action = %pending.action,
+                    requested_by = ?pending.requested_by,
+                    "executing deferred restart"
                 );
 
                 match mark_matching_pending_restarts_executed(
@@ -769,19 +924,24 @@ async fn main() -> anyhow::Result<()> {
                 {
                     Ok(count) if count > 1 => {
                         tracing::info!(
-                            "[RESTART_WATCHER] Coalesced {} pending {} request(s) for '{}'",
-                            count,
-                            pending.action,
-                            pending.service
+                            target: "agentic_api::restart_watcher",
+                            event = "restart_watcher.coalesced_pending_requests",
+                            coalesced_count = count,
+                            service = %pending.service,
+                            action = %pending.action,
+                            "coalesced pending restart requests"
                         );
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!(
-                            "[RESTART_WATCHER] Failed to coalesce restart queue entry {}; marking only this entry: {}",
-                            pending.id,
-                            e
-                        );
+                        log_ops_warn(
+                            &restart_pool,
+                            "restart_watcher",
+                            "restart_watcher.coalesce_failed",
+                            "Failed to coalesce restart queue entries",
+                            format!("entry_id={}; error={}", pending.id, e),
+                        )
+                        .await;
                         let _ = ticketing_system::restart_queue::mark_executed(
                             &restart_pool,
                             pending.id,
@@ -794,7 +954,7 @@ async fn main() -> anyhow::Result<()> {
                     &restart_pool,
                     "restart_watcher",
                     &format!(
-                        "Agents finished — executing {} for '{}' directly",
+                        "Agents finished; executing {} for '{}' directly",
                         pending.action, pending.service
                     ),
                     None,
@@ -1679,10 +1839,14 @@ fn spawn_runner_generation_reconciler(
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::error!(
-                        "Failed to reconcile stale runner generation metadata: {}",
-                        e
-                    );
+                    log_ops_error(
+                        &db_pool,
+                        "agent_runner",
+                        "runner_generation_reconcile_failed",
+                        "Failed to reconcile stale runner generation metadata",
+                        &e,
+                    )
+                    .await;
                 }
             }
         }
@@ -1730,10 +1894,22 @@ async fn shutdown_signal(
             .await
     {
         tracing::warn!(
-            "Failed to mark runner generation {} draining during shutdown: {}",
-            runner_generation_id,
-            e
+            target: "agentic_api::shutdown",
+            event = "shutdown.runner_generation_drain_failed",
+            generation_id = %runner_generation_id,
+            error = %e,
+            "failed to mark runner generation draining during shutdown"
         );
+        system_log_helper::log_warn(
+            &db_pool,
+            "agent_runner",
+            "Failed to mark runner generation draining during shutdown",
+            Some(&format!(
+                "generation_id={}; error={}",
+                runner_generation_id, e
+            )),
+        )
+        .await;
     }
 
     // Cancel all background tasks (email fetcher, cleanup loops, etc.)
@@ -1757,7 +1933,14 @@ async fn shutdown_signal(
             tracing::debug!("No running checkpoints to interrupt");
         }
         Err(e) => {
-            tracing::error!("Failed to mark checkpoints as interrupted: {}", e);
+            log_ops_error(
+                &db_pool,
+                "agent_runner",
+                "shutdown.checkpoint_interrupt_failed",
+                "Failed to mark checkpoints as interrupted during shutdown",
+                &e,
+            )
+            .await;
         }
     }
 
@@ -1768,7 +1951,14 @@ async fn shutdown_signal(
         }
         Ok(_) => {}
         Err(e) => {
-            tracing::error!("Failed to mark agent runs as failed: {}", e);
+            log_ops_error(
+                &db_pool,
+                "agent",
+                "shutdown.agent_run_interrupt_failed",
+                "Failed to mark agent runs as failed during shutdown",
+                &e,
+            )
+            .await;
         }
     }
 
@@ -1778,7 +1968,14 @@ async fn shutdown_signal(
         }
         Ok(_) => {}
         Err(e) => {
-            tracing::error!("Failed to mark daily runs as failed: {}", e);
+            log_ops_error(
+                &db_pool,
+                "dailies",
+                "shutdown.daily_run_interrupt_failed",
+                "Failed to mark daily runs as failed during shutdown",
+                &e,
+            )
+            .await;
         }
     }
 

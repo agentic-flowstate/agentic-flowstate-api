@@ -7,6 +7,7 @@
 //! * [`cancellation`] — stop-button cancellation phase logs and latency
 //!   metrics.
 //! * [`next_actions`] — post-turn follow-up suggestion generation and storage metrics.
+//! * [`runtime`] — chat/Codex runtime turn metrics and structured failure logs.
 //!
 //! # Integration
 //!
@@ -27,6 +28,7 @@
 
 pub mod cancellation;
 pub mod next_actions;
+pub mod runtime;
 pub mod streaming;
 
 use std::sync::Arc;

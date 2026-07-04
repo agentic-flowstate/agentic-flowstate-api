@@ -29,6 +29,7 @@ use super::conversation_worker_manager::WORKER_MANAGER;
 use super::sse_keepalive::{wrap_stream_with_keepalive, KeepaliveConfig};
 use crate::agents::codex_app_server::{launchd_safe_path, normalize_reasoning_effort};
 use crate::agents::{AgentType, AgentsConfig, StreamEvent};
+use crate::observability::runtime::{self, RuntimeLatencyPhase};
 use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
 use crate::rate_limiting::{self, RateLimitDecision, StreamPermit};
 use ticketing_system::{agent_runners, checkpoints, conversation_turn_jobs};
@@ -542,17 +543,28 @@ pub async fn submit(
         Ok(count) => count,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    runtime::record_latency_marker(
+        &conv_id,
+        client_id.as_deref(),
+        RuntimeLatencyPhase::SubmitReceived,
+        0,
+        received_at_ms,
+        None,
+        None,
+    );
     tracing::info!(
-        "[CHAT_LATENCY] phase=submit_received conv={} client_id={} agent={} runtime={} model={} effort={} message_chars={} attachments={} received_at_ms={}",
-        conv_id,
-        client_id.as_deref().unwrap_or("none"),
-        config.agent_type.as_str(),
-        config.runtime.as_job_runtime(),
-        config.codex_options.model,
-        config.codex_options.reasoning_effort,
-        message.chars().count(),
+        target: "agentic_api::runtime",
+        event = "chat_submit.received",
+        conversation_id = %conv_id,
+        client_id = client_id.as_deref().unwrap_or("none"),
+        agent_name = config.agent_type.as_str(),
+        runtime = config.runtime.as_job_runtime(),
+        model = %config.codex_options.model,
+        reasoning_effort = %config.codex_options.reasoning_effort,
+        message_chars = message.chars().count(),
         attachment_count,
-        received_at_ms
+        received_at_ms,
+        "chat submit received"
     );
 
     if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
@@ -640,14 +652,26 @@ pub async fn submit(
         }
     };
     let accepted_at_ms = Utc::now().timestamp_millis();
+    let submit_duration_ms = accepted_at_ms.saturating_sub(received_at_ms);
+    runtime::record_latency_marker(
+        &conv_id,
+        client_id_for_log.as_deref(),
+        RuntimeLatencyPhase::SubmitEnqueued,
+        submit_duration_ms as u64,
+        accepted_at_ms,
+        None,
+        None,
+    );
     tracing::info!(
-        "[CHAT_LATENCY] phase=submit_enqueued conv={} client_id={} job_id={} received_at_ms={} accepted_at_ms={} submit_duration_ms={}",
-        conv_id,
-        client_id_for_log.as_deref().unwrap_or("none"),
-        job_id,
+        target: "agentic_api::runtime",
+        event = "chat_submit.enqueued",
+        conversation_id = %conv_id,
+        client_id = client_id_for_log.as_deref().unwrap_or("none"),
+        job_id = %job_id,
         received_at_ms,
         accepted_at_ms,
-        accepted_at_ms.saturating_sub(received_at_ms)
+        submit_duration_ms,
+        "chat submit enqueued"
     );
     if let Err(e) = super::conversations::publish_conversation_run_status(&db, &conv_id).await {
         tracing::warn!(

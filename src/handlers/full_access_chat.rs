@@ -16,6 +16,7 @@ use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::{self, ChatAttachmentData, ChatCodexOptions, ChatConfig, ChatRuntime};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
+use crate::observability::runtime::{self, RuntimeLatencyPhase};
 
 #[derive(Debug, Deserialize)]
 pub struct FullAccessChatRequest {
@@ -123,14 +124,26 @@ pub async fn full_access_chat_submit(
         Ok(v) => v,
         Err(e) => return chat_stream::malformed_idempotency_key_response(e),
     };
-    tracing::info!(
-        "[CHAT_LATENCY] phase=handler_received endpoint=full-access/submit user={} conv={} client_id={} message_chars={} attachments={} received_at_ms={}",
-        user.user_id,
+    runtime::record_latency_marker(
         req.conversation_id.as_deref().unwrap_or("none"),
-        client_id.as_deref().unwrap_or("none"),
-        req.message.chars().count(),
-        req.attachments.as_ref().map_or(0, Vec::len),
-        handler_received_at_ms
+        client_id.as_deref(),
+        RuntimeLatencyPhase::HandlerReceived,
+        0,
+        handler_received_at_ms,
+        None,
+        None,
+    );
+    tracing::info!(
+        target: "agentic_api::runtime",
+        event = "full_access_submit.handler_received",
+        endpoint = "full-access/submit",
+        user_id = %user.user_id,
+        conversation_id = req.conversation_id.as_deref().unwrap_or("none"),
+        client_id = client_id.as_deref().unwrap_or("none"),
+        message_chars = req.message.chars().count(),
+        attachment_count = req.attachments.as_ref().map_or(0, Vec::len),
+        received_at_ms = handler_received_at_ms,
+        "full-access submit handler received request"
     );
 
     let agents_md = std::fs::read_to_string("/Users/jarvisgpt/projects/AGENTS.md")

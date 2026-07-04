@@ -3,7 +3,9 @@ use agentic_api::apns;
 use agentic_api::handlers::chat_client_manager::ChatClientManager;
 use agentic_api::handlers::chat_stream::{self, ChatAttachmentData, ChatConfig, ChatRuntime};
 use agentic_api::handlers::conversation_worker::{ConversationWorker, WorkerMessage};
+use agentic_api::observability::runtime::{self, RuntimeFailurePhase, RuntimeLatencyPhase};
 use agentic_api::runner_commands;
+use agentic_api::system_log_helper;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::FutureExt;
@@ -204,20 +206,27 @@ async fn main() -> Result<()> {
                     let claimed_at_ms = Utc::now().timestamp_millis();
                     let queue_wait_ms = claimed_at_ms.saturating_sub(job.created_at * 1000);
                     tracing::info!(
-                        "Claimed conversation job {} for conversation {}",
-                        job.id,
-                        job.conversation_id
-                    );
-                    tracing::info!(
-                        "[CHAT_LATENCY] phase=runner_claimed job_id={} conv={} client_id={} generation_id={} created_at={} started_at={} claimed_at_ms={} queue_wait_ms={}",
-                        job.id,
-                        job.conversation_id,
-                        job.payload.client_id.as_deref().unwrap_or("none"),
-                        generation_id,
-                        job.created_at,
-                        job.started_at.unwrap_or(job.updated_at),
+                        target: "agentic_runner::jobs",
+                        event = "runner.job_claimed",
+                        phase = %RuntimeLatencyPhase::RunnerClaimed,
+                        job_id = %job.id,
+                        conversation_id = %job.conversation_id,
+                        client_id = job.payload.client_id.as_deref().unwrap_or("none"),
+                        generation_id = %generation_id,
+                        created_at = job.created_at,
+                        started_at = job.started_at.unwrap_or(job.updated_at),
                         claimed_at_ms,
-                        queue_wait_ms
+                        queue_wait_ms,
+                        "claimed conversation job"
+                    );
+                    runtime::record_latency_marker(
+                        &job.conversation_id,
+                        job.payload.client_id.as_deref(),
+                        RuntimeLatencyPhase::RunnerClaimed,
+                        queue_wait_ms as u64,
+                        claimed_at_ms,
+                        None,
+                        None,
                     );
                     joins.spawn(
                         run_claimed_job(db.clone(), manager.clone(), job).map(move |r| (job_id, r)),
@@ -567,6 +576,21 @@ async fn run_claimed_job(
         }
         Err(e) => {
             let message = e.to_string();
+            runtime::record_runtime_failure(
+                &job.conversation_id,
+                RuntimeFailurePhase::RunnerJobFailed,
+                &message,
+            );
+            system_log_helper::log_error(
+                &db,
+                "agent_runner",
+                "Conversation runner job failed",
+                Some(&format!(
+                    "job_id={}; conversation_id={}; error={}",
+                    job.id, job.conversation_id, message
+                )),
+            )
+            .await;
             let _ = checkpoints::mark_interrupted(&db, &job.conversation_id).await;
             conversation_turn_jobs::mark_job_terminal(&db, &job.id, "failed", Some(&message))
                 .await?;
@@ -583,13 +607,26 @@ async fn run_claimed_job_inner(
     let worker_start_ms = Utc::now().timestamp_millis();
     verify_job_conversation_owner(&db, &job).await?;
     let worker_message = worker_message_from_job(&job)?;
+    let queue_to_worker_ms = worker_start_ms.saturating_sub(job.created_at * 1000);
     tracing::info!(
-        "[CHAT_LATENCY] phase=worker_starting job_id={} conv={} client_id={} worker_start_ms={} queue_to_worker_ms={}",
-        job.id,
-        job.conversation_id,
-        job.payload.client_id.as_deref().unwrap_or("none"),
+        target: "agentic_runner::jobs",
+        event = "runner.worker_starting",
+        phase = %RuntimeLatencyPhase::WorkerStarting,
+        job_id = %job.id,
+        conversation_id = %job.conversation_id,
+        client_id = job.payload.client_id.as_deref().unwrap_or("none"),
         worker_start_ms,
-        worker_start_ms.saturating_sub(job.created_at * 1000)
+        queue_to_worker_ms,
+        "conversation worker starting"
+    );
+    runtime::record_latency_marker(
+        &job.conversation_id,
+        job.payload.client_id.as_deref(),
+        RuntimeLatencyPhase::WorkerStarting,
+        queue_to_worker_ms as u64,
+        worker_start_ms,
+        None,
+        None,
     );
     let (tx, rx) = mpsc::channel(1);
     tx.send(worker_message)
@@ -599,24 +636,40 @@ async fn run_claimed_job_inner(
 
     let worker = ConversationWorker::new(db.clone(), job.conversation_id.clone(), manager, rx);
     worker.run().await;
+    let worker_finished_ms = Utc::now().timestamp_millis();
+    let worker_duration_ms = worker_finished_ms.saturating_sub(worker_start_ms);
     tracing::info!(
-        "[CHAT_LATENCY] phase=worker_finished job_id={} conv={} client_id={} finished_at_ms={} worker_duration_ms={}",
-        job.id,
-        job.conversation_id,
-        job.payload.client_id.as_deref().unwrap_or("none"),
-        Utc::now().timestamp_millis(),
-        Utc::now().timestamp_millis().saturating_sub(worker_start_ms)
+        target: "agentic_runner::jobs",
+        event = "runner.worker_finished",
+        phase = %RuntimeLatencyPhase::WorkerFinished,
+        job_id = %job.id,
+        conversation_id = %job.conversation_id,
+        client_id = job.payload.client_id.as_deref().unwrap_or("none"),
+        finished_at_ms = worker_finished_ms,
+        worker_duration_ms,
+        "conversation worker finished"
+    );
+    runtime::record_latency_marker(
+        &job.conversation_id,
+        job.payload.client_id.as_deref(),
+        RuntimeLatencyPhase::WorkerFinished,
+        worker_duration_ms as u64,
+        worker_finished_ms,
+        None,
+        None,
     );
 
     if let Some(terminal) = latest_terminal_event_status(&db, &job.conversation_id).await? {
         tracing::warn!(
-            "[RUNNER] Conversation job {} observed terminal event after worker finish: conv={} client_id={} event_index={} event_type={} status={}",
-            job.id,
-            job.conversation_id,
-            job.payload.client_id.as_deref().unwrap_or("none"),
-            terminal.event_index,
-            terminal.event_type,
-            terminal.status
+            target: "agentic_runner::jobs",
+            event = "runner.terminal_event_observed",
+            job_id = %job.id,
+            conversation_id = %job.conversation_id,
+            client_id = job.payload.client_id.as_deref().unwrap_or("none"),
+            event_index = terminal.event_index,
+            event_type = %terminal.event_type,
+            status = terminal.status,
+            "conversation job observed terminal event after worker finish"
         );
         if terminal.status == "failed" {
             anyhow::bail!(

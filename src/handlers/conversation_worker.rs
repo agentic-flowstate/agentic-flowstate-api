@@ -24,6 +24,7 @@ use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
 use crate::observability::cancellation;
 use crate::observability::next_actions::{record_clear, NextActionClearReason};
+use crate::observability::runtime::{self, RuntimeFailurePhase, RuntimeLatencyPhase};
 use crate::observability::streaming::{
     record_gap_detected, record_stream_event_emitted, record_ticket_preflight,
     record_ticket_preflight_error,
@@ -223,6 +224,7 @@ pub struct ConversationWorker {
     current_user_id: Option<String>,
     /// Client trace/idempotency id for the currently processed turn.
     current_client_id: Option<String>,
+    current_turn_started_at_ms: Option<i64>,
     first_message_start_logged: bool,
     first_content_delta_logged: bool,
 }
@@ -247,6 +249,7 @@ impl ConversationWorker {
             encoder,
             current_user_id: None,
             current_client_id: None,
+            current_turn_started_at_ms: None,
             first_message_start_logged: false,
             first_content_delta_logged: false,
         }
@@ -438,23 +441,24 @@ impl ConversationWorker {
         // RAII guard: fires completion signal when this function exits (normal or early return)
         let _completion = CompletionGuard(msg.completion_tx.take());
         self.current_client_id = msg.client_id.clone();
+        let turn_started_at_ms = Utc::now().timestamp_millis();
+        self.current_turn_started_at_ms = Some(turn_started_at_ms);
         self.first_message_start_logged = false;
         self.first_content_delta_logged = false;
         // Cache the turn's owner so `emit_event` can fan out silent
         // pushes on `message_stop` without plumbing user_id through
         // every call site (T-90C7FAC4).
         self.current_user_id = Some(msg.user_id.clone());
-        tracing::info!(
-            "[CHAT_LATENCY] phase=worker_process_message_start conv={} client_id={} agent={} runtime={} model={} effort={} message_chars={} attachments={} started_at_ms={}",
-            self.conversation_id,
-            msg.client_id.as_deref().unwrap_or("none"),
+        runtime::record_turn_started(
+            &self.conversation_id,
+            msg.client_id.as_deref(),
             msg.config.agent_type.as_str(),
             msg.config.runtime.as_job_runtime(),
-            msg.config.codex_options.model,
-            msg.config.codex_options.reasoning_effort,
+            &msg.config.codex_options.model,
+            &msg.config.codex_options.reasoning_effort,
             msg.message.chars().count(),
             msg.attachments.as_ref().map_or(0, Vec::len),
-            Utc::now().timestamp_millis()
+            turn_started_at_ms,
         );
         // Stage the inbound Idempotency-Key (T-A819D36B) onto the
         // encoder BEFORE any StreamEvent is encoded. The encoder
@@ -484,7 +488,14 @@ impl ConversationWorker {
                 let chat_attachments_dir = match chat_attachments_dir(&self.conversation_id) {
                     Ok(dir) => dir,
                     Err(e) => {
-                        tracing::error!("[WORKER] Failed to resolve chat attachments dir: {}", e);
+                        log_user_visible_runtime_failure(
+                            &self.db,
+                            &self.conversation_id,
+                            RuntimeFailurePhase::AttachmentStorage,
+                            "Failed to resolve attachment storage",
+                            &e,
+                        )
+                        .await;
                         self.emit_event(&StreamEvent::Status {
                             status: "failed".to_string(),
                             message: Some("Failed to resolve attachment storage".to_string()),
@@ -494,11 +505,14 @@ impl ConversationWorker {
                     }
                 };
                 if let Err(e) = std::fs::create_dir_all(&chat_attachments_dir) {
-                    tracing::error!(
-                        "[WORKER] Failed to create chat attachments dir {}: {}",
-                        chat_attachments_dir.display(),
-                        e
-                    );
+                    log_user_visible_runtime_failure(
+                        &self.db,
+                        &self.conversation_id,
+                        RuntimeFailurePhase::AttachmentStorage,
+                        "Failed to create attachment storage",
+                        &e,
+                    )
+                    .await;
                     self.emit_event(&StreamEvent::Status {
                         status: "failed".to_string(),
                         message: Some("Failed to create attachment storage".to_string()),
@@ -511,10 +525,14 @@ impl ConversationWorker {
 
                 for attachment in attachments_to_save {
                     let Some(display_name) = sanitize_display_filename(&attachment.filename) else {
-                        tracing::error!(
-                            "[WORKER] Attachment filename is invalid: {}",
-                            attachment.filename
-                        );
+                        log_user_visible_runtime_failure(
+                            &self.db,
+                            &self.conversation_id,
+                            RuntimeFailurePhase::AttachmentStorage,
+                            "Attachment filename is invalid",
+                            "sanitized filename was empty",
+                        )
+                        .await;
                         self.emit_event(&StreamEvent::Status {
                             status: "failed".to_string(),
                             message: Some("Attachment filename is invalid".to_string()),
@@ -525,11 +543,14 @@ impl ConversationWorker {
                     let bytes = match STANDARD.decode(&attachment.data) {
                         Ok(bytes) => bytes,
                         Err(e) => {
-                            tracing::error!(
-                                "[WORKER] Failed to decode base64 attachment {}: {}",
-                                display_name,
-                                e
-                            );
+                            log_user_visible_runtime_failure(
+                                &self.db,
+                                &self.conversation_id,
+                                RuntimeFailurePhase::AttachmentStorage,
+                                "Failed to decode attachment",
+                                &e,
+                            )
+                            .await;
                             self.emit_event(&StreamEvent::Status {
                                 status: "failed".to_string(),
                                 message: Some(format!(
@@ -544,11 +565,14 @@ impl ConversationWorker {
                     let stored_filename = format!("{}-{}", uuid::Uuid::new_v4(), display_name);
                     let file_path = chat_attachments_dir.join(&stored_filename);
                     if let Err(e) = std::fs::write(&file_path, &bytes) {
-                        tracing::error!(
-                            "[WORKER] Failed to write attachment {}: {}",
-                            stored_filename,
-                            e
-                        );
+                        log_user_visible_runtime_failure(
+                            &self.db,
+                            &self.conversation_id,
+                            RuntimeFailurePhase::AttachmentStorage,
+                            "Failed to save attachment",
+                            &e,
+                        )
+                        .await;
                         self.emit_event(&StreamEvent::Status {
                             status: "failed".to_string(),
                             message: Some(format!("Failed to save attachment {}", display_name)),
@@ -674,14 +698,28 @@ impl ConversationWorker {
         }
 
         if let Err(ref e) = stored_msg {
-            tracing::error!("[WORKER] Failed to store user message: {}", e);
+            log_user_visible_runtime_failure(
+                &self.db,
+                &self.conversation_id,
+                RuntimeFailurePhase::StoreUserMessage,
+                "Failed to store user message",
+                e,
+            )
+            .await;
         }
 
         // Create checkpoint
         if let Err(e) =
             checkpoints::upsert_checkpoint(&self.db, &self.conversation_id, "pending", 0).await
         {
-            tracing::warn!("[WORKER] Failed to create checkpoint: {}", e);
+            log_user_visible_runtime_failure(
+                &self.db,
+                &self.conversation_id,
+                RuntimeFailurePhase::CreateCheckpoint,
+                "Failed to create conversation checkpoint",
+                &e,
+            )
+            .await;
         } else {
             self.publish_run_status().await;
         }
@@ -774,7 +812,14 @@ impl ConversationWorker {
                 message.id
             }
             Err(e) => {
-                tracing::error!("[WORKER] Failed to create assistant message: {}", e);
+                log_user_visible_runtime_failure(
+                    &self.db,
+                    &self.conversation_id,
+                    RuntimeFailurePhase::CreateAssistantMessage,
+                    "Failed to create assistant message",
+                    &e,
+                )
+                .await;
                 self.mark_checkpoint_interrupted().await;
                 self.emit_event(&StreamEvent::Status {
                     status: "failed".to_string(),
@@ -816,30 +861,22 @@ impl ConversationWorker {
         config: &ChatConfig,
     ) -> Result<WorkContextPreflight> {
         let original = user_message.to_string();
-        // Truncate preview at a safe UTF-8 char boundary (floor to nearest boundary at or before 60)
-        let msg_preview = if user_message.len() > 60 {
-            let end = (0..=60)
-                .rev()
-                .find(|&i| user_message.is_char_boundary(i))
-                .unwrap_or(0);
-            &user_message[..end]
-        } else {
-            user_message
-        };
 
         tracing::info!(
-            "[ROUTER] === ENTER === conv={} has_routed={} msg={:?}",
-            self.conversation_id,
+            target: "agentic_api::router",
+            event = "work_context_preflight.enter",
+            conversation_id = %self.conversation_id,
             self.has_routed,
-            msg_preview
+            "starting deterministic work-context preflight"
         );
 
         if let Some(reason) = work_context_skip_reason(user_message, config, self.has_routed) {
             tracing::info!(
-                "[ROUTER] === SKIP ({}) === conv={} msg={:?}",
-                reason.as_str(),
-                self.conversation_id,
-                safe_preview(user_message, 30)
+                target: "agentic_api::router",
+                event = "work_context_preflight.skipped",
+                conversation_id = %self.conversation_id,
+                skip_reason = reason.as_str(),
+                "skipping deterministic work-context preflight"
             );
             if reason.persist_router_skip() {
                 self.has_routed = true;
@@ -859,8 +896,10 @@ impl ConversationWorker {
         }
 
         tracing::info!(
-            "[ROUTER] === RUNNING DETERMINISTIC WORK-CONTEXT PREFLIGHT === conv={}",
-            self.conversation_id
+            target: "agentic_api::router",
+            event = "work_context_preflight.running",
+            conversation_id = %self.conversation_id,
+            "running deterministic work-context preflight"
         );
 
         let started = Instant::now();
@@ -868,9 +907,11 @@ impl ConversationWorker {
         if message_references_ticket_id(user_message) {
             if let Some(org) = organization.as_deref() {
                 tracing::info!(
-                    "[ROUTER] Explicit ticket id found; using ticket organization instead of conversation organization '{}' for conv={}",
-                    org,
-                    self.conversation_id
+                    target: "agentic_api::router",
+                    event = "work_context_preflight.explicit_ticket_id",
+                    conversation_id = %self.conversation_id,
+                    conversation_organization = org,
+                    "using ticket organization lookup for explicit ticket id"
                 );
             }
             organization = None;
@@ -906,18 +947,21 @@ impl ConversationWorker {
                     response.ticket_result.elapsed_ms,
                 );
                 tracing::info!(
-                    "[ROUTER] === WORK-CONTEXT PREFLIGHT DONE ({}ms) === conv={} ticket_status={} ticket_action={} candidates={} packet={:?} snippets={} warnings={}",
-                    response.metrics.elapsed_ms,
-                    self.conversation_id,
-                    response.ticket_result.status,
-                    response.ticket_result.action,
-                    response.ticket_result.candidate_count,
-                    response
+                    target: "agentic_api::router",
+                    event = "work_context_preflight.completed",
+                    conversation_id = %self.conversation_id,
+                    duration_ms = response.metrics.elapsed_ms,
+                    ticket_status = response.ticket_result.status.as_str(),
+                    ticket_action = response.ticket_result.action.as_str(),
+                    candidate_count = response.ticket_result.candidate_count,
+                    context_packet_id = response
                         .context_packet
                         .as_ref()
-                        .map(|packet| packet.packet_id.as_str()),
-                    response.selected_snippets.len(),
-                    response.warnings.len()
+                        .map(|packet| packet.packet_id.as_str())
+                        .unwrap_or(""),
+                    selected_snippet_count = response.selected_snippets.len(),
+                    warning_count = response.warnings.len(),
+                    "deterministic work-context preflight completed"
                 );
 
                 let artifact_memory_handoff = Some(
@@ -937,7 +981,15 @@ impl ConversationWorker {
                     )
                     .await
                     {
-                        tracing::warn!("[ROUTER] Failed to persist preflight result: {}", e);
+                        tracing::warn!(
+                            target: "agentic_api::router",
+                            event = "work_context_preflight.persist_result_failed",
+                            conversation_id = %self.conversation_id,
+                            ticket_id = %ticket.ticket_id,
+                            organization = %ticket.organization,
+                            error = %e,
+                            "failed to persist work-context preflight result"
+                        );
                     }
                     self.emit_event(&StreamEvent::RouterResult {
                         enriched_message: enriched_message.clone(),
@@ -977,10 +1029,12 @@ impl ConversationWorker {
                 let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                 record_ticket_preflight_error("failed", elapsed_ms);
                 tracing::warn!(
-                    "[ROUTER] === WORK-CONTEXT PREFLIGHT FAILED ({}ms) === conv={} error={}",
-                    elapsed_ms,
-                    self.conversation_id,
-                    e
+                    target: "agentic_api::router",
+                    event = "work_context_preflight.failed",
+                    conversation_id = %self.conversation_id,
+                    duration_ms = elapsed_ms,
+                    error = %e,
+                    "deterministic work-context preflight failed"
                 );
                 let _ = conversations::set_router_result(
                     &self.db,
@@ -1004,11 +1058,14 @@ impl ConversationWorker {
 
     async fn fail_startup_context_preflight(&mut self, error: anyhow::Error) {
         let failure_message = format!("Startup context preflight failed: {error}");
-        tracing::error!(
-            "[WORKER] Startup context preflight failed for {}: {}",
-            self.conversation_id,
-            error
-        );
+        log_user_visible_runtime_failure(
+            &self.db,
+            &self.conversation_id,
+            RuntimeFailurePhase::StartupContextPreflight,
+            "Startup context preflight failed",
+            &error,
+        )
+        .await;
         self.mark_checkpoint_interrupted().await;
         if let Err(e) = conversations::add_message(
             &self.db,
@@ -1067,11 +1124,14 @@ impl ConversationWorker {
                     let mut accumulated_text = String::new();
                     let mut content_blocks = Vec::new();
                     let failure_message = format!("Failed to build Codex prompt: {}", e);
-                    tracing::error!(
-                        "[WORKER] Failed to build Codex prompt for {}: {}",
-                        self.conversation_id,
-                        e
-                    );
+                    log_user_visible_runtime_failure(
+                        &self.db,
+                        &self.conversation_id,
+                        RuntimeFailurePhase::BuildCodexPrompt,
+                        "Failed to build Codex prompt",
+                        &e,
+                    )
+                    .await;
                     self.mark_checkpoint_interrupted().await;
                     persist_failed_codex_message(
                         self,
@@ -1105,11 +1165,14 @@ impl ConversationWorker {
                 let mut accumulated_text = String::new();
                 let mut content_blocks = Vec::new();
                 let failure_message = format!("Failed to claim runner turn: {}", e);
-                tracing::error!(
-                    "[WORKER] Failed to claim runner turn for {}: {}",
-                    self.conversation_id,
-                    e
-                );
+                log_user_visible_runtime_failure(
+                    &self.db,
+                    &self.conversation_id,
+                    RuntimeFailurePhase::ClaimRunnerTurn,
+                    "Failed to claim runner turn",
+                    &e,
+                )
+                .await;
                 self.mark_checkpoint_interrupted().await;
                 persist_failed_codex_message(
                     self,
@@ -1143,14 +1206,14 @@ impl ConversationWorker {
             .unwrap_or_default();
 
         let codex_spawn_start_ms = Utc::now().timestamp_millis();
-        tracing::info!(
-            "[CHAT_LATENCY] phase=codex_spawn_start conv={} client_id={} runner_turn_id={} model={} effort={} started_at_ms={}",
-            self.conversation_id,
-            self.current_client_id.as_deref().unwrap_or("none"),
-            runner_turn_id,
-            msg.config.codex_options.model,
-            msg.config.codex_options.reasoning_effort,
-            codex_spawn_start_ms
+        runtime::record_spawn_started(
+            &self.conversation_id,
+            self.current_client_id.as_deref(),
+            &runner_turn_id,
+            msg.config.runtime.as_job_runtime(),
+            &msg.config.codex_options.model,
+            &msg.config.codex_options.reasoning_effort,
+            codex_spawn_start_ms,
         );
 
         let mut turn = match spawn_codex_app_server(CodexAppServerOptions {
@@ -1175,11 +1238,24 @@ impl ConversationWorker {
                 let mut accumulated_text = String::new();
                 let mut content_blocks = Vec::new();
                 let failure_message = format!("Failed to start Codex: {}", e);
-                tracing::error!(
-                    "[WORKER] Failed to start Codex turn for {}: {}",
-                    self.conversation_id,
-                    e
+                let failed_at_ms = Utc::now().timestamp_millis();
+                runtime::record_spawn_finished(
+                    &self.conversation_id,
+                    self.current_client_id.as_deref(),
+                    &runner_turn_id,
+                    msg.config.runtime.as_job_runtime(),
+                    "failed",
+                    failed_at_ms.saturating_sub(codex_spawn_start_ms) as u64,
+                    failed_at_ms,
                 );
+                log_user_visible_runtime_failure(
+                    &self.db,
+                    &self.conversation_id,
+                    RuntimeFailurePhase::SpawnCodex,
+                    "Failed to start Codex",
+                    &e,
+                )
+                .await;
                 if let Err(finish_err) =
                     agent_runners::finish_turn(&self.db, &runner_turn_id, "failed").await
                 {
@@ -1203,13 +1279,14 @@ impl ConversationWorker {
             }
         };
         let codex_spawn_ready_ms = Utc::now().timestamp_millis();
-        tracing::info!(
-            "[CHAT_LATENCY] phase=codex_spawn_ready conv={} client_id={} runner_turn_id={} ready_at_ms={} spawn_duration_ms={}",
-            self.conversation_id,
-            self.current_client_id.as_deref().unwrap_or("none"),
-            runner_turn_id,
+        runtime::record_spawn_finished(
+            &self.conversation_id,
+            self.current_client_id.as_deref(),
+            &runner_turn_id,
+            msg.config.runtime.as_job_runtime(),
+            "ready",
+            codex_spawn_ready_ms.saturating_sub(codex_spawn_start_ms) as u64,
             codex_spawn_ready_ms,
-            codex_spawn_ready_ms.saturating_sub(codex_spawn_start_ms)
         );
 
         self.manager
@@ -1269,13 +1346,27 @@ impl ConversationWorker {
                 maybe_event = turn.events.recv() => {
                     match maybe_event {
                         Some(CodexAppServerEvent::ThreadStarted { thread_id: tid }) => {
+                            let started_at_ms = Utc::now().timestamp_millis();
+                            if let Some(turn_started_at_ms) = self.current_turn_started_at_ms {
+                                runtime::record_latency_marker(
+                                    &self.conversation_id,
+                                    self.current_client_id.as_deref(),
+                                    RuntimeLatencyPhase::CodexThreadStarted,
+                                    started_at_ms.saturating_sub(turn_started_at_ms) as u64,
+                                    started_at_ms,
+                                    None,
+                                    None,
+                                );
+                            }
                             tracing::info!(
-                                "[CHAT_LATENCY] phase=codex_thread_started conv={} client_id={} runner_turn_id={} thread_id={} started_at_ms={}",
-                                self.conversation_id,
-                                self.current_client_id.as_deref().unwrap_or("none"),
-                                runner_turn_id,
-                                tid,
-                                Utc::now().timestamp_millis()
+                                target: "agentic_api::runtime",
+                                event = "agent_runtime.codex_thread_started",
+                                conversation_id = %self.conversation_id,
+                                client_id = self.current_client_id.as_deref().unwrap_or("none"),
+                                runner_turn_id = %runner_turn_id,
+                                thread_id = %tid,
+                                started_at_ms,
+                                "Codex thread started"
                             );
                             if let Err(e) = agent_runners::set_turn_session(
                                 &self.db,
@@ -1543,11 +1634,14 @@ impl ConversationWorker {
             }
             Err(e) => {
                 let failure_message = format!("Codex turn failed: {}", e);
-                tracing::error!(
-                    "[WORKER] Failed waiting for Codex turn for {}: {}",
-                    self.conversation_id,
-                    e
-                );
+                log_user_visible_runtime_failure(
+                    &self.db,
+                    &self.conversation_id,
+                    RuntimeFailurePhase::WaitCodexTurn,
+                    "Failed waiting for Codex turn",
+                    &e,
+                )
+                .await;
                 if let Err(finish_err) =
                     agent_runners::finish_turn(&self.db, &runner_turn_id, "failed").await
                 {
@@ -1558,6 +1652,18 @@ impl ConversationWorker {
                     );
                 }
                 self.mark_checkpoint_interrupted().await;
+                if let Some(turn_started_at_ms) = self.current_turn_started_at_ms {
+                    let finished_at_ms = Utc::now().timestamp_millis();
+                    runtime::record_turn_completed(
+                        &self.conversation_id,
+                        msg.config.agent_type.as_str(),
+                        msg.config.runtime.as_job_runtime(),
+                        "failed",
+                        finished_at_ms.saturating_sub(turn_started_at_ms) as u64,
+                        tool_call_count,
+                        accumulated_text.chars().count(),
+                    );
+                }
                 persist_failed_codex_message(
                     self,
                     &assistant_message_id,
@@ -1638,6 +1744,18 @@ impl ConversationWorker {
                 runner_terminal_status,
                 terminal_db_state_started_at_ms,
                 Utc::now().timestamp_millis(),
+            );
+        }
+        if let Some(turn_started_at_ms) = self.current_turn_started_at_ms {
+            let finished_at_ms = Utc::now().timestamp_millis();
+            runtime::record_turn_completed(
+                &self.conversation_id,
+                msg.config.agent_type.as_str(),
+                msg.config.runtime.as_job_runtime(),
+                runner_terminal_status,
+                finished_at_ms.saturating_sub(turn_started_at_ms) as u64,
+                tool_call_count,
+                accumulated_text.chars().count(),
             );
         }
 
@@ -1780,11 +1898,14 @@ impl ConversationWorker {
                 }
             }
             CodexTurnCompletion::Failed(message) => {
-                tracing::error!(
-                    "[WORKER] Codex turn failed for {}: {}",
-                    self.conversation_id,
-                    message
-                );
+                log_user_visible_runtime_failure(
+                    &self.db,
+                    &self.conversation_id,
+                    RuntimeFailurePhase::CodexTurnFailed,
+                    "Codex turn failed",
+                    &message,
+                )
+                .await;
                 self.mark_checkpoint_interrupted().await;
                 persist_failed_codex_message(
                     self,
@@ -1867,25 +1988,31 @@ impl ConversationWorker {
                     let persisted_at_ms = Utc::now().timestamp_millis();
                     if ae_type == "message_start" && !self.first_message_start_logged {
                         self.first_message_start_logged = true;
-                        tracing::info!(
-                            "[CHAT_LATENCY] phase=message_start_persisted conv={} client_id={} event_index={} bytes={} persisted_at_ms={}",
-                            self.conversation_id,
-                            self.current_client_id.as_deref().unwrap_or("none"),
-                            allocated_index,
-                            bytes,
-                            persisted_at_ms
-                        );
+                        if let Some(turn_started_at_ms) = self.current_turn_started_at_ms {
+                            runtime::record_latency_marker(
+                                &self.conversation_id,
+                                self.current_client_id.as_deref(),
+                                RuntimeLatencyPhase::MessageStartPersisted,
+                                persisted_at_ms.saturating_sub(turn_started_at_ms) as u64,
+                                persisted_at_ms,
+                                Some(allocated_index),
+                                Some(bytes),
+                            );
+                        }
                     }
                     if ae_type == "content_block_delta" && !self.first_content_delta_logged {
                         self.first_content_delta_logged = true;
-                        tracing::info!(
-                            "[CHAT_LATENCY] phase=first_assistant_delta_persisted conv={} client_id={} event_index={} bytes={} persisted_at_ms={}",
-                            self.conversation_id,
-                            self.current_client_id.as_deref().unwrap_or("none"),
-                            allocated_index,
-                            bytes,
-                            persisted_at_ms
-                        );
+                        if let Some(turn_started_at_ms) = self.current_turn_started_at_ms {
+                            runtime::record_latency_marker(
+                                &self.conversation_id,
+                                self.current_client_id.as_deref(),
+                                RuntimeLatencyPhase::FirstAssistantDeltaPersisted,
+                                persisted_at_ms.saturating_sub(turn_started_at_ms) as u64,
+                                persisted_at_ms,
+                                Some(allocated_index),
+                                Some(bytes),
+                            );
+                        }
                     }
                     if ae_type == "message_stop" {
                         message_stop_persisted = true;
@@ -2168,16 +2295,20 @@ fn trimmed_non_empty(value: &str) -> Option<String> {
     }
 }
 
-fn safe_preview(input: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (idx, ch) in input.chars().enumerate() {
-        if idx >= max_chars {
-            out.push_str("...");
-            return out;
-        }
-        out.push(ch);
-    }
-    out
+async fn log_user_visible_runtime_failure(
+    db: &Arc<SqlitePool>,
+    conversation_id: &str,
+    phase: RuntimeFailurePhase,
+    message: &str,
+    error: impl std::fmt::Display,
+) {
+    let error = error.to_string();
+    runtime::record_runtime_failure(conversation_id, phase, &error);
+    let detail = format!(
+        "conversation_id={}; phase={}; error={}",
+        conversation_id, phase, error
+    );
+    crate::system_log_helper::log_error(db, "chat", message, Some(&detail)).await;
 }
 
 /// Flush accumulated text content to the database.
