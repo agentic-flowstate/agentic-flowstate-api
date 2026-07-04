@@ -2,7 +2,8 @@
 //!
 //! Replaces individual SSE endpoints (data/subscribe, my-tickets/subscribe,
 //! emails/subscribe, daily-plan/subscribe, conversations/subscribe, dms/subscribe,
-//! meetings/subscribe, library snapshots) with ONE connection that handles all topics.
+//! meetings/subscribe, library snapshots, quick-reference invalidations) with ONE
+//! connection that handles all topics.
 //!
 //! Benefits:
 //! - Single TCP connection instead of 5-7 simultaneous ones
@@ -35,7 +36,7 @@ use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
 #[derive(Debug, Deserialize)]
 pub struct UnifiedEventsQuery {
     /// Comma-separated list of topics to subscribe to.
-    /// Available: tickets, emails, daily_plan, conversations, data, dms, meetings, library
+    /// Available: tickets, emails, daily_plan, conversations, data, dms, meetings, library, quick_references
     /// Default: tickets,emails,daily_plan
     pub topics: Option<String>,
     /// Organization for org-scoped topics (data, conversations, library)
@@ -124,6 +125,7 @@ pub async fn subscribe_unified_events(
         let mut hash_conversations: u64 = 0;
         let mut hash_dms: u64 = 0;
         let mut hash_meetings: u64 = 0;
+        let mut hash_quick_references: u64 = 0;
         let mut hash_epics: u64 = 0;
         let mut hash_slices: u64 = 0;
         let mut hash_data_tickets: u64 = 0;
@@ -354,6 +356,37 @@ pub async fn subscribe_unified_events(
                         if let Ok(json) = serde_json::to_string(&payload) {
                             yield Ok(Event::default().event("meetings").data(json));
                         }
+                    }
+                }
+            }
+
+            // ── QUICK REFERENCES (invalidation only) ─────────────────────
+            if topics.contains("quick_references") {
+                let org_names = if let Some(ref org_name) = validated_org {
+                    vec![org_name.clone()]
+                } else {
+                    user_orgs
+                        .iter()
+                        .map(|membership| membership.organization.clone())
+                        .collect()
+                };
+
+                match quick_reference_revision_hash(&pool, &org_names).await {
+                    Ok((hash, updated_at, count)) => {
+                        if hash != hash_quick_references {
+                            hash_quick_references = hash;
+                            let payload = serde_json::json!({
+                                "type": "quick_references",
+                                "updated_at": updated_at,
+                                "count": count,
+                            });
+                            if let Ok(json) = serde_json::to_string(&payload) {
+                                yield Ok(Event::default().event("quick_references").data(json));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to compute quick-reference SSE revision: {}", e);
                     }
                 }
             }
@@ -606,6 +639,50 @@ fn hash_dm_list(dms: &[ticketing_system::DmConversation]) -> u64 {
     }
     dms.len().hash(&mut hasher);
     hasher.finish()
+}
+
+async fn quick_reference_revision_hash(
+    pool: &SqlitePool,
+    organizations: &[String],
+) -> anyhow::Result<(u64, i64, usize)> {
+    let mut hasher = DefaultHasher::new();
+    let mut max_updated_at = 0_i64;
+    let mut total_count = 0_usize;
+
+    for organization in organizations {
+        organization.hash(&mut hasher);
+        let rows = sqlx::query(
+            r#"
+            SELECT id, scope, conversation_id, key, updated_at
+            FROM quick_references
+            WHERE organization = ?
+            ORDER BY scope, conversation_id, key, id
+            "#,
+        )
+        .bind(organization)
+        .fetch_all(pool)
+        .await?;
+
+        rows.len().hash(&mut hasher);
+        total_count += rows.len();
+
+        for row in rows {
+            let id: String = row.get("id");
+            let scope: String = row.get("scope");
+            let conversation_id: Option<String> = row.get("conversation_id");
+            let key: String = row.get("key");
+            let updated_at: i64 = row.get("updated_at");
+
+            id.hash(&mut hasher);
+            scope.hash(&mut hasher);
+            conversation_id.hash(&mut hasher);
+            key.hash(&mut hasher);
+            updated_at.hash(&mut hasher);
+            max_updated_at = max_updated_at.max(updated_at);
+        }
+    }
+
+    Ok((hasher.finish(), max_updated_at, total_count))
 }
 
 fn hash_epic_list(epics: &[ticketing_system::Epic]) -> u64 {
