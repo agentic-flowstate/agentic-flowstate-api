@@ -4,153 +4,53 @@ use agentic_api::handlers::chat_client_manager::ChatClientManager;
 use agentic_api::handlers::chat_stream::{self, ChatAttachmentData, ChatConfig, ChatRuntime};
 use agentic_api::handlers::conversation_worker::{ConversationWorker, WorkerMessage};
 use agentic_api::runner_commands;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use futures::FutureExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use ticketing_system::{agent_runners, checkpoints, conversation_turn_jobs, conversations};
+use ticketing_system::{
+    agent_runners, checkpoints, conversation_turn_jobs, conversations, runner_capacity,
+};
 use tokio::signal;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const RUNNER_KIND: &str = "agent-runner";
-const RUNNER_HEARTBEAT_STALE_SECONDS: i64 = 90;
+const RUNNER_KIND: &str = runner_capacity::RUNNER_KIND;
+const RUNNER_HEARTBEAT_STALE_SECONDS: i64 = runner_capacity::RUNNER_HEARTBEAT_STALE_SECONDS;
 const RUNNER_HEARTBEAT_INTERVAL_SECONDS: u64 = 15;
 const RUNNER_POLL_INTERVAL_MS: u64 = 750;
+const RUNNER_POLICY_REFRESH_INTERVAL_SECONDS: u64 = 5;
 const RUNNER_RECONCILE_INTERVAL_SECONDS: u64 = 60;
-const DEFAULT_ADAPTIVE_MAX_CONCURRENCY: usize = 12;
-const DEFAULT_ADAPTIVE_CLAIM_BURST: usize = 1;
-const DEFAULT_ADAPTIVE_DB_IDLE_RESERVE: usize = 1;
-const DEFAULT_ADAPTIVE_MAX_LOAD_PER_CORE_MILLIS: u32 = 1500;
-const DEFAULT_ADAPTIVE_CLAIM_INTERVAL_SECONDS: u64 = 10;
 const RUNNER_BACKPRESSURE_LOG_INTERVAL_SECONDS: u64 = 15;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunnerConcurrency {
-    Fixed(usize),
-    Adaptive(AdaptiveConcurrency),
+struct RunnerPolicyCache {
+    policy: runner_capacity::RunnerCapacityPolicy,
+    loaded_at: Instant,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AdaptiveConcurrency {
-    max_jobs: usize,
-    claim_burst: usize,
-    db_idle_reserve: usize,
-    max_load_per_core_millis: u32,
-    claim_interval_seconds: u64,
-}
-
-impl Default for AdaptiveConcurrency {
-    fn default() -> Self {
-        Self {
-            max_jobs: DEFAULT_ADAPTIVE_MAX_CONCURRENCY,
-            claim_burst: DEFAULT_ADAPTIVE_CLAIM_BURST,
-            db_idle_reserve: DEFAULT_ADAPTIVE_DB_IDLE_RESERVE,
-            max_load_per_core_millis: DEFAULT_ADAPTIVE_MAX_LOAD_PER_CORE_MILLIS,
-            claim_interval_seconds: DEFAULT_ADAPTIVE_CLAIM_INTERVAL_SECONDS,
-        }
+impl RunnerPolicyCache {
+    async fn load(db: &ticketing_system::SqlitePool) -> Result<Self> {
+        Ok(Self {
+            policy: runner_capacity::load_policy(db, RUNNER_KIND).await?,
+            loaded_at: Instant::now(),
+        })
     }
-}
 
-impl RunnerConcurrency {
-    fn claim_admission(
-        self,
-        active_jobs: usize,
-        claims_this_poll: usize,
-        last_claim_at: Option<Instant>,
-        db: &ticketing_system::SqlitePool,
-    ) -> Result<ClaimAdmission> {
-        match self {
-            RunnerConcurrency::Fixed(limit) => {
-                if active_jobs < limit {
-                    Ok(ClaimAdmission::Allowed)
-                } else {
-                    Ok(ClaimAdmission::Denied(ClaimDenial::ConcurrencyLimit {
-                        active_jobs,
-                        max_jobs: limit,
-                    }))
-                }
-            }
-            RunnerConcurrency::Adaptive(config) => {
-                if let Some(last_claim_at) = last_claim_at {
-                    let claim_interval = Duration::from_secs(config.claim_interval_seconds);
-                    let elapsed = last_claim_at.elapsed();
-                    if elapsed < claim_interval {
-                        return Ok(ClaimAdmission::Denied(ClaimDenial::ClaimPacing {
-                            elapsed,
-                            claim_interval,
-                        }));
-                    }
-                }
-                let load = current_system_load(config)?;
-                if load.load1 >= load.max_load {
-                    return Ok(ClaimAdmission::Denied(ClaimDenial::HostLoad(load)));
-                }
-                if active_jobs >= config.max_jobs {
-                    return Ok(ClaimAdmission::Denied(ClaimDenial::ConcurrencyLimit {
-                        active_jobs,
-                        max_jobs: config.max_jobs,
-                    }));
-                }
-                if claims_this_poll >= config.claim_burst {
-                    return Ok(ClaimAdmission::Denied(ClaimDenial::ClaimBurst {
-                        claims_this_poll,
-                        claim_burst: config.claim_burst,
-                    }));
-                }
-                if !db_has_capacity(db, config.db_idle_reserve) {
-                    return Ok(ClaimAdmission::Denied(ClaimDenial::DbPool {
-                        pool_size: db.size(),
-                        pool_max: db.options().get_max_connections(),
-                        pool_idle: db.num_idle(),
-                        idle_reserve: config.db_idle_reserve,
-                    }));
-                }
-
-                Ok(ClaimAdmission::Allowed)
-            }
+    async fn refresh_if_stale(&mut self, db: &ticketing_system::SqlitePool) -> Result<()> {
+        if self.loaded_at.elapsed() >= Duration::from_secs(RUNNER_POLICY_REFRESH_INTERVAL_SECONDS) {
+            self.policy = runner_capacity::load_policy(db, RUNNER_KIND).await?;
+            self.loaded_at = Instant::now();
         }
+        Ok(())
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ClaimAdmission {
-    Allowed,
-    Denied(ClaimDenial),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ClaimDenial {
-    ConcurrencyLimit {
-        active_jobs: usize,
-        max_jobs: usize,
-    },
-    ClaimBurst {
-        claims_this_poll: usize,
-        claim_burst: usize,
-    },
-    ClaimPacing {
-        elapsed: Duration,
-        claim_interval: Duration,
-    },
-    DbPool {
-        pool_size: u32,
-        pool_max: u32,
-        pool_idle: usize,
-        idle_reserve: usize,
-    },
-    HostLoad(SystemLoad),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SystemLoad {
-    load1: f64,
-    cpu_count: usize,
-    max_load: f64,
+    fn policy(&self) -> &runner_capacity::RunnerCapacityPolicy {
+        &self.policy
+    }
 }
 
 #[tokio::main]
@@ -223,20 +123,8 @@ async fn main() -> Result<()> {
     spawn_runner_generation_reconciler(db.clone(), shutdown.child_token());
     spawn_shutdown_listener(shutdown.clone());
 
-    let concurrency = runner_concurrency()?;
-    match concurrency {
-        RunnerConcurrency::Fixed(limit) => {
-            tracing::info!("Agentic runner concurrency fixed at {}", limit)
-        }
-        RunnerConcurrency::Adaptive(config) => tracing::info!(
-            "Agentic runner concurrency adaptive: max_jobs={}, claim_burst={}, claim_interval_seconds={}, db_idle_reserve={}, max_load_per_core={:.3}",
-            config.max_jobs,
-            config.claim_burst,
-            config.claim_interval_seconds,
-            config.db_idle_reserve,
-            max_load_per_core(config)
-        ),
-    }
+    let mut policy_cache = RunnerPolicyCache::load(&db).await?;
+    log_policy(policy_cache.policy());
     let mut joins = JoinSet::<(String, Result<String>)>::new();
     let mut accepting = true;
     let mut last_claim_at: Option<Instant> = None;
@@ -259,10 +147,33 @@ async fn main() -> Result<()> {
 
         let mut claims_this_poll = 0;
         while accepting {
-            match concurrency.claim_admission(joins.len(), claims_this_poll, last_claim_at, &db)? {
-                ClaimAdmission::Allowed => {}
-                ClaimAdmission::Denied(denial) => {
-                    log_backpressure(denial, joins.len(), &mut last_backpressure_log);
+            policy_cache.refresh_if_stale(&db).await?;
+            match runner_capacity::evaluate_claim(
+                policy_cache.policy(),
+                joins.len(),
+                claims_this_poll,
+                last_claim_at.map(|instant| instant.elapsed()),
+                &db,
+            )? {
+                runner_capacity::RunnerClaimDecision::Allowed => {}
+                runner_capacity::RunnerClaimDecision::Denied(denial) => {
+                    if should_report_backpressure(&mut last_backpressure_log) {
+                        log_backpressure(&denial);
+                        if let Err(e) = runner_capacity::record_claim_denial(
+                            &db,
+                            RUNNER_KIND,
+                            Some(&generation_id),
+                            &denial,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                "Failed to record runner claim denial for generation {}: {}",
+                                generation_id,
+                                e
+                            );
+                        }
+                    }
                     break;
                 }
             }
@@ -351,201 +262,83 @@ async fn is_generation_draining(
     Ok(status.as_deref() == Some("draining"))
 }
 
-fn runner_concurrency() -> Result<RunnerConcurrency> {
-    let mut concurrency =
-        parse_runner_concurrency(std::env::var("AGENTIC_RUNNER_CONCURRENCY").ok().as_deref())?;
-    if let RunnerConcurrency::Adaptive(config) = &mut concurrency {
-        config.max_jobs =
-            parse_optional_usize_env("AGENTIC_RUNNER_ADAPTIVE_MAX_JOBS", config.max_jobs)?;
-        config.claim_burst =
-            parse_optional_usize_env("AGENTIC_RUNNER_ADAPTIVE_CLAIM_BURST", config.claim_burst)?;
-        config.db_idle_reserve = parse_optional_usize_env(
-            "AGENTIC_RUNNER_ADAPTIVE_DB_IDLE_RESERVE",
-            config.db_idle_reserve,
-        )?;
-        config.max_load_per_core_millis = parse_optional_load_per_core_env(
-            "AGENTIC_RUNNER_ADAPTIVE_MAX_LOAD_PER_CORE",
-            config.max_load_per_core_millis,
-        )?;
-        config.claim_interval_seconds = parse_optional_u64_env(
-            "AGENTIC_RUNNER_ADAPTIVE_CLAIM_INTERVAL_SECONDS",
-            config.claim_interval_seconds,
-        )?;
-    }
-
-    Ok(concurrency)
-}
-
-fn parse_runner_concurrency(value: Option<&str>) -> Result<RunnerConcurrency> {
-    let Some(raw) = value else {
-        return Ok(RunnerConcurrency::Adaptive(AdaptiveConcurrency::default()));
-    };
-
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(RunnerConcurrency::Adaptive(AdaptiveConcurrency::default()));
-    }
-
-    if matches!(
-        trimmed.to_ascii_lowercase().as_str(),
-        "adaptive" | "unlimited"
-    ) {
-        return Ok(RunnerConcurrency::Adaptive(AdaptiveConcurrency::default()));
-    }
-
-    let limit = trimmed.parse::<usize>().with_context(|| {
-        "AGENTIC_RUNNER_CONCURRENCY must be a positive integer, 'adaptive', or 'unlimited'"
-    })?;
-    if limit == 0 {
-        bail!("AGENTIC_RUNNER_CONCURRENCY must be greater than zero");
-    }
-    Ok(RunnerConcurrency::Fixed(limit))
-}
-
-fn db_has_capacity(db: &ticketing_system::SqlitePool, idle_reserve: usize) -> bool {
-    db.size() < db.options().get_max_connections() || db.num_idle() > idle_reserve
-}
-
-fn current_system_load(config: AdaptiveConcurrency) -> Result<SystemLoad> {
-    let cpu_count = std::thread::available_parallelism()
-        .context("failed to read available CPU parallelism for runner backpressure")?
-        .get();
-    let mut loads = [0.0_f64; 3];
-    let samples = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
-    if samples != 1 {
-        bail!("failed to read 1-minute system load average for runner backpressure");
-    }
-
-    Ok(SystemLoad {
-        load1: loads[0],
-        cpu_count,
-        max_load: cpu_count as f64 * max_load_per_core(config),
-    })
-}
-
-fn max_load_per_core(config: AdaptiveConcurrency) -> f64 {
-    f64::from(config.max_load_per_core_millis) / 1000.0
-}
-
-fn parse_optional_usize_env(name: &str, default: usize) -> Result<usize> {
-    let Some(raw) = optional_env(name)? else {
-        return Ok(default);
-    };
-
-    let value = raw
-        .parse::<usize>()
-        .with_context(|| format!("{name} must be a positive integer"))?;
-    if value == 0 {
-        bail!("{name} must be greater than zero");
-    }
-    Ok(value)
-}
-
-fn parse_optional_u64_env(name: &str, default: u64) -> Result<u64> {
-    let Some(raw) = optional_env(name)? else {
-        return Ok(default);
-    };
-
-    let value = raw
-        .parse::<u64>()
-        .with_context(|| format!("{name} must be a positive integer"))?;
-    if value == 0 {
-        bail!("{name} must be greater than zero");
-    }
-    Ok(value)
-}
-
-fn parse_optional_load_per_core_env(name: &str, default: u32) -> Result<u32> {
-    let Some(raw) = optional_env(name)? else {
-        return Ok(default);
-    };
-
-    parse_load_per_core_millis(&raw).with_context(|| {
-        format!("{name} must be a positive number, such as 1.5 for 150% of CPU cores")
-    })
-}
-
-fn optional_env(name: &str) -> Result<Option<String>> {
-    match std::env::var(name) {
-        Ok(value) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(trimmed.to_string()))
-            }
-        }
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("failed to read {name}")),
+fn log_policy(policy: &runner_capacity::RunnerCapacityPolicy) {
+    if policy.mode == "fixed" {
+        tracing::info!(
+            "Agentic runner capacity policy fixed: max_jobs={} max_pending_jobs={} source={}",
+            policy.max_jobs,
+            policy.max_pending_jobs,
+            policy.policy_source
+        );
+    } else {
+        tracing::info!(
+            "Agentic runner capacity policy adaptive: max_jobs={} max_pending_jobs={} claim_burst={} claim_interval_seconds={} db_idle_reserve={} max_load_per_core={:.3} source={}",
+            policy.max_jobs,
+            policy.max_pending_jobs,
+            policy.claim_burst.unwrap_or_default(),
+            policy.claim_interval_seconds.unwrap_or_default(),
+            policy.db_idle_reserve.unwrap_or_default(),
+            f64::from(policy.max_load_per_core_millis.unwrap_or_default()) / 1000.0,
+            policy.policy_source
+        );
     }
 }
 
-fn parse_load_per_core_millis(raw: &str) -> Result<u32> {
-    let value = raw
-        .parse::<f64>()
-        .context("load threshold must be numeric")?;
-    if !value.is_finite() || value <= 0.0 {
-        bail!("load threshold must be greater than zero");
-    }
-    if value > 1000.0 {
-        bail!("load threshold is implausibly high");
-    }
-    Ok((value * 1000.0).round() as u32)
-}
-
-fn log_backpressure(denial: ClaimDenial, active_jobs: usize, last_backpressure_log: &mut Instant) {
+fn should_report_backpressure(last_backpressure_log: &mut Instant) -> bool {
     if last_backpressure_log.elapsed()
         < Duration::from_secs(RUNNER_BACKPRESSURE_LOG_INTERVAL_SECONDS)
     {
-        return;
+        return false;
     }
     *last_backpressure_log = Instant::now();
+    true
+}
 
-    match denial {
-        ClaimDenial::HostLoad(load) => tracing::warn!(
-            "Agentic runner host-load backpressure: active_jobs={} load1={:.2} max_load={:.2} cpu_count={}",
-            active_jobs,
-            load.load1,
-            load.max_load,
-            load.cpu_count
-        ),
-        ClaimDenial::DbPool {
-            pool_size,
-            pool_max,
-            pool_idle,
-            idle_reserve,
-        } => tracing::warn!(
-            "Agentic runner DB backpressure: active_jobs={} pool_size={} pool_max={} pool_idle={} idle_reserve={}",
-            active_jobs,
-            pool_size,
-            pool_max,
-            pool_idle,
-            idle_reserve
-        ),
-        ClaimDenial::ConcurrencyLimit {
-            active_jobs,
-            max_jobs,
-        } => tracing::debug!(
+fn log_backpressure(denial: &runner_capacity::RunnerClaimDenial) {
+    match denial.reason.as_str() {
+        "host_load" => {
+            if let Some(load) = denial.host {
+                tracing::warn!(
+                    "Agentic runner host-load backpressure: active_jobs={} load1={:.2} max_load={:.2} cpu_count={}",
+                    denial.active_jobs,
+                    load.load_1m,
+                    load.max_load,
+                    load.cpu_count
+                );
+            }
+        }
+        "db_pool" => {
+            if let Some(pool) = denial.db_pool {
+                tracing::warn!(
+                    "Agentic runner DB backpressure: active_jobs={} pool_size={} pool_max={} pool_idle={} idle_reserve={}",
+                    denial.active_jobs,
+                    pool.size,
+                    pool.max_connections,
+                    pool.idle,
+                    pool.idle_reserve.unwrap_or_default()
+                );
+            }
+        }
+        "concurrency_cap" => tracing::debug!(
             "Agentic runner at concurrency cap: active_jobs={} max_jobs={}",
-            active_jobs,
-            max_jobs
+            denial.active_jobs,
+            denial.max_jobs.unwrap_or_default()
         ),
-        ClaimDenial::ClaimBurst {
-            claims_this_poll,
-            claim_burst,
-        } => tracing::debug!(
+        "claim_burst" => tracing::debug!(
             "Agentic runner claim burst reached: claims_this_poll={} claim_burst={}",
-            claims_this_poll,
-            claim_burst
+            denial.claims_this_poll.unwrap_or_default(),
+            denial.claim_burst.unwrap_or_default()
         ),
-        ClaimDenial::ClaimPacing {
-            elapsed,
-            claim_interval,
-        } => tracing::debug!(
+        "claim_pacing" => tracing::debug!(
             "Agentic runner claim pacing active: active_jobs={} elapsed_ms={} claim_interval_ms={}",
-            active_jobs,
-            elapsed.as_millis(),
-            claim_interval.as_millis()
+            denial.active_jobs,
+            denial.elapsed_ms.unwrap_or_default(),
+            denial.claim_interval_ms.unwrap_or_default()
+        ),
+        other => tracing::debug!(
+            "Agentic runner claim denied: reason={} active_jobs={}",
+            other,
+            denial.active_jobs
         ),
     }
 }
@@ -616,6 +409,30 @@ fn spawn_heartbeat(
                     generation_id,
                     e
                 );
+            }
+            match runner_capacity::build_snapshot(&db).await {
+                Ok(snapshot) => {
+                    if let Err(e) = runner_capacity::record_capacity_sample(
+                        &db,
+                        Some(&generation_id),
+                        &snapshot,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "Failed to record runner capacity sample for generation {}: {}",
+                            generation_id,
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to build runner capacity sample for generation {}: {}",
+                        generation_id,
+                        e
+                    );
+                }
             }
         }
     });
@@ -977,75 +794,7 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        parse_load_per_core_millis, parse_runner_concurrency, terminal_status_from_event,
-        AdaptiveConcurrency, RunnerConcurrency, DEFAULT_ADAPTIVE_CLAIM_BURST,
-        DEFAULT_ADAPTIVE_CLAIM_INTERVAL_SECONDS, DEFAULT_ADAPTIVE_DB_IDLE_RESERVE,
-        DEFAULT_ADAPTIVE_MAX_CONCURRENCY, DEFAULT_ADAPTIVE_MAX_LOAD_PER_CORE_MILLIS,
-    };
-
-    #[test]
-    fn absent_runner_concurrency_uses_adaptive_default() {
-        let concurrency = parse_runner_concurrency(None).unwrap();
-
-        assert_eq!(
-            concurrency,
-            RunnerConcurrency::Adaptive(AdaptiveConcurrency {
-                max_jobs: DEFAULT_ADAPTIVE_MAX_CONCURRENCY,
-                claim_burst: DEFAULT_ADAPTIVE_CLAIM_BURST,
-                db_idle_reserve: DEFAULT_ADAPTIVE_DB_IDLE_RESERVE,
-                max_load_per_core_millis: DEFAULT_ADAPTIVE_MAX_LOAD_PER_CORE_MILLIS,
-                claim_interval_seconds: DEFAULT_ADAPTIVE_CLAIM_INTERVAL_SECONDS,
-            })
-        );
-    }
-
-    #[test]
-    fn empty_runner_concurrency_uses_adaptive_default() {
-        assert!(matches!(
-            parse_runner_concurrency(Some("  ")).unwrap(),
-            RunnerConcurrency::Adaptive(_)
-        ));
-    }
-
-    #[test]
-    fn unlimited_runner_concurrency_uses_adaptive_backpressure() {
-        assert!(matches!(
-            parse_runner_concurrency(Some("unlimited")).unwrap(),
-            RunnerConcurrency::Adaptive(_)
-        ));
-        assert!(matches!(
-            parse_runner_concurrency(Some("adaptive")).unwrap(),
-            RunnerConcurrency::Adaptive(_)
-        ));
-    }
-
-    #[test]
-    fn configured_runner_concurrency_limits_claims() {
-        let concurrency = parse_runner_concurrency(Some("4")).unwrap();
-
-        assert_eq!(concurrency, RunnerConcurrency::Fixed(4));
-    }
-
-    #[test]
-    fn invalid_runner_concurrency_fails() {
-        assert!(parse_runner_concurrency(Some("0")).is_err());
-        assert!(parse_runner_concurrency(Some("abc")).is_err());
-    }
-
-    #[test]
-    fn load_per_core_parser_returns_millis() {
-        assert_eq!(parse_load_per_core_millis("1.5").unwrap(), 1500);
-        assert_eq!(parse_load_per_core_millis("2").unwrap(), 2000);
-    }
-
-    #[test]
-    fn invalid_load_per_core_fails() {
-        assert!(parse_load_per_core_millis("0").is_err());
-        assert!(parse_load_per_core_millis("-1").is_err());
-        assert!(parse_load_per_core_millis("nan").is_err());
-        assert!(parse_load_per_core_millis("abc").is_err());
-    }
+    use super::terminal_status_from_event;
 
     #[test]
     fn terminal_event_status_maps_startup_errors_to_failed() {
