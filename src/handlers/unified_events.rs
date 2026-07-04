@@ -2,7 +2,7 @@
 //!
 //! Replaces individual SSE endpoints (data/subscribe, my-tickets/subscribe,
 //! emails/subscribe, daily-plan/subscribe, conversations/subscribe, dms/subscribe,
-//! meetings/subscribe, library snapshots, quick-reference invalidations) with ONE
+//! meetings/subscribe, library snapshots, ops status, quick-reference invalidations) with ONE
 //! connection that handles all topics.
 //!
 //! Benefits:
@@ -36,7 +36,7 @@ use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
 #[derive(Debug, Deserialize)]
 pub struct UnifiedEventsQuery {
     /// Comma-separated list of topics to subscribe to.
-    /// Available: tickets, emails, daily_plan, conversations, data, dms, meetings, library, quick_references
+    /// Available: tickets, emails, daily_plan, conversations, data, dms, meetings, library, agent_operations, quick_references
     /// Default: tickets,emails,daily_plan
     pub topics: Option<String>,
     /// Organization for org-scoped topics (data, conversations, library)
@@ -130,6 +130,7 @@ pub async fn subscribe_unified_events(
         let mut hash_slices: u64 = 0;
         let mut hash_data_tickets: u64 = 0;
         let mut hash_library: u64 = 0;
+        let mut hash_agent_operations: u64 = 0;
         let mut conversations_caught_up = conversation_resume_after.is_none();
 
         // Cache org memberships (rarely change during session)
@@ -473,6 +474,29 @@ pub async fn subscribe_unified_events(
                 }
             }
 
+            // ── AGENT OPERATIONS (runner capacity / host load) ─────────
+            if topics.contains("agent_operations") {
+                match super::runner_capacity::build_snapshot(&pool).await {
+                    Ok(snapshot) => {
+                        let hash = hash_json_value(&snapshot);
+                        if hash != hash_agent_operations {
+                            hash_agent_operations = hash;
+                            let payload = serde_json::json!({
+                                "type": "agent_operations",
+                                "status": snapshot,
+                                "updated_at": chrono::Utc::now().timestamp(),
+                            });
+                            if let Ok(json) = serde_json::to_string(&payload) {
+                                yield Ok(Event::default().event("agent_operations").data(json));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to build agent operations SSE snapshot: {}", e);
+                    }
+                }
+            }
+
             // ── RESTART PENDING (check flag file) ────────────────────
             // Zero-cost addition to existing poll loop — just a file stat.
             // Pushes restart notification to active clients immediately.
@@ -731,6 +755,14 @@ fn hash_library_lists(
         document.updated_at_iso.hash(&mut hasher);
     }
     documents.len().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_json_value<T: serde::Serialize>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    if let Ok(json) = serde_json::to_string(value) {
+        json.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
