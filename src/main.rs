@@ -945,19 +945,6 @@ async fn main() -> anyhow::Result<()> {
             "/api/retrieval-feedback",
             post(handlers::record_retrieval_feedback),
         )
-        // Chat quick-reference drawer routes
-        .route(
-            "/api/quick-reference",
-            get(handlers::list_quick_reference).post(handlers::upsert_quick_reference),
-        )
-        .route(
-            "/api/quick-reference/reorder",
-            post(handlers::reorder_quick_reference),
-        )
-        .route(
-            "/api/quick-reference/:id",
-            patch(handlers::patch_quick_reference).delete(handlers::delete_quick_reference),
-        )
         // Document routes (artifact-based)
         .route(
             "/api/tickets/:ticket_id/docs",
@@ -1261,6 +1248,21 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/quick-commands",
             get(handlers::quick_commands::list_quick_commands),
+        )
+        // Chat quick-reference drawer routes. These are user-scoped because
+        // conversation references are authorized by conversation ownership,
+        // while organization references are membership-gated in the handler.
+        .route(
+            "/api/quick-reference",
+            get(handlers::list_quick_reference).post(handlers::upsert_quick_reference),
+        )
+        .route(
+            "/api/quick-reference/reorder",
+            post(handlers::reorder_quick_reference),
+        )
+        .route(
+            "/api/quick-reference/:id",
+            patch(handlers::patch_quick_reference).delete(handlers::delete_quick_reference),
         )
         // Token usage tracking
         .route("/api/usage", get(handlers::usage::get_usage))
