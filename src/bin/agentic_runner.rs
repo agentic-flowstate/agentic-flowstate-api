@@ -809,6 +809,7 @@ struct TerminalEventStatus {
     message: Option<String>,
 }
 
+#[cfg(test)]
 fn terminal_status_from_event(event_type: &str, event_data: &str) -> Option<&'static str> {
     terminal_event_details_from_event(event_type, event_data).map(|details| details.status)
 }
