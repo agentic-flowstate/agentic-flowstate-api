@@ -40,6 +40,7 @@ use crate::observability::cancellation;
 use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_opened, DisconnectReason,
 };
+use crate::runner_commands;
 use tokio::sync::{broadcast, RwLock};
 
 static CONVERSATION_STATUS_BROADCASTER: Lazy<
@@ -1586,20 +1587,101 @@ pub async fn cancel_conversation(
     let runner_turn_exists = agent_runners::has_active_turn_for_conversation(&pool, &id)
         .await
         .unwrap_or(false);
+    let mut runner_command_delivered = false;
+    let mut runner_command_interrupted = false;
+    let mut runner_command_error: Option<String> = None;
+    let mut runner_command_observability_recorded = false;
+    if runner_turn_exists {
+        let command_started_ms = chrono::Utc::now().timestamp_millis();
+        match runner_commands::send_cancel_conversation_command(&id).await {
+            Ok(result) => {
+                runner_command_delivered = true;
+                runner_command_interrupted = result.interrupted;
+                let command_elapsed_ms = chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_sub(command_started_ms);
+                let command_delivered_ms = chrono::Utc::now().timestamp_millis();
+                cancellation::record_runner_command_delivered(
+                    &id,
+                    cancel_requested_ms,
+                    command_started_ms,
+                    command_delivered_ms,
+                    worker_exists,
+                    runner_turn_exists,
+                    cancelled_pending_jobs,
+                );
+                runner_command_observability_recorded = true;
+                if let Some(error) = result.error {
+                    tracing::warn!(
+                        "[CANCEL] Runner command delivered with interrupt error for conversation {} command_elapsed_ms={} marker_set={} interrupted={} error={}",
+                        id,
+                        command_elapsed_ms,
+                        result.marker_set,
+                        result.interrupted,
+                        error
+                    );
+                    runner_command_error = Some(error);
+                } else {
+                    tracing::info!(
+                        "[CANCEL] Runner command delivered for conversation {} command_elapsed_ms={} marker_set={} interrupted={}",
+                        id,
+                        command_elapsed_ms,
+                        result.marker_set,
+                        result.interrupted
+                    );
+                }
+            }
+            Err(e) => {
+                let command_checked_ms = chrono::Utc::now().timestamp_millis();
+                let command_elapsed_ms = command_checked_ms.saturating_sub(command_started_ms);
+                cancellation::record_runner_command_unavailable(
+                    &id,
+                    cancel_requested_ms,
+                    command_checked_ms,
+                    worker_exists,
+                    runner_turn_exists,
+                    cancelled_pending_jobs,
+                );
+                runner_command_observability_recorded = true;
+                tracing::warn!(
+                    "[CANCEL] Runner command unavailable for conversation {} command_elapsed_ms={} error={} durable_marker_written=true",
+                    id,
+                    command_elapsed_ms,
+                    e
+                );
+                runner_command_error = Some(e.to_string());
+            }
+        }
+    }
+    let runner_command_error = runner_command_error.unwrap_or_else(|| "none".to_string());
 
     // Try to interrupt the running agent
     let interrupt_started_ms = chrono::Utc::now().timestamp_millis();
     match manager.interrupt(&id).await {
         Ok(true) => {
             let interrupted_ms = chrono::Utc::now().timestamp_millis();
-            cancellation::record_runner_command_delivered(
-                &id,
-                cancel_requested_ms,
-                interrupt_started_ms,
-                interrupted_ms,
+            if !runner_command_observability_recorded {
+                cancellation::record_runner_command_delivered(
+                    &id,
+                    cancel_requested_ms,
+                    interrupt_started_ms,
+                    interrupted_ms,
+                    worker_exists,
+                    runner_turn_exists,
+                    cancelled_pending_jobs,
+                );
+            }
+            tracing::info!(
+                "[CANCEL] Interrupted agent for conversation {} request_to_interrupt_ms={} interrupt_elapsed_ms={} worker_exists={} runner_turn_exists={} cancelled_pending_jobs={} runner_command_delivered={} runner_command_interrupted={} runner_command_error={}",
+                id,
+                interrupted_ms.saturating_sub(cancel_requested_ms),
+                interrupted_ms.saturating_sub(interrupt_started_ms),
                 worker_exists,
                 runner_turn_exists,
                 cancelled_pending_jobs,
+                runner_command_delivered,
+                runner_command_interrupted,
+                runner_command_error
             );
             // Broadcast cancelled status so SSE clients get notified
             let event = crate::agents::StreamEvent::Status {
@@ -1613,29 +1695,37 @@ pub async fn cancel_conversation(
         }
         Ok(false) => {
             let no_live_turn_ms = chrono::Utc::now().timestamp_millis();
-            cancellation::record_runner_command_unavailable(
-                &id,
-                cancel_requested_ms,
-                no_live_turn_ms,
-                worker_exists,
-                runner_turn_exists,
-                cancelled_pending_jobs,
-            );
+            if !runner_command_observability_recorded {
+                cancellation::record_runner_command_unavailable(
+                    &id,
+                    cancel_requested_ms,
+                    no_live_turn_ms,
+                    worker_exists,
+                    runner_turn_exists,
+                    cancelled_pending_jobs,
+                );
+            }
             if worker_exists || runner_turn_exists {
                 tracing::info!(
-                    "[CANCEL] Marked active/queued turn cancelled for conversation {} request_to_marker_ms={} worker_exists={} runner_turn_exists={} cancelled_pending_jobs={}",
+                    "[CANCEL] Marked active/queued turn cancelled for conversation {} request_to_marker_ms={} worker_exists={} runner_turn_exists={} cancelled_pending_jobs={} runner_command_delivered={} runner_command_interrupted={} runner_command_error={}",
                     id,
                     no_live_turn_ms.saturating_sub(cancel_requested_ms),
                     worker_exists,
                     runner_turn_exists,
-                    cancelled_pending_jobs
+                    cancelled_pending_jobs,
+                    runner_command_delivered,
+                    runner_command_interrupted,
+                    runner_command_error
                 );
             } else {
                 tracing::info!(
-                    "[CANCEL] No active runner turn for conversation {} request_to_idle_ms={} cancelled_pending_jobs={}",
+                    "[CANCEL] No active runner turn for conversation {} request_to_idle_ms={} cancelled_pending_jobs={} runner_command_delivered={} runner_command_interrupted={} runner_command_error={}",
                     id,
                     no_live_turn_ms.saturating_sub(cancel_requested_ms),
-                    cancelled_pending_jobs
+                    cancelled_pending_jobs,
+                    runner_command_delivered,
+                    runner_command_interrupted,
+                    runner_command_error
                 );
                 let _ = manager.consume_cancelled_turn(&id).await;
                 match checkpoints::get_checkpoint(&pool, &id).await {

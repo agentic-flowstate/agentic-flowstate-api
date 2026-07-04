@@ -16,5 +16,6 @@ pub mod package_updates;
 pub mod rate_limiting;
 pub mod request_logger;
 pub mod retention;
+pub mod runner_commands;
 pub mod safety;
 pub mod system_log_helper;

@@ -3,6 +3,7 @@ use agentic_api::apns;
 use agentic_api::handlers::chat_client_manager::ChatClientManager;
 use agentic_api::handlers::chat_stream::{self, ChatAttachmentData, ChatConfig, ChatRuntime};
 use agentic_api::handlers::conversation_worker::{ConversationWorker, WorkerMessage};
+use agentic_api::runner_commands;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use futures::FutureExt;
@@ -203,6 +204,21 @@ async fn main() -> Result<()> {
         generation_id.clone(),
     ));
     let shutdown = CancellationToken::new();
+    let command_server =
+        match runner_commands::start_runner_command_server(manager.clone(), shutdown.child_token())
+            .await
+        {
+            Ok(server) => server,
+            Err(e) => {
+                let reason = format!("runner command server startup failed: {e}");
+                let _ = agent_runners::mark_generation_failed(&db, &generation_id, &reason).await;
+                return Err(e.context("Failed to start runner command server"));
+            }
+        };
+    tracing::info!(
+        "Agentic runner command socket ready at {}",
+        command_server.path().display()
+    );
     spawn_heartbeat(db.clone(), generation_id.clone(), shutdown.child_token());
     spawn_runner_generation_reconciler(db.clone(), shutdown.child_token());
     spawn_shutdown_listener(shutdown.clone());
@@ -307,6 +323,8 @@ async fn main() -> Result<()> {
             _ = tokio::time::sleep(Duration::from_millis(RUNNER_POLL_INTERVAL_MS)) => {}
         }
     }
+
+    command_server.shutdown().await;
 
     if let Err(e) = agent_runners::mark_generation_exited(&db, &generation_id).await {
         tracing::warn!(

@@ -19,6 +19,10 @@ mod retention;
 pub mod safety;
 pub mod system_log_helper;
 
+mod runner_commands {
+    pub use agentic_api::runner_commands::*;
+}
+
 use axum::{
     extract::{DefaultBodyLimit, FromRef},
     routing::{delete, get, patch, post},
