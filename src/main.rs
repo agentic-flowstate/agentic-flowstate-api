@@ -1511,6 +1511,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::agent_operations::get_agent_operations_status),
         )
         .route(
+            "/api/agent-operations/trends",
+            get(handlers::agent_operations::get_agent_operations_trends),
+        )
+        .route(
             "/api/conversations/:id/stream",
             get(handlers::reconnect_conversation_stream),
         )
@@ -1650,6 +1654,10 @@ async fn main() -> anyhow::Result<()> {
     let admin_routes = Router::new()
         .route("/api/admin/logs", get(handlers::admin_logs::list_logs))
         .route("/api/admin/check", get(handlers::admin_logs::check_admin))
+        .route(
+            "/api/admin/ops/timeline",
+            get(handlers::ops_timeline::list_ops_timeline),
+        )
         // Full Access Chat routes are admin-only; external collaborators use scoped-workspace.
         .route("/api/full-access/chat", post(handlers::full_access_chat))
         .route(
