@@ -14,7 +14,10 @@ use ticketing_system::{SqlitePool, TranscriptionResponse};
 use crate::{auth_middleware::AuthenticatedUser, system_log_helper};
 
 const CLIENT_REQUEST_ID_HEADER: &str = "X-Client-Request-ID";
+const OPENAI_TRANSCRIPTIONS_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
 const WHISPER_TIMEOUT_SECONDS: u64 = 65;
+const TRANSCRIPTION_MAX_ATTEMPTS: u8 = 2;
+const TRANSCRIPTION_RETRY_DELAY_MS: u64 = 250;
 
 // ============================================================================
 // Standalone Voice Transcription (OpenAI Whisper)
@@ -117,32 +120,6 @@ pub async fn voice_transcribe(
         }
     };
 
-    let part = match reqwest::multipart::Part::bytes(audio_bytes)
-        .file_name(file_name)
-        .mime_str(mime_type)
-    {
-        Ok(part) => part,
-        Err(e) => {
-            log_voice_event(
-                &pool,
-                "error",
-                "transcription_multipart_failed",
-                format!("request_id={} error={}", request_id, e),
-                &user.user_id,
-            )
-            .await;
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-        }
-    };
-
-    let mut form = reqwest::multipart::Form::new()
-        .part("file", part)
-        .text("model", "whisper-1");
-
-    if let Some(lang) = &req.language {
-        form = form.text("language", lang.clone());
-    }
-
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(WHISPER_TIMEOUT_SECONDS))
         .build()
@@ -161,58 +138,130 @@ pub async fn voice_transcribe(
         }
     };
 
-    let upstream_started_at = Instant::now();
-    let response = match client
-        .post("https://api.openai.com/v1/audio/transcriptions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .multipart(form)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(e) => {
-            let duration_ms = upstream_started_at.elapsed().as_millis();
+    let mut attempt = 1;
+    let (response, upstream_duration_ms) = loop {
+        let form = match build_whisper_form(
+            &audio_bytes,
+            &file_name,
+            mime_type,
+            req.language.as_deref(),
+        ) {
+            Ok(form) => form,
+            Err(e) => {
+                log_voice_event(
+                    &pool,
+                    "error",
+                    "transcription_multipart_failed",
+                    format!("request_id={} error={}", request_id, e),
+                    &user.user_id,
+                )
+                .await;
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
+        };
+
+        let upstream_started_at = Instant::now();
+        let response = match client
+            .post(OPENAI_TRANSCRIPTIONS_URL)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                let duration_ms = upstream_started_at.elapsed().as_millis();
+                if attempt < TRANSCRIPTION_MAX_ATTEMPTS {
+                    log_voice_event(
+                        &pool,
+                        "warn",
+                        "transcription_upstream_retry",
+                        format!(
+                            "request_id={} attempt={} next_attempt={} duration_ms={} timeout_seconds={} reason=request_failed error={}",
+                            request_id,
+                            attempt,
+                            attempt + 1,
+                            duration_ms,
+                            WHISPER_TIMEOUT_SECONDS,
+                            e
+                        ),
+                        &user.user_id,
+                    )
+                    .await;
+                    tokio::time::sleep(Duration::from_millis(TRANSCRIPTION_RETRY_DELAY_MS)).await;
+                    attempt += 1;
+                    continue;
+                }
+
+                log_voice_event(
+                    &pool,
+                    "error",
+                    "transcription_upstream_request_failed",
+                    format!(
+                        "request_id={} duration_ms={} timeout_seconds={} error={}",
+                        request_id, duration_ms, WHISPER_TIMEOUT_SECONDS, e
+                    ),
+                    &user.user_id,
+                )
+                .await;
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Whisper API request failed: {}", e),
+                ));
+            }
+        };
+        let upstream_duration_ms = upstream_started_at.elapsed().as_millis();
+
+        if !response.status().is_success() {
+            let upstream_status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            let truncated_error_text = error_text.chars().take(300).collect::<String>();
+            if attempt < TRANSCRIPTION_MAX_ATTEMPTS
+                && should_retry_transcription_response(upstream_status, &error_text)
+            {
+                log_voice_event(
+                    &pool,
+                    "warn",
+                    "transcription_upstream_retry",
+                    format!(
+                        "request_id={} attempt={} next_attempt={} upstream_status={} duration_ms={} reason=upstream_response body={}",
+                        request_id,
+                        attempt,
+                        attempt + 1,
+                        upstream_status.as_u16(),
+                        upstream_duration_ms,
+                        truncated_error_text
+                    ),
+                    &user.user_id,
+                )
+                .await;
+                tokio::time::sleep(Duration::from_millis(TRANSCRIPTION_RETRY_DELAY_MS)).await;
+                attempt += 1;
+                continue;
+            }
+
             log_voice_event(
                 &pool,
                 "error",
-                "transcription_upstream_request_failed",
+                "transcription_upstream_error",
                 format!(
-                    "request_id={} duration_ms={} timeout_seconds={} error={}",
-                    request_id, duration_ms, WHISPER_TIMEOUT_SECONDS, e
+                    "request_id={} upstream_status={} duration_ms={} body={}",
+                    request_id,
+                    upstream_status.as_u16(),
+                    upstream_duration_ms,
+                    truncated_error_text
                 ),
                 &user.user_id,
             )
             .await;
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Whisper API request failed: {}", e),
+                format!("OpenAI Whisper error: {}", error_text),
             ));
         }
-    };
-    let upstream_duration_ms = upstream_started_at.elapsed().as_millis();
 
-    if !response.status().is_success() {
-        let upstream_status = response.status();
-        let error_text = response.text().await.unwrap_or_default();
-        log_voice_event(
-            &pool,
-            "error",
-            "transcription_upstream_error",
-            format!(
-                "request_id={} upstream_status={} duration_ms={} body={}",
-                request_id,
-                upstream_status.as_u16(),
-                upstream_duration_ms,
-                error_text.chars().take(300).collect::<String>()
-            ),
-            &user.user_id,
-        )
-        .await;
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("OpenAI Whisper error: {}", error_text),
-        ));
-    }
+        break (response, upstream_duration_ms);
+    };
 
     #[derive(Deserialize)]
     struct WhisperResponse {
@@ -272,6 +321,38 @@ fn client_request_id(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+fn build_whisper_form(
+    audio_bytes: &[u8],
+    file_name: &str,
+    mime_type: &str,
+    language: Option<&str>,
+) -> Result<reqwest::multipart::Form, reqwest::Error> {
+    let part = reqwest::multipart::Part::bytes(audio_bytes.to_vec())
+        .file_name(file_name.to_string())
+        .mime_str(mime_type)?;
+
+    let mut form = reqwest::multipart::Form::new()
+        .part("file", part)
+        .text("model", "whisper-1");
+
+    if let Some(lang) = language {
+        form = form.text("language", lang.to_string());
+    }
+
+    Ok(form)
+}
+
+fn should_retry_transcription_response(status: StatusCode, body: &str) -> bool {
+    if status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        return true;
+    }
+
+    status == StatusCode::NOT_FOUND && body.contains("Invalid URL (POST /v1/audio/transcriptions)")
+}
+
 async fn log_voice_event(
     pool: &Arc<SqlitePool>,
     level: &str,
@@ -289,4 +370,51 @@ async fn log_voice_event(
         None,
     )
     .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retries_observed_openai_audio_route_404() {
+        let body = r#"{"error":{"message":"Invalid URL (POST /v1/audio/transcriptions)"}}"#;
+
+        assert!(should_retry_transcription_response(
+            StatusCode::NOT_FOUND,
+            body
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_unrelated_404() {
+        assert!(!should_retry_transcription_response(
+            StatusCode::NOT_FOUND,
+            r#"{"error":{"message":"missing resource"}}"#
+        ));
+    }
+
+    #[test]
+    fn retries_transient_status_codes() {
+        assert!(should_retry_transcription_response(
+            StatusCode::REQUEST_TIMEOUT,
+            ""
+        ));
+        assert!(should_retry_transcription_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            ""
+        ));
+        assert!(should_retry_transcription_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ""
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_bad_request() {
+        assert!(!should_retry_transcription_response(
+            StatusCode::BAD_REQUEST,
+            ""
+        ));
+    }
 }
