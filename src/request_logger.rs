@@ -8,6 +8,11 @@ use std::time::Instant;
 use axum::{extract::Request, middleware::Next, response::Response};
 use sqlx::SqlitePool;
 
+/// Optional response extension that handlers can set to persist diagnostic
+/// detail on the automatic request log row.
+#[derive(Clone, Debug)]
+pub struct RequestLogDetail(pub String);
+
 /// Paths that are too noisy to log (SSE streams, health checks, polling endpoints).
 const SKIP_PATHS: &[&str] = &[
     "/health",
@@ -111,6 +116,10 @@ pub async fn request_logger(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     let duration = start.elapsed();
     let status = response.status().as_u16();
+    let detail = response
+        .extensions()
+        .get::<RequestLogDetail>()
+        .map(|detail| detail.0.clone());
 
     // Log in background task — never block the response
     if let Some(pool) = pool {
@@ -131,7 +140,7 @@ pub async fn request_logger(request: Request, next: Next) -> Response {
                 &level,
                 &component,
                 &message,
-                None,
+                detail.as_deref(),
                 None,
                 sid.as_deref(),
             )

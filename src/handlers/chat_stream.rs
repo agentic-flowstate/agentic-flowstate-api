@@ -32,6 +32,7 @@ use crate::agents::{AgentType, AgentsConfig, StreamEvent};
 use crate::observability::runtime::{self, RuntimeLatencyPhase};
 use crate::observability::streaming::{record_stream_event_emitted, DisconnectReason};
 use crate::rate_limiting::{self, RateLimitDecision, StreamPermit};
+use crate::request_logger::RequestLogDetail;
 use ticketing_system::{agent_runners, checkpoints, conversation_turn_jobs};
 
 /// File data attached to a chat message (base64-encoded).
@@ -308,6 +309,18 @@ async fn codex_model_catalog() -> Result<Vec<ChatCodexModelOptionItem>, String> 
         .cloned()
 }
 
+fn codex_options_error_response(
+    status: StatusCode,
+    error: String,
+    detail: serde_json::Value,
+) -> Response {
+    let mut response = (status, Json(json!({ "error": error }))).into_response();
+    response
+        .extensions_mut()
+        .insert(RequestLogDetail(detail.to_string()));
+    response
+}
+
 fn resolve_catalog_model<'a>(
     catalog: &'a [ChatCodexModelOptionItem],
     model: &str,
@@ -321,7 +334,22 @@ async fn validate_codex_options(
     requested: Option<ChatCodexOptions>,
 ) -> Result<ChatCodexOptions, Response> {
     let catalog = codex_model_catalog().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+        tracing::error!(
+            target: "agentic_api::chat_codex_options",
+            agent = agent_type.as_str(),
+            error = %e,
+            "failed to load Codex model catalog while validating turn options"
+        );
+        codex_options_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e.clone(),
+            json!({
+                "reason": "codex_model_catalog_unavailable",
+                "operation": "validate_codex_options",
+                "agent": agent_type.as_str(),
+                "error": e,
+            }),
+        )
     })?;
 
     let Some(requested) = requested else {
@@ -330,11 +358,16 @@ async fn validate_codex_options(
 
     let model = requested.model.trim();
     let Some(model_option) = resolve_catalog_model(&catalog, model) else {
-        return Err((
+        return Err(codex_options_error_response(
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Unsupported Codex model: {}", requested.model)})),
-        )
-            .into_response());
+            format!("Unsupported Codex model: {}", requested.model),
+            json!({
+                "reason": "unsupported_codex_model",
+                "operation": "validate_codex_options",
+                "agent": agent_type.as_str(),
+                "requested_model": requested.model,
+            }),
+        ));
     };
 
     let effort = requested.reasoning_effort.trim().to_lowercase();
@@ -343,11 +376,25 @@ async fn validate_codex_options(
         .iter()
         .any(|option| option.id == effort)
     {
-        return Err((
+        return Err(codex_options_error_response(
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Unsupported Codex reasoning effort: {}", requested.reasoning_effort)})),
-        )
-            .into_response());
+            format!(
+                "Unsupported Codex reasoning effort: {}",
+                requested.reasoning_effort
+            ),
+            json!({
+                "reason": "unsupported_codex_reasoning_effort",
+                "operation": "validate_codex_options",
+                "agent": agent_type.as_str(),
+                "model": model_option.id.as_str(),
+                "requested_reasoning_effort": requested.reasoning_effort,
+                "supported_reasoning_efforts": model_option
+                    .supported_reasoning_efforts
+                    .iter()
+                    .map(|option| option.id.as_str())
+                    .collect::<Vec<_>>(),
+            }),
+        ));
     }
 
     Ok(ChatCodexOptions {
@@ -396,23 +443,66 @@ pub async fn codex_chat_options(
 ) -> Result<Json<ChatCodexOptionsResponse>, Response> {
     let agent_key = params.agent.as_deref().unwrap_or("full-access");
     let Some(agent_type) = AgentType::from_chat_agent_key(agent_key) else {
-        return Err((
+        return Err(codex_options_error_response(
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("Unsupported chat agent: {}", agent_key)})),
-        )
-            .into_response());
+            format!("Unsupported chat agent: {}", agent_key),
+            json!({
+                "reason": "unsupported_chat_agent",
+                "operation": "codex_chat_options",
+                "requested_agent": agent_key,
+            }),
+        ));
     };
 
     let catalog = codex_model_catalog().await.map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+        tracing::error!(
+            target: "agentic_api::chat_codex_options",
+            requested_agent = agent_key,
+            agent = agent_type.as_str(),
+            error = %e,
+            "failed to load Codex model catalog"
+        );
+        codex_options_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            e.clone(),
+            json!({
+                "reason": "codex_model_catalog_unavailable",
+                "operation": "codex_chat_options",
+                "requested_agent": agent_key,
+                "agent": agent_type.as_str(),
+                "error": e,
+            }),
+        )
     })?;
     let defaults = ChatCodexOptions::default_for_agent(&agent_type);
     let default_model = resolve_catalog_model(&catalog, &defaults.model).ok_or_else(|| {
-        (
+        let available_models = catalog
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        tracing::error!(
+            target: "agentic_api::chat_codex_options",
+            requested_agent = agent_key,
+            agent = agent_type.as_str(),
+            configured_model = %defaults.model,
+            ?available_models,
+            "configured Codex model is not available in the runtime catalog"
+        );
+        codex_options_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Configured Codex model is not available: {}", defaults.model)})),
+            format!(
+                "Configured Codex model is not available: {}",
+                defaults.model
+            ),
+            json!({
+                "reason": "configured_codex_model_unavailable",
+                "operation": "codex_chat_options",
+                "requested_agent": agent_key,
+                "agent": agent_type.as_str(),
+                "configured_model": defaults.model,
+                "available_models": available_models,
+            }),
         )
-            .into_response()
     })?;
     let default_reasoning_effort = if default_model
         .supported_reasoning_efforts
@@ -444,6 +534,33 @@ pub async fn codex_chat_options(
         models: catalog,
         reasoning_efforts,
     }))
+}
+
+#[cfg(test)]
+mod codex_options_error_tests {
+    use super::*;
+
+    #[test]
+    fn error_response_carries_request_log_detail() {
+        let response = codex_options_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "catalog failed".to_string(),
+            json!({
+                "reason": "codex_model_catalog_unavailable",
+                "agent": "full-access",
+            }),
+        );
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = response
+            .extensions()
+            .get::<RequestLogDetail>()
+            .expect("request log detail extension");
+        assert!(detail
+            .0
+            .contains("\"reason\":\"codex_model_catalog_unavailable\""));
+        assert!(detail.0.contains("\"agent\":\"full-access\""));
+    }
 }
 
 #[derive(Debug, Serialize)]
