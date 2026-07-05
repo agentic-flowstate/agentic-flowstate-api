@@ -17,6 +17,7 @@ use crate::{agents::prompts::load_prompt, auth_middleware::AuthenticatedUser, sy
 
 const CLIENT_REQUEST_ID_HEADER: &str = "X-Client-Request-ID";
 const OPENAI_AUDIO_TIMEOUT_SECONDS: u64 = 90;
+const ALEX_VOICE_MODEL: &str = "gpt-4o-audio-preview";
 const OUTPUT_FORMAT: &str = "mp3";
 const DEFAULT_VOICE: &str = "alloy";
 
@@ -103,12 +104,6 @@ pub async fn alex_voice_turn(
             "OPENAI_KEY not set".to_string(),
         )
     })?;
-    let model = std::env::var("OPENAI_ALEX_VOICE_MODEL").map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "OPENAI_ALEX_VOICE_MODEL not set".to_string(),
-        )
-    })?;
     let voice = req
         .voice
         .filter(|value| !value.trim().is_empty())
@@ -129,14 +124,14 @@ pub async fn alex_voice_turn(
             request_id,
             input_format,
             audio_bytes.len(),
-            model
+            ALEX_VOICE_MODEL
         ),
         &user.user_id,
     )
     .await;
 
     let body = serde_json::json!({
-        "model": model,
+        "model": ALEX_VOICE_MODEL,
         "modalities": ["text", "audio"],
         "audio": {
             "voice": voice,
@@ -252,7 +247,7 @@ pub async fn alex_voice_turn(
         format: OUTPUT_FORMAT.to_string(),
         transcript: payload.transcript,
         audio_bytes: response_audio_bytes,
-        model,
+        model: ALEX_VOICE_MODEL.to_string(),
     }))
 }
 
