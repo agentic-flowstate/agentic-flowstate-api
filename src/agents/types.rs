@@ -345,3 +345,55 @@ pub struct AgentRunsResponse {
 // enum without pulling in this file's `AgentsConfig`/`once_cell::Lazy`
 // static initializer. The compatibility re-export in `agents/mod.rs`
 // keeps every existing `use crate::agents::StreamEvent` import working.
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentType, AgentsConfig};
+
+    #[test]
+    fn home_planner_has_no_email_tools() {
+        let tools = AgentType::HomePlanner.allowed_tools();
+        let disallowed = [
+            "mcp__agentic-mcp__list_emails",
+            "mcp__agentic-mcp__get_email",
+            "mcp__agentic-mcp__search_emails",
+            "mcp__agentic-mcp__read_email_content",
+            "mcp__agentic-mcp__send_email",
+            "mcp__agentic-mcp__list_email_threads",
+            "mcp__agentic-mcp__get_email_thread",
+            "mcp__agentic-mcp__list_drafts",
+            "mcp__agentic-mcp__get_draft",
+            "mcp__agentic-mcp__create_draft",
+            "mcp__agentic-mcp__update_draft",
+            "mcp__agentic-mcp__delete_draft",
+            "mcp__agentic-mcp__send_draft",
+            "mcp__agentic-mcp__list_email_accounts",
+        ];
+
+        for tool in disallowed {
+            assert!(
+                !tools.contains(&tool),
+                "home-planner must not be an email agent: {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_email_guard_tools_are_not_explicitly_allowlisted() {
+        let removed = [
+            "mcp__agentic-mcp__prepare_email_for_agent_intake",
+            "mcp__agentic-mcp__read_guarded_email_content",
+            "mcp__agentic-mcp__get_safe_agent_email_payload",
+            "mcp__agentic-mcp__check_email_agent_action_gate",
+        ];
+
+        for (agent_name, config) in &AgentsConfig::get().agents {
+            for tool in removed {
+                assert!(
+                    !config.tools.iter().any(|allowed| allowed == tool),
+                    "{agent_name} explicitly allowlists removed email guard tool {tool}"
+                );
+            }
+        }
+    }
+}
