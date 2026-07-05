@@ -343,6 +343,14 @@ fn should_skip_log(log: &SystemLog) -> bool {
         || message.contains("[health_monitor]")
         || message.contains("health endpoint")
         || message.contains("automated health check")
+        || is_readiness_probe_503_request_log(&message)
+}
+
+fn is_readiness_probe_503_request_log(message: &str) -> bool {
+    let message = message.trim();
+    message.starts_with("get /health/ready ")
+        && (message.contains("→ 503") || message.contains("-> 503"))
+        && !message.contains("/api/")
 }
 
 fn incident_ticket_title(incident: &SystemLogIncident) -> String {
@@ -436,7 +444,23 @@ mod tests {
             "api",
             "health endpoint returned unexpected body"
         )));
+        assert!(should_skip_log(&test_log(
+            "api",
+            "GET /health/ready → 503 (0ms)"
+        )));
         assert!(!should_skip_log(&test_log("chat", "Codex runtime failed")));
+    }
+
+    #[test]
+    fn readiness_probe_skip_does_not_hide_non_health_api_failures() {
+        assert!(!should_skip_log(&test_log(
+            "api",
+            "GET /api/health/ready → 503 (0ms)"
+        )));
+        assert!(!should_skip_log(&test_log(
+            "api",
+            "GET /health/ready-check → 503 (0ms)"
+        )));
     }
 
     #[test]

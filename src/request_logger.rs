@@ -11,6 +11,7 @@ use sqlx::SqlitePool;
 /// Paths that are too noisy to log (SSE streams, health checks, polling endpoints).
 const SKIP_PATHS: &[&str] = &[
     "/health",
+    "/health/ready",
     "/api/data/subscribe",
     "/api/emails/subscribe",
     "/api/conversations/subscribe",
@@ -19,6 +20,10 @@ const SKIP_PATHS: &[&str] = &[
     "/api/daily-plan/subscribe",
     "/api/meetings/signaling",
 ];
+
+fn should_skip_path(path: &str) -> bool {
+    SKIP_PATHS.iter().any(|skip| path == *skip)
+}
 
 /// Detect component from the URL path prefix.
 fn detect_component(path: &str) -> &'static str {
@@ -76,7 +81,7 @@ pub async fn request_logger(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
 
     // Skip noisy endpoints
-    if SKIP_PATHS.iter().any(|skip| path == *skip) {
+    if should_skip_path(&path) {
         return next.run(request).await;
     }
 
@@ -135,4 +140,25 @@ pub async fn request_logger(request: Request, next: Next) -> Response {
     }
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_probe_is_skipped_as_health_check_noise() {
+        assert!(should_skip_path("/health"));
+        assert!(should_skip_path("/health/ready"));
+        assert!(!should_skip_path("/api/health"));
+        assert!(!should_skip_path("/api/admin/pending-restart"));
+    }
+
+    #[test]
+    fn non_health_5xx_responses_still_log_as_errors() {
+        assert_eq!(level_from_status(500), "error");
+        assert_eq!(level_from_status(503), "error");
+        assert_eq!(level_from_status(404), "warn");
+        assert_eq!(level_from_status(200), "info");
+    }
 }
