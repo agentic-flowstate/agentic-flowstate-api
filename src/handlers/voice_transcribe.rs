@@ -14,7 +14,10 @@ use ticketing_system::{SqlitePool, TranscriptionResponse};
 use crate::{auth_middleware::AuthenticatedUser, system_log_helper};
 
 const CLIENT_REQUEST_ID_HEADER: &str = "X-Client-Request-ID";
+const VOICE_JOB_ID_HEADER: &str = "X-Voice-Job-ID";
+const VOICE_SESSION_ID_HEADER: &str = "X-Voice-Session-ID";
 const OPENAI_TRANSCRIPTIONS_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
+const OPENAI_TRANSCRIPTIONS_PATH_ERROR: &str = "Invalid URL (POST /v1/audio/transcriptions)";
 const WHISPER_TIMEOUT_SECONDS: u64 = 65;
 const TRANSCRIPTION_MAX_ATTEMPTS: u8 = 2;
 const TRANSCRIPTION_RETRY_DELAY_MS: u64 = 250;
@@ -45,7 +48,8 @@ pub async fn voice_transcribe(
     Json(req): Json<VoiceTranscribeRequest>,
 ) -> Result<Json<TranscriptionResponse>, (StatusCode, String)> {
     use base64::Engine;
-    let request_id = client_request_id(&headers);
+    let trace_ids = voice_trace_ids(&headers);
+    let trace_detail = trace_ids.detail_prefix();
     let started_at = Instant::now();
 
     let audio_bytes = match base64::engine::general_purpose::STANDARD.decode(&req.audio_data) {
@@ -55,7 +59,7 @@ pub async fn voice_transcribe(
                 &pool,
                 "warn",
                 "transcription_invalid_audio",
-                format!("request_id={} error={}", request_id, e),
+                format!("{} error={}", trace_detail, e),
                 &user.user_id,
             )
             .await;
@@ -69,8 +73,8 @@ pub async fn voice_transcribe(
         "info",
         "transcription_request_received",
         format!(
-            "request_id={} format={} audio_bytes={} base64_chars={}",
-            request_id,
+            "{} format={} audio_bytes={} base64_chars={}",
+            trace_detail,
             req.format,
             audio_byte_count,
             req.audio_data.len()
@@ -86,7 +90,7 @@ pub async fn voice_transcribe(
                 &pool,
                 "error",
                 "transcription_config_missing",
-                format!("request_id={} missing=OPENAI_KEY", request_id),
+                format!("{} missing=OPENAI_KEY", trace_detail),
                 &user.user_id,
             )
             .await;
@@ -98,18 +102,14 @@ pub async fn voice_transcribe(
     };
 
     let file_name = format!("audio.{}", req.format);
-    let mime_type = match req.format.as_str() {
-        "webm" => "audio/webm",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        "m4a" => "audio/mp4",
-        "ogg" => "audio/ogg",
+    let mime_type = match mime_type_for_format(&req.format) {
+        Some(mime_type) => mime_type,
         _ => {
             log_voice_event(
                 &pool,
                 "warn",
                 "transcription_unsupported_format",
-                format!("request_id={} format={}", request_id, req.format),
+                format!("{} format={}", trace_detail, req.format),
                 &user.user_id,
             )
             .await;
@@ -130,7 +130,7 @@ pub async fn voice_transcribe(
                 &pool,
                 "error",
                 "transcription_http_client_failed",
-                format!("request_id={} error={}", request_id, e),
+                format!("{} error={}", trace_detail, e),
                 &user.user_id,
             )
             .await;
@@ -139,7 +139,7 @@ pub async fn voice_transcribe(
     };
 
     let mut attempt = 1;
-    let (response, upstream_duration_ms) = loop {
+    let (response, upstream_duration_ms, final_attempt) = loop {
         let form = match build_whisper_form(
             &audio_bytes,
             &file_name,
@@ -152,7 +152,7 @@ pub async fn voice_transcribe(
                     &pool,
                     "error",
                     "transcription_multipart_failed",
-                    format!("request_id={} error={}", request_id, e),
+                    format!("{} attempt={} error={}", trace_detail, attempt, e),
                     &user.user_id,
                 )
                 .await;
@@ -172,17 +172,31 @@ pub async fn voice_transcribe(
             Err(e) => {
                 let duration_ms = upstream_started_at.elapsed().as_millis();
                 if attempt < TRANSCRIPTION_MAX_ATTEMPTS {
+                    tracing::warn!(
+                        target: "agentic_api::voice_transcribe",
+                        request_id = %trace_ids.client_request_id,
+                        voice_job_id = ?trace_ids.voice_job_id,
+                        voice_session_id = ?trace_ids.voice_session_id,
+                        attempt,
+                        next_attempt = attempt + 1,
+                        duration_ms,
+                        timeout_seconds = WHISPER_TIMEOUT_SECONDS,
+                        retry_delay_ms = TRANSCRIPTION_RETRY_DELAY_MS,
+                        error = %e,
+                        "retrying voice transcription after upstream request failure"
+                    );
                     log_voice_event(
                         &pool,
                         "warn",
                         "transcription_upstream_retry",
                         format!(
-                            "request_id={} attempt={} next_attempt={} duration_ms={} timeout_seconds={} reason=request_failed error={}",
-                            request_id,
+                            "{} attempt={} next_attempt={} duration_ms={} timeout_seconds={} delay_ms={} reason=request_failed error={}",
+                            trace_detail,
                             attempt,
                             attempt + 1,
                             duration_ms,
                             WHISPER_TIMEOUT_SECONDS,
+                            TRANSCRIPTION_RETRY_DELAY_MS,
                             e
                         ),
                         &user.user_id,
@@ -193,19 +207,30 @@ pub async fn voice_transcribe(
                     continue;
                 }
 
+                tracing::error!(
+                    target: "agentic_api::voice_transcribe",
+                    request_id = %trace_ids.client_request_id,
+                    voice_job_id = ?trace_ids.voice_job_id,
+                    voice_session_id = ?trace_ids.voice_session_id,
+                    attempt,
+                    duration_ms,
+                    timeout_seconds = WHISPER_TIMEOUT_SECONDS,
+                    error = %e,
+                    "voice transcription upstream request failed"
+                );
                 log_voice_event(
                     &pool,
                     "error",
                     "transcription_upstream_request_failed",
                     format!(
-                        "request_id={} duration_ms={} timeout_seconds={} error={}",
-                        request_id, duration_ms, WHISPER_TIMEOUT_SECONDS, e
+                        "{} attempt={} duration_ms={} timeout_seconds={} error={}",
+                        trace_detail, attempt, duration_ms, WHISPER_TIMEOUT_SECONDS, e
                     ),
                     &user.user_id,
                 )
                 .await;
                 return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::BAD_GATEWAY,
                     format!("Whisper API request failed: {}", e),
                 ));
             }
@@ -215,21 +240,34 @@ pub async fn voice_transcribe(
         if !response.status().is_success() {
             let upstream_status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            let truncated_error_text = error_text.chars().take(300).collect::<String>();
+            let truncated_error_text = truncate_detail(&error_text, 300);
             if attempt < TRANSCRIPTION_MAX_ATTEMPTS
                 && should_retry_transcription_response(upstream_status, &error_text)
             {
+                tracing::warn!(
+                    target: "agentic_api::voice_transcribe",
+                    request_id = %trace_ids.client_request_id,
+                    voice_job_id = ?trace_ids.voice_job_id,
+                    voice_session_id = ?trace_ids.voice_session_id,
+                    attempt,
+                    next_attempt = attempt + 1,
+                    upstream_status = upstream_status.as_u16(),
+                    upstream_duration_ms,
+                    retry_delay_ms = TRANSCRIPTION_RETRY_DELAY_MS,
+                    "retrying voice transcription after upstream response"
+                );
                 log_voice_event(
                     &pool,
                     "warn",
                     "transcription_upstream_retry",
                     format!(
-                        "request_id={} attempt={} next_attempt={} upstream_status={} duration_ms={} reason=upstream_response body={}",
-                        request_id,
+                        "{} attempt={} next_attempt={} upstream_status={} duration_ms={} delay_ms={} reason=upstream_response body={}",
+                        trace_detail,
                         attempt,
                         attempt + 1,
                         upstream_status.as_u16(),
                         upstream_duration_ms,
+                        TRANSCRIPTION_RETRY_DELAY_MS,
                         truncated_error_text
                     ),
                     &user.user_id,
@@ -240,13 +278,24 @@ pub async fn voice_transcribe(
                 continue;
             }
 
+            tracing::error!(
+                target: "agentic_api::voice_transcribe",
+                request_id = %trace_ids.client_request_id,
+                voice_job_id = ?trace_ids.voice_job_id,
+                voice_session_id = ?trace_ids.voice_session_id,
+                attempt,
+                upstream_status = upstream_status.as_u16(),
+                upstream_duration_ms,
+                "voice transcription upstream error"
+            );
             log_voice_event(
                 &pool,
                 "error",
                 "transcription_upstream_error",
                 format!(
-                    "request_id={} upstream_status={} duration_ms={} body={}",
-                    request_id,
+                    "{} attempt={} upstream_status={} duration_ms={} body={}",
+                    trace_detail,
+                    attempt,
                     upstream_status.as_u16(),
                     upstream_duration_ms,
                     truncated_error_text
@@ -255,12 +304,12 @@ pub async fn voice_transcribe(
             )
             .await;
             return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_GATEWAY,
                 format!("OpenAI Whisper error: {}", error_text),
             ));
         }
 
-        break (response, upstream_duration_ms);
+        break (response, upstream_duration_ms, attempt);
     };
 
     #[derive(Deserialize)]
@@ -271,19 +320,29 @@ pub async fn voice_transcribe(
     let whisper: WhisperResponse = match response.json().await {
         Ok(whisper) => whisper,
         Err(e) => {
+            tracing::error!(
+                target: "agentic_api::voice_transcribe",
+                request_id = %trace_ids.client_request_id,
+                voice_job_id = ?trace_ids.voice_job_id,
+                voice_session_id = ?trace_ids.voice_session_id,
+                attempt = final_attempt,
+                upstream_duration_ms,
+                error = %e,
+                "failed to parse voice transcription response"
+            );
             log_voice_event(
                 &pool,
                 "error",
                 "transcription_upstream_parse_failed",
                 format!(
-                    "request_id={} duration_ms={} error={}",
-                    request_id, upstream_duration_ms, e
+                    "{} attempt={} duration_ms={} error={}",
+                    trace_detail, final_attempt, upstream_duration_ms, e
                 ),
                 &user.user_id,
             )
             .await;
             return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::BAD_GATEWAY,
                 format!("Failed to parse Whisper response: {}", e),
             ));
         }
@@ -294,8 +353,9 @@ pub async fn voice_transcribe(
         "info",
         "transcription_request_succeeded",
         format!(
-            "request_id={} duration_ms={} upstream_duration_ms={} audio_bytes={} text_chars={}",
-            request_id,
+            "{} attempt={} duration_ms={} upstream_duration_ms={} audio_bytes={} text_chars={}",
+            trace_detail,
+            final_attempt,
             started_at.elapsed().as_millis(),
             upstream_duration_ms,
             audio_byte_count,
@@ -311,14 +371,53 @@ pub async fn voice_transcribe(
     }))
 }
 
-fn client_request_id(headers: &HeaderMap) -> String {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VoiceTraceIds {
+    client_request_id: String,
+    voice_job_id: Option<String>,
+    voice_session_id: Option<String>,
+}
+
+impl VoiceTraceIds {
+    fn detail_prefix(&self) -> String {
+        let mut parts = vec![format!("request_id={}", self.client_request_id)];
+        if let Some(voice_job_id) = &self.voice_job_id {
+            parts.push(format!("voice_job_id={}", voice_job_id));
+        }
+        if let Some(voice_session_id) = &self.voice_session_id {
+            parts.push(format!("voice_session_id={}", voice_session_id));
+        }
+        parts.join(" ")
+    }
+}
+
+fn voice_trace_ids(headers: &HeaderMap) -> VoiceTraceIds {
+    VoiceTraceIds {
+        client_request_id: header_value(headers, CLIENT_REQUEST_ID_HEADER)
+            .unwrap_or_else(|| "missing".to_string()),
+        voice_job_id: header_value(headers, VOICE_JOB_ID_HEADER),
+        voice_session_id: header_value(headers, VOICE_SESSION_ID_HEADER),
+    }
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
-        .get(CLIENT_REQUEST_ID_HEADER)
+        .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("missing")
-        .to_string()
+        .map(ToString::to_string)
+}
+
+fn mime_type_for_format(format: &str) -> Option<&'static str> {
+    match format {
+        "webm" => Some("audio/webm"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "m4a" => Some("audio/mp4"),
+        "ogg" => Some("audio/ogg"),
+        _ => None,
+    }
 }
 
 fn build_whisper_form(
@@ -343,14 +442,15 @@ fn build_whisper_form(
 }
 
 fn should_retry_transcription_response(status: StatusCode, body: &str) -> bool {
-    if status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
-    {
+    if matches!(status.as_u16(), 408 | 409 | 425 | 429) || status.is_server_error() {
         return true;
     }
 
-    status == StatusCode::NOT_FOUND && body.contains("Invalid URL (POST /v1/audio/transcriptions)")
+    status == StatusCode::NOT_FOUND && body.contains(OPENAI_TRANSCRIPTIONS_PATH_ERROR)
+}
+
+fn truncate_detail(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 async fn log_voice_event(
@@ -416,5 +516,36 @@ mod tests {
             StatusCode::BAD_REQUEST,
             ""
         ));
+    }
+
+    #[test]
+    fn voice_trace_ids_include_client_job_and_session_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CLIENT_REQUEST_ID_HEADER, "request-1".parse().unwrap());
+        headers.insert(VOICE_JOB_ID_HEADER, "job-1".parse().unwrap());
+        headers.insert(VOICE_SESSION_ID_HEADER, "session-1".parse().unwrap());
+
+        let trace_ids = voice_trace_ids(&headers);
+
+        assert_eq!(
+            trace_ids,
+            VoiceTraceIds {
+                client_request_id: "request-1".to_string(),
+                voice_job_id: Some("job-1".to_string()),
+                voice_session_id: Some("session-1".to_string()),
+            }
+        );
+        assert_eq!(
+            trace_ids.detail_prefix(),
+            "request_id=request-1 voice_job_id=job-1 voice_session_id=session-1"
+        );
+    }
+
+    #[test]
+    fn missing_client_request_id_is_explicit_in_trace_detail() {
+        let trace_ids = voice_trace_ids(&HeaderMap::new());
+
+        assert_eq!(trace_ids.client_request_id, "missing");
+        assert_eq!(trace_ids.detail_prefix(), "request_id=missing");
     }
 }
