@@ -10,6 +10,7 @@ pub mod email_intake_scheduler;
 pub mod email_threading;
 pub mod handlers;
 pub mod health_monitor;
+pub mod log_incident_triage;
 pub mod mcp_wrapper;
 pub mod models;
 pub mod observability;

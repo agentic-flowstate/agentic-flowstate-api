@@ -10,6 +10,7 @@ mod email_intake_scheduler;
 mod email_threading;
 mod handlers;
 mod health_monitor;
+mod log_incident_triage;
 mod mcp_wrapper;
 mod models;
 mod observability;
@@ -536,6 +537,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Dailies scheduler");
     dailies_scheduler::spawn_dailies_scheduler(db_pool.clone(), shutdown_token.child_token());
+
+    tracing::info!("Starting system log incident triage scheduler");
+    log_incident_triage::spawn_system_log_incident_triage(
+        db_pool.clone(),
+        shutdown_token.child_token(),
+    );
 
     // Conversation-events retention prune (T-65DA4D32). Fires once per
     // day at RETENTION_RUN_HOUR_UTC (default 03:00 UTC). Set
@@ -1660,6 +1667,14 @@ async fn main() -> anyhow::Result<()> {
     // Admin routes (require valid session + admin role)
     let admin_routes = Router::new()
         .route("/api/admin/logs", get(handlers::admin_logs::list_logs))
+        .route(
+            "/api/admin/log-incidents",
+            get(handlers::log_incidents::list_log_incidents),
+        )
+        .route(
+            "/api/admin/log-incidents/triage",
+            post(handlers::log_incidents::run_log_incident_triage),
+        )
         .route("/api/admin/check", get(handlers::admin_logs::check_admin))
         .route(
             "/api/admin/ops/timeline",

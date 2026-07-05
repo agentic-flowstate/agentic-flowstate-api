@@ -1,0 +1,16 @@
+Investigate system log incident `{{INCIDENT_ID}}` for ticket `{{TICKET_ID}}`.
+
+Level: {{LEVEL}}
+Component: {{COMPONENT}}
+Fingerprint: {{FINGERPRINT}}
+Occurrences: {{OCCURRENCE_COUNT}}
+First log ID: {{FIRST_LOG_ID}}
+Last log ID: {{LAST_LOG_ID}}
+
+Message:
+{{MESSAGE}}
+
+Detail:
+{{DETAIL}}
+
+Determine the likely cause, inspect the relevant Agentic Flowstate backend code, implement a fix if appropriate, verify it, and update the ticket. Do not spin up additional agents for health-check noise unless explicit classification rules are added.
