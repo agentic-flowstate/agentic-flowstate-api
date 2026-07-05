@@ -378,12 +378,14 @@ async fn gather_parent_context_handoff(
     parent: &Conversation,
     kind: ChildAgentKind,
 ) -> Result<Option<ResolvedContextHandoff>> {
-    let Some(ticket_id) = parent.router_ticket_id.as_deref() else {
+    let Some(ticket_id) = router_ticket_id_for_context(parent.router_ticket_id.as_deref()) else {
         return Ok(None);
     };
     let organization = parent
         .router_organization
         .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .unwrap_or(parent.organization.as_str());
     let actor_id = format!("api-child-agent-handoff:{}", parent.id);
     let query_text = format!(
@@ -438,6 +440,14 @@ async fn gather_parent_context_handoff(
     )
     .await
     .context("resolve child-agent artifact-memory packet handoff")
+}
+
+fn router_ticket_id_for_context(value: Option<&str>) -> Option<&str> {
+    let ticket_id = value.map(str::trim).filter(|value| !value.is_empty())?;
+    if ticket_id.starts_with("__") {
+        return None;
+    }
+    Some(ticket_id)
 }
 
 fn support_context_tool_args(
@@ -569,6 +579,20 @@ mod tests {
                 metadata: json!({"query_terms": ["child", "handoff"]}),
             }],
         }
+    }
+
+    #[test]
+    fn router_ticket_context_ignores_router_sentinel_values() {
+        assert_eq!(router_ticket_id_for_context(None), None);
+        assert_eq!(router_ticket_id_for_context(Some("")), None);
+        assert_eq!(router_ticket_id_for_context(Some("   ")), None);
+        assert_eq!(router_ticket_id_for_context(Some("__skipped__")), None);
+        assert_eq!(router_ticket_id_for_context(Some("__failed__")), None);
+        assert_eq!(router_ticket_id_for_context(Some("__timeout__")), None);
+        assert_eq!(
+            router_ticket_id_for_context(Some(" T-3C7BB955 ")),
+            Some("T-3C7BB955")
+        );
     }
 
     #[test]
