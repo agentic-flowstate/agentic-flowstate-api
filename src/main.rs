@@ -3,6 +3,7 @@ pub mod apns;
 mod auth_middleware;
 mod dailies_scheduler;
 mod email_attachment_safety;
+mod email_classifier;
 mod email_delivery;
 mod email_fetcher;
 mod email_intake_scheduler;
@@ -520,6 +521,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting email intake scheduler");
     email_intake_scheduler::spawn_email_intake_scheduler(
+        db_pool.clone(),
+        shutdown_token.child_token(),
+    );
+
+    tracing::info!("Starting email classifier scheduler");
+    email_classifier::spawn_email_classifier_scheduler(
         db_pool.clone(),
         shutdown_token.child_token(),
     );

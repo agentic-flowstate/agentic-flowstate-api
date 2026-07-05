@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -184,6 +184,7 @@ pub struct CodexAppServerOptions<'a> {
     pub tool_profile: CodexToolProfile,
     pub scoped_user_id: Option<&'a str>,
     pub current_conversation_id: Option<&'a str>,
+    pub scoped_email_id: Option<i64>,
     pub approved_mcp_tools: Vec<String>,
 }
 
@@ -284,7 +285,7 @@ pub struct CodexAppServerOutcome {
     turn_completion: Option<TurnCompletion>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexAccountRateLimits {
     pub rate_limits: CodexRateLimitSnapshot,
@@ -292,7 +293,7 @@ pub struct CodexAccountRateLimits {
     pub rate_limits_by_limit_id: Option<HashMap<String, CodexRateLimitSnapshot>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexRateLimitSnapshot {
     pub limit_id: Option<String>,
@@ -304,7 +305,7 @@ pub struct CodexRateLimitSnapshot {
     pub rate_limit_reached_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexRateLimitWindow {
     pub used_percent: i32,
@@ -312,7 +313,7 @@ pub struct CodexRateLimitWindow {
     pub resets_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexCreditsSnapshot {
     pub has_credits: bool,
@@ -983,6 +984,13 @@ fn build_codex_app_server_command(
                 user_id,
             )?);
         }
+        if let Some(email_id) = options.scoped_email_id {
+            command.arg("-c").arg(mcp_server_env_override(
+                "agentic-mcp",
+                "AGENTIC_MCP_EMAIL_SCOPE_ID",
+                &email_id.to_string(),
+            )?);
+        }
     }
 
     if options.tool_profile == CodexToolProfile::RestrictedMcpOnly {
@@ -1137,6 +1145,7 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, 
         tool_profile: CodexToolProfile::Default,
         scoped_user_id: None,
         current_conversation_id: None,
+        scoped_email_id: None,
         approved_mcp_tools: Vec::new(),
     };
     let mut command = Command::from(build_codex_app_server_command(
@@ -1786,6 +1795,7 @@ async fn run_codex_text_with_profile(
         tool_profile,
         scoped_user_id: None,
         current_conversation_id: None,
+        scoped_email_id: None,
         approved_mcp_tools: Vec::new(),
     })
     .await?;
@@ -2094,6 +2104,7 @@ mod tests {
             tool_profile: CodexToolProfile::Default,
             scoped_user_id: None,
             current_conversation_id: None,
+            scoped_email_id: None,
             approved_mcp_tools: Vec::new(),
         }
     }
@@ -2436,6 +2447,28 @@ approval_mode = "approve"
         assert!(args
             .iter()
             .any(|arg| arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_USER_ID=\"alex\""));
+    }
+
+    #[test]
+    fn app_server_command_passes_scoped_email_id_to_mcp() {
+        let mut options = sample_app_server_options(None);
+        options.tool_profile = CodexToolProfile::ConfiguredMcpOnly;
+        options.approved_mcp_tools = vec!["read_email_content".to_string()];
+        options.scoped_email_id = Some(42);
+        let command = build_codex_app_server_command(
+            &options,
+            Path::new("/tmp/agentic_mcp"),
+            Path::new("/tmp/agentic_codex_home"),
+        )
+        .expect("build command");
+        let args = command_args(&command);
+
+        assert!(args
+            .iter()
+            .any(|arg| { arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_EMAIL_SCOPE_ID=\"42\"" }));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "mcp_servers.agentic-mcp.enabled_tools=[\"read_email_content\"]"));
     }
 
     #[test]

@@ -97,7 +97,8 @@ fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile
         AgentType::HomePlanner
         | AgentType::MeetingAgent
         | AgentType::ConversationEvaluator
-        | AgentType::Feedback => CodexToolProfile::ConfiguredMcpOnly,
+        | AgentType::Feedback
+        | AgentType::EmailClassifier => CodexToolProfile::ConfiguredMcpOnly,
         AgentType::ScopedWorkspace | AgentType::WorkspaceManager => {
             CodexToolProfile::RestrictedMcpOnly
         }
@@ -1229,6 +1230,7 @@ impl ConversationWorker {
             tool_profile,
             scoped_user_id: Some(&msg.user_id),
             current_conversation_id: Some(&self.conversation_id),
+            scoped_email_id: None,
             approved_mcp_tools: msg.config.agent_type.approved_mcp_tool_names(),
         })
         .await

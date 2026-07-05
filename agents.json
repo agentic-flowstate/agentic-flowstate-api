@@ -139,6 +139,14 @@
       "prompt_file": "email.txt",
       "tools": []
     },
+    "email-classifier": {
+      "model": "codex",
+      "effort": "medium",
+      "prompt_file": "email-classifier.txt",
+      "tools": [
+        "mcp__agentic-mcp__read_email_content"
+      ]
+    },
     "workspace-manager": {
       "model": "codex",
       "effort": "xhigh",

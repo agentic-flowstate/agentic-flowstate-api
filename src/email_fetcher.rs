@@ -1,3 +1,4 @@
+use crate::email_classifier;
 use anyhow::{Context, Result};
 use async_imap::extensions::idle::IdleResponse;
 use async_native_tls::TlsConnector;
@@ -569,18 +570,35 @@ async fn fetch_folder(
                             }
                         }
 
-                        if let Err(e) = email_intake::process_email_intake(
+                        match email_intake::process_email_intake(
                             db_pool,
                             stored_email.id,
                             "email_fetcher",
                         )
                         .await
                         {
-                            tracing::warn!(
-                                "Failed to run email intake for email {}: {:?}",
-                                stored_email.id,
-                                e
-                            );
+                            Ok(result) => {
+                                if let Err(e) = email_classifier::enqueue_classifier_after_intake(
+                                    db_pool,
+                                    &result,
+                                    "email_fetcher",
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        "Failed to enqueue email classifier for email {}: {:?}",
+                                        stored_email.id,
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to run email intake for email {}: {:?}",
+                                    stored_email.id,
+                                    e
+                                );
+                            }
                         }
                     }
                     Err(e) => {

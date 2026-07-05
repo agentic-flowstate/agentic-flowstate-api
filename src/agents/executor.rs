@@ -139,6 +139,7 @@ async fn run_codex_agent_turn_inner(
         tool_profile: CodexToolProfile::Default,
         scoped_user_id: None,
         current_conversation_id: None,
+        scoped_email_id: None,
         approved_mcp_tools: agent_type.approved_mcp_tool_names(),
     })
     .await

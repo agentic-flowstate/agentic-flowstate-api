@@ -8,6 +8,7 @@ use std::sync::Arc;
 use ticketing_system::{email_accounts, email_intake, emails, SqlitePool};
 
 use crate::auth_middleware::AuthenticatedUser;
+use crate::email_classifier;
 
 async fn get_user_mailboxes(
     pool: &SqlitePool,
@@ -364,11 +365,20 @@ pub async fn run_email_intake(
                 .await
                 .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
             verify_mailbox_access(&pool, &user.user_id, &email.mailbox).await?;
-            results.push(
-                email_intake::process_email_intake(&pool, id, &user.user_id)
+            let result = email_intake::process_email_intake(&pool, id, &user.user_id)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if let Err(e) =
+                email_classifier::enqueue_classifier_after_intake(&pool, &result, &user.user_id)
                     .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
-            );
+            {
+                tracing::warn!(
+                    email_id = id,
+                    error = ?e,
+                    "Failed to enqueue email classifier after manual intake"
+                );
+            }
+            results.push(result);
         }
     }
 
@@ -401,7 +411,17 @@ async fn process_recent_emails(
 
     let mut results = Vec::new();
     for email in emails {
-        results.push(email_intake::process_email_intake(pool, email.id, created_by).await?);
+        let result = email_intake::process_email_intake(pool, email.id, created_by).await?;
+        if let Err(e) =
+            email_classifier::enqueue_classifier_after_intake(pool, &result, created_by).await
+        {
+            tracing::warn!(
+                email_id = email.id,
+                error = ?e,
+                "Failed to enqueue email classifier after batch intake"
+            );
+        }
+        results.push(result);
     }
     Ok(results)
 }
