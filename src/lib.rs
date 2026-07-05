@@ -7,6 +7,7 @@ pub mod email_classifier;
 pub mod email_delivery;
 pub mod email_fetcher;
 pub mod email_intake_scheduler;
+pub mod email_notification_dispatcher;
 pub mod email_threading;
 pub mod handlers;
 pub mod health_monitor;

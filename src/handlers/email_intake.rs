@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use ticketing_system::{email_accounts, email_intake, emails, SqlitePool};
 
@@ -100,6 +101,60 @@ pub struct LinkThreadApiRequest {
     pub link_reason: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct EmailNotificationIntentResponse {
+    pub id: i64,
+    pub email_id: i64,
+    pub mailbox: String,
+    pub thread_id: Option<String>,
+    pub intent: String,
+    pub reason: String,
+    pub payload: Value,
+    pub status: String,
+    pub created_by: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct EmailNotificationIntentRow {
+    id: i64,
+    email_id: i64,
+    mailbox: String,
+    thread_id: Option<String>,
+    intent: String,
+    reason: String,
+    payload_json: String,
+    status: String,
+    created_by: String,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl EmailNotificationIntentRow {
+    fn into_response(self) -> Result<EmailNotificationIntentResponse, (StatusCode, String)> {
+        let payload = serde_json::from_str(&self.payload_json).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid notification intent payload: {e}"),
+            )
+        })?;
+        Ok(EmailNotificationIntentResponse {
+            id: self.id,
+            email_id: self.email_id,
+            mailbox: self.mailbox,
+            thread_id: self.thread_id,
+            intent: self.intent,
+            reason: self.reason,
+            payload,
+            status: self.status,
+            created_by: self.created_by,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
 pub async fn list_email_attention_items(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -121,6 +176,44 @@ pub async fn list_email_attention_items(
         );
     }
     Ok(Json(items))
+}
+
+pub async fn list_email_notification_intents(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Query(params): Query<IntakeListQuery>,
+) -> Result<Json<Vec<EmailNotificationIntentResponse>>, (StatusCode, String)> {
+    email_classifier::ensure_email_classifier_schema(&pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mailboxes = scoped_mailboxes(&pool, &user.user_id, params.mailbox.as_deref()).await?;
+    let mut intents = Vec::new();
+    for mailbox in mailboxes {
+        let rows = sqlx::query_as::<_, EmailNotificationIntentRow>(
+            r#"
+            SELECT id, email_id, mailbox, thread_id, intent, reason, payload_json,
+                   status, created_by, created_at, updated_at
+            FROM email_notification_intents
+            WHERE mailbox = ?
+              AND (? IS NULL OR status = ?)
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(&mailbox)
+        .bind(params.status.as_deref())
+        .bind(params.status.as_deref())
+        .bind(params.limit.unwrap_or(100).clamp(1, 500))
+        .fetch_all(&*pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        for row in rows {
+            intents.push(row.into_response()?);
+        }
+    }
+    Ok(Json(intents))
 }
 
 pub async fn resolve_email_attention_item(

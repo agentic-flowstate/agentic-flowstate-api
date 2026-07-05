@@ -7,6 +7,7 @@ mod email_classifier;
 mod email_delivery;
 mod email_fetcher;
 mod email_intake_scheduler;
+mod email_notification_dispatcher;
 mod email_threading;
 mod handlers;
 mod health_monitor;
@@ -641,6 +642,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    tracing::info!("Starting email notification dispatcher");
+    email_notification_dispatcher::spawn_email_notification_dispatcher(
+        db_pool.clone(),
+        shutdown_token.child_token(),
+    );
+
     // Initialize silent-push sender (durable chat streaming wake signals).
     // Gated on APNS_SILENT_ENABLED to avoid forcing every dev box to have a
     // provisioned .p8 key. When enabled, ALL five env vars are required —
@@ -1270,6 +1277,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/email-intake/attention/:id/resolve",
             post(handlers::resolve_email_attention_item),
+        )
+        .route(
+            "/api/email-intake/notification-intents",
+            get(handlers::list_email_notification_intents),
         )
         .route(
             "/api/email-intake/security-scans",

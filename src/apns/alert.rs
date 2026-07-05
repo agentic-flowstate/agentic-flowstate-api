@@ -165,6 +165,17 @@ struct ApnsPayload {
     conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notification_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "thread_id")]
+    email_thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mailbox: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deeplink: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,6 +200,19 @@ struct ApnsErrorResponse {
 struct CachedToken {
     token: String,
     created_at: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AlertMetadata<'a> {
+    conversation_id: Option<&'a str>,
+    agent_name: Option<&'a str>,
+    notification_type: Option<&'a str>,
+    email_id: Option<i64>,
+    email_thread_id: Option<&'a str>,
+    mailbox: Option<&'a str>,
+    deeplink: Option<&'a str>,
+    collapse_id: Option<String>,
+    apns_thread_id: &'a str,
 }
 
 pub struct ApnsService {
@@ -304,10 +328,42 @@ impl ApnsService {
         conversation_id: Option<&str>,
         agent_name: Option<&str>,
     ) -> Result<(), String> {
-        self.send_with_endpoint_retry(device_token, title, body, conversation_id, agent_name)
+        let metadata = AlertMetadata {
+            conversation_id,
+            agent_name,
+            collapse_id: conversation_id.map(str::to_string),
+            apns_thread_id: "agent-completion",
+            ..Default::default()
+        };
+        self.send_with_endpoint_retry(device_token, title, body, &metadata)
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    pub async fn send_email_notification_to_user(
+        &self,
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        title: &str,
+        body: &str,
+        email_id: i64,
+        email_thread_id: Option<&str>,
+        mailbox: Option<&str>,
+        deeplink: &str,
+    ) -> Result<(), String> {
+        let metadata = AlertMetadata {
+            notification_type: Some("email"),
+            email_id: Some(email_id),
+            email_thread_id,
+            mailbox,
+            deeplink: Some(deeplink),
+            collapse_id: Some(format!("email-{email_id}")),
+            apns_thread_id: "email-classifier",
+            ..Default::default()
+        };
+        self.send_to_user_with_metadata(db, user_id, title, body, &metadata)
+            .await
     }
 
     async fn send_with_endpoint_retry(
@@ -315,18 +371,10 @@ impl ApnsService {
         device_token: &str,
         title: &str,
         body: &str,
-        conversation_id: Option<&str>,
-        agent_name: Option<&str>,
+        metadata: &AlertMetadata<'_>,
     ) -> Result<ApnsDelivery, ApnsSendFailure> {
         match self
-            .send_once(
-                self.endpoint,
-                device_token,
-                title,
-                body,
-                conversation_id,
-                agent_name,
-            )
+            .send_once(self.endpoint, device_token, title, body, metadata)
             .await
         {
             Ok(delivery) => Ok(delivery),
@@ -340,14 +388,7 @@ impl ApnsService {
                 );
 
                 match self
-                    .send_once(
-                        alternate,
-                        device_token,
-                        title,
-                        body,
-                        conversation_id,
-                        agent_name,
-                    )
+                    .send_once(alternate, device_token, title, body, metadata)
                     .await
                 {
                     Ok(delivery) => {
@@ -371,8 +412,7 @@ impl ApnsService {
         device_token: &str,
         title: &str,
         body: &str,
-        conversation_id: Option<&str>,
-        agent_name: Option<&str>,
+        metadata: &AlertMetadata<'_>,
     ) -> Result<ApnsDelivery, ApnsSendFailure> {
         let token = match self.get_token().await {
             Ok(t) => t,
@@ -393,10 +433,15 @@ impl ApnsService {
                     body: body.to_string(),
                 },
                 sound: "default".to_string(),
-                thread_id: "agent-completion".to_string(),
+                thread_id: metadata.apns_thread_id.to_string(),
             },
-            conversation_id: conversation_id.map(|s| s.to_string()),
-            agent_name: agent_name.map(|s| s.to_string()),
+            conversation_id: metadata.conversation_id.map(|s| s.to_string()),
+            agent_name: metadata.agent_name.map(|s| s.to_string()),
+            notification_type: metadata.notification_type.map(|s| s.to_string()),
+            email_id: metadata.email_id,
+            email_thread_id: metadata.email_thread_id.map(|s| s.to_string()),
+            mailbox: metadata.mailbox.map(|s| s.to_string()),
+            deeplink: metadata.deeplink.map(|s| s.to_string()),
         };
 
         let url = format!("{}/3/device/{}", endpoint.base_url(), device_token);
@@ -424,7 +469,11 @@ impl ApnsService {
             )
             .header(
                 "apns-collapse-id",
-                conversation_id.unwrap_or("agent-completion"),
+                metadata
+                    .collapse_id
+                    .as_deref()
+                    .or(metadata.conversation_id)
+                    .unwrap_or("agent-completion"),
             )
             .json(&payload)
             .send()
@@ -508,7 +557,18 @@ impl ApnsService {
 
         for token in &tokens {
             match self
-                .send_with_endpoint_retry(token, title, body, conversation_id, agent_name)
+                .send_with_endpoint_retry(
+                    token,
+                    title,
+                    body,
+                    &AlertMetadata {
+                        conversation_id,
+                        agent_name,
+                        collapse_id: conversation_id.map(str::to_string),
+                        apns_thread_id: "agent-completion",
+                        ..Default::default()
+                    },
+                )
                 .await
             {
                 Ok(delivery) => {
@@ -535,6 +595,64 @@ impl ApnsService {
                             user_id,
                             failure
                         );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_to_user_with_metadata(
+        &self,
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        title: &str,
+        body: &str,
+        metadata: &AlertMetadata<'_>,
+    ) -> Result<(), String> {
+        let tokens =
+            match ticketing_system::device_tokens::get_active_tokens_for_user(db, user_id).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(
+                        "[APNS] DB error fetching tokens for user {}: {}",
+                        user_id,
+                        e
+                    );
+                    return Err(format!("DB error: {}", e));
+                }
+            };
+
+        tracing::info!(
+            "[APNS] Found {} device token(s) for user {}",
+            tokens.len(),
+            user_id
+        );
+
+        for token in &tokens {
+            match self
+                .send_with_endpoint_retry(token, title, body, metadata)
+                .await
+            {
+                Ok(delivery) => {
+                    if delivery.endpoint != self.endpoint {
+                        tracing::warn!(
+                            "[APNS] Token for user {} delivered via {} APNs while configured endpoint is {}",
+                            user_id,
+                            delivery.endpoint,
+                            self.endpoint
+                        );
+                    }
+                }
+                Err(failure) => {
+                    tracing::warn!("[APNS] Send failed for user {}: {}", user_id, failure);
+                    if failure.should_soft_delete_token() {
+                        tracing::info!("[APNS] Soft-deleting invalid token for user {}", user_id);
+                        let _ = ticketing_system::device_tokens::soft_delete_device_token(
+                            db, user_id, token,
+                        )
+                        .await;
                     }
                 }
             }
