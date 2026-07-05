@@ -1598,6 +1598,8 @@ async fn main() -> anyhow::Result<()> {
         )
         // Voice transcription (standalone Whisper)
         .route("/api/transcribe", post(handlers::voice_transcribe))
+        // Alex voice controller prototype
+        .route("/api/alex/voice-turn", post(handlers::alex_voice_turn))
         // TTS route
         .route("/api/tts", post(handlers::text_to_speech))
         // Membership routes

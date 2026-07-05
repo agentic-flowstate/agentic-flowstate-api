@@ -2,6 +2,7 @@ pub mod admin_logs;
 pub mod admin_reload;
 pub mod agent_operations;
 pub mod agent_runs;
+pub mod alex_voice;
 pub mod anthropic_event_encoder;
 pub mod auth;
 pub mod cad;
@@ -63,6 +64,7 @@ pub mod voice_transcribe;
 pub mod workspace_manager;
 
 pub use agent_runs::*;
+pub use alex_voice::*;
 pub use chat_stream::codex_chat_options;
 pub use context_packets::*;
 pub use conversation_agent_chat::*;
