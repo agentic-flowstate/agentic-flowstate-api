@@ -68,6 +68,8 @@ pub struct StorageBucket {
     path: String,
     bytes: u64,
     exists: bool,
+    skipped_entries: u64,
+    scan_warning: Option<String>,
     risk_level: RiskLevel,
     action_id: Option<String>,
     detail: String,
@@ -179,17 +181,44 @@ impl StorageActionKind {
 }
 
 /// GET /api/admin/storage/scan
-pub async fn scan_storage() -> Response {
+pub async fn scan_storage(State(pool): State<Arc<SqlitePool>>) -> Response {
     match tokio::task::spawn_blocking(|| build_scan_with_progress(None)).await {
-        Ok(Ok(scan)) => (StatusCode::OK, Json(scan)).into_response(),
-        Ok(Err(e)) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage scan failed: {e}"),
-        ),
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Storage scan task failed: {e}"),
-        ),
+        Ok(Ok(scan)) => {
+            if let Some(detail) = storage_scan_warning_detail(&scan) {
+                crate::system_log_helper::log_warn(
+                    &pool,
+                    "admin",
+                    "storage_scan_partial",
+                    Some(&detail),
+                )
+                .await;
+            }
+            (StatusCode::OK, Json(scan)).into_response()
+        }
+        Ok(Err(e)) => {
+            let message = format!("Storage scan failed: {e}");
+            tracing::error!(target: "agentic_api::storage", error = %e, "storage scan failed");
+            crate::system_log_helper::log_error(
+                &pool,
+                "admin",
+                "storage_scan_failed",
+                Some(&message),
+            )
+            .await;
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+        }
+        Err(e) => {
+            let message = format!("Storage scan task failed: {e}");
+            tracing::error!(target: "agentic_api::storage", error = %e, "storage scan task failed");
+            crate::system_log_helper::log_error(
+                &pool,
+                "admin",
+                "storage_scan_failed",
+                Some(&message),
+            )
+            .await;
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, message)
+        }
     }
 }
 
@@ -541,6 +570,7 @@ fn build_scan_with_progress(job_id: Option<&str>) -> anyhow::Result<StorageScanR
     ];
 
     let mut buckets = Vec::with_capacity(bucket_defs.len());
+    let mut scan_warnings = Vec::new();
     for (id, title, category, path, risk_level, action, detail) in bucket_defs {
         push_scan_step(
             job_id,
@@ -548,18 +578,36 @@ fn build_scan_with_progress(job_id: Option<&str>) -> anyhow::Result<StorageScanR
             &format!("Scanning {path}."),
         );
         let path_ref = FsPath::new(path);
-        let exists = path_ref.exists();
-        let bytes = if exists { directory_size(path_ref)? } else { 0 };
+        let measurement = directory_size_for_scan(path_ref);
+        let scan_warning = measurement.warning_summary();
+        if let Some(warning) = scan_warning.as_deref() {
+            push_scan_step(job_id, &format!("Partial measurement for {title}"), warning);
+            tracing::warn!(
+                target: "agentic_api::storage",
+                bucket_id = %id,
+                bucket_path = %path,
+                skipped_entries = measurement.skipped_entries,
+                first_errors = ?measurement.errors,
+                "storage scan skipped inaccessible entries"
+            );
+            scan_warnings.push(format!("{title}: {warning}"));
+        }
+        let detail = match scan_warning.as_deref() {
+            Some(warning) => format!("{detail} {warning}"),
+            None => detail.to_string(),
+        };
         buckets.push(StorageBucket {
             id: id.to_string(),
             title: title.to_string(),
             category: category.to_string(),
             path: path.to_string(),
-            bytes,
-            exists,
+            bytes: measurement.bytes,
+            exists: measurement.exists,
+            skipped_entries: measurement.skipped_entries,
+            scan_warning,
             risk_level,
             action_id: action.map(|a| a.id().to_string()),
-            detail: detail.to_string(),
+            detail,
         });
     }
 
@@ -569,18 +617,25 @@ fn build_scan_with_progress(job_id: Option<&str>) -> anyhow::Result<StorageScanR
         "Preparing results",
         "Calculating manual actions and notes.",
     );
+    let mut notes = vec![
+        "Finder System Data includes Xcode simulators, device support, caches, package-manager data, logs, and developer runtime state.".to_string(),
+        "No automatic cleanup is scheduled here. Every cleanup must be started manually from this tab.".to_string(),
+        "League of Legends now lives on ORICO with an /Applications symlink. Expect slower launch/patch/load phases than the internal SSD, but not a meaningful frame-rate hit after loading.".to_string(),
+        "Xcode.app and Docker.app now live on ORICO. The large remaining Xcode space is simulator devices/runtimes, not the app bundle.".to_string(),
+        "CoreSimulator runtimes are intentionally not symlinked by this tool. Use Xcode's component manager for runtimes, and use the explicit simulator-device cleanup action when you want to reclaim device state.".to_string(),
+    ];
+    notes.extend(
+        scan_warnings
+            .into_iter()
+            .map(|warning| format!("Storage scan partial measurement: {warning}")),
+    );
+
     Ok(StorageScanResponse {
         generated_at: Utc::now().to_rfc3339(),
         volumes,
         buckets,
         actions,
-        notes: vec![
-            "Finder System Data includes Xcode simulators, device support, caches, package-manager data, logs, and developer runtime state.".to_string(),
-            "No automatic cleanup is scheduled here. Every cleanup must be started manually from this tab.".to_string(),
-            "League of Legends now lives on ORICO with an /Applications symlink. Expect slower launch/patch/load phases than the internal SSD, but not a meaningful frame-rate hit after loading.".to_string(),
-            "Xcode.app and Docker.app now live on ORICO. The large remaining Xcode space is simulator devices/runtimes, not the app bundle.".to_string(),
-            "CoreSimulator runtimes are intentionally not symlinked by this tool. Use Xcode's component manager for runtimes, and use the explicit simulator-device cleanup action when you want to reclaim device state.".to_string(),
-        ],
+        notes,
     })
 }
 
@@ -1008,6 +1063,91 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+const MAX_SCAN_ERROR_SAMPLES: usize = 5;
+
+#[derive(Debug, Clone, Default)]
+struct DirectorySizeScan {
+    bytes: u64,
+    exists: bool,
+    skipped_entries: u64,
+    errors: Vec<String>,
+}
+
+impl DirectorySizeScan {
+    fn record_skip(&mut self, path: &FsPath, error: &std::io::Error) {
+        self.skipped_entries = self.skipped_entries.saturating_add(1);
+        if self.errors.len() < MAX_SCAN_ERROR_SAMPLES {
+            self.errors.push(format!("{}: {error}", path.display()));
+        }
+    }
+
+    fn warning_summary(&self) -> Option<String> {
+        if self.skipped_entries == 0 {
+            return None;
+        }
+
+        let mut warning = format!(
+            "Skipped {} inaccessible or transient filesystem entries while measuring; size is a partial total.",
+            self.skipped_entries
+        );
+        if let Some(first_error) = self.errors.first() {
+            warning.push_str(&format!(" First error: {first_error}."));
+        }
+        Some(warning)
+    }
+}
+
+fn directory_size_for_scan(path: &FsPath) -> DirectorySizeScan {
+    let mut result = DirectorySizeScan::default();
+    match fs::symlink_metadata(path) {
+        Ok(_) => result.exists = true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return result,
+        Err(e) => {
+            result.exists = true;
+            result.record_skip(path, &e);
+            return result;
+        }
+    }
+
+    let mut queue = VecDeque::from([path.to_path_buf()]);
+    while let Some(current) = queue.pop_front() {
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                result.record_skip(&current, &e);
+                continue;
+            }
+            Err(e) => {
+                result.record_skip(&current, &e);
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            result.bytes = result.bytes.saturating_add(metadata.len());
+            continue;
+        }
+        if metadata.is_dir() {
+            let entries = match fs::read_dir(&current) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    result.record_skip(&current, &e);
+                    continue;
+                }
+            };
+            for entry in entries {
+                match entry {
+                    Ok(entry) => queue.push_back(entry.path()),
+                    Err(e) => result.record_skip(&current, &e),
+                }
+            }
+        }
+    }
+    result
+}
+
 fn directory_size(path: &FsPath) -> anyhow::Result<u64> {
     if !path.exists() {
         return Ok(0);
@@ -1256,6 +1396,26 @@ fn json_error(status: StatusCode, message: String) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
 
+fn storage_scan_warning_detail(scan: &StorageScanResponse) -> Option<String> {
+    let warnings = scan
+        .buckets
+        .iter()
+        .filter_map(|bucket| {
+            bucket.scan_warning.as_ref().map(|warning| {
+                format!(
+                    "{} ({}) skipped_entries={}: {}",
+                    bucket.id, bucket.path, bucket.skipped_entries, warning
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1281,5 +1441,39 @@ mod tests {
         assert!(ensure_allowed_delete_root(CARGO_AUTO).is_ok());
         assert!(ensure_allowed_delete_root("/").is_err());
         assert!(ensure_allowed_delete_root("/Users/jarvisgpt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_directory_size_skips_unreadable_entries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root =
+            std::env::temp_dir().join(format!("agentic-storage-scan-test-{}", Uuid::new_v4()));
+        let unreadable = root.join("unreadable");
+        fs::create_dir_all(&unreadable).expect("create unreadable test dir");
+        fs::write(root.join("visible.bin"), [1_u8; 4]).expect("write visible test file");
+        fs::write(unreadable.join("hidden.bin"), [1_u8; 8]).expect("write hidden test file");
+
+        let original_permissions = fs::metadata(&unreadable)
+            .expect("read unreadable dir metadata before chmod")
+            .permissions();
+        let mut blocked_permissions = original_permissions.clone();
+        blocked_permissions.set_mode(0o000);
+        fs::set_permissions(&unreadable, blocked_permissions).expect("chmod unreadable test dir");
+
+        let scan = directory_size_for_scan(&root);
+
+        fs::set_permissions(&unreadable, original_permissions)
+            .expect("restore unreadable test dir permissions");
+        fs::remove_dir_all(&root).expect("remove storage scan test dir");
+
+        assert!(scan.exists);
+        assert_eq!(scan.bytes, 4);
+        assert!(scan.skipped_entries >= 1);
+        assert!(scan
+            .warning_summary()
+            .expect("scan warning")
+            .contains("partial total"));
     }
 }
