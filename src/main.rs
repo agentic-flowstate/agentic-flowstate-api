@@ -1751,6 +1751,10 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::client_telemetry::list_client_events),
         )
         .route(
+            "/api/admin/app-diagnostics/ios-degradation",
+            get(handlers::app_diagnostics::ios_degradation_diagnostics),
+        )
+        .route(
             "/api/meeting-agent/chat",
             post(handlers::meeting_agent_chat),
         )

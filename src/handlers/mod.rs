@@ -4,6 +4,7 @@ pub mod agent_operations;
 pub mod agent_runs;
 pub mod alex_voice;
 pub mod anthropic_event_encoder;
+pub mod app_diagnostics;
 pub mod auth;
 pub mod cad;
 pub mod chat_client_manager;
