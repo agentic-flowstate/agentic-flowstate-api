@@ -9,6 +9,8 @@ pub const METRIC_CANCEL_PHASE_ELAPSED_MS: &str = "agentic_cancel_phase_elapsed_m
 
 const TARGET: &str = "agentic_api::cancel";
 
+use super::contracts::assert_metric_labels;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelPhase {
     RequestReceived,
@@ -89,10 +91,12 @@ pub fn elapsed_ms(started_at_ms: i64, finished_at_ms: i64) -> i64 {
 }
 
 fn increment_phase(phase: CancelPhase) {
+    assert_metric_labels(METRIC_CANCEL_PHASE_TOTAL, &[("phase", phase.as_str())]);
     metrics::counter!(METRIC_CANCEL_PHASE_TOTAL, "phase" => phase.as_str()).increment(1);
 }
 
 fn record_phase_elapsed(phase: CancelPhase, elapsed_ms: i64) {
+    assert_metric_labels(METRIC_CANCEL_PHASE_ELAPSED_MS, &[("phase", phase.as_str())]);
     metrics::histogram!(METRIC_CANCEL_PHASE_ELAPSED_MS, "phase" => phase.as_str())
         .record(elapsed_ms as f64);
 }

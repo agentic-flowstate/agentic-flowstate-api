@@ -1,12 +1,14 @@
 //! Automatic HTTP request logging middleware.
-//! Logs every request to the system_logs table with method, path, status, duration,
-//! user_id, and auto-detected component.
+//! Logs every request to the system_logs table with method, normalized route-ish
+//! path, status, duration, and auto-detected component.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{extract::Request, middleware::Next, response::Response};
 use sqlx::SqlitePool;
+
+use crate::observability::contracts;
 
 /// Optional response extension that handlers can set to persist diagnostic
 /// detail on the automatic request log row.
@@ -28,6 +30,60 @@ const SKIP_PATHS: &[&str] = &[
 
 fn should_skip_path(path: &str) -> bool {
     SKIP_PATHS.iter().any(|skip| path == *skip)
+}
+
+fn normalize_path(path: &str) -> String {
+    if path == "/" {
+        return "/".to_string();
+    }
+
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            if is_high_cardinality_segment(segment) {
+                ":id"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>();
+
+    format!("/{}", segments.join("/"))
+}
+
+fn is_high_cardinality_segment(segment: &str) -> bool {
+    if segment.chars().all(|ch| ch.is_ascii_digit()) {
+        return true;
+    }
+    if looks_like_uuid(segment) {
+        return true;
+    }
+    if matches!(
+        segment.get(0..2),
+        Some("T-") | Some("A-") | Some("D-") | Some("R-")
+    ) || segment.starts_with("CP-")
+    {
+        return true;
+    }
+    segment.len() >= 24
+        && segment
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn looks_like_uuid(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let lengths = [8, 4, 4, 4, 12];
+    for expected_len in lengths {
+        let Some(part) = parts.next() else {
+            return false;
+        };
+        if part.len() != expected_len || !part.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    parts.next().is_none()
 }
 
 /// Detect component from the URL path prefix.
@@ -84,27 +140,12 @@ fn level_from_status(status: u16) -> &'static str {
 pub async fn request_logger(request: Request, next: Next) -> Response {
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
+    let normalized_path = normalize_path(&path);
 
     // Skip noisy endpoints
     if should_skip_path(&path) {
         return next.run(request).await;
     }
-
-    // Extract session cookie for session_id (before passing request to next)
-    let session_id = request
-        .headers()
-        .get_all("cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .find_map(|cookie| {
-            let cookie = cookie.trim();
-            if cookie.starts_with("session=") {
-                Some(cookie[8..].to_string())
-            } else {
-                None
-            }
-        });
 
     // Try to get db pool from request extensions (set by State)
     // We'll grab it from extensions after the response, but we need the pool reference.
@@ -120,6 +161,9 @@ pub async fn request_logger(request: Request, next: Next) -> Response {
         .extensions()
         .get::<RequestLogDetail>()
         .map(|detail| detail.0.clone());
+    if let Some(detail) = detail.as_deref() {
+        contracts::assert_system_log_detail(detail);
+    }
 
     // Log in background task — never block the response
     if let Some(pool) = pool {
@@ -127,12 +171,10 @@ pub async fn request_logger(request: Request, next: Next) -> Response {
         let level = level_from_status(status).to_string();
         let duration_ms = duration.as_millis();
 
-        let message = format!("{} {} → {} ({}ms)", method, path, status, duration_ms);
-
-        // Extract user_id from response extensions (set by require_auth middleware)
-        // We can't easily get it here since AuthenticatedUser is set on the request.
-        // Instead, we use session_id which is always available from the cookie.
-        let sid = session_id.clone();
+        let message = format!(
+            "{} {} -> {} ({}ms)",
+            method, normalized_path, status, duration_ms
+        );
 
         tokio::spawn(async move {
             let _ = ticketing_system::system_logs::insert_log(
@@ -142,7 +184,7 @@ pub async fn request_logger(request: Request, next: Next) -> Response {
                 &message,
                 detail.as_deref(),
                 None,
-                sid.as_deref(),
+                None,
             )
             .await;
         });
@@ -169,5 +211,22 @@ mod tests {
         assert_eq!(level_from_status(503), "error");
         assert_eq!(level_from_status(404), "warn");
         assert_eq!(level_from_status(200), "info");
+    }
+
+    #[test]
+    fn request_paths_are_normalized_before_durable_logging() {
+        assert_eq!(
+            normalize_path("/api/tickets/T-12345678"),
+            "/api/tickets/:id"
+        );
+        assert_eq!(
+            normalize_path("/api/conversations/123/messages"),
+            "/api/conversations/:id/messages"
+        );
+        assert_eq!(
+            normalize_path("/api/runs/550e8400-e29b-41d4-a716-446655440000"),
+            "/api/runs/:id"
+        );
+        assert_eq!(normalize_path("/api/admin/logs"), "/api/admin/logs");
     }
 }

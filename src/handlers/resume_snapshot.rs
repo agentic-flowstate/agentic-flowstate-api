@@ -84,6 +84,7 @@ use serde::Deserialize;
 use ticketing_system::{conversations, SqlitePool};
 
 use crate::agents::anthropic_events::{AnthropicEvent, ContentBlockStub};
+use crate::observability::contracts::assert_metric_labels;
 
 /// Counter: `content_block_snapshot` frames emitted by the resume
 /// handler. Labeled by `block_kind` so operators can chart whether
@@ -399,6 +400,10 @@ pub fn synthesize_snapshot_events(states: &[ContentBlockState]) -> Vec<Anthropic
             },
         };
 
+        assert_metric_labels(
+            METRIC_STREAM_SNAPSHOT_EMITTED,
+            &[("block_kind", state.kind.as_label())],
+        );
         counter!(
             METRIC_STREAM_SNAPSHOT_EMITTED,
             "block_kind" => state.kind.as_label(),

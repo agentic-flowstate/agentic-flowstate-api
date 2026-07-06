@@ -9,6 +9,7 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
+use crate::observability::contracts;
 use ticketing_system::models::ClientEventInput;
 
 /// POST /api/telemetry/events — accepts a JSON array of client events (max 1000)
@@ -23,6 +24,26 @@ pub async fn ingest_events(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "Maximum 1000 events per request"})),
+        )
+            .into_response();
+    }
+    if let Err(error) = contracts::validate_client_events(&events) {
+        tracing::warn!(
+            target: "observability.contracts",
+            event = "client_telemetry.rejected",
+            registry_version = contracts::registry_version(),
+            event_index = error.event_index,
+            reason = %error.reason,
+            "client telemetry batch rejected by observability guardrail"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Client telemetry rejected by observability guardrail",
+                "event_index": error.event_index,
+                "reason": error.reason,
+                "registry_version": contracts::registry_version()
+            })),
         )
             .into_response();
     }

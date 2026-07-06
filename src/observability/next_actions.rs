@@ -4,6 +4,8 @@ use std::fmt;
 
 use metrics::{counter, histogram};
 
+use super::contracts::assert_metric_labels;
+
 pub const METRIC_NEXT_ACTIONS_GENERATION_TOTAL: &str = "next_actions_generation_total";
 pub const METRIC_NEXT_ACTIONS_GENERATION_DURATION_MS: &str = "next_actions_generation_duration_ms";
 pub const METRIC_NEXT_ACTIONS_SUGGESTIONS_GENERATED: &str =
@@ -57,10 +59,19 @@ pub fn record_generation(
     suggestion_count: usize,
 ) {
     let status_label = status.to_string();
+    assert_metric_labels(
+        METRIC_NEXT_ACTIONS_GENERATION_TOTAL,
+        &[("status", status_label.as_str())],
+    );
     counter!(METRIC_NEXT_ACTIONS_GENERATION_TOTAL, "status" => status_label.clone()).increment(1);
+    assert_metric_labels(
+        METRIC_NEXT_ACTIONS_GENERATION_DURATION_MS,
+        &[("status", status_label.as_str())],
+    );
     histogram!(METRIC_NEXT_ACTIONS_GENERATION_DURATION_MS, "status" => status_label)
         .record(duration_ms as f64);
     if suggestion_count > 0 {
+        assert_metric_labels(METRIC_NEXT_ACTIONS_SUGGESTIONS_GENERATED, &[]);
         counter!(METRIC_NEXT_ACTIONS_SUGGESTIONS_GENERATED).increment(suggestion_count as u64);
     }
 
@@ -83,11 +94,14 @@ pub fn record_storage(
     deleted_count: u64,
     inserted_count: usize,
 ) {
+    assert_metric_labels(METRIC_NEXT_ACTIONS_STORAGE_REPLACEMENTS_TOTAL, &[]);
     counter!(METRIC_NEXT_ACTIONS_STORAGE_REPLACEMENTS_TOTAL).increment(1);
     if deleted_count > 0 {
+        assert_metric_labels(METRIC_NEXT_ACTIONS_STORAGE_ROWS_DELETED_TOTAL, &[]);
         counter!(METRIC_NEXT_ACTIONS_STORAGE_ROWS_DELETED_TOTAL).increment(deleted_count);
     }
     if inserted_count > 0 {
+        assert_metric_labels(METRIC_NEXT_ACTIONS_STORAGE_ROWS_INSERTED_TOTAL, &[]);
         counter!(METRIC_NEXT_ACTIONS_STORAGE_ROWS_INSERTED_TOTAL).increment(inserted_count as u64);
     }
 
@@ -104,8 +118,16 @@ pub fn record_storage(
 
 pub fn record_clear(conversation_id: &str, reason: NextActionClearReason, deleted_count: u64) {
     let reason_label = reason.to_string();
+    assert_metric_labels(
+        METRIC_NEXT_ACTIONS_CLEARS_TOTAL,
+        &[("reason", reason_label.as_str())],
+    );
     counter!(METRIC_NEXT_ACTIONS_CLEARS_TOTAL, "reason" => reason_label.clone()).increment(1);
     if deleted_count > 0 {
+        assert_metric_labels(
+            METRIC_NEXT_ACTIONS_CLEAR_ROWS_DELETED_TOTAL,
+            &[("reason", reason_label.as_str())],
+        );
         counter!(METRIC_NEXT_ACTIONS_CLEAR_ROWS_DELETED_TOTAL, "reason" => reason_label.clone())
             .increment(deleted_count);
     }

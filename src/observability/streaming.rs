@@ -31,6 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use metrics::{counter, gauge, histogram};
 
+use super::contracts::assert_metric_labels;
+
 // ---------------------------------------------------------------------------
 // Metric name constants — centralized for grepability and rename safety.
 // ---------------------------------------------------------------------------
@@ -228,16 +230,20 @@ pub fn record_stream_opened(conversation_id: &str, user_id: &str, resume: bool) 
         "false".into()
     };
 
+    assert_metric_labels(METRIC_STREAM_OPENED, &[("resume", resume_label.as_ref())]);
     counter!(METRIC_STREAM_OPENED, "resume" => resume_label).increment(1);
+    assert_metric_labels(METRIC_STREAM_CONCURRENT, &[]);
     gauge!(METRIC_STREAM_CONCURRENT).increment(1.0);
 
     // Ratio side: pick the correct bucket.
     let (resumes, colds) = if resume {
         let r = RESUME_OPENS.fetch_add(1, Ordering::Relaxed) + 1;
+        assert_metric_labels(METRIC_STREAM_RESUME, &[]);
         counter!(METRIC_STREAM_RESUME).increment(1);
         (r, COLD_OPENS.load(Ordering::Relaxed))
     } else {
         let c = COLD_OPENS.fetch_add(1, Ordering::Relaxed) + 1;
+        assert_metric_labels(METRIC_STREAM_COLD_START, &[]);
         counter!(METRIC_STREAM_COLD_START).increment(1);
         (RESUME_OPENS.load(Ordering::Relaxed), c)
     };
@@ -247,6 +253,7 @@ pub fn record_stream_opened(conversation_id: &str, user_id: &str, resume: bool) 
     } else {
         0.0
     };
+    assert_metric_labels(METRIC_STREAM_RESUME_RATIO, &[]);
     gauge!(METRIC_STREAM_RESUME_RATIO).set(ratio);
 
     tracing::info!(
@@ -267,8 +274,14 @@ pub fn record_stream_opened(conversation_id: &str, user_id: &str, resume: bool) 
 pub fn record_stream_closed(conversation_id: &str, duration_ms: u64, reason: DisconnectReason) {
     let reason_label: Cow<'static, str> = reason.to_string().into();
 
+    assert_metric_labels(METRIC_STREAM_CLOSED, &[("reason", reason_label.as_ref())]);
     counter!(METRIC_STREAM_CLOSED, "reason" => reason_label.clone()).increment(1);
+    assert_metric_labels(
+        METRIC_STREAM_DURATION_MS,
+        &[("reason", reason_label.as_ref())],
+    );
     histogram!(METRIC_STREAM_DURATION_MS, "reason" => reason_label).record(duration_ms as f64);
+    assert_metric_labels(METRIC_STREAM_CONCURRENT, &[]);
     gauge!(METRIC_STREAM_CONCURRENT).decrement(1.0);
 
     tracing::info!(
@@ -285,7 +298,9 @@ pub fn record_stream_closed(conversation_id: &str, duration_ms: u64, reason: Dis
 /// byte size so we can chart bandwidth per conversation independently of
 /// event rate.
 pub fn record_stream_event_emitted(conversation_id: &str, bytes: usize) {
+    assert_metric_labels(METRIC_STREAM_EVENTS_EMITTED, &[]);
     counter!(METRIC_STREAM_EVENTS_EMITTED).increment(1);
+    assert_metric_labels(METRIC_STREAM_BYTES_EMITTED, &[]);
     counter!(METRIC_STREAM_BYTES_EMITTED).increment(bytes as u64);
 
     tracing::trace!(
@@ -306,6 +321,7 @@ pub fn record_stream_event_emitted(conversation_id: &str, bytes: usize) {
 /// need to localize a regression, correlate against the structured
 /// `tracing::trace!` log which carries the conversation_id.
 pub fn record_keepalive_sent(conversation_id: &str) {
+    assert_metric_labels(METRIC_STREAM_KEEPALIVE_SENT, &[]);
     counter!(METRIC_STREAM_KEEPALIVE_SENT).increment(1);
     tracing::trace!(
         target: "observability.streaming",
@@ -318,6 +334,7 @@ pub fn record_keepalive_sent(conversation_id: &str) {
 /// Observed a `starting_after` cursor that sits below the oldest
 /// retained event. Emitted alongside the 410 Gone response.
 pub fn record_cursor_expired(conversation_id: &str, requested_cursor: i32, oldest_retained: i32) {
+    assert_metric_labels(METRIC_STREAM_CURSOR_EXPIRED, &[]);
     counter!(METRIC_STREAM_CURSOR_EXPIRED).increment(1);
 
     tracing::warn!(
@@ -350,6 +367,13 @@ pub fn record_stream_rate_limited(
 ) {
     let reason_label: Cow<'static, str> = reason.as_wire_str().into();
     let kind_label: Cow<'static, str> = kind.as_str().into();
+    assert_metric_labels(
+        METRIC_STREAM_RATE_LIMITED,
+        &[
+            ("reason", reason_label.as_ref()),
+            ("kind", kind_label.as_ref()),
+        ],
+    );
     counter!(
         METRIC_STREAM_RATE_LIMITED,
         "reason" => reason_label,
@@ -375,6 +399,13 @@ pub fn record_push_sent(result: PushResult, apns_status: u16) {
     let result_label: Cow<'static, str> = result.to_string().into();
     let status_label: Cow<'static, str> = apns_status.to_string().into();
 
+    assert_metric_labels(
+        METRIC_PUSH_SENT,
+        &[
+            ("result", result_label.as_ref()),
+            ("apns_status", status_label.as_ref()),
+        ],
+    );
     counter!(
         METRIC_PUSH_SENT,
         "result" => result_label.clone(),
@@ -400,6 +431,7 @@ pub fn record_gap_detected(conversation_id: &str, expected: i32, actual: i32) {
     if gap_size == 0 {
         return; // no gap — don't emit.
     }
+    assert_metric_labels(METRIC_EVENTS_GAP_DETECTED, &[]);
     counter!(METRIC_EVENTS_GAP_DETECTED).increment(gap_size);
 
     tracing::warn!(
@@ -421,12 +453,26 @@ pub fn record_ticket_preflight(status: &str, action: &str, duration_ms: u64) {
     let status_label: Cow<'static, str> = status.to_string().into();
     let action_label: Cow<'static, str> = action.to_string().into();
 
+    assert_metric_labels(
+        METRIC_TICKET_PREFLIGHT_TOTAL,
+        &[
+            ("status", status_label.as_ref()),
+            ("action", action_label.as_ref()),
+        ],
+    );
     counter!(
         METRIC_TICKET_PREFLIGHT_TOTAL,
         "status" => status_label.clone(),
         "action" => action_label.clone(),
     )
     .increment(1);
+    assert_metric_labels(
+        METRIC_TICKET_PREFLIGHT_DURATION_MS,
+        &[
+            ("status", status_label.as_ref()),
+            ("action", action_label.as_ref()),
+        ],
+    );
     histogram!(
         METRIC_TICKET_PREFLIGHT_DURATION_MS,
         "status" => status_label.clone(),
@@ -458,6 +504,13 @@ pub fn record_session_start(user_id: &str, platform: ClientPlatform, client_vers
     let platform_label: Cow<'static, str> = platform.to_string().into();
     let version_label: Cow<'static, str> = client_version.to_string().into();
 
+    assert_metric_labels(
+        METRIC_CLIENTS_SESSION_START,
+        &[
+            ("platform", platform_label.as_ref()),
+            ("client_version", version_label.as_ref()),
+        ],
+    );
     counter!(
         METRIC_CLIENTS_SESSION_START,
         "platform" => platform_label,

@@ -1,0 +1,762 @@
+version = "0.1"
+effective_date = "2026-07-06"
+source_artifacts = ["A-5E4F35CD", "A-FBE61DC4"]
+ticket_id = "T-A133CC95"
+
+[[contracts]]
+id = "C-OBS-001"
+name = "iOS Responsiveness"
+status = "draft"
+owner = "agentic-flowstate-engineering"
+
+[[contracts]]
+id = "C-OBS-002"
+name = "Conversation Fanout and Scale"
+status = "draft"
+owner = "agentic-flowstate-engineering"
+
+[[contracts]]
+id = "C-OBS-003"
+name = "Backend Request Economics"
+status = "draft"
+owner = "agentic-flowstate-engineering"
+
+[[contracts]]
+id = "C-OBS-004"
+name = "Agent Run Lifecycle"
+status = "draft"
+owner = "agentic-flowstate-engineering"
+
+[privacy]
+max_message_bytes = 512
+max_detail_bytes = 32768
+allowed_fields = [
+  "action",
+  "action_type",
+  "active_sse",
+  "agent",
+  "agent_name",
+  "aggregate_kind",
+  "apns_status",
+  "app_run_id",
+  "app_state",
+  "app_version",
+  "artifact_id",
+  "build",
+  "bytes",
+  "candidate_type",
+  "client_created_at",
+  "client_monotonic_ms",
+  "client_version",
+  "client_wall_iso",
+  "client_wall_ms",
+  "component",
+  "conversation_id",
+  "count",
+  "deleted_count",
+  "device_class",
+  "device_id",
+  "diagnostic_id",
+  "diagnostic_type",
+  "document_id",
+  "duration_ms",
+  "elapsed_ms",
+  "error_type",
+  "event_id",
+  "event_index",
+  "event_type",
+  "fanout_tier",
+  "finished_at_ms",
+  "foreground_time_ms",
+  "from_screen",
+  "handler_to_first_render_ms",
+  "level",
+  "message",
+  "method",
+  "metric_payload_id",
+  "model_class",
+  "monotonic_ms",
+  "network_state",
+  "operation",
+  "org",
+  "os_major",
+  "os_version",
+  "outcome",
+  "phase",
+  "platform",
+  "queue",
+  "reason",
+  "received_at",
+  "release_channel",
+  "report_id",
+  "request_id",
+  "response_bytes",
+  "route",
+  "runner_kind",
+  "runtime",
+  "sample_rate",
+  "sampling_reason",
+  "screen_name",
+  "session_id",
+  "severity",
+  "span_id",
+  "started_at_ms",
+  "status",
+  "status_class",
+  "ticket_id",
+  "timestamp_ms",
+  "tool_call_count",
+  "trace_id",
+  "user_id",
+  "worker_kind"
+]
+forbidden_field_names = [
+  "api_key",
+  "assistant_response",
+  "auth_header",
+  "authorization",
+  "body",
+  "clipboard",
+  "cookie",
+  "email",
+  "email_address",
+  "exact_gps",
+  "freeform_text",
+  "html",
+  "password",
+  "prompt",
+  "prompt_text",
+  "raw_request_body",
+  "raw_response_body",
+  "raw_sql",
+  "request_body",
+  "response_body",
+  "screenshot",
+  "secret",
+  "sql",
+  "stderr",
+  "stdout",
+  "token",
+  "user_text"
+]
+forbidden_metric_labels = [
+  "app_run_id",
+  "artifact_id",
+  "conversation_id",
+  "device_id",
+  "document_id",
+  "parent_conversation_id",
+  "raw_error",
+  "raw_path",
+  "raw_sql",
+  "raw_url",
+  "report_id",
+  "request_id",
+  "run_id",
+  "session_id",
+  "span_id",
+  "ticket_id",
+  "tool_call_id",
+  "trace_id",
+  "user_id"
+]
+secret_patterns = [
+  "authorization:",
+  "bearer ",
+  "cookie:",
+  "set-cookie:",
+  "api_key=",
+  "token=",
+  "password=",
+  "secret=",
+  "-----begin private key-----"
+]
+
+[[events]]
+name = "error"
+contract_id = "C-OBS-004"
+signal = "client_event"
+
+[[events]]
+name = "chat_latency"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "network"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "network_request"
+contract_id = "C-OBS-003"
+signal = "client_event"
+
+[[events]]
+name = "network_perf"
+contract_id = "C-OBS-003"
+signal = "client_event"
+
+[[events]]
+name = "network_endpoint"
+contract_id = "C-OBS-003"
+signal = "client_event"
+
+[[events]]
+name = "lifecycle"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "scene_phase"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "scenephase"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "startup"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "performance"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "battery"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "thermal"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "metrickit"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "interaction"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "ios.main_thread_hang"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "ios.frame_window_summary"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "ios.interaction_latency"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "ios.metrickit_diagnostic"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "ios.next_startup_prior_run"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "sse"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_event"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_lifecycle"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_topic_refresh"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_backoff"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_connected"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_disconnected"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_frame"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_recover"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_reconnect_fallthrough"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "sse_recovery_410_gone"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "gap_detected"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "gap_buffer_evicted"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "gap_delta_sync"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "gap_delta_sync_cooldown"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "gap_delta_sync_stuck"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "gap_duplicate_dropped"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "live_stream.connect"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "live_stream.frame_persist_failed"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "chat"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "chat_draft"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "chat_performance"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "chat_projection"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "chat_queue"
+contract_id = "C-OBS-004"
+signal = "client_event"
+
+[[events]]
+name = "chat_status"
+contract_id = "C-OBS-004"
+signal = "client_event"
+
+[[events]]
+name = "foreground_refetch"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "background_refresh"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "silent_push"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "power_management"
+contract_id = "C-OBS-001"
+signal = "client_event"
+
+[[events]]
+name = "gauge_underflow"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "auth"
+contract_id = "C-OBS-003"
+signal = "client_event"
+
+[[events]]
+name = "auth_cookie_bridge"
+contract_id = "C-OBS-003"
+signal = "client_event"
+
+[[events]]
+name = "apns_register_requested"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "apns_token_no_app_state"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "apns_token_no_user"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "registered"
+contract_id = "C-OBS-002"
+signal = "client_event"
+
+[[events]]
+name = "voice"
+contract_id = "C-OBS-003"
+signal = "client_event"
+
+[[events]]
+name = "agent_run.queued"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[events]]
+name = "agent_run.runner_claimed"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[events]]
+name = "agent_run.started"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[events]]
+name = "agent_run.child_work_admitted"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[events]]
+name = "agent_run.waiting_for_children"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[events]]
+name = "agent_run.wake_scheduled"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[events]]
+name = "agent_run.wake_fired"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[events]]
+name = "agent_run.completed"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[events]]
+name = "agent_run.failed"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[events]]
+name = "agent_run.diagnostic_bundle_created"
+contract_id = "C-OBS-004"
+signal = "system_event"
+
+[[metrics]]
+name = "stream_opened_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = ["resume"]
+
+[[metrics]]
+name = "stream_concurrent"
+kind = "gauge"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "stream_closed_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = ["reason"]
+
+[[metrics]]
+name = "stream_duration_ms"
+kind = "histogram"
+contract_id = "C-OBS-002"
+labels = ["reason"]
+
+[[metrics]]
+name = "stream_events_emitted_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "stream_bytes_emitted_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "stream_resume_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "stream_cold_start_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "stream_resume_ratio"
+kind = "gauge"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "stream_cursor_expired_410_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "stream_rate_limited_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = ["reason", "kind"]
+
+[[metrics]]
+name = "stream_keepalive_sent_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "push_sent_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = ["result", "apns_status"]
+
+[[metrics]]
+name = "events_gap_detected_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "clients_session_start_total"
+kind = "counter"
+contract_id = "C-OBS-001"
+labels = ["platform", "client_version"]
+
+[[metrics]]
+name = "ticket_preflight_total"
+kind = "counter"
+contract_id = "C-OBS-003"
+labels = ["status", "action"]
+
+[[metrics]]
+name = "ticket_preflight_duration_ms"
+kind = "histogram"
+contract_id = "C-OBS-003"
+labels = ["status", "action"]
+
+[[metrics]]
+name = "retention_rows_deleted_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "retention_prune_duration_ms"
+kind = "histogram"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "retention_conversations_touched"
+kind = "gauge"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "retention_earliest_remaining_event_age_seconds"
+kind = "gauge"
+contract_id = "C-OBS-002"
+labels = []
+
+[[metrics]]
+name = "next_actions_generation_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["status"]
+
+[[metrics]]
+name = "next_actions_generation_duration_ms"
+kind = "histogram"
+contract_id = "C-OBS-004"
+labels = ["status"]
+
+[[metrics]]
+name = "next_actions_suggestions_generated_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = []
+
+[[metrics]]
+name = "next_actions_storage_replacements_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = []
+
+[[metrics]]
+name = "next_actions_storage_rows_deleted_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = []
+
+[[metrics]]
+name = "next_actions_storage_rows_inserted_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = []
+
+[[metrics]]
+name = "next_actions_clears_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["reason"]
+
+[[metrics]]
+name = "next_actions_clear_rows_deleted_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["reason"]
+
+[[metrics]]
+name = "agentic_cancel_phase_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["phase"]
+
+[[metrics]]
+name = "agentic_cancel_phase_elapsed_ms"
+kind = "histogram"
+contract_id = "C-OBS-004"
+labels = ["phase"]
+
+[[metrics]]
+name = "agent_runtime_turn_started_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["agent", "runtime"]
+
+[[metrics]]
+name = "agent_runtime_turns_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["agent", "runtime", "status"]
+
+[[metrics]]
+name = "agent_runtime_turn_duration_ms"
+kind = "histogram"
+contract_id = "C-OBS-004"
+labels = ["agent", "runtime", "status"]
+
+[[metrics]]
+name = "agent_runtime_failures_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["phase"]
+
+[[metrics]]
+name = "agent_runtime_spawn_started_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["runtime"]
+
+[[metrics]]
+name = "agent_runtime_spawn_duration_ms"
+kind = "histogram"
+contract_id = "C-OBS-004"
+labels = ["runtime", "status"]
+
+[[metrics]]
+name = "agent_runtime_event_latency_ms"
+kind = "histogram"
+contract_id = "C-OBS-004"
+labels = ["phase"]
+
+[[metrics]]
+name = "stream_snapshot_emitted_total"
+kind = "counter"
+contract_id = "C-OBS-002"
+labels = ["block_kind"]
+
+[[spans]]
+name = "http.server.request"
+contract_id = "C-OBS-003"
+attributes = ["method", "route", "status_class", "error_type", "request_id", "trace_id"]
+
+[[spans]]
+name = "sse.stream"
+contract_id = "C-OBS-002"
+attributes = ["route", "resume", "reason", "request_id", "trace_id"]
+
+[[spans]]
+name = "agent_runtime.turn"
+contract_id = "C-OBS-004"
+attributes = ["agent", "runtime", "status", "phase", "request_id", "trace_id"]
+
+[[spans]]
+name = "client.telemetry.ingest"
+contract_id = "C-OBS-003"
+attributes = ["event_type", "component", "outcome", "error_type", "request_id"]

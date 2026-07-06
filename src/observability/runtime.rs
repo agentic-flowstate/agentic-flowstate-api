@@ -8,6 +8,8 @@ use std::fmt;
 
 use metrics::{counter, histogram};
 
+use super::contracts::assert_metric_labels;
+
 pub const METRIC_AGENT_TURN_STARTED: &str = "agent_runtime_turn_started_total";
 pub const METRIC_AGENT_TURNS: &str = "agent_runtime_turns_total";
 pub const METRIC_AGENT_TURN_DURATION_MS: &str = "agent_runtime_turn_duration_ms";
@@ -97,10 +99,19 @@ pub fn record_turn_started(
     attachment_count: usize,
     started_at_ms: i64,
 ) {
+    let agent_label = agent_name.to_string();
+    let runtime_label = runtime.to_string();
+    assert_metric_labels(
+        METRIC_AGENT_TURN_STARTED,
+        &[
+            ("agent", agent_label.as_str()),
+            ("runtime", runtime_label.as_str()),
+        ],
+    );
     counter!(
         METRIC_AGENT_TURN_STARTED,
-        "agent" => agent_name.to_string(),
-        "runtime" => runtime.to_string(),
+        "agent" => agent_label,
+        "runtime" => runtime_label,
     )
     .increment(1);
 
@@ -133,6 +144,14 @@ pub fn record_turn_completed(
     let agent_label: Cow<'static, str> = agent_name.to_string().into();
     let runtime_label: Cow<'static, str> = runtime.to_string().into();
     let status_label: Cow<'static, str> = status.to_string().into();
+    assert_metric_labels(
+        METRIC_AGENT_TURNS,
+        &[
+            ("agent", agent_label.as_ref()),
+            ("runtime", runtime_label.as_ref()),
+            ("status", status_label.as_ref()),
+        ],
+    );
     counter!(
         METRIC_AGENT_TURNS,
         "agent" => agent_label.clone(),
@@ -140,6 +159,14 @@ pub fn record_turn_completed(
         "status" => status_label.clone(),
     )
     .increment(1);
+    assert_metric_labels(
+        METRIC_AGENT_TURN_DURATION_MS,
+        &[
+            ("agent", agent_label.as_ref()),
+            ("runtime", runtime_label.as_ref()),
+            ("status", status_label.as_ref()),
+        ],
+    );
     histogram!(
         METRIC_AGENT_TURN_DURATION_MS,
         "agent" => agent_label,
@@ -164,6 +191,10 @@ pub fn record_turn_completed(
 
 pub fn record_runtime_failure(conversation_id: &str, phase: RuntimeFailurePhase, error: &str) {
     let phase_label: Cow<'static, str> = phase.to_string().into();
+    assert_metric_labels(
+        METRIC_AGENT_RUNTIME_FAILURES,
+        &[("phase", phase_label.as_ref())],
+    );
     counter!(METRIC_AGENT_RUNTIME_FAILURES, "phase" => phase_label).increment(1);
 
     tracing::error!(
@@ -185,7 +216,12 @@ pub fn record_spawn_started(
     reasoning_effort: &str,
     started_at_ms: i64,
 ) {
-    counter!(METRIC_AGENT_SPAWN_STARTED, "runtime" => runtime.to_string()).increment(1);
+    let runtime_label = runtime.to_string();
+    assert_metric_labels(
+        METRIC_AGENT_SPAWN_STARTED,
+        &[("runtime", runtime_label.as_str())],
+    );
+    counter!(METRIC_AGENT_SPAWN_STARTED, "runtime" => runtime_label).increment(1);
 
     tracing::info!(
         target: TARGET,
@@ -211,10 +247,19 @@ pub fn record_spawn_finished(
     duration_ms: u64,
     finished_at_ms: i64,
 ) {
+    let runtime_label = runtime.to_string();
+    let status_label = status.to_string();
+    assert_metric_labels(
+        METRIC_AGENT_SPAWN_DURATION_MS,
+        &[
+            ("runtime", runtime_label.as_str()),
+            ("status", status_label.as_str()),
+        ],
+    );
     histogram!(
         METRIC_AGENT_SPAWN_DURATION_MS,
-        "runtime" => runtime.to_string(),
-        "status" => status.to_string(),
+        "runtime" => runtime_label,
+        "status" => status_label,
     )
     .record(duration_ms as f64);
 
@@ -242,9 +287,14 @@ pub fn record_latency_marker(
     event_index: Option<i32>,
     bytes: Option<usize>,
 ) {
+    let phase_label = phase.to_string();
+    assert_metric_labels(
+        METRIC_AGENT_EVENT_LATENCY_MS,
+        &[("phase", phase_label.as_str())],
+    );
     histogram!(
         METRIC_AGENT_EVENT_LATENCY_MS,
-        "phase" => phase.to_string(),
+        "phase" => phase_label,
     )
     .record(elapsed_ms as f64);
 

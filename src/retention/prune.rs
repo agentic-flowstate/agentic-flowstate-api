@@ -21,6 +21,7 @@ use chrono::Utc;
 use ticketing_system::SqlitePool;
 
 use super::RetentionConfig;
+use crate::observability::contracts::assert_metric_labels;
 use crate::observability::streaming as obs;
 
 /// Report returned by [`prune_conversation_events`]. Captures every
@@ -385,8 +386,11 @@ async fn delete_one_batch(
 /// [`crate::observability::streaming`] as consts so dashboards and call
 /// sites stay in sync.
 async fn emit_run_metrics(report: &PruneReport, now_ts: i64, pool: &SqlitePool) {
+    assert_metric_labels(obs::METRIC_RETENTION_ROWS_DELETED, &[]);
     metrics::counter!(obs::METRIC_RETENTION_ROWS_DELETED).increment(report.rows_deleted);
+    assert_metric_labels(obs::METRIC_RETENTION_PRUNE_DURATION_MS, &[]);
     metrics::histogram!(obs::METRIC_RETENTION_PRUNE_DURATION_MS).record(report.duration_ms as f64);
+    assert_metric_labels(obs::METRIC_RETENTION_CONVERSATIONS_TOUCHED, &[]);
     metrics::gauge!(obs::METRIC_RETENTION_CONVERSATIONS_TOUCHED)
         .set(report.conversations_touched as f64);
 
@@ -404,10 +408,12 @@ async fn emit_run_metrics(report: &PruneReport, now_ts: i64, pool: &SqlitePool) 
             .flatten();
     if let Some(oldest) = fleet_min {
         let age_secs = (now_ts - oldest).max(0) as f64;
+        assert_metric_labels(obs::METRIC_RETENTION_EARLIEST_AGE_SECS, &[]);
         metrics::gauge!(obs::METRIC_RETENTION_EARLIEST_AGE_SECS).set(age_secs);
     } else {
         // No events at all — report a gauge value of 0 so dashboards
         // don't see a "stale metric" gap.
+        assert_metric_labels(obs::METRIC_RETENTION_EARLIEST_AGE_SECS, &[]);
         metrics::gauge!(obs::METRIC_RETENTION_EARLIEST_AGE_SECS).set(0.0);
     }
 }

@@ -4,6 +4,8 @@
 //!
 //! * [`streaming`] — durable-streaming metrics (T-56987678): stream
 //!   lifecycle, push delivery, gap detection, session start.
+//! * [`contracts`] — versioned observability contract registry plus
+//!   privacy/cardinality guardrails.
 //! * [`cancellation`] — stop-button cancellation phase logs and latency
 //!   metrics.
 //! * [`next_actions`] — post-turn follow-up suggestion generation and storage metrics.
@@ -27,6 +29,7 @@
 //!   metric — and vice-versa — so dashboards and logs agree.
 
 pub mod cancellation;
+pub mod contracts;
 pub mod next_actions;
 pub mod runtime;
 pub mod streaming;
@@ -71,6 +74,8 @@ pub enum InstallError {
 /// returns `Err(AlreadyInstalled)`. Tests that share a process use
 /// `install_for_test` which swallows the double-install.
 pub fn install_prometheus_exporter() -> Result<(), InstallError> {
+    contracts::assert_registry_loaded();
+
     if PROMETHEUS.get().is_some() {
         return Err(InstallError::AlreadyInstalled);
     }
