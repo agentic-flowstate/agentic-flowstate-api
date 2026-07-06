@@ -349,6 +349,15 @@ impl CodexAppServerOutcome {
     }
 }
 
+fn append_app_server_stderr(error: String, stderr_text: &str) -> String {
+    let stderr_text = stderr_text.trim();
+    if stderr_text.is_empty() {
+        error
+    } else {
+        format!("{error}: {stderr_text}")
+    }
+}
+
 pub fn resolve_codex_model(model: &str) -> &str {
     match model {
         "" => DEFAULT_CODEX_MODEL,
@@ -603,13 +612,11 @@ fn prepare_codex_app_server_home(
             source_auth.display()
         ));
     }
-    std::fs::copy(&source_auth, target_home.join("auth.json")).map_err(|e| {
-        format!(
-            "Failed to copy Codex auth from {} to {}: {e}",
-            source_auth.display(),
-            target_home.join("auth.json").display()
-        )
-    })?;
+    copy_file_atomically(
+        &source_auth,
+        &target_home.join("auth.json"),
+        "Codex app-server auth",
+    )?;
 
     let source_agents = source_home.join("AGENTS.md");
     let target_agents = target_home.join("AGENTS.md");
@@ -641,6 +648,10 @@ fn prepare_codex_app_server_home(
 }
 
 fn write_file_atomically(path: &Path, contents: &str, label: &str) -> Result<(), String> {
+    write_bytes_atomically(path, contents.as_bytes(), label)
+}
+
+fn write_bytes_atomically(path: &Path, contents: &[u8], label: &str) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| {
         format!(
             "Failed to resolve parent directory for {label} at {}",
@@ -656,7 +667,7 @@ fn write_file_atomically(path: &Path, contents: &str, label: &str) -> Result<(),
                 path.display()
             )
         })?;
-    write_file_atomically_with_temp_candidates(
+    write_bytes_atomically_with_temp_candidates(
         path,
         contents,
         label,
@@ -667,6 +678,18 @@ fn write_file_atomically(path: &Path, contents: &str, label: &str) -> Result<(),
 fn write_file_atomically_with_temp_candidates<I>(
     path: &Path,
     contents: &str,
+    label: &str,
+    temp_paths: I,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = Result<PathBuf, String>>,
+{
+    write_bytes_atomically_with_temp_candidates(path, contents.as_bytes(), label, temp_paths)
+}
+
+fn write_bytes_atomically_with_temp_candidates<I>(
+    path: &Path,
+    contents: &[u8],
     label: &str,
     temp_paths: I,
 ) -> Result<(), String>
@@ -686,7 +709,7 @@ where
                 )
             },
         )?;
-        file.write_all(contents.as_bytes()).map_err(|e| {
+        file.write_all(contents).map_err(|e| {
             format!(
                 "Failed to write temporary {label} at {}: {e}",
                 temp_path.display()
@@ -716,6 +739,18 @@ where
     }
 
     write_result
+}
+
+fn copy_file_atomically(source: &Path, target: &Path, label: &str) -> Result<(), String> {
+    let contents = std::fs::read(source)
+        .map_err(|e| format!("Failed to read {label} from {}: {e}", source.display()))?;
+    write_bytes_atomically(target, &contents, label).map_err(|e| {
+        format!(
+            "Failed to replace {label} at {} from {}: {e}",
+            target.display(),
+            source.display()
+        )
+    })
 }
 
 fn atomic_temp_path_candidates<'a>(
@@ -1118,14 +1153,50 @@ pub async fn spawn_codex_app_server(
             completion,
         }),
         Ok(Err(e)) => {
-            let _ = terminate_child_process(&child).await;
-            Err(e)
+            Err(
+                finalize_failed_app_server_startup(e, &child, &stdin, stdout_task, stderr_task)
+                    .await,
+            )
+        }
+        Err(e) => Err(finalize_failed_app_server_startup(
+            format!("codex app-server startup task exited: {e}"),
+            &child,
+            &stdin,
+            stdout_task,
+            stderr_task,
+        )
+        .await),
+    }
+}
+
+async fn finalize_failed_app_server_startup(
+    error: String,
+    child: &Arc<Mutex<Child>>,
+    stdin: &Arc<Mutex<Option<ChildStdin>>>,
+    stdout_task: JoinHandle<Result<(), String>>,
+    stderr_task: JoinHandle<Result<String, std::io::Error>>,
+) -> String {
+    close_stdin(stdin).await;
+    let _ = terminate_child_process(child).await;
+    let _ = child.lock().await.wait().await;
+
+    if let Err(e) = stdout_task.await {
+        tracing::warn!("[CODEX] Failed joining startup stdout task: {}", e);
+    }
+
+    let stderr_text = match stderr_task.await {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => {
+            tracing::warn!("[CODEX] Failed reading startup stderr: {}", e);
+            String::new()
         }
         Err(e) => {
-            let _ = terminate_child_process(&child).await;
-            Err(format!("codex app-server startup task exited: {e}"))
+            tracing::warn!("[CODEX] Failed joining startup stderr task: {}", e);
+            String::new()
         }
-    }
+    };
+
+    append_app_server_stderr(error, &stderr_text)
 }
 
 pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, String> {
@@ -1250,14 +1321,7 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, 
         .map_err(|e| format!("Failed joining app-server stderr reader: {e}"))?
         .map_err(|e| format!("Failed reading app-server stderr: {e}"))?;
 
-    result.map_err(|e| {
-        let stderr_text = stderr_text.trim();
-        if stderr_text.is_empty() {
-            e
-        } else {
-            format!("{e}: {stderr_text}")
-        }
-    })
+    result.map_err(|e| append_app_server_stderr(e, &stderr_text))
 }
 
 fn effective_sandbox(options: &CodexAppServerOptions<'_>) -> CodexSandboxMode {
@@ -2601,6 +2665,77 @@ approval_mode = "approve"
         assert!(collision_path.exists());
         assert!(!retry_path.exists());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn atomic_auth_write_keeps_concurrent_readers_on_valid_json() {
+        let root = unique_temp_path("codex-auth-atomic-write");
+        std::fs::create_dir_all(&root).expect("create root");
+        let auth_path = root.join("auth.json");
+        write_bytes_atomically(&auth_path, br#"{"token":"initial"}"#, "test auth")
+            .expect("write initial auth");
+
+        let done = StdArc::new(AtomicBool::new(false));
+        let failure = StdArc::new(StdMutex::new(None::<String>));
+        let reader_done = done.clone();
+        let reader_failure = failure.clone();
+        let reader_path = auth_path.clone();
+        let reader = thread::spawn(move || {
+            while !reader_done.load(Ordering::SeqCst) {
+                let bytes = match std::fs::read(&reader_path) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        *reader_failure.lock().expect("failure lock") =
+                            Some(format!("read failed: {e}"));
+                        break;
+                    }
+                };
+                if let Err(e) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    *reader_failure.lock().expect("failure lock") =
+                        Some(format!("parse failed: {e}: {bytes:?}"));
+                    break;
+                }
+            }
+        });
+
+        for index in 0..200 {
+            let auth = format!(
+                r#"{{"token":"token-{index}","refresh_token":"{}"}}"#,
+                "x".repeat(2048)
+            );
+            write_bytes_atomically(&auth_path, auth.as_bytes(), "test auth")
+                .expect("atomic auth write");
+        }
+
+        done.store(true, Ordering::SeqCst);
+        reader.join().expect("reader join");
+        assert_eq!(*failure.lock().expect("failure lock"), None);
+
+        let temp_files = std::fs::read_dir(&root)
+            .expect("read root")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temp_files, 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn startup_error_formatter_appends_trimmed_stderr() {
+        assert_eq!(
+            append_app_server_stderr(
+                "codex app-server closed stdout before initialize response".to_string(),
+                "\nfailed to read auth.json\n"
+            ),
+            "codex app-server closed stdout before initialize response: failed to read auth.json"
+        );
+        assert_eq!(
+            append_app_server_stderr(
+                "codex app-server closed stdout before initialize response".to_string(),
+                " \n "
+            ),
+            "codex app-server closed stdout before initialize response"
+        );
     }
 
     #[test]
