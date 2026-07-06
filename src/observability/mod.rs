@@ -29,6 +29,7 @@
 //! * Every `tracing::info!` emitted from this module MUST also update a
 //!   metric — and vice-versa — so dashboards and logs agree.
 
+pub mod agent_lifecycle;
 pub mod cancellation;
 pub mod contracts;
 pub mod next_actions;

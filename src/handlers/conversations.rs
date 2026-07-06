@@ -37,7 +37,6 @@ use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
 use super::runner_capacity;
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
-use crate::observability::cancellation;
 use crate::observability::request::{
     maybe_log_economics_guardrail, observe_serialized_payload, record_db_operation,
     record_db_query_count, Outcome, ROUTE_CONVERSATIONS, ROUTE_CONVERSATION_EVENTS_PAGE,
@@ -46,6 +45,7 @@ use crate::observability::request::{
 use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_opened, DisconnectReason,
 };
+use crate::observability::{agent_lifecycle, cancellation};
 use crate::runner_commands;
 use tokio::sync::{broadcast, RwLock};
 
@@ -1085,6 +1085,9 @@ fn prepare_initial_child_turns(
         .count();
     let child_batch_id =
         (child_batch_size > 0).then(|| format!("child-batch-{}", uuid::Uuid::new_v4()));
+    let child_batch_report_id = child_batch_id
+        .as_ref()
+        .map(|_| agent_lifecycle::new_report_id());
     let mut child_batch_index = 0usize;
 
     for (child_index, (spec, handoff)) in children.iter().zip(handoffs).enumerate() {
@@ -1154,6 +1157,7 @@ fn prepare_initial_child_turns(
             child_batch_id.as_deref(),
             child_batch_size,
             child_batch_index,
+            child_batch_report_id.as_deref(),
         )?;
         let prompt_vars = encode_codex_options_for_job(
             prompt_vars,
@@ -1213,6 +1217,30 @@ fn queued_child_turn_responses(
         .collect()
 }
 
+async fn record_prepared_child_batch_pending(
+    pool: &SqlitePool,
+    parent_conversation_id: &str,
+    prepared_turns: &[PreparedChildTurn],
+    queued_jobs: &[conversations::CreatedChildTurnJob],
+) {
+    let Some(context) = prepared_turns.iter().find_map(|turn| {
+        agent_lifecycle::child_batch_context_from_metadata(
+            turn.request.payload.message_metadata.as_deref(),
+        )
+    }) else {
+        return;
+    };
+
+    agent_lifecycle::record_child_batch_pending(
+        pool,
+        parent_conversation_id,
+        &context,
+        queued_jobs.len(),
+    )
+    .await;
+    agent_lifecycle::refresh_queue_metrics(pool).await;
+}
+
 async fn publish_queued_child_turn_statuses(
     pool: &SqlitePool,
     queued_jobs: &[conversations::CreatedChildTurnJob],
@@ -1266,6 +1294,7 @@ fn orchestrated_child_turn_metadata(
     child_batch_id: Option<&str>,
     child_batch_size: usize,
     child_batch_index: usize,
+    report_id: Option<&str>,
 ) -> Result<String, (StatusCode, String)> {
     let mut value = serde_json::json!({
         "origin": "agent_orchestrated",
@@ -1277,6 +1306,9 @@ fn orchestrated_child_turn_metadata(
         value["child_batch_id"] = serde_json::Value::String(child_batch_id.to_string());
         value["child_batch_size"] = serde_json::json!(child_batch_size);
         value["child_batch_index"] = serde_json::json!(child_batch_index);
+    }
+    if let Some(report_id) = report_id {
+        value["report_id"] = serde_json::Value::String(report_id.to_string());
     }
     if agent == "conversation-evaluator" {
         value["suppress_parent_completion_relay"] = serde_json::Value::Bool(true);
@@ -1695,6 +1727,13 @@ pub async fn create_multi_agent_conversation(
     publish_queued_child_turn_statuses(&pool, &created.queued_jobs)
         .await
         .map_err(text_error_response)?;
+    record_prepared_child_batch_pending(
+        &pool,
+        &created.parent.id,
+        &prepared_turns,
+        &created.queued_jobs,
+    )
+    .await;
     let queued_turns = queued_child_turn_responses(&prepared_turns, &created.queued_jobs);
     let parent = created.parent;
     let children = created.children;
@@ -1803,6 +1842,7 @@ pub async fn create_child_conversations(
     publish_queued_child_turn_statuses(&pool, &created.queued_jobs)
         .await
         .map_err(text_error_response)?;
+    record_prepared_child_batch_pending(&pool, &id, &prepared_turns, &created.queued_jobs).await;
     let queued_turns = queued_child_turn_responses(&prepared_turns, &created.queued_jobs);
     let children = created.children;
     let context_handoffs = context_handoff_responses(&children, &resolved_handoffs);
@@ -3447,6 +3487,7 @@ mod tests {
             Some("child-batch-test"),
             2,
             1,
+            Some("af-report-test"),
         )
         .expect("child turn metadata");
         let value: Value = serde_json::from_str(&metadata).expect("metadata json");
@@ -3463,6 +3504,7 @@ mod tests {
         assert_eq!(value["child_batch_id"], "child-batch-test");
         assert_eq!(value["child_batch_size"], 2);
         assert_eq!(value["child_batch_index"], 1);
+        assert_eq!(value["report_id"], "af-report-test");
 
         let handoff_metadata = &value["artifact_memory_handoff"];
         assert!(handoff_metadata.get("packets").is_none());
@@ -3483,6 +3525,7 @@ mod tests {
             Some("child-batch-test"),
             1,
             1,
+            Some("af-report-test"),
         )
         .expect("child turn metadata");
         let value: Value = serde_json::from_str(&metadata).expect("metadata json");

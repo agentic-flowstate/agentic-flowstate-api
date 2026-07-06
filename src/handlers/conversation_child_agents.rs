@@ -20,6 +20,7 @@ use crate::handlers::chat_stream::{self, ChatCodexOptions, ChatRuntime};
 use crate::handlers::conversation_handoff::{
     resolve_context_handoff, ContextHandoffRequest, ResolvedContextHandoff,
 };
+use crate::observability::agent_lifecycle;
 
 #[derive(Debug, Deserialize)]
 pub struct LaunchConversationChildAgentRequest {
@@ -336,6 +337,7 @@ fn orchestrated_message_metadata(
         "orchestrated_by": orchestrated_by,
         "orchestration": "child_initial_turn",
         "agent": agent,
+        "report_id": agent_lifecycle::new_report_id(),
     });
     if agent == "conversation-evaluator" {
         value["suppress_parent_completion_relay"] = serde_json::Value::Bool(true);

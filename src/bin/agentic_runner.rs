@@ -3,6 +3,7 @@ use agentic_api::apns;
 use agentic_api::handlers::chat_client_manager::ChatClientManager;
 use agentic_api::handlers::chat_stream::{self, ChatAttachmentData, ChatConfig, ChatRuntime};
 use agentic_api::handlers::conversation_worker::{ConversationWorker, WorkerMessage};
+use agentic_api::observability::agent_lifecycle;
 use agentic_api::observability::runtime::{self, RuntimeFailurePhase, RuntimeLatencyPhase};
 use agentic_api::runner_commands;
 use agentic_api::system_log_helper;
@@ -228,6 +229,7 @@ async fn main() -> Result<()> {
                         None,
                         None,
                     );
+                    agent_lifecycle::refresh_queue_metrics(&db).await;
                     joins.spawn(
                         run_claimed_job(db.clone(), manager.clone(), job).map(move |r| (job_id, r)),
                     );
@@ -572,6 +574,7 @@ async fn run_claimed_job(
     match result {
         Ok(status) => {
             conversation_turn_jobs::mark_job_terminal(&db, &job.id, &status, None).await?;
+            agent_lifecycle::record_coordinator_wake_terminal(&db, &job, &status, None).await;
             Ok(status)
         }
         Err(e) => {
@@ -594,6 +597,8 @@ async fn run_claimed_job(
             let _ = checkpoints::mark_interrupted(&db, &job.conversation_id).await;
             conversation_turn_jobs::mark_job_terminal(&db, &job.id, "failed", Some(&message))
                 .await?;
+            agent_lifecycle::record_coordinator_wake_terminal(&db, &job, "failed", Some(&message))
+                .await;
             Err(e)
         }
     }

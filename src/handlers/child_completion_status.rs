@@ -14,6 +14,7 @@ struct ChildCompletionStatus {
     terminal_status: String,
     conversation_type: Option<String>,
     summary: Option<String>,
+    report_id: Option<String>,
 }
 
 /// Legacy child completion relays were queued into the parent as `role=user`
@@ -64,6 +65,7 @@ fn child_completion_status_from_metadata(metadata: Option<&str>) -> Option<Child
         terminal_status: string_field(&value, "child_terminal_status")?,
         conversation_type: optional_string_field(&value, "child_conversation_type"),
         summary: optional_string_field(&value, "summary"),
+        report_id: optional_string_field(&value, "report_id"),
     })
 }
 
@@ -108,9 +110,14 @@ fn format_child_completion_status_message(status: &ChildCompletionStatus, summar
         .as_ref()
         .map(|id| format!("\nAssistant message: `{id}`"))
         .unwrap_or_default();
+    let report_line = status
+        .report_id
+        .as_ref()
+        .map(|id| format!("\nReport ID: `{id}`"))
+        .unwrap_or_default();
 
     format!(
-        "Child agent {terminal_status}: {child_title}\n\n{summary}\n\nOpen child chat: agenticflowstate://conversation/{child_conversation_id}?agent={child_agent}\n\nChild conversation: `{child_conversation_id}`{assistant_line}",
+        "Child agent {terminal_status}: {child_title}\n\n{summary}\n\nOpen child chat: agenticflowstate://conversation/{child_conversation_id}?agent={child_agent}\n\nChild conversation: `{child_conversation_id}`{assistant_line}{report_line}",
         terminal_status = status.terminal_status,
         child_title = status.child_title,
         child_conversation_id = status.child_conversation_id,
@@ -140,6 +147,9 @@ fn child_completion_status_metadata(status: &ChildCompletionStatus, summary: &st
     }
     if let Some(conversation_type) = &status.conversation_type {
         value["child_conversation_type"] = Value::String(conversation_type.clone());
+    }
+    if let Some(report_id) = &status.report_id {
+        value["report_id"] = Value::String(report_id.clone());
     }
 
     value.to_string()
@@ -261,7 +271,8 @@ mod tests {
             "child_title": "Schema Design",
             "child_agent": "codebase-research",
             "child_terminal_status": "completed",
-            "child_assistant_message_id": "assistant-1"
+            "child_assistant_message_id": "assistant-1",
+            "report_id": "af-report-test"
         })
         .to_string();
         let message = ConversationMessage {
@@ -285,11 +296,11 @@ mod tests {
             .content
             .contains("Child agent completed: Schema Design"));
         assert!(sanitized.content.contains("Built the schema foundation."));
+        assert!(sanitized.content.contains("Report ID: `af-report-test`"));
         assert!(!sanitized.content.contains("Final output:"));
-        assert!(sanitized
-            .metadata
-            .unwrap()
-            .contains(CHILD_COMPLETION_STATUS));
+        let metadata = sanitized.metadata.unwrap();
+        assert!(metadata.contains(CHILD_COMPLETION_STATUS));
+        assert!(metadata.contains("af-report-test"));
     }
 
     #[test]

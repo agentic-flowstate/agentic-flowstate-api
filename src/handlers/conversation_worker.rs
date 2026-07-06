@@ -22,6 +22,7 @@ use crate::agents::codex_app_server::{
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
+use crate::observability::agent_lifecycle::{self, WakeKind};
 use crate::observability::cancellation;
 use crate::observability::next_actions::{record_clear, NextActionClearReason};
 use crate::observability::runtime::{self, RuntimeFailurePhase, RuntimeLatencyPhase};
@@ -2620,6 +2621,17 @@ async fn maybe_insert_child_completion_status_to_parent(
             child_conversation_id,
             terminal_status
         );
+        agent_lifecycle::record_wake_suppressed(
+            db,
+            WakeKind::CompletionRelay,
+            None,
+            Some(child_conversation_id),
+            None,
+            "completion_relay_suppressed",
+            None,
+            None,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2654,6 +2666,7 @@ struct ChildBatchContext {
     batch_id: String,
     expected_count: usize,
     child_index: Option<usize>,
+    report_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2665,6 +2678,7 @@ struct CompletedChildCompletion {
     terminal_status: String,
     child_assistant_message_id: Option<String>,
     status_message_id: String,
+    status_created_at: Option<i64>,
 }
 
 fn child_batch_context_from_initial_metadata(
@@ -2699,6 +2713,12 @@ fn child_batch_context_from_initial_metadata(
         batch_id,
         expected_count,
         child_index,
+        report_id: value
+            .get("report_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
     })
 }
 
@@ -2751,6 +2771,9 @@ async fn insert_child_completion_status_to_parent(
     })?;
     let child_conversation_type = child.conversation_type.as_deref().unwrap_or("general");
     let summary = summarize_child_completion_output(child_output, error_message);
+    let report_id = batch_context
+        .and_then(|context| context.report_id.clone())
+        .unwrap_or_else(agent_lifecycle::new_report_id);
     let relay_message = format_child_completion_status_message(
         &child.title,
         &child.id,
@@ -2758,6 +2781,7 @@ async fn insert_child_completion_status_to_parent(
         terminal_status,
         child_assistant_message_id,
         &summary,
+        &report_id,
     );
     let metadata = child_completion_status_metadata(
         &child.id,
@@ -2768,6 +2792,7 @@ async fn insert_child_completion_status_to_parent(
         child_conversation_type,
         &summary,
         batch_context,
+        &report_id,
     )?;
 
     let status_message = conversations::add_message(
@@ -2808,9 +2833,27 @@ async fn insert_child_completion_status_to_parent(
         child_assistant_message_id,
         &status_message.id,
         batch_context,
+        &report_id,
     )
     .await
     {
+        let error_text = e.to_string();
+        let wake_kind = if batch_context.is_some() {
+            WakeKind::BatchCompletion
+        } else {
+            WakeKind::SingleChild
+        };
+        let child_batch_id = batch_context.map(|context| context.batch_id.as_str());
+        agent_lifecycle::record_wake_missed(
+            db,
+            wake_kind,
+            &parent.id,
+            Some(&child.id),
+            child_batch_id,
+            runner_capacity::classify_failure_message(&error_text),
+            &safe_error_summary(&error_text),
+        )
+        .await;
         tracing::error!(
             "[WORKER] Failed to enqueue parent coordinator wake parent={} child={} status={}: {}",
             parent.id,
@@ -2833,6 +2876,7 @@ async fn maybe_enqueue_parent_coordinator_wake(
     child_assistant_message_id: &str,
     status_message_id: &str,
     batch_context: Option<&ChildBatchContext>,
+    report_id: &str,
 ) -> Result<()> {
     if let Some(batch_context) = batch_context {
         return enqueue_parent_coordinator_batch_wake_if_complete(db, parent, batch_context).await;
@@ -2847,6 +2891,7 @@ async fn maybe_enqueue_parent_coordinator_wake(
         terminal_status,
         child_assistant_message_id,
         status_message_id,
+        report_id,
     )
     .await
 }
@@ -2860,6 +2905,7 @@ async fn enqueue_parent_coordinator_wake(
     terminal_status: &str,
     child_assistant_message_id: &str,
     status_message_id: &str,
+    report_id: &str,
 ) -> Result<()> {
     let agent_type = parent_coordinator_agent_type(parent)?;
     let prompt_vars = parent_coordinator_prompt_vars(&agent_type, &parent.user_id)?;
@@ -2879,6 +2925,7 @@ async fn enqueue_parent_coordinator_wake(
         terminal_status,
         child_assistant_message_id,
         status_message_id,
+        report_id,
     )?;
 
     if !admit_parent_coordinator_wake_enqueue(
@@ -2926,6 +2973,18 @@ async fn enqueue_parent_coordinator_wake(
                 parent.id, child.id
             )
         })?;
+    agent_lifecycle::record_wake_fired(
+        db,
+        WakeKind::SingleChild,
+        &parent.id,
+        Some(&child.id),
+        None,
+        &job_id,
+        Some(report_id),
+        None,
+        None,
+    )
+    .await;
     super::conversations::publish_conversation_run_status(db, &parent.id)
         .await
         .with_context(|| format!("publish parent coordinator wake status {}", parent.id))?;
@@ -2946,6 +3005,8 @@ async fn enqueue_parent_coordinator_batch_wake_if_complete(
 ) -> Result<()> {
     let completed_children =
         completed_child_cards_for_batch(db, &parent.id, &batch_context.batch_id).await?;
+    let wait_duration_ms = wait_duration_ms_from_completed_children(&completed_children);
+    let telemetry_context = child_batch_telemetry_context(batch_context);
     if completed_children.len() < batch_context.expected_count {
         tracing::info!(
             "[WORKER] Delaying parent coordinator wake parent={} child_batch_id={} completed={}/{}",
@@ -2954,6 +3015,14 @@ async fn enqueue_parent_coordinator_batch_wake_if_complete(
             completed_children.len(),
             batch_context.expected_count
         );
+        agent_lifecycle::record_wake_delayed(
+            db,
+            &parent.id,
+            &telemetry_context,
+            completed_children.len(),
+            wait_duration_ms,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2963,8 +3032,24 @@ async fn enqueue_parent_coordinator_batch_wake_if_complete(
             parent.id,
             batch_context.batch_id
         );
+        agent_lifecycle::record_wake_deduped(
+            db,
+            &parent.id,
+            &telemetry_context,
+            "existing_wake_message_or_job",
+        )
+        .await;
         return Ok(());
     }
+
+    agent_lifecycle::record_child_batch_completed(
+        db,
+        &parent.id,
+        &telemetry_context,
+        completed_children.len(),
+        wait_duration_ms,
+    )
+    .await;
 
     let agent_type = parent_coordinator_agent_type(parent)?;
     let prompt_vars = parent_coordinator_prompt_vars(&agent_type, &parent.user_id)?;
@@ -3005,7 +3090,7 @@ async fn enqueue_parent_coordinator_batch_wake_if_complete(
         message_metadata: Some(metadata),
     };
 
-    let job_id = conversation_turn_jobs::enqueue_job(db, &parent.id, payload)
+    let enqueued = conversation_turn_jobs::enqueue_job_with_outcome(db, &parent.id, payload)
         .await
         .with_context(|| {
             format!(
@@ -3013,12 +3098,34 @@ async fn enqueue_parent_coordinator_batch_wake_if_complete(
                 parent.id, batch_context.batch_id
             )
         })?;
+    if enqueued.outcome == conversation_turn_jobs::ConversationTurnJobEnqueueOutcome::Merged {
+        agent_lifecycle::record_wake_deduped(
+            db,
+            &parent.id,
+            &telemetry_context,
+            "pending_job_merge",
+        )
+        .await;
+    } else {
+        agent_lifecycle::record_wake_fired(
+            db,
+            WakeKind::BatchCompletion,
+            &parent.id,
+            None,
+            Some(&batch_context.batch_id),
+            &enqueued.id,
+            batch_context.report_id.as_deref(),
+            Some(completed_children.len()),
+            wait_duration_ms,
+        )
+        .await;
+    }
     super::conversations::publish_conversation_run_status(db, &parent.id)
         .await
         .with_context(|| format!("publish parent coordinator batch wake status {}", parent.id))?;
     tracing::info!(
         "[WORKER] Enqueued parent coordinator batch wake job={} parent={} child_batch_id={} completed={}",
-        job_id,
+        enqueued.id,
         parent.id,
         batch_context.batch_id,
         completed_children.len()
@@ -3051,6 +3158,22 @@ async fn admit_parent_coordinator_wake_enqueue(
         max_pending_jobs = admission.snapshot.config.max_pending_jobs,
         "Skipped parent coordinator wake enqueue because runner queue admission rejected it"
     );
+    let wake_kind = if child_batch_id.is_some() {
+        WakeKind::BatchCompletion
+    } else {
+        WakeKind::SingleChild
+    };
+    agent_lifecycle::record_wake_suppressed(
+        db,
+        wake_kind,
+        Some(parent_conversation_id),
+        child_conversation_id,
+        child_batch_id,
+        admission.reason.as_str(),
+        Some(admission.snapshot.jobs.pending),
+        Some(admission.snapshot.config.max_pending_jobs),
+    )
+    .await;
     Ok(false)
 }
 
@@ -3068,6 +3191,7 @@ async fn completed_child_cards_for_batch(
         child_conversation_type: Option<String>,
         terminal_status: Option<String>,
         child_assistant_message_id: Option<String>,
+        status_created_at: String,
     }
 
     let rows = sqlx::query_as::<_, CompletionCardRow>(
@@ -3079,7 +3203,8 @@ async fn completed_child_cards_for_batch(
             json_extract(metadata, '$.child_agent') AS child_agent,
             json_extract(metadata, '$.child_conversation_type') AS child_conversation_type,
             json_extract(metadata, '$.child_terminal_status') AS terminal_status,
-            json_extract(metadata, '$.child_assistant_message_id') AS child_assistant_message_id
+            json_extract(metadata, '$.child_assistant_message_id') AS child_assistant_message_id,
+            created_at AS status_created_at
         FROM conversation_messages
         WHERE conversation_id = ?
           AND metadata IS NOT NULL
@@ -3117,10 +3242,59 @@ async fn completed_child_cards_for_batch(
                 .unwrap_or_else(|| "completed".to_string()),
             child_assistant_message_id: row.child_assistant_message_id,
             status_message_id: row.status_message_id,
+            status_created_at: parse_rfc3339_epoch_seconds(&row.status_created_at),
         });
     }
 
     Ok(completed)
+}
+
+fn wait_duration_ms_from_completed_children(
+    completed_children: &[CompletedChildCompletion],
+) -> Option<i64> {
+    let oldest_status_created_at = completed_children
+        .iter()
+        .filter_map(|child| child.status_created_at)
+        .min()?;
+    Some(
+        Utc::now()
+            .timestamp()
+            .saturating_sub(oldest_status_created_at)
+            .max(0)
+            * 1000,
+    )
+}
+
+fn child_batch_telemetry_context(
+    context: &ChildBatchContext,
+) -> agent_lifecycle::ChildBatchTelemetryContext {
+    agent_lifecycle::ChildBatchTelemetryContext {
+        batch_id: context.batch_id.clone(),
+        expected_count: context.expected_count,
+        child_index: context.child_index,
+        report_id: context.report_id.clone(),
+    }
+}
+
+fn parse_rfc3339_epoch_seconds(raw: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|value| value.timestamp())
+}
+
+fn safe_error_summary(error: &str) -> String {
+    const MAX_CHARS: usize = 180;
+    let normalized = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+
+    let mut summary = normalized
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    summary.push_str("...");
+    summary
 }
 
 async fn parent_coordinator_batch_wake_exists(
@@ -3264,12 +3438,14 @@ fn parent_coordinator_wake_metadata(
     terminal_status: &str,
     child_assistant_message_id: &str,
     status_message_id: &str,
+    report_id: &str,
 ) -> Result<String> {
     serde_json::to_string(&serde_json::json!({
         "origin": "agent_orchestrated",
         "orchestrated_by": "agent-runner",
         "orchestration": "coordinator_child_completion_wake",
         "display": "coordinator_wake_request",
+        "report_id": report_id,
         "child_conversation_id": child_conversation_id,
         "child_title": child_title,
         "child_agent": child_agent,
@@ -3305,6 +3481,10 @@ fn parent_coordinator_batch_wake_metadata(
         "orchestrated_by": "agent-runner",
         "orchestration": "coordinator_child_completion_wake",
         "display": "coordinator_wake_request",
+        "report_id": batch_context
+            .report_id
+            .clone()
+            .unwrap_or_else(agent_lifecycle::new_report_id),
         "child_batch_id": batch_context.batch_id,
         "child_batch_size": batch_context.expected_count,
         "child_completion_count": completed_children.len(),
@@ -3320,6 +3500,7 @@ fn format_child_completion_status_message(
     terminal_status: &str,
     child_assistant_message_id: &str,
     summary: &str,
+    report_id: &str,
 ) -> String {
     let summary = summary.trim();
     let summary = if summary.is_empty() {
@@ -3329,7 +3510,7 @@ fn format_child_completion_status_message(
     };
 
     format!(
-        "Child agent {terminal_status}: {child_title}\n\n{summary}\n\nOpen child chat: agenticflowstate://conversation/{child_conversation_id}?agent={child_agent}\n\nChild conversation: `{child_conversation_id}`\nAssistant message: `{child_assistant_message_id}`"
+        "Child agent {terminal_status}: {child_title}\n\n{summary}\n\nOpen child chat: agenticflowstate://conversation/{child_conversation_id}?agent={child_agent}\n\nChild conversation: `{child_conversation_id}`\nAssistant message: `{child_assistant_message_id}`\nReport ID: `{report_id}`"
     )
 }
 
@@ -3342,6 +3523,7 @@ fn child_completion_status_metadata(
     child_conversation_type: &str,
     summary: &str,
     batch_context: Option<&ChildBatchContext>,
+    report_id: &str,
 ) -> Result<String> {
     let mut value = serde_json::json!({
         "origin": "agent_orchestrated",
@@ -3355,6 +3537,7 @@ fn child_completion_status_metadata(
         "child_terminal_status": terminal_status,
         "child_conversation_type": child_conversation_type,
         "summary": summary,
+        "report_id": report_id,
         "open_url": format!(
             "agenticflowstate://conversation/{}?agent={}",
             child_conversation_id, child_agent
@@ -4244,6 +4427,23 @@ mod streaming_persistence_tests {
         .execute(&pool)
         .await
         .expect("create conversation_events");
+        sqlx::query(
+            r#"
+            CREATE TABLE system_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                level TEXT NOT NULL,
+                component TEXT NOT NULL,
+                message TEXT NOT NULL,
+                detail TEXT,
+                user_id TEXT,
+                session_id TEXT,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create system_logs");
 
         runner_capacity::ensure_schema_and_seed_policy(&pool)
             .await
@@ -4384,6 +4584,7 @@ mod streaming_persistence_tests {
             "completed",
             "assistant-1",
             "status-1",
+            "af-report-test",
         )
         .await
         .expect("single coordinator wake admission should not error");
@@ -4404,6 +4605,7 @@ mod streaming_persistence_tests {
             batch_id: "batch-1".to_string(),
             expected_count: 1,
             child_index: None,
+            report_id: Some("af-report-test".to_string()),
         };
         let metadata = child_completion_status_metadata(
             "child-1",
@@ -4414,6 +4616,7 @@ mod streaming_persistence_tests {
             "implementation",
             "Finished",
             Some(&batch_context),
+            "af-report-test",
         )
         .expect("serialize child completion metadata");
         sqlx::query(
@@ -4804,6 +5007,7 @@ mod streaming_persistence_tests {
             "completed",
             "assistant-1",
             "Use a layered memory model.",
+            "af-report-test",
         );
 
         assert!(message.contains("Child agent completed: Architecture Synthesis"));
@@ -4811,6 +5015,7 @@ mod streaming_persistence_tests {
         assert!(message.contains("agenticflowstate://conversation/child-1?agent=codebase-research"));
         assert!(message.contains("Child conversation: `child-1`"));
         assert!(message.contains("Assistant message: `assistant-1`"));
+        assert!(message.contains("Report ID: `af-report-test`"));
         assert!(!message.contains("Coordinator instruction:"));
         assert!(!message.contains("Final output:"));
     }
@@ -4821,6 +5026,7 @@ mod streaming_persistence_tests {
             batch_id: "child-batch-test".to_string(),
             expected_count: 3,
             child_index: Some(2),
+            report_id: Some("af-report-test".to_string()),
         };
         let metadata = child_completion_status_metadata(
             "child-1",
@@ -4831,6 +5037,7 @@ mod streaming_persistence_tests {
             "research",
             "Use a layered memory model.",
             Some(&batch_context),
+            "af-report-test",
         )
         .expect("serialize status metadata");
         let value: serde_json::Value =
@@ -4847,6 +5054,7 @@ mod streaming_persistence_tests {
         assert_eq!(value["child_batch_id"], "child-batch-test");
         assert_eq!(value["child_batch_size"], 3);
         assert_eq!(value["child_batch_index"], 2);
+        assert_eq!(value["report_id"], "af-report-test");
     }
 
     #[test]
@@ -4874,6 +5082,7 @@ mod streaming_persistence_tests {
             "completed",
             "assistant-1",
             "status-message-1",
+            "af-report-test",
         )
         .expect("serialize wake metadata");
         let value: serde_json::Value =
@@ -4886,6 +5095,7 @@ mod streaming_persistence_tests {
         assert_eq!(value["child_agent"], "codebase-research");
         assert_eq!(value["child_terminal_status"], "completed");
         assert_eq!(value["child_completion_message_id"], "status-message-1");
+        assert_eq!(value["report_id"], "af-report-test");
     }
 
     #[test]
@@ -4894,6 +5104,7 @@ mod streaming_persistence_tests {
             batch_id: "child-batch-test".to_string(),
             expected_count: 2,
             child_index: None,
+            report_id: Some("af-report-test".to_string()),
         };
         let completed_children = vec![
             CompletedChildCompletion {
@@ -4904,6 +5115,7 @@ mod streaming_persistence_tests {
                 terminal_status: "completed".to_string(),
                 child_assistant_message_id: Some("assistant-1".to_string()),
                 status_message_id: "status-1".to_string(),
+                status_created_at: Some(1_783_310_400),
             },
             CompletedChildCompletion {
                 child_conversation_id: "child-2".to_string(),
@@ -4913,6 +5125,7 @@ mod streaming_persistence_tests {
                 terminal_status: "completed".to_string(),
                 child_assistant_message_id: Some("assistant-2".to_string()),
                 status_message_id: "status-2".to_string(),
+                status_created_at: Some(1_783_310_460),
             },
         ];
 
@@ -4934,6 +5147,7 @@ mod streaming_persistence_tests {
         assert_eq!(value["child_batch_id"], "child-batch-test");
         assert_eq!(value["child_batch_size"], 2);
         assert_eq!(value["child_completion_count"], 2);
+        assert_eq!(value["report_id"], "af-report-test");
         assert_eq!(
             value["child_conversations"][0]["child_conversation_id"],
             "child-1"
