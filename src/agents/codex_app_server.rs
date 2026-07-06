@@ -25,6 +25,7 @@ const DEFAULT_MODEL_PROVIDER: &str = "openai";
 const APP_SERVER_CLIENT_NAME: &str = "agentic_flowstate_api";
 const APP_SERVER_CLIENT_TITLE: &str = "Agentic Flowstate API";
 const APP_SERVER_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const DEFAULT_APP_SERVER_RUST_LOG: &str = "warn";
 const REQUIRED_CODEX_PATH_ENTRIES: &[&str] = &[
     "/opt/homebrew/opt/node@20/bin",
     "/opt/homebrew/bin",
@@ -574,6 +575,10 @@ pub fn app_server_generated_images_dir(profile: CodexToolProfile) -> Result<Path
     Ok(app_server_codex_home(profile)?.join("generated_images"))
 }
 
+fn app_server_sqlite_home(target_home: &Path) -> PathBuf {
+    target_home.join("sqlite-state")
+}
+
 fn restricted_runtime_working_dir() -> Result<PathBuf, String> {
     let dir = dirs::home_dir()
         .map(|home| {
@@ -604,6 +609,8 @@ fn prepare_codex_app_server_home(
     let source_home = default_codex_home()?;
     let target_home = app_server_codex_home(profile)?;
     ensure_directory(&target_home, "Codex app-server home")?;
+    let sqlite_home = app_server_sqlite_home(&target_home);
+    ensure_directory(&sqlite_home, "Codex app-server SQLite state home")?;
 
     let source_auth = source_home.join("auth.json");
     if !source_auth.is_file() {
@@ -637,7 +644,7 @@ fn prepare_codex_app_server_home(
         })?;
     }
 
-    let config = build_app_server_config(&source_home, agentic_mcp_command, profile)?;
+    let config = build_app_server_config(&source_home, &sqlite_home, agentic_mcp_command, profile)?;
     write_file_atomically(
         &target_home.join("config.toml"),
         &config,
@@ -872,6 +879,7 @@ fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
 
 fn build_app_server_config(
     source_home: &Path,
+    sqlite_home: &Path,
     agentic_mcp_command: &Path,
     profile: CodexToolProfile,
 ) -> Result<String, String> {
@@ -887,6 +895,10 @@ fn build_app_server_config(
     root.insert(
         "web_search".to_string(),
         toml::Value::String("disabled".to_string()),
+    );
+    root.insert(
+        "sqlite_home".to_string(),
+        toml::Value::String(sqlite_home.to_string_lossy().to_string()),
     );
 
     if profile != CodexToolProfile::NoTools {
@@ -984,6 +996,11 @@ fn build_codex_app_server_command(
     command.current_dir(&working_dir);
     command.env("PATH", launchd_safe_path());
     command.env("CODEX_HOME", codex_home);
+    command.env(
+        "RUST_LOG",
+        std::env::var("AGENTIC_CODEX_APP_SERVER_RUST_LOG")
+            .unwrap_or_else(|_| DEFAULT_APP_SERVER_RUST_LOG.to_string()),
+    );
     command
         .arg("app-server")
         .arg("--listen")
@@ -2180,6 +2197,16 @@ mod tests {
             .collect()
     }
 
+    fn command_env(command: &StdCommand, key: &str) -> Option<String> {
+        command.get_envs().find_map(|(name, value)| {
+            if name == OsStr::new(key) {
+                value.map(|value| value.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        })
+    }
+
     fn unique_temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "agentic-{name}-{}-{}",
@@ -2290,6 +2317,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--listen"));
         assert!(args.iter().any(|arg| arg == "stdio://"));
         assert!(!args.iter().any(|arg| arg == "exec"));
+        assert_eq!(command_env(&command, "RUST_LOG").as_deref(), Some("warn"));
     }
 
     #[test]
@@ -2356,12 +2384,17 @@ mod tests {
     fn no_tools_profile_omits_mcp_server_and_disables_shell_features() {
         let config = build_app_server_config(
             Path::new("/tmp/source-codex-home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
             Path::new("/tmp/agentic_mcp"),
             CodexToolProfile::NoTools,
         )
         .expect("build config");
         let parsed: toml::Value = toml::from_str(&config).expect("parse config");
         assert!(parsed.get("mcp_servers").is_none());
+        assert_eq!(
+            parsed.get("sqlite_home").and_then(|value| value.as_str()),
+            Some("/tmp/agentic-codex-sqlite")
+        );
 
         let mut options = sample_app_server_options(None);
         options.tool_profile = CodexToolProfile::NoTools;
@@ -2388,6 +2421,7 @@ mod tests {
     fn app_server_config_points_mcp_child_at_source_codex_home() {
         let config = build_app_server_config(
             Path::new("/tmp/source-codex-home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
             Path::new("/tmp/agentic_mcp"),
             CodexToolProfile::Default,
         )
@@ -2408,6 +2442,10 @@ mod tests {
                 .and_then(|env| env.get("CODEX_HOME"))
                 .and_then(|value| value.as_str()),
             Some("/tmp/source-codex-home")
+        );
+        assert_eq!(
+            parsed.get("sqlite_home").and_then(|value| value.as_str()),
+            Some("/tmp/agentic-codex-sqlite")
         );
     }
 
@@ -2439,6 +2477,7 @@ approval_mode = "approve"
 
         let config = build_app_server_config(
             &source_home,
+            Path::new("/tmp/agentic-codex-sqlite"),
             Path::new("/tmp/agentic_mcp"),
             CodexToolProfile::RestrictedMcpOnly,
         )
