@@ -26,7 +26,7 @@ use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use ticketing_system::SqlitePool;
+use ticketing_system::{ConversationHierarchyScope, SqlitePool};
 
 use crate::auth_middleware::AuthenticatedUser;
 use crate::observability::request::{
@@ -272,8 +272,16 @@ pub async fn subscribe_unified_events(
             if topics.contains("conversations") {
                 let mut estimated_query_count = 0_u64;
                 let list_started = Instant::now();
-                let convs_result = ticketing_system::conversations::list_conversations(
-                    &pool, validated_org.as_deref(), Some(&user_id), None, None, None, None,
+                let convs_result = ticketing_system::conversations::list_conversations_with_hierarchy_page(
+                    &pool,
+                    validated_org.as_deref(),
+                    Some(&user_id),
+                    None,
+                    None,
+                    None,
+                    ConversationHierarchyScope::Roots,
+                    None,
+                    ticketing_system::conversations::ConversationListPageOptions::roots(None, None),
                 ).await;
                 record_db_operation(
                     ROUTE_UNIFIED_EVENTS,
@@ -283,7 +291,8 @@ pub async fn subscribe_unified_events(
                 );
                 estimated_query_count += 1;
 
-                if let Ok(mut convs) = convs_result {
+                if let Ok(mut page) = convs_result {
+                    let mut convs = std::mem::take(&mut page.conversations);
                     let active_count = convs
                         .iter()
                         .filter(|conv| conv.is_active == Some(true))
@@ -353,10 +362,19 @@ pub async fn subscribe_unified_events(
                     );
                     if should_emit {
                         hash_conversations = hash;
+                        let returned_count = summaries.len();
                         let payload = serde_json::json!({
                             "type": "sync",
                             "conversations": summaries,
                             "updated_at": chrono::Utc::now().timestamp(),
+                            "meta": {
+                                "applied_hierarchy_scope": "roots",
+                                "applied_limit": page.applied_limit,
+                                "offset": page.offset,
+                                "returned_count": returned_count,
+                                "has_more": page.has_more,
+                                "truncated": page.truncated,
+                            },
                         });
                         let serialization_started = Instant::now();
                         match serde_json::to_string(&payload) {

@@ -53,6 +53,12 @@ static CONVERSATION_STATUS_BROADCASTER: Lazy<
     RwLock<HashMap<String, broadcast::Sender<ConversationRunStatusResponse>>>,
 > = Lazy::new(|| RwLock::new(HashMap::new()));
 
+const DEFAULT_EVENT_PAGE_LIMIT: i64 = 100;
+const MAX_EVENT_PAGE_LIMIT: i64 = 200;
+const DEFAULT_EVENT_PAGE_PAYLOAD_BYTES: usize = 192 * 1024;
+const MAX_EVENT_PAGE_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_SINGLE_EVENT_PAYLOAD_BYTES: usize = 96 * 1024;
+
 #[derive(Debug, Deserialize)]
 pub struct ListConversationsQuery {
     pub organization: Option<String>,
@@ -64,6 +70,7 @@ pub struct ListConversationsQuery {
     /// Comma-separated status filter (e.g., "open,waiting"). Default: "open,waiting"
     pub status: Option<String>,
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
     pub updated_since: Option<String>,
 }
 
@@ -79,6 +86,27 @@ pub struct ConversationScaleCockpitQuery {
 pub struct ConversationListResponse {
     pub conversations: Vec<ConversationListItem>,
     pub total: i64,
+    pub meta: ConversationListResponseMeta,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationListResponseMeta {
+    pub requested_hierarchy_scope: String,
+    pub applied_hierarchy_scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_limit: Option<i64>,
+    pub applied_limit: i64,
+    pub offset: i64,
+    pub returned_count: i64,
+    pub has_more: bool,
+    pub truncated: bool,
+    pub child_fanout_guardrail: bool,
+    pub max_root_limit: i64,
+    pub max_child_limit: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub truncation_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -734,6 +762,88 @@ pub(crate) async fn conversation_list_items(
             ConversationListItem::from_conversation(conversation, &metadata, child_activity)
         })
         .collect())
+}
+
+fn hierarchy_scope_label(scope: ConversationHierarchyScope) -> &'static str {
+    match scope {
+        ConversationHierarchyScope::Roots => "roots",
+        ConversationHierarchyScope::Children => "children",
+        ConversationHierarchyScope::All => "all",
+    }
+}
+
+fn resolve_conversation_list_scope(
+    requested_scope: ConversationHierarchyScope,
+    parent_conversation_id: Option<&str>,
+) -> (ConversationHierarchyScope, Vec<String>, bool) {
+    if parent_conversation_id.is_some() {
+        return (ConversationHierarchyScope::Children, Vec::new(), false);
+    }
+
+    match requested_scope {
+        ConversationHierarchyScope::Roots => (ConversationHierarchyScope::Roots, Vec::new(), false),
+        ConversationHierarchyScope::Children => (
+            ConversationHierarchyScope::Roots,
+            vec!["children_scope_requires_parent_conversation_id".to_string()],
+            true,
+        ),
+        ConversationHierarchyScope::All => (
+            ConversationHierarchyScope::Roots,
+            vec!["all_hierarchy_clamped_to_root_summaries".to_string()],
+            true,
+        ),
+    }
+}
+
+fn conversation_list_page_options(
+    applied_scope: ConversationHierarchyScope,
+    requested_limit: Option<i64>,
+    offset: Option<i64>,
+) -> conversations::ConversationListPageOptions {
+    match applied_scope {
+        ConversationHierarchyScope::Children => {
+            conversations::ConversationListPageOptions::children(requested_limit, offset)
+        }
+        ConversationHierarchyScope::Roots | ConversationHierarchyScope::All => {
+            conversations::ConversationListPageOptions::roots(requested_limit, offset)
+        }
+    }
+}
+
+fn conversation_list_response_meta(
+    requested_scope: ConversationHierarchyScope,
+    applied_scope: ConversationHierarchyScope,
+    parent_conversation_id: Option<String>,
+    page: &conversations::ConversationListPage,
+    child_fanout_guardrail: bool,
+    mut truncation_reasons: Vec<String>,
+) -> ConversationListResponseMeta {
+    if page.has_more {
+        truncation_reasons.push("page_limit_reached".to_string());
+    }
+    if page
+        .requested_limit
+        .map(|requested| requested > page.applied_limit)
+        .unwrap_or(false)
+    {
+        truncation_reasons.push("requested_limit_capped".to_string());
+    }
+
+    ConversationListResponseMeta {
+        requested_hierarchy_scope: hierarchy_scope_label(requested_scope).to_string(),
+        applied_hierarchy_scope: hierarchy_scope_label(applied_scope).to_string(),
+        parent_conversation_id,
+        requested_limit: page.requested_limit,
+        applied_limit: page.applied_limit,
+        offset: page.offset,
+        returned_count: page.returned_count,
+        has_more: page.has_more,
+        truncated: page.truncated || child_fanout_guardrail,
+        child_fanout_guardrail,
+        max_root_limit: conversations::MAX_ROOT_CONVERSATION_PAGE_LIMIT,
+        max_child_limit: conversations::MAX_CHILD_CONVERSATION_PAGE_LIMIT,
+        truncation_reasons,
+    }
 }
 
 pub(crate) async fn conversation_summaries(
@@ -1422,31 +1532,35 @@ pub async fn list_conversations(
     Extension(user): Extension<AuthenticatedUser>,
     Query(params): Query<ListConversationsQuery>,
 ) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
-    let hierarchy_scope = ConversationHierarchyScope::parse(params.hierarchy_scope.as_deref())
+    let requested_scope = ConversationHierarchyScope::parse(params.hierarchy_scope.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let (applied_scope, truncation_reasons, child_fanout_guardrail) =
+        resolve_conversation_list_scope(requested_scope, params.parent_conversation_id.as_deref());
+    let page_options = conversation_list_page_options(applied_scope, params.limit, params.offset);
 
     let mut estimated_query_count = 0_u64;
     let list_started = Instant::now();
-    let list_result = conversations::list_conversations_with_hierarchy(
+    let page_result = conversations::list_conversations_with_hierarchy_page(
         &pool,
         params.organization.as_deref(),
         Some(&user.user_id),
         params.agent.as_deref(),
         params.status.as_deref(),
-        params.limit,
         params.updated_since.as_deref(),
-        hierarchy_scope,
+        applied_scope,
         params.parent_conversation_id.as_deref(),
+        page_options,
     )
     .await;
     record_db_operation(
         ROUTE_CONVERSATIONS,
         "conversation.list_with_hierarchy",
         list_started.elapsed(),
-        Outcome::from_result(&list_result),
+        Outcome::from_result(&page_result),
     );
     estimated_query_count += 1;
-    let mut list = list_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut page = page_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut list = std::mem::take(&mut page.conversations);
 
     let active_count = list
         .iter()
@@ -1492,10 +1606,19 @@ pub async fn list_conversations(
     estimated_query_count += 2 + active_count.saturating_mul(4);
     let conversations =
         conversations_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    page.returned_count = conversations.len() as i64;
 
     let response = ConversationListResponse {
         conversations,
         total,
+        meta: conversation_list_response_meta(
+            requested_scope,
+            applied_scope,
+            params.parent_conversation_id.clone(),
+            &page,
+            child_fanout_guardrail,
+            truncation_reasons,
+        ),
     };
     let payload_bytes = observe_serialized_payload(
         ROUTE_CONVERSATIONS,
@@ -1760,8 +1883,10 @@ pub async fn list_child_conversations(
     Query(params): Query<ListConversationsQuery>,
 ) -> Result<Json<ConversationListResponse>, (StatusCode, String)> {
     let parent = require_user_conversation(&pool, &user.user_id, &id).await?;
+    let page_options =
+        conversations::ConversationListPageOptions::children(params.limit, params.offset);
 
-    let mut list = conversations::list_conversations_with_hierarchy(
+    let mut page = conversations::list_conversations_with_hierarchy_page(
         &pool,
         params
             .organization
@@ -1770,13 +1895,14 @@ pub async fn list_child_conversations(
         Some(&user.user_id),
         params.agent.as_deref(),
         params.status.as_deref(),
-        params.limit,
         params.updated_since.as_deref(),
         ConversationHierarchyScope::Children,
         Some(&id),
+        page_options,
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut list = std::mem::take(&mut page.conversations);
 
     for conv in &mut list {
         if conv.is_active == Some(true) {
@@ -1791,10 +1917,19 @@ pub async fn list_child_conversations(
     let conversations = conversation_list_items(&pool, &user.user_id, list)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    page.returned_count = conversations.len() as i64;
 
     Ok(Json(ConversationListResponse {
         conversations,
         total,
+        meta: conversation_list_response_meta(
+            ConversationHierarchyScope::Children,
+            ConversationHierarchyScope::Children,
+            Some(id),
+            &page,
+            false,
+            Vec::new(),
+        ),
     }))
 }
 
@@ -2766,12 +2901,46 @@ fn status_sse_event(snapshot: &ConversationRunStatusResponse) -> Event {
 pub struct ConversationEventsPageQuery {
     pub starting_after: Option<i32>,
     pub limit: Option<i64>,
+    pub max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ConversationEventsPageResponse {
     pub events: Vec<RecentEvent>,
     pub last_event_index: i32,
+    pub meta: ConversationEventsPageMeta,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversationEventsPageMeta {
+    pub starting_after: i32,
+    pub next_starting_after: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_limit: Option<i64>,
+    pub applied_limit: i64,
+    pub returned_count: usize,
+    pub has_more: bool,
+    pub truncated: bool,
+    pub payload_bytes: usize,
+    pub max_payload_bytes: usize,
+    pub max_event_payload_bytes: usize,
+    pub skipped_oversized_event_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_oversized_event_indexes: Vec<i32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub truncation_reasons: Vec<String>,
+}
+
+fn applied_event_page_limit(requested: Option<i64>) -> i64 {
+    requested
+        .unwrap_or(DEFAULT_EVENT_PAGE_LIMIT)
+        .clamp(1, MAX_EVENT_PAGE_LIMIT)
+}
+
+fn applied_event_page_payload_bytes(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_EVENT_PAGE_PAYLOAD_BYTES)
+        .clamp(MAX_SINGLE_EVENT_PAYLOAD_BYTES, MAX_EVENT_PAGE_PAYLOAD_BYTES)
 }
 
 /// GET /api/v1/conversations/:id/events/page?starting_after=N&limit=M
@@ -2804,7 +2973,8 @@ pub async fn list_conversation_events_page(
     }
 
     let after = query.starting_after.unwrap_or(-1);
-    let limit = query.limit.unwrap_or(200).clamp(1, 500);
+    let limit = applied_event_page_limit(query.limit);
+    let max_payload_bytes = applied_event_page_payload_bytes(query.max_bytes);
     let max_event_started = Instant::now();
     let last_event_index_result = conversations::get_max_event_index(&pool, &id).await;
     record_db_operation(
@@ -2817,7 +2987,7 @@ pub async fn list_conversation_events_page(
     let last_event_index = last_event_index_result.unwrap_or(-1);
 
     let events_started = Instant::now();
-    let raw_result = conversations::get_events_after_limited(&pool, &id, after, limit).await;
+    let raw_result = conversations::get_events_after_limited(&pool, &id, after, limit + 1).await;
     record_db_operation(
         ROUTE_CONVERSATION_EVENTS_PAGE,
         "conversation.events_page",
@@ -2828,8 +2998,26 @@ pub async fn list_conversation_events_page(
     let raw = raw_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut events = Vec::with_capacity(raw.len());
+    let mut payload_bytes = 0_usize;
+    let mut next_starting_after = after;
+    let mut has_more = false;
+    let mut truncated = query
+        .limit
+        .map(|requested| requested > limit)
+        .unwrap_or(false);
+    let mut truncation_reasons = Vec::new();
+    if truncated {
+        truncation_reasons.push("requested_limit_capped".to_string());
+    }
+    let mut skipped_oversized_event_indexes = Vec::new();
     let materialize_started = Instant::now();
     for e in raw {
+        if events.len() as i64 >= limit {
+            has_more = true;
+            truncated = true;
+            truncation_reasons.push("page_limit_reached".to_string());
+            break;
+        }
         let event_data = conversations::load_event_payload_str(&pool, &e)
             .await
             .map_err(|err| {
@@ -2841,6 +3029,35 @@ pub async fn list_conversation_events_page(
                 );
                 (StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
             })?;
+        let event_bytes = event_data.len();
+        if event_bytes > MAX_SINGLE_EVENT_PAYLOAD_BYTES {
+            truncated = true;
+            next_starting_after = e.event_index;
+            skipped_oversized_event_indexes.push(e.event_index);
+            if !truncation_reasons
+                .iter()
+                .any(|reason| reason == "oversized_event_skipped")
+            {
+                truncation_reasons.push("oversized_event_skipped".to_string());
+            }
+            tracing::warn!(
+                conversation_id = %id,
+                event_index = e.event_index,
+                event_type = %e.event_type,
+                event_bytes,
+                max_event_payload_bytes = MAX_SINGLE_EVENT_PAYLOAD_BYTES,
+                "Skipping oversized conversation event from page response"
+            );
+            continue;
+        }
+        if !events.is_empty() && payload_bytes.saturating_add(event_bytes) > max_payload_bytes {
+            has_more = true;
+            truncated = true;
+            truncation_reasons.push("payload_byte_budget_reached".to_string());
+            break;
+        }
+        payload_bytes = payload_bytes.saturating_add(event_bytes);
+        next_starting_after = e.event_index;
         events.push(RecentEvent {
             event_index: e.event_index,
             event_type: e.event_type,
@@ -2857,10 +3074,30 @@ pub async fn list_conversation_events_page(
         );
         estimated_query_count += events.len() as u64;
     }
+    if last_event_index > next_starting_after {
+        has_more = true;
+    }
 
+    let returned_count = events.len();
+    let skipped_oversized_event_count = skipped_oversized_event_indexes.len();
     let response = ConversationEventsPageResponse {
         events,
         last_event_index,
+        meta: ConversationEventsPageMeta {
+            starting_after: after,
+            next_starting_after,
+            requested_limit: query.limit,
+            applied_limit: limit,
+            returned_count,
+            has_more,
+            truncated,
+            payload_bytes,
+            max_payload_bytes,
+            max_event_payload_bytes: MAX_SINGLE_EVENT_PAYLOAD_BYTES,
+            skipped_oversized_event_count,
+            skipped_oversized_event_indexes,
+            truncation_reasons,
+        },
     };
     let payload_bytes = observe_serialized_payload(
         ROUTE_CONVERSATION_EVENTS_PAGE,
@@ -3550,6 +3787,55 @@ mod tests {
         assert_eq!(
             value["artifact_memory_handoff"]["retrievals"][0]["retrieval_id"],
             RETRIEVAL_ID
+        );
+    }
+
+    #[test]
+    fn all_hierarchy_list_requests_are_clamped_to_root_summaries() {
+        let (applied_scope, reasons, guardrail) =
+            resolve_conversation_list_scope(ConversationHierarchyScope::All, None);
+        let page = conversations::ConversationListPage {
+            conversations: Vec::new(),
+            applied_limit: conversations::DEFAULT_ROOT_CONVERSATION_PAGE_LIMIT,
+            requested_limit: None,
+            offset: 0,
+            returned_count: 100,
+            has_more: true,
+            truncated: true,
+        };
+        let meta = conversation_list_response_meta(
+            ConversationHierarchyScope::All,
+            applied_scope,
+            None,
+            &page,
+            guardrail,
+            reasons,
+        );
+
+        assert_eq!(applied_scope, ConversationHierarchyScope::Roots);
+        assert!(meta.child_fanout_guardrail);
+        assert!(meta.truncated);
+        assert_eq!(meta.applied_hierarchy_scope, "roots");
+        assert!(meta
+            .truncation_reasons
+            .iter()
+            .any(|reason| reason == "all_hierarchy_clamped_to_root_summaries"));
+        assert!(meta
+            .truncation_reasons
+            .iter()
+            .any(|reason| reason == "page_limit_reached"));
+    }
+
+    #[test]
+    fn event_page_limits_are_capped_to_guardrail_policy() {
+        assert_eq!(applied_event_page_limit(Some(10_000)), MAX_EVENT_PAGE_LIMIT);
+        assert_eq!(
+            applied_event_page_payload_bytes(Some(1)),
+            MAX_SINGLE_EVENT_PAYLOAD_BYTES
+        );
+        assert_eq!(
+            applied_event_page_payload_bytes(Some(usize::MAX)),
+            MAX_EVENT_PAGE_PAYLOAD_BYTES
         );
     }
 }
