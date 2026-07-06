@@ -30,7 +30,7 @@ use crate::observability::streaming::{
     record_ticket_preflight_error,
 };
 use ticketing_system::{
-    agent_runners, checkpoints, conversation_turn_jobs, conversations,
+    agent_runners, checkpoints, conversation_turn_jobs, conversations, runner_capacity,
     token_usage::{self, TokenUsageBreakdown},
     work_context::{
         collect_work_context, CollectWorkContextRequest, CollectWorkContextResponse,
@@ -2881,6 +2881,18 @@ async fn enqueue_parent_coordinator_wake(
         status_message_id,
     )?;
 
+    if !admit_parent_coordinator_wake_enqueue(
+        db,
+        "parent_coordinator_child_completion_wake",
+        &parent.id,
+        Some(&child.id),
+        None,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     checkpoints::upsert_checkpoint(db, &parent.id, "queued", 0)
         .await
         .with_context(|| format!("queue parent coordinator checkpoint {}", parent.id))?;
@@ -2959,6 +2971,18 @@ async fn enqueue_parent_coordinator_batch_wake_if_complete(
     let message = format_parent_coordinator_batch_wake_message(batch_context, &completed_children);
     let metadata = parent_coordinator_batch_wake_metadata(batch_context, &completed_children)?;
 
+    if !admit_parent_coordinator_wake_enqueue(
+        db,
+        "parent_coordinator_batch_completion_wake",
+        &parent.id,
+        None,
+        Some(&batch_context.batch_id),
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     checkpoints::upsert_checkpoint(db, &parent.id, "queued", 0)
         .await
         .with_context(|| format!("queue parent coordinator checkpoint {}", parent.id))?;
@@ -3000,6 +3024,34 @@ async fn enqueue_parent_coordinator_batch_wake_if_complete(
         completed_children.len()
     );
     Ok(())
+}
+
+async fn admit_parent_coordinator_wake_enqueue(
+    db: &SqlitePool,
+    context: &str,
+    parent_conversation_id: &str,
+    child_conversation_id: Option<&str>,
+    child_batch_id: Option<&str>,
+) -> Result<bool> {
+    let admission = runner_capacity::admit_enqueue(db, 1, context)
+        .await
+        .with_context(|| format!("inspect runner queue capacity for {context}"))?;
+    if admission.accepted {
+        return Ok(true);
+    }
+
+    tracing::warn!(
+        context,
+        parent_conversation_id,
+        child_conversation_id,
+        child_batch_id,
+        reason = admission.reason.as_str(),
+        requested_jobs = admission.requested_jobs,
+        pending_jobs = admission.snapshot.jobs.pending,
+        max_pending_jobs = admission.snapshot.config.max_pending_jobs,
+        "Skipped parent coordinator wake enqueue because runner queue admission rejected it"
+    );
+    Ok(false)
 }
 
 async fn completed_child_cards_for_batch(
@@ -4037,6 +4089,249 @@ mod streaming_persistence_tests {
         pool
     }
 
+    async fn parent_wake_test_pool() -> SqlitePool {
+        let url = format!(
+            "file:parent-wake-admission-test-{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
+        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+            .expect("parse sqlite url")
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .disable_statement_logging();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .expect("connect parent wake test pool");
+
+        sqlx::query(
+            r#"
+            CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                user_id TEXT,
+                organization TEXT,
+                agent TEXT,
+                conversation_type TEXT,
+                parent_conversation_id TEXT,
+                conversation_role TEXT NOT NULL DEFAULT 'standard',
+                title TEXT,
+                started_at TEXT,
+                updated_at TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                archived_at TEXT,
+                router_ticket_id TEXT,
+                router_organization TEXT,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                last_event_index INTEGER NOT NULL DEFAULT -1
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create conversations");
+        sqlx::query(
+            r#"
+            CREATE TABLE conversation_messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                attachments TEXT,
+                metadata TEXT,
+                created_at TEXT NOT NULL,
+                message_index INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create conversation_messages");
+        sqlx::query(
+            r#"
+            CREATE TABLE agent_checkpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                cc_session_id TEXT NOT NULL,
+                tool_call_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'running',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                UNIQUE(conversation_id)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create agent_checkpoints");
+        sqlx::query(
+            r#"
+            CREATE TABLE agent_runner_generations (
+                generation_id TEXT PRIMARY KEY,
+                runner_kind TEXT NOT NULL,
+                version_hash TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                active_turn_count INTEGER NOT NULL DEFAULT 0,
+                started_at INTEGER NOT NULL,
+                last_heartbeat_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create agent_runner_generations");
+        sqlx::query(
+            r#"
+            CREATE TABLE agent_runner_turns (
+                turn_id TEXT PRIMARY KEY,
+                generation_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                cc_session_id TEXT,
+                status TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                completed_at INTEGER
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create agent_runner_turns");
+        sqlx::query(
+            r#"
+            CREATE TABLE conversation_turn_jobs (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                agent_type TEXT NOT NULL,
+                runtime TEXT NOT NULL,
+                prompt_name TEXT NOT NULL,
+                working_dir TEXT NOT NULL,
+                prompt_vars TEXT NOT NULL,
+                images TEXT,
+                client_id TEXT,
+                message_metadata TEXT,
+                status TEXT NOT NULL,
+                locked_by_generation_id TEXT,
+                error_message TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                started_at INTEGER,
+                completed_at INTEGER,
+                queue_wait_ms INTEGER,
+                run_duration_ms INTEGER,
+                failure_category TEXT
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create conversation_turn_jobs");
+        sqlx::query(
+            r#"
+            CREATE TABLE conversation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                event_index INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                event_data TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create conversation_events");
+
+        runner_capacity::ensure_schema_and_seed_policy(&pool)
+            .await
+            .expect("seed runner capacity policy");
+        sqlx::query("UPDATE runner_capacity_policy SET max_pending_jobs = 1 WHERE runner_kind = ?")
+            .bind(runner_capacity::RUNNER_KIND)
+            .execute(&pool)
+            .await
+            .expect("tighten pending cap");
+        sqlx::query(
+            r#"
+            INSERT INTO conversation_turn_jobs (
+                id, conversation_id, user_id, message, agent_type, runtime, prompt_name,
+                working_dir, prompt_vars, status, created_at, updated_at
+            ) VALUES (
+                'job-existing', 'other-conversation', 'user-1', 'already pending', 'full-access',
+                'codex-app-server', 'full-access', '/tmp', '{}', 'pending', 100, 100
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed saturated pending job");
+
+        pool
+    }
+
+    fn test_conversation(
+        id: &str,
+        title: &str,
+        parent_id: Option<&str>,
+    ) -> ticketing_system::Conversation {
+        ticketing_system::Conversation {
+            id: id.to_string(),
+            user_id: "user-1".to_string(),
+            session_id: None,
+            organization: "agentic-flowstate".to_string(),
+            agent: Some("full-access".to_string()),
+            conversation_type: Some("implementation".to_string()),
+            parent_conversation_id: parent_id.map(ToString::to_string),
+            conversation_role: if parent_id.is_some() {
+                "sub_agent".to_string()
+            } else {
+                "multi_agent_parent".to_string()
+            },
+            child_conversation_count: None,
+            child_sort_order: None,
+            title: title.to_string(),
+            started_at: "2026-07-06T00:00:00Z".to_string(),
+            updated_at: "2026-07-06T00:00:00Z".to_string(),
+            status: "open".to_string(),
+            archived_at: None,
+            router_ticket_id: None,
+            router_organization: None,
+            message_count: None,
+            last_event_index: None,
+            last_read_event_index: None,
+            unread_event_count: None,
+            is_active: None,
+            messages: None,
+        }
+    }
+
+    async fn coordinator_wake_job_count(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM conversation_turn_jobs
+            WHERE message_metadata IS NOT NULL
+              AND json_valid(message_metadata)
+              AND json_extract(message_metadata, '$.orchestration') = 'coordinator_child_completion_wake'
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .expect("count coordinator wake jobs")
+    }
+
+    async fn queue_pending_cap_admission_count(pool: &SqlitePool, context: &str) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runner_admission_events WHERE context = ? AND accepted = 0 AND reason = 'queue_pending_cap'",
+        )
+        .bind(context)
+        .fetch_one(pool)
+        .await
+        .expect("count rejected admission events")
+    }
+
     /// Drive a sequence of the previous SDK StreamEvents through the encoder, persist
     /// every emitted Anthropic event via `insert_conversation_event`, then
     /// replay from the DB and return (event_types, parsed_json_values).
@@ -4072,6 +4367,79 @@ mod streaming_persistence_tests {
             .map(|r| serde_json::from_str(&r.event_data).expect("parse persisted event_data"))
             .collect();
         (types, values)
+    }
+
+    #[tokio::test]
+    async fn parent_coordinator_single_wake_respects_saturated_pending_cap() {
+        let pool = parent_wake_test_pool().await;
+        let parent = test_conversation("parent-1", "Parent", None);
+        let child = test_conversation("child-1", "Child", Some("parent-1"));
+
+        enqueue_parent_coordinator_wake(
+            &pool,
+            &parent,
+            &child,
+            "full-access",
+            "implementation",
+            "completed",
+            "assistant-1",
+            "status-1",
+        )
+        .await
+        .expect("single coordinator wake admission should not error");
+
+        assert_eq!(coordinator_wake_job_count(&pool).await, 0);
+        assert_eq!(
+            queue_pending_cap_admission_count(&pool, "parent_coordinator_child_completion_wake")
+                .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_coordinator_batch_wake_respects_saturated_pending_cap() {
+        let pool = parent_wake_test_pool().await;
+        let parent = test_conversation("parent-1", "Parent", None);
+        let batch_context = ChildBatchContext {
+            batch_id: "batch-1".to_string(),
+            expected_count: 1,
+            child_index: None,
+        };
+        let metadata = child_completion_status_metadata(
+            "child-1",
+            "Child",
+            "full-access",
+            "assistant-1",
+            "completed",
+            "implementation",
+            "Finished",
+            Some(&batch_context),
+        )
+        .expect("serialize child completion metadata");
+        sqlx::query(
+            r#"
+            INSERT INTO conversation_messages (
+                id, conversation_id, role, content, metadata, created_at, message_index
+            ) VALUES (
+                'status-1', 'parent-1', 'system', 'child completed', ?, '2026-07-06T00:00:00Z', 0
+            )
+            "#,
+        )
+        .bind(metadata)
+        .execute(&pool)
+        .await
+        .expect("seed child completion card");
+
+        enqueue_parent_coordinator_batch_wake_if_complete(&pool, &parent, &batch_context)
+            .await
+            .expect("batch coordinator wake admission should not error");
+
+        assert_eq!(coordinator_wake_job_count(&pool).await, 0);
+        assert_eq!(
+            queue_pending_cap_admission_count(&pool, "parent_coordinator_batch_completion_wake")
+                .await,
+            1
+        );
     }
 
     fn assert_all_anthropic(types: &[String]) {
