@@ -1202,10 +1202,6 @@ impl ConversationWorker {
                 None
             }
         };
-        let generated_attachments_before = generated_images_root
-            .as_deref()
-            .map(generated_attachment_snapshot)
-            .unwrap_or_default();
 
         let codex_spawn_start_ms = Utc::now().timestamp_millis();
         runtime::record_spawn_started(
@@ -1312,6 +1308,9 @@ impl ConversationWorker {
         let mut usage: Option<TokenUsageBreakdown> = None;
         let mut kill_requested = false;
         let mut streamed_agent_message_items: HashSet<String> = HashSet::new();
+        let mut generated_attachment_snapshots_by_tool: HashMap<String, HashSet<PathBuf>> =
+            HashMap::new();
+        let mut generated_paths_to_attach: HashSet<PathBuf> = HashSet::new();
         heartbeat.tick().await;
 
         // If Stop lands while Codex is still launching, the cancel endpoint can
@@ -1485,6 +1484,13 @@ impl ConversationWorker {
                                 tracing::error!("[WORKER] Failed to insert tool call: {}", e);
                             }
 
+                            if tool_may_generate_visual_attachment(&name) {
+                                if let Some(root) = generated_images_root.as_deref() {
+                                    generated_attachment_snapshots_by_tool
+                                        .insert(id.clone(), generated_attachment_snapshot(root));
+                                }
+                            }
+
                             let checkpoint_session = thread_id.as_deref().unwrap_or("running");
                             if let Err(e) = checkpoints::upsert_checkpoint(
                                 &self.db,
@@ -1515,6 +1521,14 @@ impl ConversationWorker {
                             is_error,
                         }) => {
                             let scoped_tool_id = scoped_tool_call_id(&assistant_message_id, &id);
+                            if let (Some(root), Some(before)) = (
+                                generated_images_root.as_deref(),
+                                generated_attachment_snapshots_by_tool.remove(&id),
+                            ) {
+                                generated_paths_to_attach
+                                    .extend(new_generated_attachments(root, &before));
+                            }
+
                             if let Err(e) = conversations::update_tool_call_result(
                                 &self.db,
                                 &scoped_tool_id,
@@ -1776,8 +1790,9 @@ impl ConversationWorker {
             }
         }
 
-        if let Some(root) = generated_images_root.as_deref() {
-            let generated_paths = new_generated_attachments(root, &generated_attachments_before);
+        if !generated_paths_to_attach.is_empty() {
+            let mut generated_paths: Vec<PathBuf> = generated_paths_to_attach.into_iter().collect();
+            generated_paths.sort();
             if !generated_paths.is_empty() {
                 match persist_generated_visual_attachments(
                     &self.db,
@@ -2391,6 +2406,14 @@ fn new_generated_attachments(root: &Path, before: &HashSet<PathBuf>) -> Vec<Path
         .collect();
     attachments.sort();
     attachments
+}
+
+fn tool_may_generate_visual_attachment(tool_name: &str) -> bool {
+    let normalized = tool_name.to_ascii_lowercase().replace(['-', '.'], "_");
+    normalized.contains("image_gen")
+        || normalized.contains("imagegen")
+        || normalized.contains("image_generation")
+        || normalized.contains("generate_image")
 }
 
 fn collect_generated_attachments(dir: &Path, files: &mut HashSet<PathBuf>) {
@@ -4936,6 +4959,29 @@ mod streaming_persistence_tests {
 
         assert_eq!(new_attachments, expected);
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn visual_attachment_detection_only_accepts_generation_tools() {
+        assert!(tool_may_generate_visual_attachment("image_gen.imagegen"));
+        assert!(tool_may_generate_visual_attachment("image_generation"));
+        assert!(tool_may_generate_visual_attachment("generate_image"));
+
+        assert!(!tool_may_generate_visual_attachment("view_image"));
+        assert!(!tool_may_generate_visual_attachment("read_mcp_resource"));
+        assert!(!tool_may_generate_visual_attachment("exec_command"));
+    }
+
+    #[test]
+    fn full_access_prompt_documents_native_speech_card_contract() {
+        let prompt_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("_prompts")
+            .join("full-access.txt");
+        let prompt = fs::read_to_string(prompt_path).expect("read full-access prompt");
+
+        assert!(prompt.contains("Native Chat UI Contracts"));
+        assert!(prompt.contains("fenced `speech`, `speak`, or `tts` blocks"));
+        assert!(prompt.contains("```speech Short button title"));
     }
 
     #[test]
