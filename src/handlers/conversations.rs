@@ -16,7 +16,7 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use ticketing_system::{
     agent_runners, checkpoints, conversation_turn_jobs, conversations, AddMessageRequest,
     BranchConversationRequest, Conversation, ConversationHierarchyScope, ConversationMessage,
@@ -38,6 +38,11 @@ use super::runner_capacity;
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 use crate::observability::cancellation;
+use crate::observability::request::{
+    maybe_log_economics_guardrail, observe_serialized_payload, record_db_operation,
+    record_db_query_count, Outcome, ROUTE_CONVERSATIONS, ROUTE_CONVERSATION_EVENTS_PAGE,
+    ROUTE_CONVERSATION_MESSAGES,
+};
 use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_opened, DisconnectReason,
 };
@@ -1380,7 +1385,9 @@ pub async fn list_conversations(
     let hierarchy_scope = ConversationHierarchyScope::parse(params.hierarchy_scope.as_deref())
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
-    let mut list = conversations::list_conversations_with_hierarchy(
+    let mut estimated_query_count = 0_u64;
+    let list_started = Instant::now();
+    let list_result = conversations::list_conversations_with_hierarchy(
         &pool,
         params.organization.as_deref(),
         Some(&user.user_id),
@@ -1391,27 +1398,89 @@ pub async fn list_conversations(
         hierarchy_scope,
         params.parent_conversation_id.as_deref(),
     )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .await;
+    record_db_operation(
+        ROUTE_CONVERSATIONS,
+        "conversation.list_with_hierarchy",
+        list_started.elapsed(),
+        Outcome::from_result(&list_result),
+    );
+    estimated_query_count += 1;
+    let mut list = list_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let active_count = list
+        .iter()
+        .filter(|conv| conv.is_active == Some(true))
+        .count() as u64;
+    let active_status_started = Instant::now();
     for conv in &mut list {
         if conv.is_active == Some(true) {
-            let status = conversation_run_status_snapshot(&pool, &conv.id, Some(manager.as_ref()))
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let status =
+                conversation_run_status_snapshot(&pool, &conv.id, Some(manager.as_ref())).await;
+            if let Err(e) = status {
+                record_db_operation(
+                    ROUTE_CONVERSATIONS,
+                    "conversation.active_status_snapshots",
+                    active_status_started.elapsed(),
+                    Outcome::Error,
+                );
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
+            let status = status.expect("status result checked above");
             conv.is_active = Some(status.is_processing);
         }
     }
+    if active_count > 0 {
+        record_db_operation(
+            ROUTE_CONVERSATIONS,
+            "conversation.active_status_snapshots",
+            active_status_started.elapsed(),
+            Outcome::Success,
+        );
+        estimated_query_count += active_count.saturating_mul(8);
+    }
 
     let total = list.len() as i64;
-    let conversations = conversation_list_items(&pool, &user.user_id, list)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let enrichment_started = Instant::now();
+    let conversations_result = conversation_list_items(&pool, &user.user_id, list).await;
+    record_db_operation(
+        ROUTE_CONVERSATIONS,
+        "conversation.summary_enrichment",
+        enrichment_started.elapsed(),
+        Outcome::from_result(&conversations_result),
+    );
+    estimated_query_count += 2 + active_count.saturating_mul(4);
+    let conversations =
+        conversations_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(Json(ConversationListResponse {
+    let response = ConversationListResponse {
         conversations,
         total,
-    }))
+    };
+    let payload_bytes = observe_serialized_payload(
+        ROUTE_CONVERSATIONS,
+        "conversation_list",
+        &response,
+        response.conversations.len() as u64,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    record_db_query_count(
+        ROUTE_CONVERSATIONS,
+        "request.estimated_total",
+        estimated_query_count,
+        Outcome::Success,
+    );
+    maybe_log_economics_guardrail(
+        pool.clone(),
+        "chat",
+        ROUTE_CONVERSATIONS,
+        "list_conversations",
+        estimated_query_count,
+        payload_bytes,
+        response.conversations.len() as u64,
+    );
+
+    Ok(Json(response))
 }
 
 /// Get single conversation by ID (GET /api/conversations/:id)
@@ -2181,20 +2250,40 @@ pub async fn list_messages(
     Path(id): Path<String>,
     Query(params): Query<ListMessagesQuery>,
 ) -> Result<Json<Vec<ConversationMessage>>, (StatusCode, String)> {
+    let mut estimated_query_count = 0_u64;
+
     // Verify conversation exists and belongs to user
-    let conv = conversations::get_conversation(&pool, &id, false)
-        .await
+    let conversation_started = Instant::now();
+    let conv_result = conversations::get_conversation(&pool, &id, false).await;
+    record_db_operation(
+        ROUTE_CONVERSATION_MESSAGES,
+        "conversation.lookup",
+        conversation_started.elapsed(),
+        Outcome::from_result(&conv_result),
+    );
+    estimated_query_count += 1;
+    let conv = conv_result
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
     if conv.user_id != user.user_id {
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
 
-    let mut messages = conversations::list_messages(&pool, &id, params.limit, params.before)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let messages_started = Instant::now();
+    let messages_result =
+        conversations::list_messages(&pool, &id, params.limit, params.before).await;
+    record_db_operation(
+        ROUTE_CONVERSATION_MESSAGES,
+        "conversation.messages_page",
+        messages_started.elapsed(),
+        Outcome::from_result(&messages_result),
+    );
+    estimated_query_count += 1;
+    let mut messages =
+        messages_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     if params.defer_active.unwrap_or(false) {
+        let defer_started = Instant::now();
         if let Err(e) = agent_runners::recover_stale_active_work_for_conversation(
             &pool,
             &id,
@@ -2208,17 +2297,21 @@ pub async fn list_messages(
                 e
             );
         }
+        estimated_query_count += 1;
         let mut checkpoint = checkpoints::get_checkpoint(&pool, &id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        estimated_query_count += 1;
         let checkpoint_status = checkpoint.as_ref().map(|cp| cp.status.clone());
         if repair_checkpoint_from_active_durable_work(&pool, &id, checkpoint_status.as_deref())
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         {
+            estimated_query_count += 3;
             checkpoint = checkpoints::get_checkpoint(&pool, &id)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            estimated_query_count += 1;
         }
         let is_processing = matches!(
             checkpoint.as_ref().map(|cp| cp.status.as_str()),
@@ -2232,13 +2325,41 @@ pub async fn list_messages(
                 messages.remove(idx);
             }
         }
+        record_db_operation(
+            ROUTE_CONVERSATION_MESSAGES,
+            "conversation.defer_active_state",
+            defer_started.elapsed(),
+            Outcome::Success,
+        );
     }
 
     let messages = messages
         .into_iter()
         .filter(|message| !super::child_completion_status::is_hidden_from_chat_display(message))
         .map(super::child_completion_status::sanitize_message_for_display)
-        .collect();
+        .collect::<Vec<_>>();
+    let payload_bytes = observe_serialized_payload(
+        ROUTE_CONVERSATION_MESSAGES,
+        "message_page",
+        &messages,
+        messages.len() as u64,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    record_db_query_count(
+        ROUTE_CONVERSATION_MESSAGES,
+        "request.estimated_total",
+        estimated_query_count,
+        Outcome::Success,
+    );
+    maybe_log_economics_guardrail(
+        pool.clone(),
+        "chat",
+        ROUTE_CONVERSATION_MESSAGES,
+        "list_messages",
+        estimated_query_count,
+        payload_bytes,
+        messages.len() as u64,
+    );
 
     Ok(Json(messages))
 }
@@ -2569,8 +2690,18 @@ pub async fn list_conversation_events_page(
     Path(id): Path<String>,
     Query(query): Query<ConversationEventsPageQuery>,
 ) -> Result<Json<ConversationEventsPageResponse>, (StatusCode, String)> {
-    let conv = conversations::get_conversation(&pool, &id, false)
-        .await
+    let mut estimated_query_count = 0_u64;
+
+    let conversation_started = Instant::now();
+    let conv_result = conversations::get_conversation(&pool, &id, false).await;
+    record_db_operation(
+        ROUTE_CONVERSATION_EVENTS_PAGE,
+        "conversation.lookup",
+        conversation_started.elapsed(),
+        Outcome::from_result(&conv_result),
+    );
+    estimated_query_count += 1;
+    let conv = conv_result
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
     if conv.user_id != user.user_id {
@@ -2579,14 +2710,30 @@ pub async fn list_conversation_events_page(
 
     let after = query.starting_after.unwrap_or(-1);
     let limit = query.limit.unwrap_or(200).clamp(1, 500);
-    let last_event_index = conversations::get_max_event_index(&pool, &id)
-        .await
-        .unwrap_or(-1);
-    let raw = conversations::get_events_after_limited(&pool, &id, after, limit)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let max_event_started = Instant::now();
+    let last_event_index_result = conversations::get_max_event_index(&pool, &id).await;
+    record_db_operation(
+        ROUTE_CONVERSATION_EVENTS_PAGE,
+        "conversation.max_event_index",
+        max_event_started.elapsed(),
+        Outcome::from_result(&last_event_index_result),
+    );
+    estimated_query_count += 1;
+    let last_event_index = last_event_index_result.unwrap_or(-1);
+
+    let events_started = Instant::now();
+    let raw_result = conversations::get_events_after_limited(&pool, &id, after, limit).await;
+    record_db_operation(
+        ROUTE_CONVERSATION_EVENTS_PAGE,
+        "conversation.events_page",
+        events_started.elapsed(),
+        Outcome::from_result(&raw_result),
+    );
+    estimated_query_count += 1;
+    let raw = raw_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let mut events = Vec::with_capacity(raw.len());
+    let materialize_started = Instant::now();
     for e in raw {
         let event_data = conversations::load_event_payload_str(&pool, &e)
             .await
@@ -2606,11 +2753,44 @@ pub async fn list_conversation_events_page(
             created_at: e.created_at,
         });
     }
+    if !events.is_empty() {
+        record_db_operation(
+            ROUTE_CONVERSATION_EVENTS_PAGE,
+            "conversation.event_payload_materialization",
+            materialize_started.elapsed(),
+            Outcome::Success,
+        );
+        estimated_query_count += events.len() as u64;
+    }
 
-    Ok(Json(ConversationEventsPageResponse {
+    let response = ConversationEventsPageResponse {
         events,
         last_event_index,
-    }))
+    };
+    let payload_bytes = observe_serialized_payload(
+        ROUTE_CONVERSATION_EVENTS_PAGE,
+        "conversation_events_page",
+        &response,
+        response.events.len() as u64,
+    )
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    record_db_query_count(
+        ROUTE_CONVERSATION_EVENTS_PAGE,
+        "request.estimated_total",
+        estimated_query_count,
+        Outcome::Success,
+    );
+    maybe_log_economics_guardrail(
+        pool.clone(),
+        "chat",
+        ROUTE_CONVERSATION_EVENTS_PAGE,
+        "list_conversation_events_page",
+        estimated_query_count,
+        payload_bytes,
+        response.events.len() as u64,
+    );
+
+    Ok(Json(response))
 }
 
 /// GET /api/v1/conversations/:id/events

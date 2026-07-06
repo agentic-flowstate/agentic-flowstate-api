@@ -610,6 +610,54 @@ contract_id = "C-OBS-003"
 labels = ["status", "action"]
 
 [[metrics]]
+name = "af_http_requests_total"
+kind = "counter"
+contract_id = "C-OBS-003"
+labels = ["method", "route", "status_class", "outcome", "error_type"]
+
+[[metrics]]
+name = "af_http_request_duration_seconds"
+kind = "histogram"
+contract_id = "C-OBS-003"
+labels = ["method", "route", "status_class", "outcome", "error_type"]
+
+[[metrics]]
+name = "af_request_db_queries_total"
+kind = "counter"
+contract_id = "C-OBS-003"
+labels = ["route", "operation", "outcome"]
+
+[[metrics]]
+name = "af_request_db_query_duration_seconds"
+kind = "histogram"
+contract_id = "C-OBS-003"
+labels = ["route", "operation", "outcome"]
+
+[[metrics]]
+name = "af_request_payload_bytes"
+kind = "histogram"
+contract_id = "C-OBS-003"
+labels = ["route", "payload_kind", "outcome"]
+
+[[metrics]]
+name = "af_request_payload_objects"
+kind = "histogram"
+contract_id = "C-OBS-003"
+labels = ["route", "payload_kind", "outcome"]
+
+[[metrics]]
+name = "af_request_serialization_duration_seconds"
+kind = "histogram"
+contract_id = "C-OBS-003"
+labels = ["route", "payload_kind", "outcome"]
+
+[[metrics]]
+name = "af_request_serialization_bytes"
+kind = "histogram"
+contract_id = "C-OBS-003"
+labels = ["route", "payload_kind", "outcome"]
+
+[[metrics]]
 name = "retention_rows_deleted_total"
 kind = "counter"
 contract_id = "C-OBS-002"

@@ -25,10 +25,14 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use ticketing_system::SqlitePool;
 
 use crate::auth_middleware::AuthenticatedUser;
+use crate::observability::request::{
+    maybe_log_economics_guardrail, record_db_operation, record_db_query_count, record_payload,
+    record_serialization, Outcome, ROUTE_UNIFIED_EVENTS,
+};
 
 use super::chat_client_manager::ChatClientManager;
 use super::resume_cursor::{extract_cursor, CursorError, ResumeQuery};
@@ -266,9 +270,25 @@ pub async fn subscribe_unified_events(
 
             // ── CONVERSATIONS ────────────────────────────────────────────
             if topics.contains("conversations") {
-                if let Ok(mut convs) = ticketing_system::conversations::list_conversations(
+                let mut estimated_query_count = 0_u64;
+                let list_started = Instant::now();
+                let convs_result = ticketing_system::conversations::list_conversations(
                     &pool, validated_org.as_deref(), Some(&user_id), None, None, None, None,
-                ).await {
+                ).await;
+                record_db_operation(
+                    ROUTE_UNIFIED_EVENTS,
+                    "conversation.list",
+                    list_started.elapsed(),
+                    Outcome::from_result(&convs_result),
+                );
+                estimated_query_count += 1;
+
+                if let Ok(mut convs) = convs_result {
+                    let active_count = convs
+                        .iter()
+                        .filter(|conv| conv.is_active == Some(true))
+                        .count() as u64;
+                    let active_started = Instant::now();
                     for conv in &mut convs {
                         if conv.is_active == Some(true) {
                             match crate::handlers::conversations::conversation_run_status_snapshot(
@@ -289,14 +309,39 @@ pub async fn subscribe_unified_events(
                             }
                         }
                     }
+                    if active_count > 0 {
+                        record_db_operation(
+                            ROUTE_UNIFIED_EVENTS,
+                            "conversation.active_status_snapshots",
+                            active_started.elapsed(),
+                            Outcome::Success,
+                        );
+                        estimated_query_count += active_count.saturating_mul(8);
+                    }
+                    let summary_started = Instant::now();
                     let summaries = match crate::handlers::conversations::conversation_list_items(&pool, &user_id, convs).await {
-                        Ok(summaries) => summaries,
+                        Ok(summaries) => {
+                            record_db_operation(
+                                ROUTE_UNIFIED_EVENTS,
+                                "conversation.summary_enrichment",
+                                summary_started.elapsed(),
+                                Outcome::Success,
+                            );
+                            summaries
+                        },
                         Err(e) => {
+                            record_db_operation(
+                                ROUTE_UNIFIED_EVENTS,
+                                "conversation.summary_enrichment",
+                                summary_started.elapsed(),
+                                Outcome::Error,
+                            );
                             tracing::error!("Failed to summarize conversations for unified SSE: {}", e);
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             continue;
                         }
                     };
+                    estimated_query_count += 2 + active_count.saturating_mul(4);
                     let hash = hash_conversation_list(&summaries);
                     let event_id = conversation_snapshot_event_id(&summaries);
                     let should_emit = should_emit_conversation_snapshot(
@@ -313,9 +358,67 @@ pub async fn subscribe_unified_events(
                             "conversations": summaries,
                             "updated_at": chrono::Utc::now().timestamp(),
                         });
-                        if let Ok(json) = serde_json::to_string(&payload) {
-                            yield Ok(Event::default().id(event_id.to_string()).event("conversations").data(json));
+                        let serialization_started = Instant::now();
+                        match serde_json::to_string(&payload) {
+                            Ok(json) => {
+                                let payload_bytes = json.len() as u64;
+                                record_serialization(
+                                    ROUTE_UNIFIED_EVENTS,
+                                    "conversation_snapshot",
+                                    serialization_started.elapsed(),
+                                    payload_bytes,
+                                    Outcome::Success,
+                                );
+                                record_payload(
+                                    ROUTE_UNIFIED_EVENTS,
+                                    "conversation_snapshot",
+                                    payload_bytes,
+                                    payload
+                                        .get("conversations")
+                                        .and_then(|value| value.as_array())
+                                        .map(|items| items.len() as u64)
+                                        .unwrap_or(0),
+                                    Outcome::Success,
+                                );
+                                record_db_query_count(
+                                    ROUTE_UNIFIED_EVENTS,
+                                    "conversation_snapshot.estimated_total",
+                                    estimated_query_count,
+                                    Outcome::Success,
+                                );
+                                maybe_log_economics_guardrail(
+                                    pool.clone(),
+                                    "chat",
+                                    ROUTE_UNIFIED_EVENTS,
+                                    "unified_conversation_snapshot",
+                                    estimated_query_count,
+                                    payload_bytes,
+                                    payload
+                                        .get("conversations")
+                                        .and_then(|value| value.as_array())
+                                        .map(|items| items.len() as u64)
+                                        .unwrap_or(0),
+                                );
+                                yield Ok(Event::default().id(event_id.to_string()).event("conversations").data(json));
+                            }
+                            Err(e) => {
+                                record_serialization(
+                                    ROUTE_UNIFIED_EVENTS,
+                                    "conversation_snapshot",
+                                    serialization_started.elapsed(),
+                                    0,
+                                    Outcome::Error,
+                                );
+                                tracing::error!("Failed to serialize unified SSE conversation snapshot: {}", e);
+                            }
                         }
+                    } else {
+                        record_db_query_count(
+                            ROUTE_UNIFIED_EVENTS,
+                            "conversation_poll.estimated_total",
+                            estimated_query_count,
+                            Outcome::Success,
+                        );
                     }
                 }
             }

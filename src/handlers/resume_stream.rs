@@ -46,7 +46,7 @@
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_stream::stream;
 use axum::{
@@ -64,6 +64,10 @@ use serde_json::json;
 use ticketing_system::{checkpoints, conversations, SqlitePool};
 
 use crate::auth_middleware::AuthenticatedUser;
+use crate::observability::request::{
+    record_db_operation, record_db_query_count, record_payload, record_serialization, Outcome,
+    ROUTE_CONVERSATION_EVENTS_STREAM,
+};
 use crate::observability::streaming::{
     record_cursor_expired, record_stream_closed, record_stream_event_emitted, record_stream_opened,
     DisconnectReason,
@@ -141,7 +145,15 @@ pub async fn resume_conversation_stream(
     };
 
     // ---- 2. Auth + conversation ownership. ----
-    let conv = match conversations::get_conversation(&pool, &id, false).await {
+    let conversation_started = Instant::now();
+    let conv_result = conversations::get_conversation(&pool, &id, false).await;
+    record_db_operation(
+        ROUTE_CONVERSATION_EVENTS_STREAM,
+        "conversation.lookup",
+        conversation_started.elapsed(),
+        Outcome::from_result(&conv_result),
+    );
+    let conv = match conv_result {
         Ok(Some(c)) => c,
         Ok(None) => {
             return (
@@ -204,8 +216,15 @@ pub async fn resume_conversation_stream(
     // the client is free to tail from wherever; nothing to replay
     // anyway).
     if cursor.is_resume() {
+        let retention_started = Instant::now();
         match retention_prune::earliest_retained_event_index(&pool, &id).await {
             Ok(Some(earliest)) => {
+                record_db_operation(
+                    ROUTE_CONVERSATION_EVENTS_STREAM,
+                    "conversation.retention_floor",
+                    retention_started.elapsed(),
+                    Outcome::Success,
+                );
                 if cursor.event_index < earliest.saturating_sub(1) {
                     // The `-1` adjustment mirrors the contract in
                     // `earliest_retained_event_index`'s doc comment: a
@@ -218,11 +237,23 @@ pub async fn resume_conversation_stream(
                 }
             }
             Ok(None) => {
+                record_db_operation(
+                    ROUTE_CONVERSATION_EVENTS_STREAM,
+                    "conversation.retention_floor",
+                    retention_started.elapsed(),
+                    Outcome::Success,
+                );
                 // Empty conversation — nothing to replay or reject. The
                 // stream will open, send zero replay frames, and either
                 // tail live events or close cleanly.
             }
             Err(e) => {
+                record_db_operation(
+                    ROUTE_CONVERSATION_EVENTS_STREAM,
+                    "conversation.retention_floor",
+                    retention_started.elapsed(),
+                    Outcome::Error,
+                );
                 tracing::error!(
                     conversation_id = %id,
                     error = %e,
@@ -244,7 +275,15 @@ pub async fn resume_conversation_stream(
     //         whether to transition into live-tailing mode after catching
     //         up. Failure to read the checkpoint is not fatal — we default
     //         to "none" which skips the live phase. ----
-    let checkpoint_status = match checkpoints::get_checkpoint(&pool, &id).await {
+    let checkpoint_started = Instant::now();
+    let checkpoint_result = checkpoints::get_checkpoint(&pool, &id).await;
+    record_db_operation(
+        ROUTE_CONVERSATION_EVENTS_STREAM,
+        "conversation.checkpoint",
+        checkpoint_started.elapsed(),
+        Outcome::from_result(&checkpoint_result),
+    );
+    let checkpoint_status = match checkpoint_result {
         Ok(Some(cp)) => cp.status,
         _ => "none".to_string(),
     };
@@ -359,6 +398,7 @@ fn build_resume_stream(
         // returns everything strictly greater than N, which is exactly the
         // contract the client expects.
         let after = cursor.event_index.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        let mut estimated_query_count = 0_u64;
 
         // ---- Phase 1a: synthetic resumption snapshot (T-F8F986A9). ----
         //
@@ -382,7 +422,17 @@ fn build_resume_stream(
         // a client that hasn't seen anything yet has no half-rendered
         // state to heal.
         if cursor.is_resume() {
-            match reconstruct_state_up_to_cursor(&db, &conversation_id, cursor.event_index).await {
+            let reconstruct_started = Instant::now();
+            let reconstructed =
+                reconstruct_state_up_to_cursor(&db, &conversation_id, cursor.event_index).await;
+            record_db_operation(
+                ROUTE_CONVERSATION_EVENTS_STREAM,
+                "resume.reconstruct_snapshot",
+                reconstruct_started.elapsed(),
+                Outcome::from_result(&reconstructed),
+            );
+            estimated_query_count += 1;
+            match reconstructed {
                 Ok(states) if !states.is_empty() => {
                     let snapshots = synthesize_snapshot_events(&states);
                     tracing::info!(
@@ -391,10 +441,20 @@ fn build_resume_stream(
                         unstopped_blocks = states.len(),
                         "resume stream: emitting synthetic content_block_snapshot frames"
                     );
+                    let mut snapshot_payload_bytes = 0_u64;
+                    let mut snapshot_payload_count = 0_u64;
                     for snap in snapshots {
+                        let serialization_started = Instant::now();
                         let payload = match serde_json::to_string(&snap) {
                             Ok(s) => s,
                             Err(e) => {
+                                record_serialization(
+                                    ROUTE_CONVERSATION_EVENTS_STREAM,
+                                    "content_block_snapshot",
+                                    serialization_started.elapsed(),
+                                    0,
+                                    Outcome::Error,
+                                );
                                 tracing::error!(
                                     conversation_id = %conversation_id,
                                     cursor = cursor.event_index,
@@ -404,12 +464,28 @@ fn build_resume_stream(
                                 continue;
                             }
                         };
+                        record_serialization(
+                            ROUTE_CONVERSATION_EVENTS_STREAM,
+                            "content_block_snapshot",
+                            serialization_started.elapsed(),
+                            payload.len() as u64,
+                            Outcome::Success,
+                        );
+                        snapshot_payload_bytes += payload.len() as u64;
+                        snapshot_payload_count += 1;
                         record_stream_event_emitted(&conversation_id, payload.len());
                         yield Ok(Event::default()
                             .id(cursor.event_index.to_string())
                             .event("content_block_snapshot")
                             .data(payload));
                     }
+                    record_payload(
+                        ROUTE_CONVERSATION_EVENTS_STREAM,
+                        "content_block_snapshot",
+                        snapshot_payload_bytes,
+                        snapshot_payload_count,
+                        Outcome::Success,
+                    );
                 }
                 Ok(_) => {
                     // No unstopped blocks — nothing to heal.
@@ -430,7 +506,16 @@ fn build_resume_stream(
             }
         }
 
-        let replay = match conversations::get_events_after(&db, &conversation_id, after).await {
+        let replay_started = Instant::now();
+        let replay_result = conversations::get_events_after(&db, &conversation_id, after).await;
+        record_db_operation(
+            ROUTE_CONVERSATION_EVENTS_STREAM,
+            "resume.replay_events",
+            replay_started.elapsed(),
+            Outcome::from_result(&replay_result),
+        );
+        estimated_query_count += 1;
+        let replay = match replay_result {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!(
@@ -444,6 +529,9 @@ fn build_resume_stream(
         };
 
         let mut last_event_index: i32 = after;
+        let materialize_started = Instant::now();
+        let mut replay_payload_bytes = 0_u64;
+        let mut replay_payload_count = 0_u64;
         for ev in &replay {
             last_event_index = ev.event_index;
             let payload = match conversations::load_event_payload_str(&db, ev).await {
@@ -458,12 +546,36 @@ fn build_resume_stream(
                     continue;
                 }
             };
+            replay_payload_bytes += payload.len() as u64;
+            replay_payload_count += 1;
             record_stream_event_emitted(&conversation_id, payload.len());
             yield Ok(Event::default()
                 .id(ev.event_index.to_string())
                 .event(ev.event_type.clone())
                 .data(payload));
         }
+        if replay_payload_count > 0 {
+            record_db_operation(
+                ROUTE_CONVERSATION_EVENTS_STREAM,
+                "resume.replay_payload_materialization",
+                materialize_started.elapsed(),
+                Outcome::Success,
+            );
+            estimated_query_count += replay_payload_count;
+            record_payload(
+                ROUTE_CONVERSATION_EVENTS_STREAM,
+                "resume_replay",
+                replay_payload_bytes,
+                replay_payload_count,
+                Outcome::Success,
+            );
+        }
+        record_db_query_count(
+            ROUTE_CONVERSATION_EVENTS_STREAM,
+            "resume.open.estimated_total",
+            estimated_query_count,
+            Outcome::Success,
+        );
 
         // ---- Phase 2: tail live events via the broadcast channel. ----
         //

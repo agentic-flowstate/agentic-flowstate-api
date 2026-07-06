@@ -9,6 +9,7 @@
 //! * [`cancellation`] — stop-button cancellation phase logs and latency
 //!   metrics.
 //! * [`next_actions`] — post-turn follow-up suggestion generation and storage metrics.
+//! * [`request`] — HTTP trace propagation, route RED metrics, and request economics.
 //! * [`runtime`] — chat/Codex runtime turn metrics and structured failure logs.
 //!
 //! # Integration
@@ -31,6 +32,7 @@
 pub mod cancellation;
 pub mod contracts;
 pub mod next_actions;
+pub mod request;
 pub mod runtime;
 pub mod streaming;
 
