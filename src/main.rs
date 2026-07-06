@@ -1474,6 +1474,10 @@ async fn main() -> anyhow::Result<()> {
             post(handlers::sync_conversation_read_states),
         )
         .route(
+            "/api/conversations/scale-cockpit",
+            get(handlers::get_conversation_scale_cockpit),
+        )
+        .route(
             "/api/conversations/:id/children",
             get(handlers::list_child_conversations).post(handlers::create_child_conversations),
         )

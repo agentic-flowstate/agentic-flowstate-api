@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use ticketing_system::{
     agent_runners, checkpoints, conversation_turn_jobs, conversations, AddMessageRequest,
     BranchConversationRequest, Conversation, ConversationHierarchyScope, ConversationMessage,
-    ConversationReadState,
+    ConversationReadState, ConversationScaleCockpit, ConversationScaleCockpitOptions,
     CreateChildConversationRequest as TicketingCreateChildConversationRequest,
     CreateConversationRequest, SqlitePool, UpdateConversationRequest,
 };
@@ -65,6 +65,14 @@ pub struct ListConversationsQuery {
     pub status: Option<String>,
     pub limit: Option<i64>,
     pub updated_since: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConversationScaleCockpitQuery {
+    pub organization: Option<String>,
+    pub agent: Option<String>,
+    pub limit: Option<i64>,
+    pub include_archived_parents: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1481,6 +1489,53 @@ pub async fn list_conversations(
     );
 
     Ok(Json(response))
+}
+
+/// Conversation scale cockpit (GET /api/conversations/scale-cockpit)
+pub async fn get_conversation_scale_cockpit(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Query(params): Query<ConversationScaleCockpitQuery>,
+) -> Result<Json<ConversationScaleCockpit>, (StatusCode, String)> {
+    let snapshot = conversations::conversation_scale_cockpit(
+        &pool,
+        ConversationScaleCockpitOptions {
+            organization: params.organization,
+            user_id: Some(user.user_id),
+            agent: params.agent,
+            limit: params.limit.unwrap_or(10),
+            include_archived_parents: params.include_archived_parents.unwrap_or(true),
+        },
+    )
+    .await
+    .map_err(|e| {
+        metrics::counter!(
+            "af_conversation_scale_cockpit_requests_total",
+            "outcome" => "error",
+            "health_status" => "unknown"
+        )
+        .increment(1);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
+
+    metrics::counter!(
+        "af_conversation_scale_cockpit_requests_total",
+        "outcome" => "success",
+        "health_status" => snapshot.health_status.clone()
+    )
+    .increment(1);
+    metrics::histogram!(
+        "af_conversation_scale_cockpit_response_payload_bytes",
+        "health_status" => snapshot.health_status.clone()
+    )
+    .record(snapshot.estimated_response_payload_bytes as f64);
+    metrics::histogram!(
+        "af_conversation_scale_cockpit_query_count",
+        "health_status" => snapshot.health_status.clone()
+    )
+    .record(snapshot.query_count_estimate as f64);
+
+    Ok(Json(snapshot))
 }
 
 /// Get single conversation by ID (GET /api/conversations/:id)
