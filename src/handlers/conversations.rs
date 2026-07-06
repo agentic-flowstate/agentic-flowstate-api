@@ -64,8 +64,48 @@ pub struct ListConversationsQuery {
 
 #[derive(Debug, Serialize)]
 pub struct ConversationListResponse {
-    pub conversations: Vec<ConversationSummary>,
+    pub conversations: Vec<ConversationListItem>,
     pub total: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationListItem {
+    pub id: String,
+    pub title: String,
+    pub organization: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_conversation_id: Option<String>,
+    pub conversation_role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_conversation_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_child_conversation_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unread_child_conversation_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_sort_order: Option<i32>,
+    pub updated_at: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_read_event_index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unread_event_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_started_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tool_call_started_at_epoch: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -257,6 +297,26 @@ struct LastToolCallStartedAtRow {
 #[derive(sqlx::FromRow)]
 struct RunStartedAtRow {
     started_at: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct ConversationRunMetadataMaps {
+    tool_call_counts: HashMap<String, i32>,
+    run_started_times: HashMap<String, i64>,
+    last_tool_calls: HashMap<String, i64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ChildActivityCounts {
+    active: i32,
+    unread: i32,
+}
+
+#[derive(sqlx::FromRow)]
+struct ChildActivityCountsRow {
+    parent_conversation_id: String,
+    active_child_conversation_count: i64,
+    unread_child_conversation_count: i64,
 }
 
 async fn last_tool_call_started_at_epoch_map(
@@ -478,10 +538,10 @@ async fn list_pending_queued_messages(
         .collect())
 }
 
-pub(crate) async fn conversation_summaries(
+async fn conversation_run_metadata_maps(
     pool: &SqlitePool,
-    conversations: Vec<Conversation>,
-) -> anyhow::Result<Vec<ConversationSummary>> {
+    conversations: &[Conversation],
+) -> anyhow::Result<ConversationRunMetadataMaps> {
     let ids = conversations
         .iter()
         .map(|conv| conv.id.clone())
@@ -516,12 +576,166 @@ pub(crate) async fn conversation_summaries(
         }
     }
 
+    Ok(ConversationRunMetadataMaps {
+        tool_call_counts,
+        run_started_times,
+        last_tool_calls,
+    })
+}
+
+async fn child_activity_counts_map(
+    pool: &SqlitePool,
+    user_id: &str,
+    parent_ids: &[String],
+) -> anyhow::Result<HashMap<String, ChildActivityCounts>> {
+    if parent_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(parent_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        r#"
+        SELECT
+            child.parent_conversation_id,
+            SUM(
+                CASE
+                    WHEN ac.status IN ('running', 'pending', 'queued') THEN 1
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM conversation_turn_jobs j
+                        WHERE j.conversation_id = child.id
+                          AND j.status IN ('pending', 'running')
+                    ) THEN 1
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM agent_runner_turns t
+                        WHERE t.conversation_id = child.id
+                          AND t.status IN ('queued', 'running')
+                    ) THEN 1
+                    ELSE 0
+                END
+            ) AS active_child_conversation_count,
+            SUM(
+                CASE
+                    WHEN child.last_event_index > COALESCE(crc.last_read_event_index, -1) THEN 1
+                    ELSE 0
+                END
+            ) AS unread_child_conversation_count
+        FROM conversations child
+        LEFT JOIN agent_checkpoints ac ON ac.conversation_id = child.id
+        LEFT JOIN conversation_read_cursors crc
+               ON crc.conversation_id = child.id
+              AND crc.user_id = ?
+        WHERE child.parent_conversation_id IN ({})
+          AND child.status <> 'archived'
+        GROUP BY child.parent_conversation_id
+        "#,
+        placeholders
+    );
+
+    let mut query = sqlx::query_as::<_, ChildActivityCountsRow>(&sql).bind(user_id);
+    for id in parent_ids {
+        query = query.bind(id);
+    }
+
+    let rows = query.fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.parent_conversation_id,
+                ChildActivityCounts {
+                    active: row.active_child_conversation_count.min(i64::from(i32::MAX)) as i32,
+                    unread: row.unread_child_conversation_count.min(i64::from(i32::MAX)) as i32,
+                },
+            )
+        })
+        .collect())
+}
+
+impl ConversationListItem {
+    fn from_conversation(
+        conversation: Conversation,
+        metadata: &ConversationRunMetadataMaps,
+        child_activity: Option<ChildActivityCounts>,
+    ) -> Self {
+        let tool_call_count = metadata.tool_call_counts.get(&conversation.id).copied();
+        let run_started_at = metadata.run_started_times.get(&conversation.id).copied();
+        let last_tool_call_started_at_epoch =
+            metadata.last_tool_calls.get(&conversation.id).copied();
+        let has_children = conversation.child_conversation_count.unwrap_or(0) > 0;
+
+        ConversationListItem {
+            id: conversation.id,
+            title: conversation.title,
+            organization: conversation.organization,
+            agent: conversation.agent,
+            conversation_type: conversation.conversation_type,
+            parent_conversation_id: conversation.parent_conversation_id,
+            conversation_role: conversation.conversation_role,
+            child_conversation_count: conversation.child_conversation_count,
+            active_child_conversation_count: child_activity
+                .filter(|_| has_children)
+                .map(|activity| activity.active),
+            unread_child_conversation_count: child_activity
+                .filter(|_| has_children)
+                .map(|activity| activity.unread),
+            child_sort_order: conversation.child_sort_order,
+            updated_at: conversation.updated_at,
+            status: conversation.status,
+            message_count: conversation.message_count,
+            last_event_index: conversation.last_event_index,
+            last_read_event_index: conversation.last_read_event_index,
+            unread_event_count: conversation.unread_event_count,
+            is_active: conversation.is_active,
+            tool_call_count,
+            run_started_at,
+            last_tool_call_started_at_epoch,
+        }
+    }
+}
+
+pub(crate) async fn conversation_list_items(
+    pool: &SqlitePool,
+    user_id: &str,
+    conversations: Vec<Conversation>,
+) -> anyhow::Result<Vec<ConversationListItem>> {
+    let metadata = conversation_run_metadata_maps(pool, &conversations).await?;
+    let parent_ids = conversations
+        .iter()
+        .filter(|conversation| {
+            conversation.parent_conversation_id.is_none()
+                && conversation.child_conversation_count.unwrap_or(0) > 0
+        })
+        .map(|conversation| conversation.id.clone())
+        .collect::<Vec<_>>();
+    let mut child_activity_counts = child_activity_counts_map(pool, user_id, &parent_ids).await?;
+
     Ok(conversations
         .into_iter()
         .map(|conversation| {
-            let tool_call_count = tool_call_counts.get(&conversation.id).copied();
-            let run_started_at = run_started_times.get(&conversation.id).copied();
-            let last_tool_call_started_at_epoch = last_tool_calls.get(&conversation.id).copied();
+            let child_activity = child_activity_counts.remove(&conversation.id);
+            ConversationListItem::from_conversation(conversation, &metadata, child_activity)
+        })
+        .collect())
+}
+
+pub(crate) async fn conversation_summaries(
+    pool: &SqlitePool,
+    conversations: Vec<Conversation>,
+) -> anyhow::Result<Vec<ConversationSummary>> {
+    let metadata = conversation_run_metadata_maps(pool, &conversations).await?;
+
+    Ok(conversations
+        .into_iter()
+        .map(|conversation| {
+            let tool_call_count = metadata.tool_call_counts.get(&conversation.id).copied();
+            let run_started_at = metadata.run_started_times.get(&conversation.id).copied();
+            let last_tool_call_started_at_epoch =
+                metadata.last_tool_calls.get(&conversation.id).copied();
             ConversationSummary {
                 conversation,
                 tool_call_count,
@@ -1190,7 +1404,7 @@ pub async fn list_conversations(
     }
 
     let total = list.len() as i64;
-    let conversations = conversation_summaries(&pool, list)
+    let conversations = conversation_list_items(&pool, &user.user_id, list)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -1411,7 +1625,7 @@ pub async fn list_child_conversations(
     }
 
     let total = list.len() as i64;
-    let conversations = conversation_summaries(&pool, list)
+    let conversations = conversation_list_items(&pool, &user.user_id, list)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -2588,7 +2802,7 @@ pub enum ConversationStreamEvent {
     /// Full list of conversations (sent on connect and when changes detected)
     #[serde(rename = "sync")]
     Sync {
-        conversations: Vec<ConversationSummary>,
+        conversations: Vec<ConversationListItem>,
         updated_at: i64,
     },
 }
@@ -2609,7 +2823,7 @@ pub async fn subscribe_conversations(
             // Get current conversations for this user
             match conversations::list_conversations(&pool, params.organization.as_deref(), Some(&user_id), params.agent.as_deref(), params.status.as_deref(), None, None).await {
                 Ok(convs) => {
-                    let summaries = match conversation_summaries(&pool, convs).await {
+                    let summaries = match conversation_list_items(&pool, &user_id, convs).await {
                         Ok(summaries) => summaries,
                         Err(e) => {
                             tracing::error!("Failed to summarize conversations for SSE: {}", e);
@@ -2620,14 +2834,17 @@ pub async fn subscribe_conversations(
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     for summary in &summaries {
-                        summary.conversation.updated_at.hash(&mut hasher);
-                        summary.conversation.id.hash(&mut hasher);
-                        summary.conversation.parent_conversation_id.hash(&mut hasher);
-                        summary.conversation.conversation_role.hash(&mut hasher);
-                        summary.conversation.child_conversation_count.hash(&mut hasher);
-                        summary.conversation.last_event_index.hash(&mut hasher);
-                        summary.conversation.last_read_event_index.hash(&mut hasher);
-                        summary.conversation.unread_event_count.hash(&mut hasher);
+                        summary.updated_at.hash(&mut hasher);
+                        summary.id.hash(&mut hasher);
+                        summary.parent_conversation_id.hash(&mut hasher);
+                        summary.conversation_role.hash(&mut hasher);
+                        summary.child_conversation_count.hash(&mut hasher);
+                        summary.active_child_conversation_count.hash(&mut hasher);
+                        summary.unread_child_conversation_count.hash(&mut hasher);
+                        summary.last_event_index.hash(&mut hasher);
+                        summary.last_read_event_index.hash(&mut hasher);
+                        summary.unread_event_count.hash(&mut hasher);
+                        summary.is_active.hash(&mut hasher);
                         summary.tool_call_count.hash(&mut hasher);
                         summary.run_started_at.hash(&mut hasher);
                         summary.last_tool_call_started_at_epoch.hash(&mut hasher);
@@ -2807,6 +3024,48 @@ mod tests {
             is_active,
             messages: Some(vec![]),
         }
+    }
+
+    #[test]
+    fn conversation_list_item_serializes_compact_sidebar_shape() {
+        let mut conversation = conversation_with_activity(Some(true));
+        conversation.child_conversation_count = Some(3);
+        conversation.router_ticket_id = Some("T-12345678".to_string());
+        conversation.router_organization = Some("agentic-flowstate".to_string());
+
+        let mut metadata = ConversationRunMetadataMaps::default();
+        metadata.tool_call_counts.insert(conversation.id.clone(), 7);
+        metadata
+            .run_started_times
+            .insert(conversation.id.clone(), 1_783_305_000);
+        metadata
+            .last_tool_calls
+            .insert(conversation.id.clone(), 1_783_305_100);
+
+        let item = ConversationListItem::from_conversation(
+            conversation,
+            &metadata,
+            Some(ChildActivityCounts {
+                active: 1,
+                unread: 2,
+            }),
+        );
+        let value = serde_json::to_value(&item).expect("serialize list item");
+
+        assert_eq!(value["id"], "conv-1");
+        assert_eq!(value["child_conversation_count"], 3);
+        assert_eq!(value["active_child_conversation_count"], 1);
+        assert_eq!(value["unread_child_conversation_count"], 2);
+        assert_eq!(value["tool_call_count"], 7);
+        assert_eq!(value["run_started_at"], 1_783_305_000);
+        assert_eq!(value["last_tool_call_started_at_epoch"], 1_783_305_100);
+        assert!(value.get("user_id").is_none());
+        assert!(value.get("session_id").is_none());
+        assert!(value.get("started_at").is_none());
+        assert!(value.get("archived_at").is_none());
+        assert!(value.get("router_ticket_id").is_none());
+        assert!(value.get("router_organization").is_none());
+        assert!(value.get("messages").is_none());
     }
 
     fn run_status(is_processing: bool) -> ConversationRunStatusResponse {

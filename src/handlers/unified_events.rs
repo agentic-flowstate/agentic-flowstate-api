@@ -289,7 +289,7 @@ pub async fn subscribe_unified_events(
                             }
                         }
                     }
-                    let summaries = match crate::handlers::conversations::conversation_summaries(&pool, convs).await {
+                    let summaries = match crate::handlers::conversations::conversation_list_items(&pool, &user_id, convs).await {
                         Ok(summaries) => summaries,
                         Err(e) => {
                             tracing::error!("Failed to summarize conversations for unified SSE: {}", e);
@@ -572,26 +572,22 @@ fn hash_daily_plan(plan: &ticketing_system::DailyPlanView) -> u64 {
     hasher.finish()
 }
 
-fn hash_conversation_list(convs: &[crate::handlers::conversations::ConversationSummary]) -> u64 {
+fn hash_conversation_list(convs: &[crate::handlers::conversations::ConversationListItem]) -> u64 {
     let mut hasher = DefaultHasher::new();
     for summary in convs {
-        summary.conversation.updated_at.hash(&mut hasher);
-        summary.conversation.id.hash(&mut hasher);
-        summary
-            .conversation
-            .parent_conversation_id
-            .hash(&mut hasher);
-        summary.conversation.conversation_role.hash(&mut hasher);
-        summary
-            .conversation
-            .child_conversation_count
-            .hash(&mut hasher);
-        summary.conversation.status.hash(&mut hasher);
-        summary.conversation.message_count.hash(&mut hasher);
-        summary.conversation.last_event_index.hash(&mut hasher);
-        summary.conversation.last_read_event_index.hash(&mut hasher);
-        summary.conversation.unread_event_count.hash(&mut hasher);
-        summary.conversation.is_active.hash(&mut hasher);
+        summary.updated_at.hash(&mut hasher);
+        summary.id.hash(&mut hasher);
+        summary.parent_conversation_id.hash(&mut hasher);
+        summary.conversation_role.hash(&mut hasher);
+        summary.child_conversation_count.hash(&mut hasher);
+        summary.active_child_conversation_count.hash(&mut hasher);
+        summary.unread_child_conversation_count.hash(&mut hasher);
+        summary.status.hash(&mut hasher);
+        summary.message_count.hash(&mut hasher);
+        summary.last_event_index.hash(&mut hasher);
+        summary.last_read_event_index.hash(&mut hasher);
+        summary.unread_event_count.hash(&mut hasher);
+        summary.is_active.hash(&mut hasher);
         summary.tool_call_count.hash(&mut hasher);
         summary.run_started_at.hash(&mut hasher);
         summary.last_tool_call_started_at_epoch.hash(&mut hasher);
@@ -601,15 +597,11 @@ fn hash_conversation_list(convs: &[crate::handlers::conversations::ConversationS
 }
 
 fn conversation_snapshot_event_id(
-    convs: &[crate::handlers::conversations::ConversationSummary],
+    convs: &[crate::handlers::conversations::ConversationListItem],
 ) -> i64 {
     convs.iter().fold(0_i64, |max_seen, summary| {
-        let updated_at = parse_conversation_timestamp_millis(&summary.conversation.updated_at);
-        let last_event = summary
-            .conversation
-            .last_event_index
-            .map(i64::from)
-            .unwrap_or(0);
+        let updated_at = parse_conversation_timestamp_millis(&summary.updated_at);
+        let last_event = summary.last_event_index.map(i64::from).unwrap_or(0);
         let run_started_at = summary
             .run_started_at
             .map(epoch_seconds_to_millis)
@@ -841,41 +833,34 @@ fn unified_events_poll_interval(topics: &HashSet<String>) -> Duration {
 mod tests {
     use super::*;
 
-    use crate::handlers::conversations::ConversationSummary;
-    use ticketing_system::{ArtifactSummary, Conversation, DocumentSummary};
+    use crate::handlers::conversations::ConversationListItem;
+    use ticketing_system::{ArtifactSummary, DocumentSummary};
 
     fn conversation_summary(
         updated_at: &str,
         last_event_index: Option<i32>,
         run_started_at: Option<i64>,
         last_tool_call_started_at_epoch: Option<i64>,
-    ) -> ConversationSummary {
-        ConversationSummary {
-            conversation: Conversation {
-                id: "conv-1".to_string(),
-                user_id: "alex".to_string(),
-                session_id: None,
-                organization: "agentic-flowstate".to_string(),
-                agent: Some("full-access".to_string()),
-                conversation_type: Some("research".to_string()),
-                parent_conversation_id: None,
-                conversation_role: "standard".to_string(),
-                child_conversation_count: Some(0),
-                child_sort_order: None,
-                title: "Conversation".to_string(),
-                started_at: "2026-06-08T21:59:00Z".to_string(),
-                updated_at: updated_at.to_string(),
-                status: "open".to_string(),
-                archived_at: None,
-                router_ticket_id: None,
-                router_organization: None,
-                message_count: Some(1),
-                last_event_index,
-                last_read_event_index: None,
-                unread_event_count: None,
-                is_active: Some(false),
-                messages: Some(vec![]),
-            },
+    ) -> ConversationListItem {
+        ConversationListItem {
+            id: "conv-1".to_string(),
+            title: "Conversation".to_string(),
+            organization: "agentic-flowstate".to_string(),
+            agent: Some("full-access".to_string()),
+            conversation_type: Some("research".to_string()),
+            parent_conversation_id: None,
+            conversation_role: "standard".to_string(),
+            child_conversation_count: Some(0),
+            active_child_conversation_count: None,
+            unread_child_conversation_count: None,
+            child_sort_order: None,
+            updated_at: updated_at.to_string(),
+            status: "open".to_string(),
+            message_count: Some(1),
+            last_event_index,
+            last_read_event_index: None,
+            unread_event_count: None,
+            is_active: Some(false),
             tool_call_count: None,
             run_started_at,
             last_tool_call_started_at_epoch,
@@ -969,8 +954,8 @@ mod tests {
             None,
         )];
         let mut read = unread.clone();
-        read[0].conversation.last_read_event_index = Some(128);
-        read[0].conversation.unread_event_count = Some(0);
+        read[0].last_read_event_index = Some(128);
+        read[0].unread_event_count = Some(0);
 
         assert_ne!(
             hash_conversation_list(&unread),
