@@ -7,10 +7,12 @@ use std::sync::Arc;
 use ticketing_system::models::{
     CreateTicketRequest, SystemLog, SystemLogIncident, SystemLogIncidentStatus, Ticket, TicketType,
 };
+use ticketing_system::system_logs::SystemLogIncidentScanState;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-const SCANNER_KEY: &str = "api-system-log-incident-triage";
+pub const SCANNER_KEY: &str = "api-system-log-incident-triage";
+pub const SCANNER_STALE_AFTER_SECONDS: i64 = (POLL_SECONDS as i64) * 3;
 const ORGANIZATION: &str = "agentic-flowstate";
 const EPIC_ID: &str = "backend";
 const SLICE_ID: &str = "mcp-server";
@@ -33,6 +35,7 @@ pub struct LogIncidentTriageSummary {
     pub already_addressed: usize,
     pub fixed_refreshed: u64,
     pub last_scanned_log_id: i64,
+    pub scanner_status: Option<SystemLogIncidentScanState>,
 }
 
 pub fn spawn_system_log_incident_triage(pool: Arc<SqlitePool>, token: CancellationToken) {
@@ -113,17 +116,13 @@ pub async fn run_once(pool: Arc<SqlitePool>) -> Result<LogIncidentTriageSummary>
         }
     }
 
-    if last_seen_log_id > cursor {
-        ticketing_system::system_logs::advance_system_log_incident_scan_cursor(
-            pool.as_ref(),
-            SCANNER_KEY,
-            last_seen_log_id,
-        )
-        .await?;
-        summary.last_scanned_log_id = last_seen_log_id;
-    } else {
-        summary.last_scanned_log_id = cursor;
-    }
+    ticketing_system::system_logs::advance_system_log_incident_scan_cursor(
+        pool.as_ref(),
+        SCANNER_KEY,
+        last_seen_log_id,
+    )
+    .await?;
+    summary.last_scanned_log_id = last_seen_log_id;
 
     let incidents = ticketing_system::system_logs::list_system_log_incidents_with_runtime_status(
         pool.as_ref(),
@@ -138,6 +137,13 @@ pub async fn run_once(pool: Arc<SqlitePool>) -> Result<LogIncidentTriageSummary>
             TicketOutcome::AlreadyAddressed => summary.already_addressed += 1,
         }
     }
+
+    summary.scanner_status = ticketing_system::system_logs::get_system_log_incident_scan_state(
+        pool.as_ref(),
+        SCANNER_KEY,
+        SCANNER_STALE_AFTER_SECONDS,
+    )
+    .await?;
 
     Ok(summary)
 }

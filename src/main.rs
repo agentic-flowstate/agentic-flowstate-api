@@ -1690,6 +1690,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/admin/log-incidents/triage",
             post(handlers::log_incidents::run_log_incident_triage),
         )
+        .route(
+            "/api/admin/log-incidents/triage/status",
+            get(handlers::log_incidents::get_log_incident_triage_status),
+        )
         .route("/api/admin/check", get(handlers::admin_logs::check_admin))
         .route(
             "/api/admin/ops/timeline",

@@ -79,6 +79,42 @@ pub async fn run_log_incident_triage(State(pool): State<Arc<SqlitePool>>) -> Res
     }
 }
 
+pub async fn get_log_incident_triage_status(State(pool): State<Arc<SqlitePool>>) -> Response {
+    match ticketing_system::system_logs::get_system_log_incident_scan_state(
+        pool.as_ref(),
+        crate::log_incident_triage::SCANNER_KEY,
+        crate::log_incident_triage::SCANNER_STALE_AFTER_SECONDS,
+    )
+    .await
+    {
+        Ok(Some(status)) => (StatusCode::OK, Json(json!(status))).into_response(),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(json!({
+                "scanner_key": crate::log_incident_triage::SCANNER_KEY,
+                "last_log_id": 0,
+                "updated_at": null,
+                "updated_at_iso": null,
+                "age_seconds": null,
+                "stale": true
+            })),
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::error!(
+                target: "agentic_api::log_incidents",
+                error = %error,
+                "failed to load log incident triage status"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "Failed to load log incident triage status" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 fn parse_status(value: Option<&str>) -> Result<Option<SystemLogIncidentStatus>, String> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
