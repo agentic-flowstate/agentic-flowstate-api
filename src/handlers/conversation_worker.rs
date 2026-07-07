@@ -3214,7 +3214,7 @@ async fn completed_child_cards_for_batch(
         child_conversation_type: Option<String>,
         terminal_status: Option<String>,
         child_assistant_message_id: Option<String>,
-        status_created_at: String,
+        status_created_at: Option<i64>,
     }
 
     let rows = sqlx::query_as::<_, CompletionCardRow>(
@@ -3265,7 +3265,7 @@ async fn completed_child_cards_for_batch(
                 .unwrap_or_else(|| "completed".to_string()),
             child_assistant_message_id: row.child_assistant_message_id,
             status_message_id: row.status_message_id,
-            status_created_at: parse_rfc3339_epoch_seconds(&row.status_created_at),
+            status_created_at: row.status_created_at,
         });
     }
 
@@ -3297,12 +3297,6 @@ fn child_batch_telemetry_context(
         child_index: context.child_index,
         report_id: context.report_id.clone(),
     }
-}
-
-fn parse_rfc3339_epoch_seconds(raw: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|value| value.timestamp())
 }
 
 fn safe_error_summary(error: &str) -> String {
@@ -4303,7 +4297,7 @@ mod streaming_persistence_tests {
         pool
     }
 
-    async fn parent_wake_test_pool() -> SqlitePool {
+    async fn parent_wake_test_pool(saturate_queue: bool) -> SqlitePool {
         let url = format!(
             "file:parent-wake-admission-test-{}?mode=memory&cache=shared",
             uuid::Uuid::new_v4()
@@ -4353,7 +4347,7 @@ mod streaming_persistence_tests {
                 content TEXT NOT NULL,
                 attachments TEXT,
                 metadata TEXT,
-                created_at TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
                 message_index INTEGER NOT NULL
             )
             "#,
@@ -4361,6 +4355,23 @@ mod streaming_persistence_tests {
         .execute(&pool)
         .await
         .expect("create conversation_messages");
+        sqlx::query(
+            r#"
+            CREATE TABLE conversation_tool_calls (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                conversation_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                input TEXT,
+                result TEXT,
+                is_error INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create conversation_tool_calls");
         sqlx::query(
             r#"
             CREATE TABLE agent_checkpoints (
@@ -4479,25 +4490,29 @@ mod streaming_persistence_tests {
         runner_capacity::ensure_schema_and_seed_policy(&pool)
             .await
             .expect("seed runner capacity policy");
-        sqlx::query("UPDATE runner_capacity_policy SET max_pending_jobs = 1 WHERE runner_kind = ?")
+        if saturate_queue {
+            sqlx::query(
+                "UPDATE runner_capacity_policy SET max_pending_jobs = 1 WHERE runner_kind = ?",
+            )
             .bind(runner_capacity::RUNNER_KIND)
             .execute(&pool)
             .await
             .expect("tighten pending cap");
-        sqlx::query(
-            r#"
-            INSERT INTO conversation_turn_jobs (
-                id, conversation_id, user_id, message, agent_type, runtime, prompt_name,
-                working_dir, prompt_vars, status, created_at, updated_at
-            ) VALUES (
-                'job-existing', 'other-conversation', 'user-1', 'already pending', 'full-access',
-                'codex-app-server', 'full-access', '/tmp', '{}', 'pending', 100, 100
+            sqlx::query(
+                r#"
+                INSERT INTO conversation_turn_jobs (
+                    id, conversation_id, user_id, message, agent_type, runtime, prompt_name,
+                    working_dir, prompt_vars, status, created_at, updated_at
+                ) VALUES (
+                    'job-existing', 'other-conversation', 'user-1', 'already pending', 'full-access',
+                    'codex-app-server', 'full-access', '/tmp', '{}', 'pending', 100, 100
+                )
+                "#,
             )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .expect("seed saturated pending job");
+            .execute(&pool)
+            .await
+            .expect("seed saturated pending job");
+        }
 
         pool
     }
@@ -4602,7 +4617,7 @@ mod streaming_persistence_tests {
 
     #[tokio::test]
     async fn parent_coordinator_single_wake_respects_saturated_pending_cap() {
-        let pool = parent_wake_test_pool().await;
+        let pool = parent_wake_test_pool(true).await;
         let parent = test_conversation("parent-1", "Parent", None);
         let child = test_conversation("child-1", "Child", Some("parent-1"));
 
@@ -4630,7 +4645,7 @@ mod streaming_persistence_tests {
 
     #[tokio::test]
     async fn parent_coordinator_batch_wake_respects_saturated_pending_cap() {
-        let pool = parent_wake_test_pool().await;
+        let pool = parent_wake_test_pool(true).await;
         let parent = test_conversation("parent-1", "Parent", None);
         let batch_context = ChildBatchContext {
             batch_id: "batch-1".to_string(),
@@ -4655,7 +4670,7 @@ mod streaming_persistence_tests {
             INSERT INTO conversation_messages (
                 id, conversation_id, role, content, metadata, created_at, message_index
             ) VALUES (
-                'status-1', 'parent-1', 'system', 'child completed', ?, '2026-07-06T00:00:00Z', 0
+                'status-1', 'parent-1', 'system', 'child completed', ?, 1783310400, 0
             )
             "#,
         )
@@ -4674,6 +4689,55 @@ mod streaming_persistence_tests {
                 .await,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn parent_coordinator_batch_wake_enqueues_after_all_children_complete() {
+        let pool = parent_wake_test_pool(false).await;
+        let parent = test_conversation("parent-1", "Parent", None);
+        let batch_context = ChildBatchContext {
+            batch_id: "batch-1".to_string(),
+            expected_count: 2,
+            child_index: None,
+            report_id: Some("af-report-test".to_string()),
+        };
+
+        for (index, child_id) in ["child-1", "child-2"].iter().enumerate() {
+            let metadata = child_completion_status_metadata(
+                child_id,
+                &format!("Child {}", index + 1),
+                "full-access",
+                &format!("assistant-{}", index + 1),
+                "completed",
+                "implementation",
+                "Finished",
+                Some(&batch_context),
+                "af-report-test",
+            )
+            .expect("serialize child completion metadata");
+            sqlx::query(
+                r#"
+                INSERT INTO conversation_messages (
+                    id, conversation_id, role, content, metadata, created_at, message_index
+                ) VALUES (
+                    ?, 'parent-1', 'system', 'child completed', ?, ?, ?
+                )
+                "#,
+            )
+            .bind(format!("status-{}", index + 1))
+            .bind(metadata)
+            .bind(1_783_310_400_i64 + index as i64)
+            .bind(index as i64)
+            .execute(&pool)
+            .await
+            .expect("seed child completion card");
+        }
+
+        enqueue_parent_coordinator_batch_wake_if_complete(&pool, &parent, &batch_context)
+            .await
+            .expect("batch coordinator wake should enqueue");
+
+        assert_eq!(coordinator_wake_job_count(&pool).await, 1);
     }
 
     fn assert_all_anthropic(types: &[String]) {
