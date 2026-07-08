@@ -2961,18 +2961,6 @@ async fn enqueue_parent_coordinator_wake(
         report_id,
     )?;
 
-    if !admit_parent_coordinator_wake_enqueue(
-        db,
-        "parent_coordinator_child_completion_wake",
-        &parent.id,
-        Some(&child.id),
-        None,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-
     checkpoints::upsert_checkpoint(db, &parent.id, "queued", 0)
         .await
         .with_context(|| format!("queue parent coordinator checkpoint {}", parent.id))?;
@@ -2998,7 +2986,7 @@ async fn enqueue_parent_coordinator_wake(
         message_metadata: Some(metadata),
     };
 
-    let job_id = conversation_turn_jobs::enqueue_job(db, &parent.id, payload)
+    let enqueued = conversation_turn_jobs::enqueue_job_with_outcome(db, &parent.id, payload)
         .await
         .with_context(|| {
             format!(
@@ -3006,24 +2994,26 @@ async fn enqueue_parent_coordinator_wake(
                 parent.id, child.id
             )
         })?;
-    agent_lifecycle::record_wake_fired(
-        db,
-        WakeKind::SingleChild,
-        &parent.id,
-        Some(&child.id),
-        None,
-        &job_id,
-        Some(report_id),
-        None,
-        None,
-    )
-    .await;
+    if enqueued.outcome == conversation_turn_jobs::ConversationTurnJobEnqueueOutcome::Inserted {
+        agent_lifecycle::record_wake_fired(
+            db,
+            WakeKind::SingleChild,
+            &parent.id,
+            Some(&child.id),
+            None,
+            &enqueued.id,
+            Some(report_id),
+            None,
+            None,
+        )
+        .await;
+    }
     super::conversations::publish_conversation_run_status(db, &parent.id)
         .await
         .with_context(|| format!("publish parent coordinator wake status {}", parent.id))?;
     tracing::info!(
         "[WORKER] Enqueued parent coordinator wake job={} parent={} child={} status={}",
-        job_id,
+        enqueued.id,
         parent.id,
         child.id,
         terminal_status
@@ -3089,18 +3079,6 @@ async fn enqueue_parent_coordinator_batch_wake_if_complete(
     let message = format_parent_coordinator_batch_wake_message(batch_context, &completed_children);
     let metadata = parent_coordinator_batch_wake_metadata(batch_context, &completed_children)?;
 
-    if !admit_parent_coordinator_wake_enqueue(
-        db,
-        "parent_coordinator_batch_completion_wake",
-        &parent.id,
-        None,
-        Some(&batch_context.batch_id),
-    )
-    .await?
-    {
-        return Ok(());
-    }
-
     checkpoints::upsert_checkpoint(db, &parent.id, "queued", 0)
         .await
         .with_context(|| format!("queue parent coordinator checkpoint {}", parent.id))?;
@@ -3164,50 +3142,6 @@ async fn enqueue_parent_coordinator_batch_wake_if_complete(
         completed_children.len()
     );
     Ok(())
-}
-
-async fn admit_parent_coordinator_wake_enqueue(
-    db: &SqlitePool,
-    context: &str,
-    parent_conversation_id: &str,
-    child_conversation_id: Option<&str>,
-    child_batch_id: Option<&str>,
-) -> Result<bool> {
-    let admission = runner_capacity::admit_enqueue(db, 1, context)
-        .await
-        .with_context(|| format!("inspect runner queue capacity for {context}"))?;
-    if admission.accepted {
-        return Ok(true);
-    }
-
-    tracing::warn!(
-        context,
-        parent_conversation_id,
-        child_conversation_id,
-        child_batch_id,
-        reason = admission.reason.as_str(),
-        requested_jobs = admission.requested_jobs,
-        pending_jobs = admission.snapshot.jobs.pending,
-        max_pending_jobs = admission.snapshot.config.max_pending_jobs,
-        "Skipped parent coordinator wake enqueue because runner queue admission rejected it"
-    );
-    let wake_kind = if child_batch_id.is_some() {
-        WakeKind::BatchCompletion
-    } else {
-        WakeKind::SingleChild
-    };
-    agent_lifecycle::record_wake_suppressed(
-        db,
-        wake_kind,
-        Some(parent_conversation_id),
-        child_conversation_id,
-        child_batch_id,
-        admission.reason.as_str(),
-        Some(admission.snapshot.jobs.pending),
-        Some(admission.snapshot.config.max_pending_jobs),
-    )
-    .await;
-    Ok(false)
 }
 
 async fn completed_child_cards_for_batch(
@@ -4578,16 +4512,6 @@ mod streaming_persistence_tests {
         .expect("count coordinator wake jobs")
     }
 
-    async fn queue_pending_cap_admission_count(pool: &SqlitePool, context: &str) -> i64 {
-        sqlx::query_scalar(
-            "SELECT COUNT(*) FROM runner_admission_events WHERE context = ? AND accepted = 0 AND reason = 'queue_pending_cap'",
-        )
-        .bind(context)
-        .fetch_one(pool)
-        .await
-        .expect("count rejected admission events")
-    }
-
     /// Drive a sequence of the previous SDK StreamEvents through the encoder, persist
     /// every emitted Anthropic event via `insert_conversation_event`, then
     /// replay from the DB and return (event_types, parsed_json_values).
@@ -4626,7 +4550,7 @@ mod streaming_persistence_tests {
     }
 
     #[tokio::test]
-    async fn parent_coordinator_single_wake_respects_saturated_pending_cap() {
+    async fn parent_coordinator_single_wake_persists_when_runner_queue_is_saturated() {
         let pool = parent_wake_test_pool(true).await;
         let parent = test_conversation("parent-1", "Parent", None);
         let child = test_conversation("child-1", "Child", Some("parent-1"));
@@ -4643,18 +4567,13 @@ mod streaming_persistence_tests {
             "af-report-test",
         )
         .await
-        .expect("single coordinator wake admission should not error");
+        .expect("single coordinator wake should persist");
 
-        assert_eq!(coordinator_wake_job_count(&pool).await, 0);
-        assert_eq!(
-            queue_pending_cap_admission_count(&pool, "parent_coordinator_child_completion_wake")
-                .await,
-            1
-        );
+        assert_eq!(coordinator_wake_job_count(&pool).await, 1);
     }
 
     #[tokio::test]
-    async fn parent_coordinator_batch_wake_respects_saturated_pending_cap() {
+    async fn parent_coordinator_batch_wake_persists_when_runner_queue_is_saturated() {
         let pool = parent_wake_test_pool(true).await;
         let parent = test_conversation("parent-1", "Parent", None);
         let batch_context = ChildBatchContext {
@@ -4691,14 +4610,9 @@ mod streaming_persistence_tests {
 
         enqueue_parent_coordinator_batch_wake_if_complete(&pool, &parent, &batch_context)
             .await
-            .expect("batch coordinator wake admission should not error");
+            .expect("batch coordinator wake should persist");
 
-        assert_eq!(coordinator_wake_job_count(&pool).await, 0);
-        assert_eq!(
-            queue_pending_cap_admission_count(&pool, "parent_coordinator_batch_completion_wake")
-                .await,
-            1
-        );
+        assert_eq!(coordinator_wake_job_count(&pool).await, 1);
     }
 
     #[tokio::test]
