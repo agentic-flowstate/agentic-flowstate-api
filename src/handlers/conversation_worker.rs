@@ -1794,7 +1794,7 @@ impl ConversationWorker {
             let mut generated_paths: Vec<PathBuf> = generated_paths_to_attach.into_iter().collect();
             generated_paths.sort();
             if !generated_paths.is_empty() {
-                match persist_generated_visual_attachments(
+                match persist_generated_attachments(
                     &self.db,
                     &self.conversation_id,
                     &assistant_message_id,
@@ -1803,12 +1803,12 @@ impl ConversationWorker {
                 .await
                 {
                     Ok(saved) => tracing::info!(
-                        "[WORKER] Attached {} generated visual file(s) to assistant message {}",
+                        "[WORKER] Attached {} generated file(s) to assistant message {}",
                         saved,
                         assistant_message_id
                     ),
                     Err(e) => tracing::error!(
-                        "[WORKER] Failed to attach generated visual file(s) to assistant message {}: {}",
+                        "[WORKER] Failed to attach generated file(s) to assistant message {}: {}",
                         assistant_message_id,
                         e
                     ),
@@ -2370,7 +2370,12 @@ fn sanitize_display_filename(filename: &str) -> Option<String> {
 
 fn generated_attachment_extension_for_mime(mime_type: &str) -> &'static str {
     match mime_type {
+        "application/x-wireguard-config" => "conf",
         "application/pdf" => "pdf",
+        "application/json" => "json",
+        "text/csv" => "csv",
+        "text/markdown" => "md",
+        "text/plain" => "txt",
         "image/png" => "png",
         "image/gif" => "gif",
         "image/webp" => "webp",
@@ -2383,7 +2388,12 @@ fn generated_attachment_extension_for_mime(mime_type: &str) -> &'static str {
 fn mime_type_for_generated_attachment_path(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
+        "conf" => Some("application/x-wireguard-config"),
         "pdf" => Some("application/pdf"),
+        "json" => Some("application/json"),
+        "csv" => Some("text/csv"),
+        "md" | "markdown" => Some("text/markdown"),
+        "txt" | "log" => Some("text/plain"),
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
         "gif" => Some("image/gif"),
@@ -2471,7 +2481,7 @@ async fn update_message_attachments(
     Ok(())
 }
 
-async fn persist_generated_visual_attachments(
+async fn persist_generated_attachments(
     db: &SqlitePool,
     conversation_id: &str,
     assistant_message_id: &str,
@@ -4995,7 +5005,7 @@ mod streaming_persistence_tests {
     }
 
     #[test]
-    fn generated_attachment_snapshot_detects_new_previewable_files_only() {
+    fn generated_attachment_snapshot_detects_new_supported_files_only() {
         let root = std::env::temp_dir().join(format!(
             "agentic-generated-attachments-test-{}",
             uuid::Uuid::new_v4()
@@ -5010,15 +5020,19 @@ mod streaming_persistence_tests {
         let before = generated_attachment_snapshot(&root);
         let new_image = batch.join("new.jpg");
         let new_pdf = batch.join("diagram.pdf");
+        let new_config = batch.join("houston.conf");
+        let ignored_binary = batch.join("raw.bin");
         let nested_dir = batch.join("nested");
         fs::create_dir_all(&nested_dir).expect("create nested generated dir");
         let nested_image = nested_dir.join("new.webp");
         fs::write(&new_image, b"new").expect("write new image");
         fs::write(&new_pdf, b"%PDF").expect("write new pdf");
+        fs::write(&new_config, b"[Interface]").expect("write new config");
+        fs::write(&ignored_binary, b"raw").expect("write ignored binary");
         fs::write(&nested_image, b"webp").expect("write nested image");
 
         let new_attachments = new_generated_attachments(&root, &before);
-        let mut expected = vec![new_image, new_pdf, nested_image];
+        let mut expected = vec![new_image, new_pdf, new_config, nested_image];
         expected.sort();
 
         assert_eq!(new_attachments, expected);
