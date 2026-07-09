@@ -977,6 +977,7 @@ fn build_codex_app_server_command(
     let working_dir = effective_working_dir(options)?;
     let mut command = StdCommand::new("codex");
     command.current_dir(&working_dir);
+    command.env_remove("EXA_API_KEY");
     command.env("PATH", launchd_safe_path());
     command.env("CODEX_HOME", codex_home);
     command.env(
@@ -2190,6 +2191,12 @@ mod tests {
         })
     }
 
+    fn command_removes_env(command: &StdCommand, key: &str) -> bool {
+        command
+            .get_envs()
+            .any(|(name, value)| name == OsStr::new(key) && value.is_none())
+    }
+
     fn unique_temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "agentic-{name}-{}-{}",
@@ -2302,6 +2309,7 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "stdio://"));
         assert!(!args.iter().any(|arg| arg == "exec"));
         assert_eq!(command_env(&command, "RUST_LOG").as_deref(), Some("warn"));
+        assert!(command_removes_env(&command, "EXA_API_KEY"));
     }
 
     #[test]
