@@ -27,7 +27,8 @@ use ticketing_system::{
 
 use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::{
-    encode_codex_options_for_job, get_broadcast_sender, ChatCodexOptions, ChatRuntime,
+    encode_codex_options_for_job, get_broadcast_sender, validate_codex_options, ChatCodexOptions,
+    ChatRuntime,
 };
 use super::conversation_handoff::{
     resolve_context_handoff, ContextHandoffRequest, ResolvedContextHandoff,
@@ -273,6 +274,10 @@ pub struct CreateChildConversationSpec {
     pub working_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -291,6 +296,8 @@ pub struct QueuedChildTurnResponse {
     pub job_id: String,
     pub agent: String,
     pub prompt_name: String,
+    pub model: String,
+    pub reasoning_effort: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_packet_ids: Vec<String>,
@@ -1179,14 +1186,63 @@ struct PreparedChildTurn {
     request: conversations::InitialChildTurnJobRequest,
     agent: String,
     prompt_name: String,
+    codex_options: ChatCodexOptions,
     context_packet_ids: Vec<String>,
     retrieval_ids: Vec<String>,
+}
+
+async fn resolve_initial_child_codex_options(
+    children: &[CreateChildConversationSpec],
+) -> Result<Vec<Option<ChatCodexOptions>>, Response> {
+    let mut resolved = Vec::with_capacity(children.len());
+    for child in children {
+        let has_initial_message = has_initial_child_message(child);
+        if !has_initial_message {
+            if child.model.is_some() || child.reasoning_effort.is_some() {
+                return Err(text_error_response((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Child '{}' cannot set model or reasoning_effort without initial_message",
+                        child.title
+                    ),
+                )));
+            }
+            resolved.push(None);
+            continue;
+        }
+
+        let agent = child.agent.as_deref().ok_or_else(|| {
+            text_error_response((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Child '{}' must set agent when initial_message is provided",
+                    child.title
+                ),
+            ))
+        })?;
+        let agent_type = parse_child_agent_type(agent).map_err(text_error_response)?;
+        let defaults = ChatCodexOptions::default_for_agent(&agent_type);
+        let requested = if child.model.is_some() || child.reasoning_effort.is_some() {
+            Some(ChatCodexOptions {
+                model: child.model.clone().unwrap_or(defaults.model),
+                reasoning_effort: child
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or(defaults.reasoning_effort),
+            })
+        } else {
+            None
+        };
+        resolved.push(Some(validate_codex_options(&agent_type, requested).await?));
+    }
+    Ok(resolved)
 }
 
 fn prepare_initial_child_turns(
     user_id: &str,
     children: &[CreateChildConversationSpec],
     handoffs: &[Option<ResolvedContextHandoff>],
+    codex_options: &[Option<ChatCodexOptions>],
 ) -> Result<Vec<PreparedChildTurn>, (StatusCode, String)> {
     let mut prepared = Vec::new();
     let child_batch_size = children
@@ -1233,6 +1289,15 @@ fn prepare_initial_child_turns(
             .map(str::trim)
             .filter(|dir| !dir.is_empty())
             .unwrap_or("/Users/jarvisgpt/projects");
+        let codex_options = codex_options
+            .get(child_index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Missing resolved Codex options for child '{}'", spec.title),
+                )
+            })?;
 
         let mut prompt_vars = HashMap::new();
         prompt_vars.insert(
@@ -1269,10 +1334,7 @@ fn prepare_initial_child_turns(
             child_batch_index,
             child_batch_report_id.as_deref(),
         )?;
-        let prompt_vars = encode_codex_options_for_job(
-            prompt_vars,
-            &ChatCodexOptions::default_for_agent(&agent_type),
-        );
+        let prompt_vars = encode_codex_options_for_job(prompt_vars, codex_options);
         prepared.push(PreparedChildTurn {
             request: conversations::InitialChildTurnJobRequest {
                 child_index,
@@ -1291,6 +1353,7 @@ fn prepare_initial_child_turns(
             },
             agent: agent.to_string(),
             prompt_name: prompt_name.to_string(),
+            codex_options: codex_options.clone(),
             context_packet_ids: handoff
                 .as_ref()
                 .map(ResolvedContextHandoff::packet_ids)
@@ -1319,6 +1382,8 @@ fn queued_child_turn_responses(
                 job_id: queued.job_id.clone(),
                 agent: prepared.agent.clone(),
                 prompt_name: prepared.prompt_name.clone(),
+                model: prepared.codex_options.model.clone(),
+                reasoning_effort: prepared.codex_options.reasoning_effort.clone(),
                 status: "queued".to_string(),
                 context_packet_ids: prepared.context_packet_ids.clone(),
                 retrieval_ids: prepared.retrieval_ids.clone(),
@@ -1819,10 +1884,15 @@ pub async fn create_multi_agent_conversation(
             .map_err(text_error_response)?;
     let child_requests =
         child_conversation_requests(&children_specs).map_err(text_error_response)?;
+    let resolved_codex_options = resolve_initial_child_codex_options(&children_specs).await?;
     guard_runner_queue_admission(&pool, &children_specs, "create_multi_agent_conversation").await?;
-    let prepared_turns =
-        prepare_initial_child_turns(&user.user_id, &children_specs, &resolved_handoffs)
-            .map_err(text_error_response)?;
+    let prepared_turns = prepare_initial_child_turns(
+        &user.user_id,
+        &children_specs,
+        &resolved_handoffs,
+        &resolved_codex_options,
+    )
+    .map_err(text_error_response)?;
     let initial_turn_jobs = prepared_turns
         .iter()
         .map(|turn| turn.request.clone())
@@ -1956,10 +2026,15 @@ pub async fn create_child_conversations(
             .map_err(text_error_response)?;
     let child_requests =
         child_conversation_requests(&children_specs).map_err(text_error_response)?;
+    let resolved_codex_options = resolve_initial_child_codex_options(&children_specs).await?;
     guard_runner_queue_admission(&pool, &children_specs, "create_child_conversations").await?;
-    let prepared_turns =
-        prepare_initial_child_turns(&user.user_id, &children_specs, &resolved_handoffs)
-            .map_err(text_error_response)?;
+    let prepared_turns = prepare_initial_child_turns(
+        &user.user_id,
+        &children_specs,
+        &resolved_handoffs,
+        &resolved_codex_options,
+    )
+    .map_err(text_error_response)?;
     let initial_turn_jobs = prepared_turns
         .iter()
         .map(|turn| turn.request.clone())
@@ -3504,6 +3579,8 @@ mod tests {
             prompt_name: Some("codex".to_string()),
             working_dir: None,
             client_id: None,
+            model: None,
+            reasoning_effort: None,
         }])
         .expect("child request");
 

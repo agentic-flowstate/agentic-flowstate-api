@@ -374,7 +374,8 @@ pub fn normalize_reasoning_effort(effort: &str) -> &str {
         "medium" => "medium",
         "high" => "high",
         "xhigh" => "xhigh",
-        "max" => "xhigh",
+        "max" => "max",
+        "ultra" => "ultra",
         _ => "medium",
     }
 }
@@ -2257,7 +2258,8 @@ mod tests {
         assert_eq!(normalize_reasoning_effort("none"), "none");
         assert_eq!(normalize_reasoning_effort("low"), "low");
         assert_eq!(normalize_reasoning_effort("xhigh"), "xhigh");
-        assert_eq!(normalize_reasoning_effort("max"), "xhigh");
+        assert_eq!(normalize_reasoning_effort("max"), "max");
+        assert_eq!(normalize_reasoning_effort("ultra"), "ultra");
         assert_eq!(normalize_reasoning_effort("unknown"), "medium");
     }
 

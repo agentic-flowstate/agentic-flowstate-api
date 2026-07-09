@@ -94,8 +94,9 @@ fn validate_chat_attachments(attachments: Option<&[ChatAttachmentData]>) -> Resu
     Ok(attachments.len())
 }
 
-const CODEX_REASONING_EFFORT_ORDER: &[&str] =
-    &["none", "minimal", "low", "medium", "high", "xhigh"];
+const CODEX_REASONING_EFFORT_ORDER: &[&str] = &[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
 const JOB_CODEX_MODEL_KEY: &str = "__agentic_codex_model";
 const JOB_CODEX_REASONING_EFFORT_KEY: &str = "__agentic_codex_reasoning_effort";
 static CODEX_MODEL_CATALOG: OnceCell<Vec<ChatCodexModelOptionItem>> = OnceCell::const_new();
@@ -329,7 +330,7 @@ fn resolve_catalog_model<'a>(
     catalog.iter().find(|option| option.id == resolved_model)
 }
 
-async fn validate_codex_options(
+pub(crate) async fn validate_codex_options(
     agent_type: &AgentType,
     requested: Option<ChatCodexOptions>,
 ) -> Result<ChatCodexOptions, Response> {
