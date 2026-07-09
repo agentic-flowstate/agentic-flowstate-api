@@ -3,13 +3,14 @@
     "codex": "gpt-5.6-sol"
   },
   "agents": {
-    "exa-research": {
+    "research": {
       "model": "codex",
       "effort": "xhigh",
-      "prompt_file": "exa-research.txt",
+      "prompt_file": "research.txt",
       "tools": [
-        "mcp__agentic-mcp__exa_search",
-        "mcp__agentic-mcp__exa_get_contents",
+        "mcp__agentic-mcp__research_search",
+        "mcp__agentic-mcp__research_get_contents",
+        "mcp__agentic-mcp__research_crawl",
         "Read",
         "Glob",
         "Grep",
@@ -25,8 +26,9 @@
       "effort": "medium",
       "prompt_file": "daily-research.txt",
       "tools": [
-        "mcp__agentic-mcp__exa_search",
-        "mcp__agentic-mcp__exa_get_contents",
+        "mcp__agentic-mcp__research_search",
+        "mcp__agentic-mcp__research_get_contents",
+        "mcp__agentic-mcp__research_crawl",
         "mcp__agentic-mcp__search_artifacts",
         "mcp__agentic-mcp__list_artifacts",
         "mcp__agentic-mcp__get_artifact"
@@ -84,8 +86,9 @@
         "Glob",
         "Grep",
         "Task",
-        "mcp__agentic-mcp__exa_search",
-        "mcp__agentic-mcp__exa_get_contents"
+        "mcp__agentic-mcp__research_search",
+        "mcp__agentic-mcp__research_get_contents",
+        "mcp__agentic-mcp__research_crawl"
       ]
     },
     "execution": {
@@ -155,8 +158,9 @@
         "Read",
         "Glob",
         "Grep",
-        "mcp__agentic-mcp__exa_search",
-        "mcp__agentic-mcp__exa_get_contents",
+        "mcp__agentic-mcp__research_search",
+        "mcp__agentic-mcp__research_get_contents",
+        "mcp__agentic-mcp__research_crawl",
         "mcp__agentic-mcp__list_epics",
         "mcp__agentic-mcp__list_slices",
         "mcp__agentic-mcp__list_tickets",
@@ -183,8 +187,9 @@
         "Read",
         "Glob",
         "Grep",
-        "mcp__agentic-mcp__exa_search",
-        "mcp__agentic-mcp__exa_get_contents"
+        "mcp__agentic-mcp__research_search",
+        "mcp__agentic-mcp__research_get_contents",
+        "mcp__agentic-mcp__research_crawl"
       ]
     },
     "doc-drafter": {
@@ -319,8 +324,9 @@
         "mcp__agentic-mcp__list_documents",
         "mcp__agentic-mcp__get_document",
         "mcp__agentic-mcp__get_user",
-        "mcp__agentic-mcp__exa_search",
-        "mcp__agentic-mcp__exa_get_contents"
+        "mcp__agentic-mcp__research_search",
+        "mcp__agentic-mcp__research_get_contents",
+        "mcp__agentic-mcp__research_crawl"
       ]
     },
     "dep-update-reviewer": {

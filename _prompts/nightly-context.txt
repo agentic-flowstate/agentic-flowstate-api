@@ -26,11 +26,11 @@ Classification: {{CLASSIFICATION}}
 </codebase_research>
 {{/if}}
 
-{{#if EXA_RESEARCH}}
+{{#if RESEARCH}}
 ## External Research Findings
-<exa_research>
-{{EXA_RESEARCH}}
-</exa_research>
+<research>
+{{RESEARCH}}
+</research>
 {{/if}}
 
 {{#if MANUAL_TICKET}}

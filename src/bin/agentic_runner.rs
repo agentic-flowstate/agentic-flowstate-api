@@ -879,7 +879,7 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
         "email" => Ok("email"),
         "meeting-notes" => Ok("meeting-notes"),
         "ticket-assistant" => Ok("ticket-assistant"),
-        "exa-research" => Ok("exa-research"),
+        "research" => Ok("research"),
         "daily-research" => Ok("daily-research"),
         "package-update-review" => Ok("package-update-review"),
         "research-synthesis" => Ok("research-synthesis"),
@@ -895,7 +895,15 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_status_from_event;
+    use super::{prompt_name_static, terminal_status_from_event};
+
+    #[test]
+    fn runner_accepts_canonical_research_prompt() {
+        assert_eq!(
+            prompt_name_static("research").expect("research prompt"),
+            "research"
+        );
+    }
 
     #[test]
     fn terminal_event_status_maps_startup_errors_to_failed() {

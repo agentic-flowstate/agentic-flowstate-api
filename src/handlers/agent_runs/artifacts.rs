@@ -17,7 +17,6 @@ pub async fn write_artifact(
     // Map agent_type to artifact_type
     let artifact_type = match agent_type {
         "research"
-        | "exa-research"
         | "research-synthesis"
         | "competitive-research"
         | "vendor-research"

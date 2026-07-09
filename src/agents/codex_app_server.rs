@@ -98,8 +98,9 @@ const SCOPED_MCP_ALLOWED_TOOLS: &[&str] = &[
     "get_document",
     "list_documents",
     "search_documents",
-    "exa_search",
-    "exa_get_contents",
+    "research_search",
+    "research_get_contents",
+    "research_crawl",
 ];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -917,7 +918,7 @@ fn build_app_server_config(
             toml::Value::String(agentic_mcp_command.to_string_lossy().to_string()),
         );
         agentic_mcp.insert("startup_timeout_sec".to_string(), toml::Value::Integer(30));
-        upsert_agentic_mcp_env(&mut agentic_mcp, source_home)?;
+        replace_agentic_mcp_env(&mut agentic_mcp, source_home);
 
         let mut mcp_servers = toml::map::Map::new();
         mcp_servers.insert("agentic-mcp".to_string(), toml::Value::Table(agentic_mcp));
@@ -928,35 +929,16 @@ fn build_app_server_config(
         .map_err(|e| format!("Failed to encode Codex app-server config: {e}"))
 }
 
-fn upsert_agentic_mcp_env(
+fn replace_agentic_mcp_env(
     agentic_mcp: &mut toml::map::Map<String, toml::Value>,
     source_home: &Path,
-) -> Result<(), String> {
-    match agentic_mcp.remove("env") {
-        Some(toml::Value::Table(mut env)) => {
-            env.insert(
-                "CODEX_HOME".to_string(),
-                toml::Value::String(source_home.to_string_lossy().to_string()),
-            );
-            agentic_mcp.insert("env".to_string(), toml::Value::Table(env));
-        }
-        Some(_) => {
-            return Err(
-                "Source Codex config has mcp_servers.agentic-mcp.env, but it is not a table"
-                    .to_string(),
-            );
-        }
-        None => {
-            let mut env = toml::map::Map::new();
-            env.insert(
-                "CODEX_HOME".to_string(),
-                toml::Value::String(source_home.to_string_lossy().to_string()),
-            );
-            agentic_mcp.insert("env".to_string(), toml::Value::Table(env));
-        }
-    }
-
-    Ok(())
+) {
+    let mut env = toml::map::Map::new();
+    env.insert(
+        "CODEX_HOME".to_string(),
+        toml::Value::String(source_home.to_string_lossy().to_string()),
+    );
+    agentic_mcp.insert("env".to_string(), toml::Value::Table(env));
 }
 
 fn source_agentic_mcp_table(
@@ -2452,7 +2434,7 @@ mod tests {
     }
 
     #[test]
-    fn app_server_config_strips_source_tool_policy() {
+    fn app_server_config_strips_source_tool_policy_and_environment() {
         let source_home = std::env::temp_dir().join(format!(
             "agentic-codex-config-test-{}-{}",
             std::process::id(),
@@ -2469,7 +2451,7 @@ mod tests {
 command = "/tmp/old_agentic_mcp"
 
 [mcp_servers.agentic-mcp.env]
-EXA_API_KEY = "keep-for-mcp"
+SOURCE_ONLY_TOKEN = "do-not-copy"
 
 [mcp_servers.agentic-mcp.tools.list_tickets]
 approval_mode = "approve"
@@ -2498,12 +2480,16 @@ approval_mode = "approve"
         assert!(agentic_mcp.get("enabled_tools").is_none());
         assert!(agentic_mcp.get("default_tools_enabled").is_none());
         assert!(agentic_mcp.get("default_tools_approval_mode").is_none());
+        assert!(agentic_mcp
+            .get("env")
+            .and_then(|env| env.get("SOURCE_ONLY_TOKEN"))
+            .is_none());
         assert_eq!(
             agentic_mcp
                 .get("env")
-                .and_then(|env| env.get("EXA_API_KEY"))
-                .and_then(|value| value.as_str()),
-            Some("keep-for-mcp")
+                .and_then(|env| env.as_table())
+                .map(toml::map::Map::len),
+            Some(1)
         );
 
         let _ = std::fs::remove_dir_all(source_home);
@@ -2511,7 +2497,11 @@ approval_mode = "approve"
 
     #[test]
     fn app_server_command_approves_requested_mcp_tools() {
-        let approved = vec!["exa_search".to_string(), "exa_get_contents".to_string()];
+        let approved = vec![
+            "research_search".to_string(),
+            "research_get_contents".to_string(),
+            "research_crawl".to_string(),
+        ];
         let mut options = sample_app_server_options(None);
         options.approved_mcp_tools = approved;
         let command = build_codex_app_server_command(
@@ -2523,14 +2513,29 @@ approval_mode = "approve"
         let args = command_args(&command);
 
         assert!(args.iter().any(|arg| {
-            arg == "mcp_servers.agentic-mcp.enabled_tools=[\"exa_get_contents\", \"exa_search\"]"
+            arg == "mcp_servers.agentic-mcp.enabled_tools=[\"research_crawl\", \"research_get_contents\", \"research_search\"]"
         }));
         assert!(args
             .iter()
-            .any(|arg| arg == "mcp_servers.agentic-mcp.tools.exa_search.enabled=true"));
+            .any(|arg| arg == "mcp_servers.agentic-mcp.tools.research_search.enabled=true"));
         assert!(args.iter().any(|arg| {
-            arg == "mcp_servers.agentic-mcp.tools.exa_search.approval_mode=\"approve\""
+            arg == "mcp_servers.agentic-mcp.tools.research_search.approval_mode=\"approve\""
         }));
+    }
+
+    #[test]
+    fn scoped_profile_allows_the_self_hosted_research_contract() {
+        let overrides = mcp_tool_config_overrides(CodexToolProfile::RestrictedMcpOnly, &[])
+            .expect("scoped MCP overrides");
+
+        for tool in ["research_search", "research_get_contents", "research_crawl"] {
+            assert!(
+                overrides.iter().any(|value| {
+                    value == &format!("mcp_servers.agentic-mcp.tools.{tool}.enabled=true")
+                }),
+                "scoped profile is missing {tool}"
+            );
+        }
     }
 
     #[test]

@@ -65,8 +65,8 @@ pub enum AgentType {
     WorkspaceManager,
     MeetingNotes,
     TicketAssistant,
-    /// EXA-powered deep research agent - uses EXA API for web search/content and model analysis
-    ExaResearch,
+    /// Deep research agent backed by the self-hosted research index and HTTP crawler
+    Research,
     /// Recurring research agent invoked by Dailies automation
     DailyResearch,
     /// Recurring package-update summarizer invoked by Dailies automation
@@ -108,6 +108,7 @@ impl AgentType {
             "scoped-workspace" => Some(AgentType::ScopedWorkspace),
             "conversation-evaluator" => Some(AgentType::ConversationEvaluator),
             "feedback" => Some(AgentType::Feedback),
+            "research" => Some(AgentType::Research),
             _ => None,
         }
     }
@@ -124,7 +125,7 @@ impl AgentType {
             AgentType::WorkspaceManager => "workspace-manager",
             AgentType::MeetingNotes => "meeting-notes",
             AgentType::TicketAssistant => "ticket-assistant",
-            AgentType::ExaResearch => "exa-research",
+            AgentType::Research => "research",
             AgentType::DailyResearch => "daily-research",
             AgentType::PackageUpdateReview => "package-update-review",
             AgentType::ResearchSynthesis => "research-synthesis",
@@ -351,6 +352,83 @@ pub struct AgentRunsResponse {
 #[cfg(test)]
 mod tests {
     use super::{AgentType, AgentsConfig};
+
+    const RESEARCH_CONTRACT: [&str; 3] = [
+        "mcp__agentic-mcp__research_search",
+        "mcp__agentic-mcp__research_get_contents",
+        "mcp__agentic-mcp__research_crawl",
+    ];
+
+    #[test]
+    fn research_agent_uses_canonical_name_prompt_and_tools() {
+        let config = AgentsConfig::get()
+            .agents
+            .get("research")
+            .expect("research agent config");
+
+        assert_eq!(AgentType::Research.as_str(), "research");
+        assert_eq!(
+            AgentType::from_chat_agent_key("research"),
+            Some(AgentType::Research)
+        );
+        assert_eq!(config.prompt_file, "research.txt");
+        for tool in RESEARCH_CONTRACT {
+            assert!(
+                config.tools.iter().any(|allowed| allowed == tool),
+                "research agent is missing canonical tool {tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn research_enabled_agents_allow_the_complete_self_hosted_contract() {
+        let agents = [
+            "research",
+            "daily-research",
+            "planning",
+            "workspace-manager",
+            "ticket-assistant",
+            "scoped-workspace",
+        ];
+
+        for agent in agents {
+            let config = AgentsConfig::get().agents.get(agent).expect("agent config");
+            for tool in RESEARCH_CONTRACT {
+                assert!(
+                    config.tools.iter().any(|allowed| allowed == tool),
+                    "{agent} is missing canonical research tool {tool}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn research_prompts_document_the_complete_self_hosted_contract() {
+        let prompts = [
+            ("research", include_str!("../../_prompts/research.txt")),
+            (
+                "nightly-research",
+                include_str!("../../_prompts/nightly-research.txt"),
+            ),
+            (
+                "daily-research",
+                include_str!("../../_prompts/daily-research.txt"),
+            ),
+            (
+                "scoped-workspace",
+                include_str!("../../_prompts/scoped-workspace.txt"),
+            ),
+        ];
+
+        for (prompt_name, prompt) in prompts {
+            for tool in ["research_search", "research_get_contents", "research_crawl"] {
+                assert!(
+                    prompt.contains(tool),
+                    "{prompt_name} prompt is missing canonical research tool {tool}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn home_planner_has_no_email_tools() {

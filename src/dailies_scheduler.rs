@@ -531,7 +531,7 @@ fn is_package_update_daily(daily: &ticketing_system::Daily) -> bool {
 fn agent_type_for_daily(daily: &ticketing_system::Daily) -> Result<AgentType> {
     match daily.agent_type.as_str() {
         "daily-research" => Ok(AgentType::DailyResearch),
-        "exa-research" => Ok(AgentType::ExaResearch),
+        "research" => Ok(AgentType::Research),
         other => bail!("Unsupported daily agent_type: {}", other),
     }
 }
