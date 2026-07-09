@@ -20,7 +20,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
-const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
+const DEFAULT_CODEX_MODEL: &str = "gpt-5.6-sol";
 const DEFAULT_MODEL_PROVIDER: &str = "openai";
 const APP_SERVER_CLIENT_NAME: &str = "agentic_flowstate_api";
 const APP_SERVER_CLIENT_TITLE: &str = "Agentic Flowstate API";
@@ -2247,9 +2247,9 @@ mod tests {
     }
 
     #[test]
-    fn resolves_empty_model_to_gpt_5_5() {
-        assert_eq!(resolve_codex_model(""), "gpt-5.5");
-        assert_eq!(resolve_codex_model("gpt-5.5"), "gpt-5.5");
+    fn resolves_empty_model_to_gpt_5_6_sol() {
+        assert_eq!(resolve_codex_model(""), "gpt-5.6-sol");
+        assert_eq!(resolve_codex_model("gpt-5.6-sol"), "gpt-5.6-sol");
     }
 
     #[test]
@@ -2630,7 +2630,7 @@ approval_mode = "approve"
         let config_path = root.join("config.toml");
         write_file_atomically(
             &config_path,
-            "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"medium\"\n",
+            "model = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"medium\"\n",
             "test config",
         )
         .expect("write initial config");
@@ -2660,7 +2660,7 @@ approval_mode = "approve"
 
         for index in 0..200 {
             let config = format!(
-                "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"medium\"\n\n[mcp_servers.agentic-mcp]\ncommand = \"/tmp/agentic_mcp_{index}\"\nstartup_timeout_sec = 30\n\n[mcp_servers.agentic-mcp.env]\nCODEX_HOME = \"/tmp/source-{index}\"\n"
+                "model = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"medium\"\n\n[mcp_servers.agentic-mcp]\ncommand = \"/tmp/agentic_mcp_{index}\"\nstartup_timeout_sec = 30\n\n[mcp_servers.agentic-mcp.env]\nCODEX_HOME = \"/tmp/source-{index}\"\n"
             );
             write_file_atomically(&config_path, &config, "test config")
                 .expect("atomic config write");
@@ -2686,7 +2686,7 @@ approval_mode = "approve"
         let config_path = root.join("config.toml");
         let collision_path = root.join(".config.toml.collision.tmp");
         let retry_path = root.join(".config.toml.retry.tmp");
-        let config = "model = \"gpt-5.5\"\nmodel_reasoning_effort = \"medium\"\n";
+        let config = "model = \"gpt-5.6-sol\"\nmodel_reasoning_effort = \"medium\"\n";
 
         std::fs::write(&collision_path, "leftover temp file").expect("write collision file");
         write_file_atomically_with_temp_candidates(
