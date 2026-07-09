@@ -83,7 +83,7 @@ pub async fn ensure_package_update_daily(pool: &SqlitePool, user_id: &str) -> Re
             cadence_interval: 1,
             run_until: None,
             next_run_at: Some(Utc::now().timestamp()),
-            unread_pause_threshold: 12,
+            unread_pause_threshold: 0,
             agent_type: "package-update-review".to_string(),
             prompt: "Scan installed package managers, summarize available updates only when updates exist, and wait for user approval before applying."
                 .to_string(),
