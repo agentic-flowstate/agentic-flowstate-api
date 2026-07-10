@@ -934,6 +934,18 @@ fn replace_agentic_mcp_env(
     source_home: &Path,
 ) {
     let mut env = toml::map::Map::new();
+    if let Some(exa_api_key) = agentic_mcp
+        .get("env")
+        .and_then(toml::Value::as_table)
+        .and_then(|source_env| source_env.get("EXA_API_KEY"))
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        env.insert(
+            "EXA_API_KEY".to_string(),
+            toml::Value::String(exa_api_key.to_string()),
+        );
+    }
     env.insert(
         "CODEX_HOME".to_string(),
         toml::Value::String(source_home.to_string_lossy().to_string()),
@@ -2460,6 +2472,7 @@ command = "/tmp/old_agentic_mcp"
 
 [mcp_servers.agentic-mcp.env]
 SOURCE_ONLY_TOKEN = "do-not-copy"
+EXA_API_KEY = "research-only-secret"
 
 [mcp_servers.agentic-mcp.tools.list_tickets]
 approval_mode = "approve"
@@ -2495,9 +2508,16 @@ approval_mode = "approve"
         assert_eq!(
             agentic_mcp
                 .get("env")
+                .and_then(|env| env.get("EXA_API_KEY"))
+                .and_then(|value| value.as_str()),
+            Some("research-only-secret")
+        );
+        assert_eq!(
+            agentic_mcp
+                .get("env")
                 .and_then(|env| env.as_table())
                 .map(toml::map::Map::len),
-            Some(1)
+            Some(2)
         );
 
         let _ = std::fs::remove_dir_all(source_home);
