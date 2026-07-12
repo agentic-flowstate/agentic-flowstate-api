@@ -56,6 +56,7 @@ dependencies = [
 name = "agentic_api"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ammonia",
  "anyhow",
  "apns-h2",
@@ -83,6 +84,7 @@ dependencies = [
  "metrics 0.22.4",
  "metrics-exporter-prometheus",
  "once_cell",
+ "rand 0.8.5",
  "regex",
  "reqwest",
  "serde",
@@ -5520,6 +5522,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "unicode-normalization",
  "uuid",
 ]

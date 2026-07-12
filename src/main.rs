@@ -20,6 +20,7 @@ mod rate_limiting;
 mod request_logger;
 mod retention;
 pub mod safety;
+mod secret_cipher;
 pub mod system_log_helper;
 
 mod runner_commands {
@@ -1453,6 +1454,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/quick-reference/:id",
             patch(handlers::patch_quick_reference).delete(handlers::delete_quick_reference),
+        )
+        .route(
+            "/api/secret-references",
+            get(handlers::list_secret_references).post(handlers::upsert_secret_reference),
+        )
+        .route(
+            "/api/secret-references/:id",
+            axum::routing::delete(handlers::delete_secret_reference),
         )
         // Token usage tracking
         .route("/api/usage", get(handlers::usage::get_usage))

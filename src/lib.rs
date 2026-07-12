@@ -21,4 +21,5 @@ pub mod request_logger;
 pub mod retention;
 pub mod runner_commands;
 pub mod safety;
+pub mod secret_cipher;
 pub mod system_log_helper;

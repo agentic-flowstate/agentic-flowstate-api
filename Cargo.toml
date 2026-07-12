@@ -70,6 +70,8 @@ dirs = "5.0"
 # HTTP client for OpenAI API
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"] }
 base64 = "0.22"
+aes-gcm = "0.10"
+rand = "0.8"
 webauthn-rs = { version = "0.6.1-dev", features = ["danger-allow-state-serialisation"] }
 lazy_static = "1.4"
 # APNs push notifications (JWT signing)
