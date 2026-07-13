@@ -67,7 +67,7 @@ pub enum AgentType {
     TicketAssistant,
     /// Deep research agent backed by the self-hosted research index and HTTP crawler
     Research,
-    /// Polymarket analysis agent with scoped residential egress and read-only research tools
+    /// Full-access Polymarket agent with a dedicated residential egress tool
     Polymarket,
     /// Recurring research agent invoked by Dailies automation
     DailyResearch,
@@ -385,11 +385,15 @@ mod tests {
     }
 
     #[test]
-    fn polymarket_agent_is_runnable_and_scoped_to_analysis_tools() {
+    fn polymarket_agent_is_runnable_with_full_access_tools() {
         let config = AgentsConfig::get()
             .agents
             .get("polymarket")
             .expect("polymarket agent config");
+        let full_access = AgentsConfig::get()
+            .agents
+            .get("full-access")
+            .expect("full-access agent config");
 
         assert_eq!(AgentType::Polymarket.as_str(), "polymarket");
         assert_eq!(
@@ -397,15 +401,12 @@ mod tests {
             Some(AgentType::Polymarket)
         );
         assert_eq!(config.prompt_file, "polymarket.txt");
+        assert_eq!(config.tools, full_access.tools);
+        assert!(config.tools.iter().any(|tool| tool == "Bash"));
         assert!(config
             .tools
             .iter()
-            .any(|tool| tool == "mcp__agentic-mcp__polymarket_tools"));
-        assert!(!config.tools.iter().any(|tool| tool == "Bash"));
-        assert!(!config
-            .tools
-            .iter()
-            .any(|tool| tool.ends_with("__send_email")));
+            .any(|tool| tool == "mcp__agentic-mcp__*"));
     }
 
     #[test]
