@@ -27,6 +27,9 @@ pub struct OutboundEmail {
 #[derive(Debug, Clone)]
 pub struct DeliveryResult {
     pub message_id: String,
+    pub provider: Option<String>,
+    pub provider_message_id: Option<String>,
+    pub configuration_set: Option<String>,
     pub source_mailbox: String,
 }
 
@@ -39,31 +42,57 @@ pub async fn send_outbound_email(
         email_accounts::resolve_email_identity_for_user(pool, user_id, &req.from).await?;
     let message_id = format!("<{}@agentic-flowstate.local>", Uuid::new_v4());
 
-    if identity.account.imap_host == PURELYMAIL_IMAP_HOST {
-        send_purelymail_smtp(&identity, req, &message_id).await?;
-        return Ok(DeliveryResult {
-            message_id,
-            source_mailbox: identity.account.email,
-        });
+    match identity.account.outbound_transport.as_str() {
+        "smtp" => {
+            if identity.account.imap_host != PURELYMAIL_IMAP_HOST {
+                bail!(
+                    "SMTP outbound transport is not configured for IMAP host '{}'",
+                    identity.account.imap_host
+                );
+            }
+            send_purelymail_smtp(&identity, req, &message_id).await?;
+            Ok(DeliveryResult {
+                message_id,
+                provider: None,
+                provider_message_id: None,
+                configuration_set: None,
+                source_mailbox: identity.account.email,
+            })
+        }
+        "ses" => {
+            let configuration_set = identity
+                .account
+                .ses_configuration_set
+                .clone()
+                .ok_or_else(|| anyhow!("SES configuration set is required for '{}'", req.from))?;
+            let provider_message_id =
+                send_ses_raw(&identity, req, &message_id, &configuration_set).await?;
+            Ok(DeliveryResult {
+                message_id,
+                provider: Some("ses".to_string()),
+                provider_message_id: Some(provider_message_id),
+                configuration_set: Some(configuration_set),
+                source_mailbox: identity.account.email,
+            })
+        }
+        other => bail!("Unsupported outbound transport '{}'", other),
     }
-
-    let ses_message_id = send_ses_raw(&identity, req, &message_id).await?;
-    Ok(DeliveryResult {
-        message_id: ses_message_id,
-        source_mailbox: identity.account.email,
-    })
 }
 
 async fn send_ses_raw(
     identity: &ResolvedEmailIdentity,
     req: &OutboundEmail,
     message_id: &str,
+    configuration_set: &str,
 ) -> Result<String> {
-    let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-        .region(aws_config::Region::new(identity.account.aws_region.clone()));
-    if let Some(ref profile) = identity.account.aws_profile {
-        config_loader = config_loader.profile_name(profile);
-    }
+    let profile = identity
+        .account
+        .aws_profile
+        .as_deref()
+        .ok_or_else(|| anyhow!("AWS profile is required for SES sender '{}'", req.from))?;
+    let config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(aws_config::Region::new(identity.account.aws_region.clone()))
+        .profile_name(profile);
     let config = config_loader.load().await;
     let ses_client = aws_sdk_sesv2::Client::new(&config);
     let raw_bytes = build_raw_message(req, message_id)?;
@@ -80,20 +109,25 @@ async fn send_ses_raw(
     let result = ses_client
         .send_email()
         .from_email_address(&req.from)
+        .configuration_set_name(configuration_set)
         .content(content)
         .send()
         .await
         .context("SES send failed")?;
 
-    if let Some(provider_message_id) = result.message_id() {
-        tracing::debug!(
-            "SES accepted email with provider message id {} for RFC Message-ID {}",
-            provider_message_id,
-            message_id
-        );
-    }
-
-    Ok(message_id.to_string())
+    let provider_message_id = result
+        .message_id()
+        .ok_or_else(|| anyhow!("SES response did not include MessageId"))?
+        .to_string();
+    tracing::info!(
+        component = "email_delivery",
+        provider = "ses",
+        provider_message_id,
+        rfc_message_id = message_id,
+        configuration_set,
+        "SES accepted outbound email"
+    );
+    Ok(provider_message_id)
 }
 
 async fn send_purelymail_smtp(
@@ -185,7 +219,9 @@ fn build_raw_message(req: &OutboundEmail, message_id: &str) -> Result<Vec<u8>> {
             builder = builder.text_body(text).html_body(html);
         }
         (Some(text), None) => {
-            builder = builder.text_body(text);
+            builder = builder
+                .text_body(text)
+                .html_body(plain_text_email_html(text));
         }
         (None, Some(html)) => {
             builder = builder.html_body(html);
@@ -198,6 +234,18 @@ fn build_raw_message(req: &OutboundEmail, message_id: &str) -> Result<Vec<u8>> {
     builder
         .write_to_vec()
         .map_err(|e| anyhow!("Failed to build MIME message: {}", e))
+}
+
+fn plain_text_email_html(body: &str) -> String {
+    let escaped = body
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
+    format!(
+        "<!doctype html><html><body><div style=\"white-space:pre-wrap;font-family:system-ui,-apple-system,sans-serif\">{escaped}</div></body></html>"
+    )
 }
 
 async fn smtp_command<S>(

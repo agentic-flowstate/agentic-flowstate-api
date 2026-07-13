@@ -394,6 +394,7 @@ pub struct SendEmailRequest {
 #[derive(Debug, Serialize)]
 pub struct SendEmailResponse {
     pub message_id: String,
+    pub provider_message_id: Option<String>,
     pub success: bool,
     pub expected_response_id: Option<i64>,
 }
@@ -443,8 +444,8 @@ pub async fn send_email(
         )
     })?;
 
-    let message_id = delivery.message_id;
-    let source_mailbox = delivery.source_mailbox;
+    let message_id = delivery.message_id.clone();
+    let source_mailbox = delivery.source_mailbox.clone();
     let thread_id = req.thread_id.clone().or_else(|| Some(message_id.clone()));
     tracing::info!("Email sent successfully, message_id: {}", message_id);
 
@@ -479,6 +480,34 @@ pub async fn send_email(
                 format!("Failed to store sent email: {}", e),
             )
         })?;
+
+    if let (Some(provider), Some(provider_message_id)) = (
+        delivery.provider.as_deref(),
+        delivery.provider_message_id.as_deref(),
+    ) {
+        ticketing_system::email_tracking::register_provider_message(
+            &pool,
+            stored_email.id,
+            provider,
+            provider_message_id,
+            &message_id,
+            delivery.configuration_set.as_deref(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                component = "email_delivery",
+                email_id = stored_email.id,
+                provider_message_id,
+                error = ?error,
+                "failed to register provider message correlation"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to register email tracking: {error}"),
+            )
+        })?;
+    }
 
     if let Err(e) = email_intake::process_email_intake(&pool, stored_email.id, "api_send").await {
         tracing::warn!(
@@ -521,6 +550,7 @@ pub async fn send_email(
 
     Ok(Json(SendEmailResponse {
         message_id,
+        provider_message_id: delivery.provider_message_id,
         success: true,
         expected_response_id,
     }))
