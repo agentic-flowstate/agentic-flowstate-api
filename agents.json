@@ -21,6 +21,22 @@
         "mcp__agentic-mcp__search_artifacts"
       ]
     },
+    "polymarket": {
+      "model": "codex",
+      "effort": "xhigh",
+      "prompt_file": "polymarket.txt",
+      "tools": [
+        "mcp__agentic-mcp__polymarket_tools",
+        "mcp__agentic-mcp__research_search",
+        "mcp__agentic-mcp__research_get_contents",
+        "mcp__agentic-mcp__research_crawl",
+        "mcp__agentic-mcp__create_artifact",
+        "mcp__agentic-mcp__update_artifact",
+        "mcp__agentic-mcp__get_artifact",
+        "mcp__agentic-mcp__list_artifacts",
+        "mcp__agentic-mcp__search_artifacts"
+      ]
+    },
     "daily-research": {
       "model": "codex",
       "effort": "medium",

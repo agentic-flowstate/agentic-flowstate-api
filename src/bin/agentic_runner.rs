@@ -880,6 +880,7 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
         "meeting-notes" => Ok("meeting-notes"),
         "ticket-assistant" => Ok("ticket-assistant"),
         "research" => Ok("research"),
+        "polymarket" => Ok("polymarket"),
         "daily-research" => Ok("daily-research"),
         "package-update-review" => Ok("package-update-review"),
         "research-synthesis" => Ok("research-synthesis"),

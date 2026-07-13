@@ -67,6 +67,8 @@ pub enum AgentType {
     TicketAssistant,
     /// Deep research agent backed by the self-hosted research index and HTTP crawler
     Research,
+    /// Polymarket analysis agent with scoped residential egress and read-only research tools
+    Polymarket,
     /// Recurring research agent invoked by Dailies automation
     DailyResearch,
     /// Recurring package-update summarizer invoked by Dailies automation
@@ -109,6 +111,7 @@ impl AgentType {
             "conversation-evaluator" => Some(AgentType::ConversationEvaluator),
             "feedback" => Some(AgentType::Feedback),
             "research" => Some(AgentType::Research),
+            "polymarket" => Some(AgentType::Polymarket),
             _ => None,
         }
     }
@@ -126,6 +129,7 @@ impl AgentType {
             AgentType::MeetingNotes => "meeting-notes",
             AgentType::TicketAssistant => "ticket-assistant",
             AgentType::Research => "research",
+            AgentType::Polymarket => "polymarket",
             AgentType::DailyResearch => "daily-research",
             AgentType::PackageUpdateReview => "package-update-review",
             AgentType::ResearchSynthesis => "research-synthesis",
@@ -378,6 +382,30 @@ mod tests {
                 "research agent is missing canonical tool {tool}"
             );
         }
+    }
+
+    #[test]
+    fn polymarket_agent_is_runnable_and_scoped_to_analysis_tools() {
+        let config = AgentsConfig::get()
+            .agents
+            .get("polymarket")
+            .expect("polymarket agent config");
+
+        assert_eq!(AgentType::Polymarket.as_str(), "polymarket");
+        assert_eq!(
+            AgentType::from_chat_agent_key("polymarket"),
+            Some(AgentType::Polymarket)
+        );
+        assert_eq!(config.prompt_file, "polymarket.txt");
+        assert!(config
+            .tools
+            .iter()
+            .any(|tool| tool == "mcp__agentic-mcp__polymarket_tools"));
+        assert!(!config.tools.iter().any(|tool| tool == "Bash"));
+        assert!(!config
+            .tools
+            .iter()
+            .any(|tool| tool.ends_with("__send_email")));
     }
 
     #[test]

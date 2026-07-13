@@ -96,6 +96,7 @@ impl WorkContextSkipReason {
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
     match agent_type {
         AgentType::HomePlanner
+        | AgentType::Polymarket
         | AgentType::MeetingAgent
         | AgentType::ConversationEvaluator
         | AgentType::Feedback
