@@ -146,7 +146,10 @@ impl HealthReporter {
         outreach_metrics::set_queue_depth(QueueKind::Dlq, state.dlq_depth);
         outreach_metrics::set_oldest_age(state.oldest_age_seconds);
 
-        let changed = self.last_state != Some(state);
+        let changed = self
+            .last_state
+            .map(|last| (last.consumer_healthy, last.queue_healthy, last.reason))
+            != Some((state.consumer_healthy, state.queue_healthy, state.reason));
         if !state.consumer_healthy || !state.queue_healthy {
             if changed {
                 if let Err(error) = ticketing_system::outreach::pause_outreach(
@@ -516,6 +519,8 @@ async fn consume_configured_queue(
         let mut batch_inserted = 0_usize;
         let mut batch_duplicates = 0_usize;
         let mut batch_failed = 0_usize;
+        let queue_already_unhealthy =
+            !age_known || oldest_age > QUEUE_AGE_LIMIT_SECONDS || before.dlq_visible != Some(0);
         for message in messages {
             outreach_metrics::record_message(MessageOutcome::Received);
             let started = Instant::now();
@@ -544,22 +549,36 @@ async fn consume_configured_queue(
                         MessageOutcome::Poison,
                         started.elapsed().as_secs_f64() * 1_000.0,
                     );
-                    reporter
-                        .report(pool, HealthState::unhealthy(HealthReason::PoisonMessage))
+                    if !queue_already_unhealthy {
+                        reporter
+                            .report(
+                                pool,
+                                HealthState {
+                                    consumer_healthy: false,
+                                    queue_healthy: false,
+                                    reason: HealthReason::PoisonMessage,
+                                    main_depth: before.main_depth(),
+                                    dlq_depth: before.dlq_visible.unwrap_or(0),
+                                    oldest_age_seconds: oldest_age,
+                                },
+                            )
+                            .await;
+                    }
+                    if receive_count <= 1 {
+                        let detail = json!({
+                            "status": "poison",
+                            "receive_count": receive_count,
+                            "error_type": error,
+                        })
+                        .to_string();
+                        system_log_helper::log_error(
+                            pool,
+                            COMPONENT,
+                            "SES event message failed permanent parsing and remains for redrive",
+                            Some(&detail),
+                        )
                         .await;
-                    let detail = json!({
-                        "status": "poison",
-                        "receive_count": receive_count,
-                        "error_type": error,
-                    })
-                    .to_string();
-                    system_log_helper::log_error(
-                        pool,
-                        COMPONENT,
-                        "SES event message failed permanent parsing and remains for redrive",
-                        Some(&detail),
-                    )
-                    .await;
+                    }
                 }
                 Err(ProcessError::Storage(error)) => {
                     batch_failed += 1;
