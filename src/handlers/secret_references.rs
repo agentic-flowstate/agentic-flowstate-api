@@ -1,6 +1,6 @@
 use crate::{auth_middleware::AuthenticatedUser, secret_cipher};
 use axum::{
-    extract::{Extension, Path, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -12,23 +12,36 @@ use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 pub struct UpsertSecretReferenceRequest {
+    pub scope: String,
+    pub conversation_id: Option<String>,
     pub key: String,
     pub label: String,
     pub value: String,
     pub description: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct ListSecretReferenceQuery {
+    pub conversation_id: Option<String>,
+}
+
 pub async fn list_secret_references(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
     headers: HeaderMap,
+    Query(query): Query<ListSecretReferenceQuery>,
 ) -> Response {
     let organization = match require_org(&pool, &user.user_id, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-    match ticketing_system::secret_references::list_metadata(&pool, &user.user_id, &organization)
-        .await
+    match ticketing_system::secret_references::list_metadata(
+        &pool,
+        &user.user_id,
+        &organization,
+        query.conversation_id.as_deref(),
+    )
+    .await
     {
         Ok(entries) => Json(entries).into_response(),
         Err(error) => server_error("Failed to list secret references", error),
@@ -46,16 +59,26 @@ pub async fn upsert_secret_reference(
         Err(response) => return response,
     };
     let key = request.key.trim().to_ascii_uppercase();
+    let encryption_context = match ticketing_system::secret_references::encryption_context(
+        &request.scope,
+        &organization,
+        request.conversation_id.as_deref(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return bad_request_error("Secure Key scope rejected", error),
+    };
     let (encrypted_value, nonce) = match secret_cipher::encrypt(
         &request.value,
-        &secret_cipher::aad(&user.user_id, &organization, &key),
+        &secret_cipher::aad(&user.user_id, &encryption_context, &key),
     ) {
         Ok(value) => value,
         Err(error) => return bad_request_error("Secret value rejected", error),
     };
     let storage_request = ticketing_system::UpsertSecretReference {
         user_id: user.user_id.clone(),
+        scope: request.scope.clone(),
         organization: organization.clone(),
+        conversation_id: request.conversation_id,
         key: key.clone(),
         label: request.label,
         encrypted_value,
@@ -64,7 +87,7 @@ pub async fn upsert_secret_reference(
     };
     match ticketing_system::secret_references::upsert(&pool, storage_request).await {
         Ok(entry) => {
-            tracing::info!(component = "secret_references", operation = "upsert", user_id = %user.user_id, organization = %organization, secret_key = %key, "secret reference stored");
+            tracing::info!(component = "secret_references", operation = "upsert", user_id = %user.user_id, organization = %organization, scope = %request.scope, secret_key = %key, "secret reference stored");
             (StatusCode::OK, Json(entry)).into_response()
         }
         Err(error) => bad_request_error("Failed to store secret reference", error),
