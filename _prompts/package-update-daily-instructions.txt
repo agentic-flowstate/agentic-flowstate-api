@@ -1,0 +1,1 @@
+Summarize the server-provided package scan. Do not apply updates. A package-update Daily remains incomplete until a separate explicit approval and durable apply action succeeds.

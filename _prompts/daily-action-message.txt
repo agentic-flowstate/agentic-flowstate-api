@@ -1,0 +1,20 @@
+Run the following stored Daily action through this durable conversation.
+
+Daily ID: {{DAILY_ID}}
+Occurrence ID: {{OCCURRENCE_ID}}
+Action: {{ACTION_KEY}}
+Title: {{DAILY_TITLE}}
+Description: {{DAILY_DESCRIPTION}}
+
+Stored Daily instructions:
+{{DAILY_PROMPT}}
+
+{{#if PACKAGE_UPDATE_REPORT}}
+The server completed a deterministic read-only package scan before queueing this turn. Summarize only this report; do not run package commands and do not apply updates:
+
+```json
+{{PACKAGE_UPDATE_REPORT}}
+```
+{{/if}}
+
+Return the result in this conversation. Do not create a separate agent run or conversation.

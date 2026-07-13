@@ -2,6 +2,7 @@ mod agents;
 pub mod apns;
 mod auth_middleware;
 mod dailies_scheduler;
+mod daily_actions;
 mod email_attachment_safety;
 mod email_classifier;
 mod email_delivery;
@@ -341,6 +342,46 @@ async fn main() -> anyhow::Result<()> {
     // Initialize SQLite database pool
     let db_pool = Arc::new(ticketing_system::init_db().await?);
     tracing::info!("SQLite database pool initialized");
+
+    match ticketing_system::daily_action_executions::reconcile_daily_action_executions(&db_pool)
+        .await
+    {
+        Ok(report) if report.execution_transitions > 0 || report.job_repairs > 0 => {
+            tracing::warn!(
+                component = "dailies_api",
+                operation = "daily_action.startup_reconciled",
+                inspected = report.inspected,
+                execution_transitions = report.execution_transitions,
+                job_repairs = report.job_repairs,
+                checkpoint_repairs = report.checkpoint_repairs,
+                unrecoverable_link_mismatches = report.unrecoverable_link_mismatches,
+                "reconciled durable Daily state at API startup"
+            );
+        }
+        Ok(_) => tracing::debug!("No durable Daily state required startup reconciliation"),
+        Err(error) => {
+            log_ops_error(
+                &db_pool,
+                "dailies",
+                "daily_action.startup_reconcile_failed",
+                "Failed to reconcile durable Daily state at startup",
+                &error,
+            )
+            .await;
+        }
+    }
+    if let Err(error) =
+        ticketing_system::daily_action_executions::trace_daily_action_diagnostics(&db_pool).await
+    {
+        log_ops_error(
+            &db_pool,
+            "dailies",
+            "daily_action.startup_diagnostics_failed",
+            "Failed to aggregate durable Daily diagnostics at startup",
+            &error,
+        )
+        .await;
+    }
 
     match ticketing_system::agent_runners::reconcile_stale_runner_generations(
         &db_pool,
@@ -1182,6 +1223,23 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/dailies",
             get(handlers::list_dailies).post(handlers::create_daily),
+        )
+        .route("/api/dailies/window", get(handlers::get_daily_window))
+        .route(
+            "/api/dailies/events",
+            get(handlers::stream_daily_execution_events),
+        )
+        .route(
+            "/api/dailies/:daily_id/occurrences/:occurrence_id/actions/:action_key/executions",
+            post(handlers::create_daily_execution),
+        )
+        .route(
+            "/api/daily-executions/by-idempotency-key/:key",
+            get(handlers::get_daily_execution_by_idempotency_key),
+        )
+        .route(
+            "/api/daily-executions/:execution_id",
+            get(handlers::get_daily_execution),
         )
         .route(
             "/api/dailies/:daily_id",
