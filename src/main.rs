@@ -1106,6 +1106,18 @@ async fn main() -> anyhow::Result<()> {
             "/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/history",
             get(handlers::get_ticket_history),
         )
+        .route(
+            "/api/ticket-schedule-offsets/preview",
+            post(handlers::preview_schedule_offset),
+        )
+        .route(
+            "/api/ticket-schedule-offsets/:operation_id",
+            get(handlers::get_schedule_offset_preview),
+        )
+        .route(
+            "/api/ticket-schedule-offsets/:operation_id/apply",
+            post(handlers::apply_schedule_offset),
+        )
         // Agent run routes (org-scoped, nested under epics)
         .route(
             "/api/epics/:epic_id/slices/:slice_id/tickets/:ticket_id/agent-runs",

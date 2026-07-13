@@ -224,6 +224,7 @@ async fn ensure_ticket(pool: &SqlitePool, incident: &SystemLogIncident) -> Resul
             blocked_by: None,
             milestone_id: Some(MILESTONE_ID.to_string()),
             due_date: Some(today),
+            anchored: Some(false),
             classification: Some("automated".to_string()),
         },
     )

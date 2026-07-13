@@ -32,6 +32,7 @@ pub struct CreateTicketHttpBody {
     pub agent: Option<String>,
     pub repository: Option<String>,
     pub due_date: Option<String>,
+    pub anchored: Option<bool>,
     pub classification: Option<String>,
 }
 
@@ -40,6 +41,8 @@ pub struct UpdateTicketRequest {
     pub status: Option<String>,
     pub notes: Option<String>,
     pub due_date: Option<String>,
+    pub anchored: Option<bool>,
+    pub expected_updated_at: Option<i64>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub assignee: Option<String>,

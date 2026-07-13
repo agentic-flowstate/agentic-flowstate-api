@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -12,6 +12,7 @@ use ticketing_system::{models::TicketType, work_ticket::EnsureWorkTicketRequest}
 use tracing::{error, info};
 
 use crate::{
+    auth_middleware::AuthenticatedUser,
     mcp_wrapper::call_mcp_tool,
     models::{CreateTicketHttpBody, UpdateTicketRequest},
     observability::streaming::{record_ticket_preflight, record_ticket_preflight_error},
@@ -271,6 +272,7 @@ fn create_ticket_args(
         "agent": request.agent,
         "repository": request.repository,
         "due_date": due_date,
+        "anchored": request.anchored.unwrap_or(false),
         "classification": request.classification,
     });
 
@@ -285,11 +287,41 @@ fn create_ticket_args(
 // Update ticket with full path (epic_id, slice_id, ticket_id)
 pub async fn update_ticket_nested(
     State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
     headers: HeaderMap,
     Path((epic_id, slice_id, ticket_id)): Path<(String, String, String)>,
     Json(request): Json<UpdateTicketRequest>,
 ) -> Response {
     let organization = get_organization(&headers);
+
+    let has_schedule_mutation = request.anchored.is_some() || request.due_date.is_some();
+    let has_other_mutation = request.status.is_some()
+        || request.notes.is_some()
+        || request.title.is_some()
+        || request.description.is_some()
+        || request.assignee.is_some()
+        || request.agent.is_some()
+        || request.repository.is_some()
+        || request.ticket_type.is_some()
+        || request.guidance.is_some();
+    if has_schedule_mutation && has_other_mutation {
+        return super::schedule_offsets::error_response(
+            ticketing_system::schedule_offsets::ScheduleOffsetError::new(
+                ticketing_system::schedule_offsets::ScheduleOffsetErrorCode::InvalidFilter,
+                "Date and anchor mutations must use a field-specific PATCH request.",
+                json!({"fields": ["anchored", "due_date"]}),
+            ),
+        );
+    }
+    if request.anchored.is_some() && request.due_date.is_some() {
+        return super::schedule_offsets::error_response(
+            ticketing_system::schedule_offsets::ScheduleOffsetError::new(
+                ticketing_system::schedule_offsets::ScheduleOffsetErrorCode::InvalidFilter,
+                "Anchor and due-date changes require separate PATCH requests.",
+                json!({"fields": ["anchored", "due_date"]}),
+            ),
+        );
+    }
 
     // Determine which update operation to use based on what's being updated
     if let Some(status) = request.status.as_deref() {
@@ -346,15 +378,19 @@ pub async fn update_ticket_nested(
             &slice_id,
             &ticket_id,
             request,
+            &user.user_id,
         )
         .await
         {
             Ok(ticket) => (StatusCode::OK, Json(ticket)).into_response(),
-            Err(e) => {
+            Err(UpdateTicketFieldsError::Schedule(error)) => {
+                super::schedule_offsets::error_response(error)
+            }
+            Err(UpdateTicketFieldsError::Other(e)) => {
                 error!("Failed to update ticket fields: {:?}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": format!("Failed to update ticket fields: {}", e) })),
+                    Json(json!({ "error": "Failed to update ticket fields" })),
                 )
                     .into_response()
             }
@@ -378,6 +414,24 @@ impl UpdateTicketRequest {
             || self.repository.is_some()
             || self.ticket_type.is_some()
             || self.guidance.is_some()
+            || self.anchored.is_some()
+    }
+}
+
+enum UpdateTicketFieldsError {
+    Schedule(ticketing_system::schedule_offsets::ScheduleOffsetError),
+    Other(anyhow::Error),
+}
+
+impl From<ticketing_system::schedule_offsets::ScheduleOffsetError> for UpdateTicketFieldsError {
+    fn from(error: ticketing_system::schedule_offsets::ScheduleOffsetError) -> Self {
+        Self::Schedule(error)
+    }
+}
+
+impl From<anyhow::Error> for UpdateTicketFieldsError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Other(error)
     }
 }
 
@@ -388,16 +442,69 @@ async fn update_ticket_fields(
     slice_id: &str,
     ticket_id: &str,
     request: UpdateTicketRequest,
-) -> anyhow::Result<ticketing_system::models::Ticket> {
+    actor_id: &str,
+) -> Result<ticketing_system::models::Ticket, UpdateTicketFieldsError> {
+    let has_remaining_updates = request.title.is_some()
+        || request.description.is_some()
+        || request.assignee.is_some()
+        || request.agent.is_some()
+        || request.repository.is_some()
+        || request.ticket_type.is_some()
+        || request.guidance.is_some();
+    ticketing_system::tickets::get_ticket(pool, organization, epic_id, slice_id, ticket_id)
+        .await?
+        .ok_or_else(|| {
+            ticketing_system::schedule_offsets::ScheduleOffsetError::new(
+                ticketing_system::schedule_offsets::ScheduleOffsetErrorCode::TicketNotFound,
+                "The ticket was not found.",
+                json!({"ticket_id": ticket_id}),
+            )
+        })?;
+
+    let actor = ticketing_system::schedule_offsets::ScheduleOffsetActor {
+        actor_type: ticketing_system::schedule_offsets::ActorType::User,
+        actor_id: actor_id.to_string(),
+    };
+    let mut expected_updated_at = request.expected_updated_at;
+    if let Some(anchored) = request.anchored {
+        let result = ticketing_system::schedule_offsets::set_ticket_anchored(
+            pool,
+            organization,
+            ticket_id,
+            anchored,
+            expected_updated_at,
+            &actor,
+        )
+        .await?;
+        expected_updated_at = Some(result.updated_at);
+    }
+    if let Some(ref due_date) = request.due_date {
+        ticketing_system::schedule_offsets::set_ticket_due_date(
+            pool,
+            organization,
+            ticket_id,
+            due_date,
+            expected_updated_at,
+            &actor,
+        )
+        .await?;
+    }
+
     let mut ticket =
         ticketing_system::tickets::get_ticket(pool, organization, epic_id, slice_id, ticket_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Ticket not found"))?;
+            .ok_or_else(|| {
+                ticketing_system::schedule_offsets::ScheduleOffsetError::new(
+                    ticketing_system::schedule_offsets::ScheduleOffsetErrorCode::TicketNotFound,
+                    "The ticket was not found.",
+                    json!({"ticket_id": ticket_id}),
+                )
+            })?;
 
     if let Some(title) = request.title {
         let title = title.trim();
         if title.is_empty() {
-            anyhow::bail!("Ticket title cannot be empty");
+            return Err(anyhow::anyhow!("Ticket title cannot be empty").into());
         }
         ticket.title = title.to_string();
     }
@@ -416,18 +523,16 @@ async fn update_ticket_fields(
     if let Some(guidance) = request.guidance {
         ticket.guidance = non_empty_string(guidance);
     }
-    if let Some(due_date) = request.due_date {
-        let due_date = due_date.trim();
-        if due_date.is_empty() {
-            anyhow::bail!("Cannot clear due_date — due dates are required on all tickets. Provide a new date instead.");
-        }
-        ticket.due_date = Some(due_date.to_string());
-    }
     if let Some(ticket_type) = request.ticket_type {
-        ticket.ticket_type = parse_ticket_type(&ticket_type)?;
+        ticket.ticket_type =
+            parse_ticket_type(&ticket_type).map_err(UpdateTicketFieldsError::Other)?;
     }
 
-    ticketing_system::tickets::update_ticket(pool, &ticket).await
+    if has_remaining_updates {
+        Ok(ticketing_system::tickets::update_ticket(pool, &ticket).await?)
+    } else {
+        Ok(ticket)
+    }
 }
 
 fn non_empty_string(value: String) -> Option<String> {
@@ -464,6 +569,7 @@ mod tests {
             "agent": "codex",
             "repository": "agentic-flowstate-app",
             "due_date": "2026-06-09",
+            "anchored": true,
             "classification": "automated"
         }))
         .expect("decode request");
@@ -491,6 +597,7 @@ mod tests {
         assert_eq!(ticket["agent"], "codex");
         assert_eq!(ticket["repository"], "agentic-flowstate-app");
         assert_eq!(ticket["due_date"], "2026-06-09");
+        assert_eq!(ticket["anchored"], true);
         assert_eq!(ticket["classification"], "automated");
     }
 

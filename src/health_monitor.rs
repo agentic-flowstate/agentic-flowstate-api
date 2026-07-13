@@ -145,6 +145,7 @@ pub async fn run_checks(pool: &SqlitePool) {
                     blocked_by: None,
                     milestone_id: Some(ep.milestone_id.clone()),
                     due_date: Some(today),
+                    anchored: Some(false),
                     classification: Some("manual".to_string()),
                 };
 
