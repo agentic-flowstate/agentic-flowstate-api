@@ -3196,6 +3196,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 name = "mcp-handlers"
 version = "1.0.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-native-tls",
  "async-std",
@@ -3214,6 +3215,7 @@ dependencies = [
  "mail-builder",
  "md5",
  "once_cell",
+ "rand 0.8.5",
  "regex",
  "reqwest",
  "scraper",
