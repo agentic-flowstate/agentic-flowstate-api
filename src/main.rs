@@ -9,6 +9,7 @@ mod email_fetcher;
 mod email_intake_scheduler;
 mod email_notification_dispatcher;
 mod email_threading;
+mod email_tracking_consumer;
 mod handlers;
 mod health_monitor;
 mod log_incident_triage;
@@ -521,6 +522,9 @@ async fn main() -> anyhow::Result<()> {
     // Start email fetcher background task (queries email_accounts table each cycle)
     tracing::info!("Starting email fetcher (hot-reload from database)");
     email_fetcher::start_email_fetcher(db_pool.clone(), shutdown_token.child_token());
+
+    tracing::info!("Starting SES outreach event consumer");
+    email_tracking_consumer::spawn(db_pool.clone(), shutdown_token.child_token());
 
     tracing::info!("Starting email intake scheduler");
     email_intake_scheduler::spawn_email_intake_scheduler(

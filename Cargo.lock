@@ -67,6 +67,7 @@ dependencies = [
  "async-trait",
  "aws-config",
  "aws-sdk-sesv2",
+ "aws-sdk-sqs",
  "axum",
  "base64 0.22.1",
  "chrono",

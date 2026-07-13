@@ -33,6 +33,7 @@ pub mod agent_lifecycle;
 pub mod cancellation;
 pub mod contracts;
 pub mod next_actions;
+pub mod outreach;
 pub mod request;
 pub mod runtime;
 pub mod streaming;

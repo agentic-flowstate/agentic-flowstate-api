@@ -27,6 +27,12 @@ name = "Agent Run Lifecycle"
 status = "draft"
 owner = "agentic-flowstate-engineering"
 
+[[contracts]]
+id = "C-OBS-005"
+name = "SES Outreach Event Consumer"
+status = "active"
+owner = "agentic-flowstate-engineering"
+
 [privacy]
 max_message_bytes = 512
 max_detail_bytes = 32768
@@ -788,6 +794,48 @@ name = "stream_snapshot_emitted_total"
 kind = "counter"
 contract_id = "C-OBS-002"
 labels = ["block_kind"]
+
+[[metrics]]
+name = "outreach_ses_queue_messages_total"
+kind = "counter"
+contract_id = "C-OBS-005"
+labels = ["outcome"]
+
+[[metrics]]
+name = "outreach_ses_event_records_total"
+kind = "counter"
+contract_id = "C-OBS-005"
+labels = ["event_type", "outcome"]
+
+[[metrics]]
+name = "outreach_ses_queue_depth"
+kind = "gauge"
+contract_id = "C-OBS-005"
+labels = ["queue"]
+
+[[metrics]]
+name = "outreach_ses_oldest_message_age_seconds"
+kind = "gauge"
+contract_id = "C-OBS-005"
+labels = []
+
+[[metrics]]
+name = "outreach_ses_consumer_healthy"
+kind = "gauge"
+contract_id = "C-OBS-005"
+labels = []
+
+[[metrics]]
+name = "outreach_ses_message_processing_duration_ms"
+kind = "histogram"
+contract_id = "C-OBS-005"
+labels = ["outcome"]
+
+[[metrics]]
+name = "outreach_ses_retention_deleted_total"
+kind = "counter"
+contract_id = "C-OBS-005"
+labels = ["retention_class"]
 
 [[spans]]
 name = "http.server.request"

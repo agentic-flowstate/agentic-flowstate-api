@@ -12,6 +12,28 @@ use ticketing_system::{
 
 use crate::auth_middleware::AuthenticatedUser;
 
+async fn register_draft_provider_message(
+    pool: &SqlitePool,
+    email_id: i64,
+    delivery: &crate::email_delivery::DeliveryResult,
+) -> anyhow::Result<()> {
+    if let (Some(provider), Some(provider_message_id)) = (
+        delivery.provider.as_deref(),
+        delivery.provider_message_id.as_deref(),
+    ) {
+        ticketing_system::email_tracking::register_provider_message(
+            pool,
+            email_id,
+            provider,
+            provider_message_id,
+            &delivery.message_id,
+            delivery.configuration_set.as_deref(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListDraftsQuery {
     pub include_all: Option<bool>,
@@ -191,7 +213,9 @@ pub async fn send_draft(
         )
     })?;
 
-    let message_id = delivery.message_id;
+    let message_id = delivery.message_id.clone();
+    let provider = delivery.provider.clone();
+    let provider_message_id = delivery.provider_message_id.clone();
     tracing::info!("Draft {} sent successfully, message_id: {}", id, message_id);
 
     // Mark draft as sent
@@ -216,7 +240,7 @@ pub async fn send_draft(
 
     let create_req = ticketing_system::CreateEmailRequest {
         message_id: message_id.clone(),
-        mailbox: delivery.source_mailbox,
+        mailbox: delivery.source_mailbox.clone(),
         folder: "Sent".to_string(),
         from_address: draft.from_address.clone(),
         from_name: None,
@@ -230,8 +254,76 @@ pub async fn send_draft(
         in_reply_to: None,
     };
 
-    if let Err(e) = ticketing_system::emails::create_email(&pool, &create_req).await {
-        tracing::warn!("Failed to store sent email in database: {}", e);
+    let stored_email = match ticketing_system::emails::create_email(&pool, &create_req).await {
+        Ok(email) => email,
+        Err(error) => {
+            tracing::error!(
+                component = "email_delivery",
+                draft_id = id,
+                provider = provider.as_deref().unwrap_or("none"),
+                provider_message_id = provider_message_id.as_deref().unwrap_or(""),
+                error = %error,
+                "provider accepted draft but sent-email persistence failed"
+            );
+            crate::system_log_helper::log_error(
+                &pool,
+                "email_delivery",
+                "Provider accepted draft but local persistence failed",
+                Some(
+                    &serde_json::json!({
+                        "draft_id": id,
+                        "provider": provider.as_deref().unwrap_or("none"),
+                        "provider_message_id": provider_message_id,
+                        "phase": "sent_email_persistence",
+                    })
+                    .to_string(),
+                ),
+            )
+            .await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Provider accepted the draft, but durable local persistence failed; do not resend"
+                    .to_string(),
+            ));
+        }
+    };
+
+    if provider.is_some() && provider_message_id.is_some() {
+        if let Err(error) = register_draft_provider_message(&pool, stored_email.id, &delivery).await
+        {
+            let provider = provider.as_deref().unwrap_or("unknown");
+            let provider_message_id = provider_message_id.as_deref().unwrap_or("unknown");
+            tracing::error!(
+                component = "email_delivery",
+                draft_id = id,
+                email_id = stored_email.id,
+                provider,
+                provider_message_id,
+                error = %error,
+                "provider accepted draft but provider correlation failed"
+            );
+            crate::system_log_helper::log_error(
+                &pool,
+                "email_delivery",
+                "Provider accepted draft but provider correlation failed",
+                Some(
+                    &serde_json::json!({
+                        "draft_id": id,
+                        "email_id": stored_email.id,
+                        "provider": provider,
+                        "provider_message_id": provider_message_id,
+                        "phase": "provider_correlation",
+                    })
+                    .to_string(),
+                ),
+            )
+            .await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Provider accepted the draft, but provider correlation failed; do not resend"
+                    .to_string(),
+            ));
+        }
     }
 
     // Link thread to ticket if draft had a ticket_id
@@ -265,6 +357,7 @@ pub async fn send_draft(
 
     Ok(Json(SendDraftResponse {
         message_id,
+        provider_message_id,
         success: true,
     }))
 }
@@ -272,5 +365,60 @@ pub async fn send_draft(
 #[derive(Debug, Serialize)]
 pub struct SendDraftResponse {
     pub message_id: String,
+    pub provider_message_id: Option<String>,
     pub success: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn draft_delivery_registers_provider_correlation() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE emails (id INTEGER PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO emails(id) VALUES (42)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        ticketing_system::email_tracking::ensure_schema(&pool)
+            .await
+            .unwrap();
+
+        register_draft_provider_message(
+            &pool,
+            42,
+            &crate::email_delivery::DeliveryResult {
+                message_id: "<draft@agentic-flowstate.local>".to_string(),
+                provider: Some("ses".to_string()),
+                provider_message_id: Some("provider-draft-42".to_string()),
+                configuration_set: Some("reply-first".to_string()),
+                source_mailbox: "sender@example.com".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let row: (String, String, String) = sqlx::query_as(
+            "SELECT provider, provider_message_id, configuration_set FROM email_provider_messages WHERE email_id = 42",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "ses");
+        assert_eq!(row.1, "provider-draft-42");
+        assert_eq!(row.2, "reply-first");
+    }
 }

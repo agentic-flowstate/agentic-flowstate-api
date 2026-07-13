@@ -88,6 +88,7 @@ async-std = { version = "1.13", features = ["attributes"] }
 # AWS SES for sending emails
 aws-config = "1.1"
 aws-sdk-sesv2 = "1.9"
+aws-sdk-sqs = "1.9"
 
 # HTML sanitization
 ammonia = "4"
