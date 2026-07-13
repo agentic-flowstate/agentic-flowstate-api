@@ -29,6 +29,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.9"
+sha2 = "0.10"
 
 # Error handling
 anyhow = "1.0"
@@ -103,3 +104,7 @@ path = "src/main.rs"
 [[bin]]
 name = "agentic_runner"
 path = "src/bin/agentic_runner.rs"
+
+[[bin]]
+name = "ses_event_quarantine"
+path = "src/bin/ses_event_quarantine.rs"

@@ -22,4 +22,5 @@ pub mod retention;
 pub mod runner_commands;
 pub mod safety;
 pub mod secret_cipher;
+pub mod ses_event_quarantine;
 pub mod system_log_helper;

@@ -18,6 +18,7 @@ const RETENTION_DELETED: &str = "outreach_ses_retention_deleted_total";
 pub enum MessageOutcome {
     Received,
     Stored,
+    ControlAcknowledged,
     Duplicate,
     Poison,
     StorageError,
@@ -29,6 +30,7 @@ impl fmt::Display for MessageOutcome {
         f.write_str(match self {
             Self::Received => "received",
             Self::Stored => "stored",
+            Self::ControlAcknowledged => "control_acknowledged",
             Self::Duplicate => "duplicate",
             Self::Poison => "poison",
             Self::StorageError => "storage_error",
@@ -122,6 +124,7 @@ mod tests {
     fn outreach_metrics_use_registered_low_cardinality_labels() {
         crate::observability::install_for_test();
         record_message(MessageOutcome::Stored);
+        record_message(MessageOutcome::ControlAcknowledged);
         record_event("delivery", EventOutcome::Inserted);
         set_queue_depth(QueueKind::Main, 2);
         set_oldest_age(901);

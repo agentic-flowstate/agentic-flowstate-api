@@ -90,6 +90,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "thiserror 1.0.69",
  "ticketing-system",
@@ -3216,6 +3217,7 @@ dependencies = [
  "mail-builder",
  "md5",
  "once_cell",
+ "percent-encoding",
  "rand 0.8.5",
  "regex",
  "reqwest",
@@ -3232,6 +3234,7 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "zeroize",
 ]
 
 [[package]]

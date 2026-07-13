@@ -4,7 +4,9 @@
 //! outreach authority have durably accepted every normalized recipient event.
 //! Permanent parse failures are returned to the queue with zero visibility so
 //! the queue's configured max-receive policy, rather than this process, owns
-//! poison-message redrive. No event body or recipient address is logged.
+//! poison-message redrive. SES event-destination validation controls are
+//! fingerprinted into the privacy-safe quarantine ledger and acknowledged as
+//! non-recipient control traffic. No event body or recipient address is logged.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -25,6 +27,7 @@ use uuid::Uuid;
 use crate::observability::outreach::{
     self as outreach_metrics, EventOutcome, MessageOutcome, QueueKind,
 };
+use crate::ses_event_quarantine::{self, BodyClassification, QuarantineEvidence};
 use crate::system_log_helper;
 
 const COMPONENT: &str = "ses_outreach_consumer";
@@ -266,6 +269,7 @@ struct ParsedEvent {
 struct MessageStoreResult {
     inserted: usize,
     duplicates: usize,
+    controls_acknowledged: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -295,6 +299,18 @@ pub fn spawn(pool: Arc<SqlitePool>, token: CancellationToken) {
 
 async fn run_consumer(pool: Arc<SqlitePool>, token: CancellationToken) {
     let mut reporter = HealthReporter::new();
+    if let Err(error) = ses_event_quarantine::ensure_schema(&pool).await {
+        tracing::error!(
+            target: "agentic_api::ses_outreach_consumer",
+            event = "ses_outreach_consumer.quarantine_schema_failed",
+            error = %error,
+            "SES outreach consumer cannot start without durable quarantine storage"
+        );
+        reporter
+            .report(&pool, HealthState::unhealthy(HealthReason::StorageFailed))
+            .await;
+        return;
+    }
     system_log_helper::log_info(
         &pool,
         COMPONENT,
@@ -424,7 +440,10 @@ async fn consume_configured_queue(
                 .wait_time_seconds(WAIT_TIME_SECONDS)
                 .visibility_timeout(VISIBILITY_TIMEOUT_SECONDS)
                 .message_system_attribute_names(MessageSystemAttributeName::SentTimestamp)
+                .message_system_attribute_names(MessageSystemAttributeName::ApproximateFirstReceiveTimestamp)
                 .message_system_attribute_names(MessageSystemAttributeName::ApproximateReceiveCount)
+                .message_system_attribute_names(MessageSystemAttributeName::SenderId)
+                .message_attribute_names("All")
                 .send() => result,
         };
         let response = match receive {
@@ -518,6 +537,7 @@ async fn consume_configured_queue(
 
         let mut batch_inserted = 0_usize;
         let mut batch_duplicates = 0_usize;
+        let mut batch_controls_acknowledged = 0_usize;
         let mut batch_failed = 0_usize;
         let queue_already_unhealthy =
             !age_known || oldest_age > QUEUE_AGE_LIMIT_SECONDS || before.dlq_visible != Some(0);
@@ -528,7 +548,10 @@ async fn consume_configured_queue(
                 Ok(result) => {
                     batch_inserted += result.inserted;
                     batch_duplicates += result.duplicates;
-                    let outcome = if result.inserted == 0 {
+                    batch_controls_acknowledged += result.controls_acknowledged;
+                    let outcome = if result.controls_acknowledged > 0 {
+                        MessageOutcome::ControlAcknowledged
+                    } else if result.inserted == 0 {
                         MessageOutcome::Duplicate
                     } else {
                         MessageOutcome::Stored
@@ -542,6 +565,7 @@ async fn consume_configured_queue(
                 Err(ProcessError::Poison {
                     error,
                     receive_count,
+                    evidence,
                 }) => {
                     batch_failed += 1;
                     outreach_metrics::record_message(MessageOutcome::Poison);
@@ -565,16 +589,21 @@ async fn consume_configured_queue(
                             .await;
                     }
                     if receive_count <= 1 {
-                        let detail = json!({
-                            "status": "poison",
-                            "receive_count": receive_count,
-                            "error_type": error,
-                        })
-                        .to_string();
+                        let detail = evidence.map_or_else(
+                            || {
+                                json!({
+                                    "status": "redrive_pending",
+                                    "receive_count": receive_count,
+                                    "error_type": error,
+                                })
+                                .to_string()
+                            },
+                            |item| item.diagnostic_detail("redrive_pending"),
+                        );
                         system_log_helper::log_error(
                             pool,
                             COMPONENT,
-                            "SES event message failed permanent parsing and remains for redrive",
+                            "SES event message was recorded in privacy-safe quarantine and remains for redrive",
                             Some(&detail),
                         )
                         .await;
@@ -622,6 +651,7 @@ async fn consume_configured_queue(
             messages = messages.len(),
             events_inserted = batch_inserted,
             event_duplicates = batch_duplicates,
+            controls_acknowledged = batch_controls_acknowledged,
             failures = batch_failed,
             oldest_age_seconds = oldest_age,
             "processed SES event queue batch"
@@ -692,6 +722,7 @@ enum ProcessError {
     Poison {
         error: &'static str,
         receive_count: u64,
+        evidence: Option<QuarantineEvidence>,
     },
     Storage(anyhow::Error),
     Delete(anyhow::Error),
@@ -710,33 +741,82 @@ async fn process_message(
             return Err(ProcessError::Poison {
                 error: "missing_receipt_handle",
                 receive_count,
+                evidence: None,
             })
         }
     };
     let body = match message.body() {
         Some(value) => value,
         None => {
+            let evidence = QuarantineEvidence::from_message(
+                message,
+                BodyClassification::MissingBody,
+                "missing_body",
+            );
+            if let Err(error) =
+                ses_event_quarantine::record(pool, &evidence, "redrive_pending", None).await
+            {
+                return Err(ProcessError::Storage(error));
+            }
             accelerate_redrive(client, queue_url, receipt_handle).await;
             return Err(ProcessError::Poison {
                 error: "missing_body",
                 receive_count,
+                evidence: Some(evidence),
             });
         }
     };
     let event = match parse_ses_event(body) {
         Ok(value) => value,
         Err(error) => {
+            let error_type = classify_parse_error(&error);
+            let classification = ses_event_quarantine::classify_non_json_body(body);
+            let evidence = QuarantineEvidence::from_message(message, classification, error_type);
+            if classification.is_acknowledgeable_control() {
+                ses_event_quarantine::record(pool, &evidence, "acknowledgement_pending", None)
+                    .await
+                    .map_err(ProcessError::Storage)?;
+                ses_event_quarantine::log_diagnostic(
+                    pool,
+                    &evidence,
+                    "info",
+                    "Known SES event-destination validation control message recorded before acknowledgement",
+                    "acknowledgement_pending",
+                )
+                .await
+                .map_err(ProcessError::Storage)?;
+                client
+                    .delete_message()
+                    .queue_url(queue_url)
+                    .receipt_handle(receipt_handle)
+                    .send()
+                    .await
+                    .map_err(|error| ProcessError::Delete(anyhow!(error)))?;
+                ses_event_quarantine::record(pool, &evidence, "acknowledged_control", None)
+                    .await
+                    .map_err(ProcessError::Storage)?;
+                outreach_metrics::record_event("provider_control", EventOutcome::Inserted);
+                return Ok(MessageStoreResult {
+                    controls_acknowledged: 1,
+                    ..MessageStoreResult::default()
+                });
+            }
+            ses_event_quarantine::record(pool, &evidence, "redrive_pending", None)
+                .await
+                .map_err(ProcessError::Storage)?;
             tracing::warn!(
                 target: "agentic_api::ses_outreach_consumer",
                 event = "ses_outreach_consumer.poison_detected",
                 receive_count,
-                error = %error,
+                error_type,
+                body_sha256 = %evidence.fingerprint,
                 "SES event could not be parsed; returning it for SQS redrive"
             );
             accelerate_redrive(client, queue_url, receipt_handle).await;
             return Err(ProcessError::Poison {
-                error: classify_parse_error(&error),
+                error: error_type,
                 receive_count,
+                evidence: Some(evidence),
             });
         }
     };

@@ -22,6 +22,7 @@ mod request_logger;
 mod retention;
 pub mod safety;
 mod secret_cipher;
+mod ses_event_quarantine;
 pub mod system_log_helper;
 
 mod runner_commands {
