@@ -1225,6 +1225,7 @@ impl ConversationWorker {
             bypass_approvals_and_sandbox,
             resume_session_id: None,
             ephemeral: true,
+            state_owner_id: &self.conversation_id,
             tool_profile,
             scoped_user_id: Some(&msg.user_id),
             current_conversation_id: Some(&self.conversation_id),

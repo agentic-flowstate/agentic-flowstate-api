@@ -136,6 +136,7 @@ async fn run_codex_agent_turn_inner(
         bypass_approvals_and_sandbox,
         resume_session_id,
         ephemeral: !persist_session,
+        state_owner_id: result_session_id,
         tool_profile: CodexToolProfile::Default,
         scoped_user_id: None,
         current_conversation_id: None,

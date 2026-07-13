@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::OpenOptions;
@@ -36,6 +37,8 @@ const REQUIRED_CODEX_PATH_ENTRIES: &[&str] = &[
     "/sbin",
 ];
 const ATOMIC_WRITE_MAX_TEMP_ATTEMPTS: usize = 32;
+const SQLITE_STATE_RUNTIMES_DIR: &str = "sqlite-state-runtimes";
+const SQLITE_STATE_OWNER_HASH_CHARS: usize = 16;
 
 static ATOMIC_WRITE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -127,6 +130,15 @@ pub enum CodexToolProfile {
 }
 
 impl CodexToolProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::ConfiguredMcpOnly => "configured_mcp_only",
+            Self::RestrictedMcpOnly => "restricted_mcp_only",
+            Self::NoTools => "no_tools",
+        }
+    }
+
     fn config_overrides(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
@@ -183,6 +195,10 @@ pub struct CodexAppServerOptions<'a> {
     pub bypass_approvals_and_sandbox: bool,
     pub resume_session_id: Option<&'a str>,
     pub ephemeral: bool,
+    /// Stable logical owner for persistent state, or a diagnostic owner for an
+    /// ephemeral per-process state directory. This must never be shared by
+    /// concurrently running persistent app-server processes.
+    pub state_owner_id: &'a str,
     pub tool_profile: CodexToolProfile,
     pub scoped_user_id: Option<&'a str>,
     pub current_conversation_id: Option<&'a str>,
@@ -240,6 +256,37 @@ pub struct RunningCodexAppServer {
     stdout_task: JoinHandle<Result<(), String>>,
     stderr_task: JoinHandle<Result<String, std::io::Error>>,
     completion: Arc<Mutex<Option<TurnCompletion>>>,
+    sqlite_state: CodexSqliteStateLease,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum CodexSqliteStatePersistence {
+    Ephemeral,
+    Persistent,
+}
+
+impl CodexSqliteStatePersistence {
+    fn from_ephemeral(ephemeral: bool) -> Self {
+        if ephemeral {
+            Self::Ephemeral
+        } else {
+            Self::Persistent
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ephemeral => "ephemeral",
+            Self::Persistent => "persistent",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CodexSqliteStateLease {
+    home: PathBuf,
+    owner_hash: String,
+    persistence: CodexSqliteStatePersistence,
 }
 
 #[derive(Clone)]
@@ -577,8 +624,85 @@ pub fn app_server_generated_images_dir(profile: CodexToolProfile) -> Result<Path
     Ok(app_server_codex_home(profile)?.join("generated_images"))
 }
 
-fn app_server_sqlite_home(target_home: &Path) -> PathBuf {
-    target_home.join("sqlite-state")
+impl CodexSqliteStateLease {
+    fn create(
+        target_home: &Path,
+        owner_id: &str,
+        persistence: CodexSqliteStatePersistence,
+    ) -> Result<Self, String> {
+        Self::create_with_instance_id(
+            target_home,
+            owner_id,
+            persistence,
+            &uuid::Uuid::new_v4().simple().to_string(),
+        )
+    }
+
+    fn create_with_instance_id(
+        target_home: &Path,
+        owner_id: &str,
+        persistence: CodexSqliteStatePersistence,
+        instance_id: &str,
+    ) -> Result<Self, String> {
+        let owner_id = owner_id.trim();
+        if owner_id.is_empty() {
+            return Err("Codex SQLite state owner ID must not be empty".to_string());
+        }
+
+        let owner_hash = hex::encode(Sha256::digest(owner_id.as_bytes()))
+            .chars()
+            .take(SQLITE_STATE_OWNER_HASH_CHARS)
+            .collect::<String>();
+        let runtime_name = match persistence {
+            CodexSqliteStatePersistence::Ephemeral => {
+                if instance_id.trim().is_empty()
+                    || !instance_id
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                {
+                    return Err("Codex SQLite state instance ID is invalid".to_string());
+                }
+                format!("{owner_hash}-{instance_id}")
+            }
+            CodexSqliteStatePersistence::Persistent => owner_hash.clone(),
+        };
+        let home = target_home
+            .join(SQLITE_STATE_RUNTIMES_DIR)
+            .join(persistence.as_str())
+            .join(runtime_name);
+        ensure_directory(&home, "Codex app-server SQLite state runtime")?;
+
+        Ok(Self {
+            home,
+            owner_hash,
+            persistence,
+        })
+    }
+
+    fn cleanup(&self) {
+        if self.persistence != CodexSqliteStatePersistence::Ephemeral {
+            return;
+        }
+
+        match std::fs::remove_dir_all(&self.home) {
+            Ok(()) => tracing::debug!(
+                event = "codex.sqlite_state_runtime_cleaned",
+                sqlite_state_home = %self.home.display(),
+                sqlite_state_owner_hash = %self.owner_hash,
+                sqlite_state_persistence = self.persistence.as_str(),
+                "cleaned Codex SQLite state runtime"
+            ),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                event = "codex.sqlite_state_runtime_cleanup_failed",
+                sqlite_state_home = %self.home.display(),
+                sqlite_state_owner_hash = %self.owner_hash,
+                sqlite_state_persistence = self.persistence.as_str(),
+                error = %error,
+                "failed to clean Codex SQLite state runtime"
+            ),
+        }
+    }
 }
 
 fn restricted_runtime_working_dir() -> Result<PathBuf, String> {
@@ -611,8 +735,6 @@ fn prepare_codex_app_server_home(
     let source_home = default_codex_home()?;
     let target_home = app_server_codex_home(profile)?;
     ensure_directory(&target_home, "Codex app-server home")?;
-    let sqlite_home = app_server_sqlite_home(&target_home);
-    ensure_directory(&sqlite_home, "Codex app-server SQLite state home")?;
 
     let source_auth = source_home.join("auth.json");
     if !source_auth.is_file() {
@@ -646,7 +768,7 @@ fn prepare_codex_app_server_home(
         })?;
     }
 
-    let config = build_app_server_config(&source_home, &sqlite_home, agentic_mcp_command, profile)?;
+    let config = build_app_server_config(&source_home, agentic_mcp_command, profile)?;
     write_file_atomically(
         &target_home.join("config.toml"),
         &config,
@@ -881,7 +1003,6 @@ fn ensure_directory(path: &Path, label: &str) -> Result<(), String> {
 
 fn build_app_server_config(
     source_home: &Path,
-    sqlite_home: &Path,
     agentic_mcp_command: &Path,
     profile: CodexToolProfile,
 ) -> Result<String, String> {
@@ -898,11 +1019,6 @@ fn build_app_server_config(
         "web_search".to_string(),
         toml::Value::String("disabled".to_string()),
     );
-    root.insert(
-        "sqlite_home".to_string(),
-        toml::Value::String(sqlite_home.to_string_lossy().to_string()),
-    );
-
     if profile != CodexToolProfile::NoTools {
         let mut agentic_mcp = source_agentic_mcp_table(source_home)?.unwrap_or_default();
         // The API runs Codex app-server turns unattended. User-facing approval
@@ -985,6 +1101,7 @@ fn build_codex_app_server_command(
     options: &CodexAppServerOptions<'_>,
     agentic_mcp_command: &Path,
     codex_home: &Path,
+    sqlite_home: &Path,
 ) -> Result<StdCommand, String> {
     let working_dir = effective_working_dir(options)?;
     let mut command = StdCommand::new("codex");
@@ -1002,7 +1119,12 @@ fn build_codex_app_server_command(
         .arg("--listen")
         .arg("stdio://")
         .arg("-c")
-        .arg("forced_login_method=\"chatgpt\"");
+        .arg("forced_login_method=\"chatgpt\"")
+        .arg("-c")
+        .arg(format!(
+            "sqlite_home={}",
+            config_string_literal(sqlite_home.to_string_lossy().as_ref())?
+        ));
 
     for trust_override in working_dir_trust_overrides(&working_dir)? {
         command.arg("-c").arg(trust_override);
@@ -1083,31 +1205,61 @@ pub async fn spawn_codex_app_server(
     let normalized_effort = normalize_reasoning_effort(options.reasoning_effort).to_string();
     let agentic_mcp_command = agentic_mcp_binary()?;
     let codex_home = prepare_codex_app_server_home(&agentic_mcp_command, options.tool_profile)?;
+    let sqlite_state = CodexSqliteStateLease::create(
+        &codex_home,
+        options.state_owner_id,
+        CodexSqliteStatePersistence::from_ephemeral(options.ephemeral),
+    )?;
     let working_dir = effective_working_dir(&options)?;
-    let mut command = Command::from(build_codex_app_server_command(
+    let mut command = match build_codex_app_server_command(
         &options,
         &agentic_mcp_command,
         &codex_home,
-    )?);
+        &sqlite_state.home,
+    ) {
+        Ok(command) => Command::from(command),
+        Err(error) => {
+            sqlite_state.cleanup();
+            return Err(error);
+        }
+    };
+
+    metrics::counter!(
+        "codex_sqlite_state_runtime_starts_total",
+        "profile" => options.tool_profile.as_str(),
+        "persistence" => sqlite_state.persistence.as_str()
+    )
+    .increment(1);
 
     tracing::info!(
-        "[CODEX] Launching app-server: cwd={}, codex_home={}, model={}, effort={}, sandbox={}, profile={:?}, mcp_servers={:?}, disabled_features={:?}",
-        working_dir.display(),
-        codex_home.display(),
-        resolve_codex_model(options.model),
-        normalized_effort,
-        effective_sandbox(&options).as_app_server_sandbox(),
-        options.tool_profile,
-        ["agentic-mcp"],
-        options.tool_profile.disabled_features(),
+        event = "codex.app_server_launching",
+        cwd = %working_dir.display(),
+        codex_home = %codex_home.display(),
+        sqlite_state_home = %sqlite_state.home.display(),
+        sqlite_state_owner_hash = %sqlite_state.owner_hash,
+        sqlite_state_persistence = sqlite_state.persistence.as_str(),
+        conversation_id = options.current_conversation_id.unwrap_or("none"),
+        model = resolve_codex_model(options.model),
+        effort = %normalized_effort,
+        sandbox = effective_sandbox(&options).as_app_server_sandbox(),
+        profile = options.tool_profile.as_str(),
+        mcp_servers = ?["agentic-mcp"],
+        disabled_features = ?options.tool_profile.disabled_features(),
+        "launching Codex app-server with an explicitly owned SQLite state runtime"
     );
 
-    let mut child = command
+    let mut child = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to start codex app-server: {e}"))?;
+    {
+        Ok(child) => child,
+        Err(error) => {
+            sqlite_state.cleanup();
+            return Err(format!("Failed to start codex app-server: {error}"));
+        }
+    };
 
     let stdin = child
         .stdin
@@ -1164,22 +1316,59 @@ pub async fn spawn_codex_app_server(
             stdout_task,
             stderr_task,
             completion,
+            sqlite_state,
         }),
         Ok(Err(e)) => {
-            Err(
+            let error =
                 finalize_failed_app_server_startup(e, &child, &stdin, stdout_task, stderr_task)
-                    .await,
-            )
+                    .await;
+            record_sqlite_state_startup_failure(&sqlite_state, options.tool_profile, &error);
+            sqlite_state.cleanup();
+            Err(error)
         }
-        Err(e) => Err(finalize_failed_app_server_startup(
-            format!("codex app-server startup task exited: {e}"),
-            &child,
-            &stdin,
-            stdout_task,
-            stderr_task,
-        )
-        .await),
+        Err(e) => {
+            let error = finalize_failed_app_server_startup(
+                format!("codex app-server startup task exited: {e}"),
+                &child,
+                &stdin,
+                stdout_task,
+                stderr_task,
+            )
+            .await;
+            record_sqlite_state_startup_failure(&sqlite_state, options.tool_profile, &error);
+            sqlite_state.cleanup();
+            Err(error)
+        }
     }
+}
+
+fn record_sqlite_state_startup_failure(
+    sqlite_state: &CodexSqliteStateLease,
+    profile: CodexToolProfile,
+    error: &str,
+) {
+    let failure_class = if error.contains("failed to initialize sqlite state runtime") {
+        "sqlite_init"
+    } else {
+        "app_server_startup"
+    };
+    metrics::counter!(
+        "codex_sqlite_state_runtime_start_failures_total",
+        "profile" => profile.as_str(),
+        "persistence" => sqlite_state.persistence.as_str(),
+        "failure_class" => failure_class
+    )
+    .increment(1);
+    tracing::error!(
+        event = "codex.sqlite_state_runtime_start_failed",
+        profile = profile.as_str(),
+        sqlite_state_home = %sqlite_state.home.display(),
+        sqlite_state_owner_hash = %sqlite_state.owner_hash,
+        sqlite_state_persistence = sqlite_state.persistence.as_str(),
+        failure_class,
+        error,
+        "Codex app-server failed while starting its explicitly owned SQLite state runtime"
+    );
 }
 
 async fn finalize_failed_app_server_startup(
@@ -1216,6 +1405,7 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, 
     let agentic_mcp_command = agentic_mcp_binary()?;
     let codex_home =
         prepare_codex_app_server_home(&agentic_mcp_command, CodexToolProfile::Default)?;
+    let state_owner_id = format!("account-rate-limits-{}", uuid::Uuid::new_v4());
     let options = CodexAppServerOptions {
         model: DEFAULT_CODEX_MODEL,
         reasoning_effort: "medium",
@@ -1226,21 +1416,32 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, 
         bypass_approvals_and_sandbox: false,
         resume_session_id: None,
         ephemeral: true,
+        state_owner_id: &state_owner_id,
         tool_profile: CodexToolProfile::Default,
         scoped_user_id: None,
         current_conversation_id: None,
         scoped_email_id: None,
         approved_mcp_tools: Vec::new(),
     };
+    let sqlite_state = CodexSqliteStateLease::create(
+        &codex_home,
+        options.state_owner_id,
+        CodexSqliteStatePersistence::Ephemeral,
+    )?;
     let mut command = Command::from(build_codex_app_server_command(
         &options,
         &agentic_mcp_command,
         &codex_home,
+        &sqlite_state.home,
     )?);
 
     tracing::info!(
-        "[CODEX] Reading account rate limits: codex_home={}",
-        codex_home.display()
+        event = "codex.account_rate_limits_starting",
+        codex_home = %codex_home.display(),
+        sqlite_state_home = %sqlite_state.home.display(),
+        sqlite_state_owner_hash = %sqlite_state.owner_hash,
+        sqlite_state_persistence = sqlite_state.persistence.as_str(),
+        "reading Codex account rate limits with an explicitly owned SQLite state runtime"
     );
 
     let mut child = command
@@ -1329,12 +1530,18 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, 
     close_stdin(&stdin).await;
     let _ = terminate_child_process(&child).await;
     let _ = child.lock().await.wait().await;
-    let stderr_text = stderr_task
+    let stderr_result = stderr_task
         .await
         .map_err(|e| format!("Failed joining app-server stderr reader: {e}"))?
-        .map_err(|e| format!("Failed reading app-server stderr: {e}"))?;
+        .map_err(|e| format!("Failed reading app-server stderr: {e}"));
+    sqlite_state.cleanup();
+    let stderr_text = stderr_result?;
 
-    result.map_err(|e| append_app_server_stderr(e, &stderr_text))
+    result.map_err(|e| {
+        let error = append_app_server_stderr(e, &stderr_text);
+        record_sqlite_state_startup_failure(&sqlite_state, CodexToolProfile::Default, &error);
+        error
+    })
 }
 
 fn effective_sandbox(options: &CodexAppServerOptions<'_>) -> CodexSandboxMode {
@@ -1750,33 +1957,45 @@ impl RunningCodexAppServer {
     }
 
     pub async fn wait(self) -> Result<CodexAppServerOutcome, String> {
-        let stdout_result = self
-            .stdout_task
-            .await
-            .map_err(|e| format!("Failed joining codex app-server stdout reader: {e}"))?;
-        stdout_result?;
-
-        let exit_status = {
-            let mut child = self.child.lock().await;
-            child
-                .wait()
+        let RunningCodexAppServer {
+            child,
+            stdin: _,
+            events: _,
+            stdout_task,
+            stderr_task,
+            completion,
+            sqlite_state,
+        } = self;
+        let result = async {
+            let stdout_result = stdout_task
                 .await
-                .map_err(|e| format!("Failed waiting for codex app-server: {e}"))?
-        };
+                .map_err(|e| format!("Failed joining codex app-server stdout reader: {e}"))?;
+            stdout_result?;
 
-        let stderr_text = self
-            .stderr_task
-            .await
-            .map_err(|e| format!("Failed joining codex app-server stderr reader: {e}"))?
-            .map_err(|e| format!("Failed reading codex app-server stderr: {e}"))?;
+            let exit_status = {
+                let mut child = child.lock().await;
+                child
+                    .wait()
+                    .await
+                    .map_err(|e| format!("Failed waiting for codex app-server: {e}"))?
+            };
 
-        let turn_completion = self.completion.lock().await.clone();
+            let stderr_text = stderr_task
+                .await
+                .map_err(|e| format!("Failed joining codex app-server stderr reader: {e}"))?
+                .map_err(|e| format!("Failed reading codex app-server stderr: {e}"))?;
 
-        Ok(CodexAppServerOutcome {
-            exit_status,
-            stderr_text,
-            turn_completion,
-        })
+            let turn_completion = completion.lock().await.clone();
+
+            Ok(CodexAppServerOutcome {
+                exit_status,
+                stderr_text,
+                turn_completion,
+            })
+        }
+        .await;
+        sqlite_state.cleanup();
+        result
     }
 }
 
@@ -1859,6 +2078,7 @@ async fn run_codex_text_with_profile(
     prompt: &str,
     tool_profile: CodexToolProfile,
 ) -> Result<String, String> {
+    let state_owner_id = format!("codex-text-{}", uuid::Uuid::new_v4());
     let mut running = spawn_codex_app_server(CodexAppServerOptions {
         model,
         reasoning_effort,
@@ -1869,6 +2089,7 @@ async fn run_codex_text_with_profile(
         bypass_approvals_and_sandbox: false,
         resume_session_id: None,
         ephemeral: true,
+        state_owner_id: &state_owner_id,
         tool_profile,
         scoped_user_id: None,
         current_conversation_id: None,
@@ -2160,9 +2381,10 @@ fn extract_dynamic_tool_result_text(item: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use std::sync::{Arc as StdArc, Barrier, Mutex as StdMutex};
     use std::thread;
 
     fn sample_app_server_options<'a>(
@@ -2178,6 +2400,7 @@ mod tests {
             bypass_approvals_and_sandbox: false,
             resume_session_id,
             ephemeral: true,
+            state_owner_id: "test-state-owner",
             tool_profile: CodexToolProfile::Default,
             scoped_user_id: None,
             current_conversation_id: None,
@@ -2249,6 +2472,82 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_ephemeral_app_servers_receive_distinct_sqlite_state_runtimes() {
+        const PROCESS_COUNT: usize = 32;
+        let root = unique_temp_path("codex-sqlite-runtime-ownership");
+        std::fs::create_dir_all(&root).expect("create root");
+        let barrier = StdArc::new(Barrier::new(PROCESS_COUNT));
+
+        let threads = (0..PROCESS_COUNT)
+            .map(|index| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    CodexSqliteStateLease::create_with_instance_id(
+                        &root,
+                        "queued-child-conversation",
+                        CodexSqliteStatePersistence::Ephemeral,
+                        &format!("instance-{index}"),
+                    )
+                    .expect("create isolated runtime")
+                })
+            })
+            .collect::<Vec<_>>();
+        let leases = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("join runtime allocator"))
+            .collect::<Vec<_>>();
+        let homes = leases
+            .iter()
+            .map(|lease| lease.home.clone())
+            .collect::<HashSet<_>>();
+
+        assert_eq!(homes.len(), PROCESS_COUNT);
+        assert!(homes.iter().all(|home| home.is_dir()));
+        assert!(homes
+            .iter()
+            .all(|home| home.starts_with(root.join(SQLITE_STATE_RUNTIMES_DIR).join("ephemeral"))));
+
+        for lease in leases {
+            lease.cleanup();
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn persistent_sqlite_state_runtime_is_stable_per_logical_owner() {
+        let root = unique_temp_path("codex-persistent-sqlite-runtime");
+        std::fs::create_dir_all(&root).expect("create root");
+        let first = CodexSqliteStateLease::create_with_instance_id(
+            &root,
+            "agent-run-1",
+            CodexSqliteStatePersistence::Persistent,
+            "ignored-1",
+        )
+        .expect("first persistent runtime");
+        let resumed = CodexSqliteStateLease::create_with_instance_id(
+            &root,
+            "agent-run-1",
+            CodexSqliteStatePersistence::Persistent,
+            "ignored-2",
+        )
+        .expect("resumed persistent runtime");
+        let other = CodexSqliteStateLease::create_with_instance_id(
+            &root,
+            "agent-run-2",
+            CodexSqliteStatePersistence::Persistent,
+            "ignored-3",
+        )
+        .expect("other persistent runtime");
+
+        assert_eq!(first.home, resumed.home);
+        assert_ne!(first.home, other.home);
+        assert_ne!(first.owner_hash, other.owner_hash);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn resolves_empty_model_to_gpt_5_6_sol() {
         assert_eq!(resolve_codex_model(""), "gpt-5.6-sol");
         assert_eq!(resolve_codex_model("gpt-5.6-sol"), "gpt-5.6-sol");
@@ -2312,6 +2611,7 @@ mod tests {
             &sample_app_server_options(None),
             Path::new("/tmp/agentic_mcp"),
             Path::new("/tmp/agentic_codex_home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
         )
         .expect("build command");
         let args = command_args(&command);
@@ -2320,6 +2620,9 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--listen"));
         assert!(args.iter().any(|arg| arg == "stdio://"));
         assert!(!args.iter().any(|arg| arg == "exec"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "sqlite_home=\"/tmp/agentic-codex-sqlite\""));
         assert_eq!(command_env(&command, "RUST_LOG").as_deref(), Some("warn"));
         assert!(command_removes_env(&command, "EXA_API_KEY"));
     }
@@ -2333,6 +2636,7 @@ mod tests {
             &options,
             Path::new("/tmp/agentic_mcp"),
             Path::new("/tmp/agentic_codex_home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
         )
         .expect("build command");
         let args = command_args(&command);
@@ -2388,17 +2692,13 @@ mod tests {
     fn no_tools_profile_omits_mcp_server_and_disables_shell_features() {
         let config = build_app_server_config(
             Path::new("/tmp/source-codex-home"),
-            Path::new("/tmp/agentic-codex-sqlite"),
             Path::new("/tmp/agentic_mcp"),
             CodexToolProfile::NoTools,
         )
         .expect("build config");
         let parsed: toml::Value = toml::from_str(&config).expect("parse config");
         assert!(parsed.get("mcp_servers").is_none());
-        assert_eq!(
-            parsed.get("sqlite_home").and_then(|value| value.as_str()),
-            Some("/tmp/agentic-codex-sqlite")
-        );
+        assert!(parsed.get("sqlite_home").is_none());
 
         let mut options = sample_app_server_options(None);
         options.tool_profile = CodexToolProfile::NoTools;
@@ -2406,6 +2706,7 @@ mod tests {
             &options,
             Path::new("/tmp/agentic_mcp"),
             Path::new("/tmp/agentic_codex_home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
         )
         .expect("build command");
         let args = command_args(&command);
@@ -2425,7 +2726,6 @@ mod tests {
     fn app_server_config_points_mcp_child_at_source_codex_home() {
         let config = build_app_server_config(
             Path::new("/tmp/source-codex-home"),
-            Path::new("/tmp/agentic-codex-sqlite"),
             Path::new("/tmp/agentic_mcp"),
             CodexToolProfile::Default,
         )
@@ -2447,10 +2747,7 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("/tmp/source-codex-home")
         );
-        assert_eq!(
-            parsed.get("sqlite_home").and_then(|value| value.as_str()),
-            Some("/tmp/agentic-codex-sqlite")
-        );
+        assert!(parsed.get("sqlite_home").is_none());
     }
 
     #[test]
@@ -2482,7 +2779,6 @@ approval_mode = "approve"
 
         let config = build_app_server_config(
             &source_home,
-            Path::new("/tmp/agentic-codex-sqlite"),
             Path::new("/tmp/agentic_mcp"),
             CodexToolProfile::RestrictedMcpOnly,
         )
@@ -2536,6 +2832,7 @@ approval_mode = "approve"
             &options,
             Path::new("/tmp/agentic_mcp"),
             Path::new("/tmp/agentic_codex_home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
         )
         .expect("build command");
         let args = command_args(&command);
@@ -2575,6 +2872,7 @@ approval_mode = "approve"
             &options,
             Path::new("/tmp/agentic_mcp"),
             Path::new("/tmp/agentic_codex_home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
         )
         .expect("build command");
         let args = command_args(&command);
@@ -2597,6 +2895,7 @@ approval_mode = "approve"
             &options,
             Path::new("/tmp/agentic_mcp"),
             Path::new("/tmp/agentic_codex_home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
         )
         .expect("build command");
         let args = command_args(&command);
@@ -2619,6 +2918,7 @@ approval_mode = "approve"
             &options,
             Path::new("/tmp/agentic_mcp"),
             Path::new("/tmp/agentic_codex_home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
         )
         .expect("build command");
         let args = command_args(&command);
@@ -2644,6 +2944,7 @@ approval_mode = "approve"
             &options,
             Path::new("/tmp/agentic_mcp"),
             Path::new("/tmp/agentic_codex_home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
         );
         let args = command_args(&command.expect("build command"));
 

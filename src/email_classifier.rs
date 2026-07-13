@@ -425,6 +425,7 @@ async fn run_scoped_classifier_turn(
     prompt: &str,
     email_id: i64,
 ) -> Result<ClassifierTurnOutput> {
+    let state_owner_id = format!("email-classifier-{email_id}");
     let mut turn = spawn_codex_app_server(CodexAppServerOptions {
         model: agent_type.model(),
         reasoning_effort: agent_type.effort(),
@@ -435,6 +436,7 @@ async fn run_scoped_classifier_turn(
         bypass_approvals_and_sandbox: false,
         resume_session_id: None,
         ephemeral: true,
+        state_owner_id: &state_owner_id,
         tool_profile: CodexToolProfile::ConfiguredMcpOnly,
         scoped_user_id: None,
         current_conversation_id: None,
