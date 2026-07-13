@@ -364,6 +364,7 @@ pub async fn get_email_stats(
 
 #[derive(Debug, Deserialize)]
 pub struct SendEmailRequest {
+    pub message_class: EmailMessageClass,
     pub to: Vec<String>,
     #[serde(default)]
     pub cc: Vec<String>,
@@ -391,6 +392,14 @@ pub struct SendEmailRequest {
     pub expected_response_notes: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmailMessageClass {
+    Transactional,
+    PersonalReply,
+    CommercialOutreach,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SendEmailResponse {
     pub message_id: String,
@@ -408,6 +417,22 @@ pub async fn send_email(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<SendEmailRequest>,
 ) -> Result<Json<SendEmailResponse>, (StatusCode, String)> {
+    if matches!(req.message_class, EmailMessageClass::CommercialOutreach) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "commercial_outreach is accepted only by the dedicated fail-closed outreach endpoint"
+                .to_string(),
+        ));
+    }
+    if matches!(req.message_class, EmailMessageClass::PersonalReply)
+        && req.in_reply_to.is_none()
+        && req.source_email_id.is_none()
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "personal_reply requires in_reply_to or source_email_id".to_string(),
+        ));
+    }
     if let Some(source_email_id) =
         resolve_source_email_id(&pool, req.source_email_id, req.in_reply_to.as_deref()).await?
     {
@@ -433,6 +458,11 @@ pub async fn send_email(
             body_html: req.body_html.clone(),
             reply_to: req.reply_to.clone(),
             in_reply_to: req.in_reply_to.clone(),
+            headers: Vec::new(),
+            ses_tags: Vec::new(),
+            required_configuration_set: None,
+            outreach_message_id: None,
+            outreach_recipient_hash: None,
         },
     )
     .await

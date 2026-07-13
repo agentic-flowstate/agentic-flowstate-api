@@ -510,6 +510,21 @@ async fn fetch_folder(
                             req.from_address
                         );
 
+                        if let Err(error) = crate::inbound_outreach::process_inbound_outreach_email(
+                            db_pool,
+                            &stored_email,
+                            "email_fetcher",
+                        )
+                        .await
+                        {
+                            crate::inbound_outreach::fail_closed_on_processing_error(
+                                db_pool,
+                                stored_email.id,
+                                &error,
+                            )
+                            .await;
+                        }
+
                         let attachment_count = parsed.attachment_count();
                         if attachment_count > 0 {
                             let attachments_dir = dirs::home_dir()

@@ -45,6 +45,7 @@ pub mod meeting_transcription;
 pub mod meetings;
 pub mod memberships;
 pub mod ops_timeline;
+pub mod outreach;
 pub mod passkeys;
 pub mod quick_commands;
 pub mod quick_reference;

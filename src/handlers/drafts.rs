@@ -156,7 +156,18 @@ pub async fn send_draft(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<i64>,
+    Json(request): Json<SendDraftRequest>,
 ) -> Result<Json<SendDraftResponse>, (StatusCode, String)> {
+    if matches!(
+        request.message_class,
+        crate::handlers::emails::EmailMessageClass::CommercialOutreach
+    ) {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "commercial_outreach drafts must use the dedicated fail-closed outreach endpoint"
+                .to_string(),
+        ));
+    }
     // Get the draft
     let draft = drafts::get_draft_by_id(&pool, id)
         .await
@@ -202,6 +213,11 @@ pub async fn send_draft(
             )),
             reply_to: None,
             in_reply_to: None,
+            headers: Vec::new(),
+            ses_tags: Vec::new(),
+            required_configuration_set: None,
+            outreach_message_id: None,
+            outreach_recipient_hash: None,
         },
     )
     .await
@@ -360,6 +376,11 @@ pub async fn send_draft(
         provider_message_id,
         success: true,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendDraftRequest {
+    pub message_class: crate::handlers::emails::EmailMessageClass,
 }
 
 #[derive(Debug, Serialize)]

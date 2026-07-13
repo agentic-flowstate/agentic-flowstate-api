@@ -837,6 +837,24 @@ kind = "counter"
 contract_id = "C-OBS-005"
 labels = ["retention_class"]
 
+[[metrics]]
+name = "outreach_unsubscribe_requests_total"
+kind = "counter"
+contract_id = "C-OBS-005"
+labels = ["mechanism", "outcome"]
+
+[[metrics]]
+name = "outreach_unsubscribe_duration_ms"
+kind = "histogram"
+contract_id = "C-OBS-005"
+labels = ["mechanism", "outcome"]
+
+[[metrics]]
+name = "outreach_commercial_send_total"
+kind = "counter"
+contract_id = "C-OBS-005"
+labels = ["outcome"]
+
 [[spans]]
 name = "http.server.request"
 contract_id = "C-OBS-003"

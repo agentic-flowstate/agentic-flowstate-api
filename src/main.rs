@@ -12,10 +12,12 @@ mod email_threading;
 mod email_tracking_consumer;
 mod handlers;
 mod health_monitor;
+mod inbound_outreach;
 mod log_incident_triage;
 mod mcp_wrapper;
 mod models;
 mod observability;
+mod outreach_compliance;
 mod package_updates;
 mod rate_limiting;
 mod request_logger;
@@ -1043,7 +1045,12 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/leitner/progress",
             get(handlers::leitner_sync::latest_progress),
-        );
+        )
+        .route(
+            "/u/:token",
+            get(handlers::outreach::human_get).post(handlers::outreach::one_click_post),
+        )
+        .route("/u/:token/confirm", post(handlers::outreach::human_confirm));
 
     // Org-scoped routes (require valid session + org membership)
     let org_scoped_routes = Router::new()
@@ -1269,6 +1276,10 @@ async fn main() -> anyhow::Result<()> {
         // Email routes
         .route("/api/emails", get(handlers::list_emails))
         .route("/api/emails/send", post(handlers::send_email))
+        .route(
+            "/api/outreach/messages/:outreach_message_id/send",
+            post(handlers::outreach::send_commercial_message),
+        )
         .route("/api/emails/stats", get(handlers::get_email_stats))
         .route("/api/emails/search", get(handlers::search_emails))
         .route("/api/emails/archive", post(handlers::archive_emails))

@@ -101,7 +101,11 @@ fn detect_component(route: &str) -> &'static str {
         "auth"
     } else if route.starts_with("/api/agent-runs") || route.contains("/agent-runs") {
         "agent"
-    } else if route.starts_with("/api/email") || route.starts_with("/api/drafts") {
+    } else if route.starts_with("/api/email")
+        || route.starts_with("/api/drafts")
+        || route.starts_with("/api/outreach")
+        || route.starts_with("/u/")
+    {
         "email"
     } else if route.starts_with("/api/conversations")
         || route.starts_with("/api/dms")

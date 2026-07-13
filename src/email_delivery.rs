@@ -22,6 +22,19 @@ pub struct OutboundEmail {
     pub body_html: Option<String>,
     pub reply_to: Option<String>,
     pub in_reply_to: Option<String>,
+    /// Additional deterministic MIME headers. Header names and values are
+    /// validated against CR/LF injection before serialization.
+    pub headers: Vec<(String, String)>,
+    /// Opaque SES message tags. Recipient addresses and other PII are forbidden.
+    pub ses_tags: Vec<(String, String)>,
+    /// Fail unless the resolved mailbox uses this exact SES configuration set.
+    pub required_configuration_set: Option<String>,
+    /// Durable outreach reservation rechecked immediately before the SES SDK
+    /// submission call. Required whenever required_configuration_set is set.
+    pub outreach_message_id: Option<String>,
+    /// Keyed, non-PII recipient identifier used for the independent global
+    /// suppression authority recheck immediately before SES submission.
+    pub outreach_recipient_hash: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +57,9 @@ pub async fn send_outbound_email(
 
     match identity.account.outbound_transport.as_str() {
         "smtp" => {
+            if req.required_configuration_set.is_some() {
+                bail!("commercial outreach requires the approved SES configuration set");
+            }
             if identity.account.imap_host != PURELYMAIL_IMAP_HOST {
                 bail!(
                     "SMTP outbound transport is not configured for IMAP host '{}'",
@@ -60,13 +76,26 @@ pub async fn send_outbound_email(
             })
         }
         "ses" => {
+            if req.required_configuration_set.is_some()
+                && (req.outreach_message_id.is_none() || req.outreach_recipient_hash.is_none())
+            {
+                bail!("commercial outreach requires a durable reservation and recipient suppression key");
+            }
             let configuration_set = identity
                 .account
                 .ses_configuration_set
                 .clone()
                 .ok_or_else(|| anyhow!("SES configuration set is required for '{}'", req.from))?;
+            if let Some(required) = req.required_configuration_set.as_deref() {
+                if configuration_set != required {
+                    bail!(
+                        "SES configuration set '{}' does not match required commercial-outreach set",
+                        configuration_set
+                    );
+                }
+            }
             let provider_message_id =
-                send_ses_raw(&identity, req, &message_id, &configuration_set).await?;
+                send_ses_raw(pool, &identity, req, &message_id, &configuration_set).await?;
             Ok(DeliveryResult {
                 message_id,
                 provider: Some("ses".to_string()),
@@ -80,6 +109,7 @@ pub async fn send_outbound_email(
 }
 
 async fn send_ses_raw(
+    pool: &SqlitePool,
     identity: &ResolvedEmailIdentity,
     req: &OutboundEmail,
     message_id: &str,
@@ -106,11 +136,54 @@ async fn send_ses_raw(
         .raw(raw_message)
         .build();
 
+    let email_tags = req
+        .ses_tags
+        .iter()
+        .map(|(name, value)| {
+            validate_ses_tag(name, value)?;
+            aws_sdk_sesv2::types::MessageTag::builder()
+                .name(name)
+                .value(value)
+                .build()
+                .map_err(|error| anyhow!(error.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if let Some(outreach_message_id) = req.outreach_message_id.as_deref() {
+        let recipient_hash = req
+            .outreach_recipient_hash
+            .as_deref()
+            .ok_or_else(|| anyhow!("commercial outreach recipient suppression key is missing"))?;
+        let compliance_config = crate::outreach_compliance::OutreachComplianceConfig::from_env()
+            .context("final public suppression configuration recheck failed")?;
+        let registry = compliance_config
+            .load_registry()
+            .await
+            .context("final public suppression authority recheck failed")?;
+        if registry.is_suppressed(recipient_hash).await? {
+            bail!("final global public suppression recheck blocked SES submission");
+        }
+        let decision = ticketing_system::outreach::revalidate_reservation(
+            pool,
+            outreach_message_id,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .context("final commercial-outreach eligibility recheck failed")?;
+        if !decision.eligible {
+            bail!(
+                "final commercial-outreach eligibility recheck blocked SES submission: {}",
+                decision.reasons.join(", ")
+            );
+        }
+    }
+
     let result = ses_client
         .send_email()
         .from_email_address(&req.from)
         .configuration_set_name(configuration_set)
         .content(content)
+        .set_email_tags((!email_tags.is_empty()).then_some(email_tags))
         .send()
         .await
         .context("SES send failed")?;
@@ -213,6 +286,13 @@ fn build_raw_message(req: &OutboundEmail, message_id: &str) -> Result<Vec<u8>> {
     if let Some(reply_to) = &req.reply_to {
         builder = builder.header("Reply-To", mail_builder::headers::raw::Raw::new(reply_to));
     }
+    for (name, value) in &req.headers {
+        validate_mime_header(name, value)?;
+        builder = builder.header(
+            name.as_str(),
+            mail_builder::headers::raw::Raw::new(value.as_str()),
+        );
+    }
 
     match (&req.body_text, &req.body_html) {
         (Some(text), Some(html)) => {
@@ -234,6 +314,33 @@ fn build_raw_message(req: &OutboundEmail, message_id: &str) -> Result<Vec<u8>> {
     builder
         .write_to_vec()
         .map_err(|e| anyhow!("Failed to build MIME message: {}", e))
+}
+
+fn validate_mime_header(name: &str, value: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || value.contains('\r')
+        || value.contains('\n')
+    {
+        bail!("outbound MIME header is invalid");
+    }
+    Ok(())
+}
+
+fn validate_ses_tag(name: &str, value: &str) -> Result<()> {
+    let valid = |text: &str| {
+        !text.is_empty()
+            && text.len() <= 256
+            && text.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
+            })
+    };
+    if !valid(name) || !valid(value) {
+        bail!("SES message tag is invalid");
+    }
+    Ok(())
 }
 
 fn plain_text_email_html(body: &str) -> String {
@@ -330,4 +437,62 @@ where
         .context("Failed to finish SMTP data")?;
     writer.flush().await.context("Failed to flush SMTP data")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compliant_message() -> OutboundEmail {
+        OutboundEmail {
+            from: "Alex Lewis, BallotRadar <alex@ballotradar.com>".into(),
+            to: vec!["recipient@example.com".into()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "A truthful subject".into(),
+            body_text: Some("Advertisement — exact text footer".into()),
+            body_html: Some("<p>Advertisement — exact HTML footer</p>".into()),
+            reply_to: Some("alex@ballotradar.com".into()),
+            in_reply_to: None,
+            headers: vec![
+                (
+                    "List-Unsubscribe".into(),
+                    "<https://email.ballotradar.com/u/opaque>, <mailto:unsubscribe@ballotradar.com?subject=unsubscribe>".into(),
+                ),
+                (
+                    "List-Unsubscribe-Post".into(),
+                    "List-Unsubscribe=One-Click".into(),
+                ),
+            ],
+            ses_tags: vec![
+                ("MessageClass".into(), "commercial-outreach".into()),
+                ("outreach_message_id".into(), "OM-OPAQUE".into()),
+            ],
+            required_configuration_set: Some("outreach-reply-first".into()),
+            outreach_message_id: Some("OM-OPAQUE".into()),
+            outreach_recipient_hash: Some("recipient-hash".into()),
+        }
+    }
+
+    #[test]
+    fn raw_message_contains_rfc_8058_headers_exactly_once() {
+        let raw = build_raw_message(&compliant_message(), "<message-id@agentic-flowstate.local>")
+            .unwrap();
+        let raw = String::from_utf8(raw).unwrap();
+        assert_eq!(raw.matches("List-Unsubscribe:").count(), 1);
+        assert_eq!(raw.matches("List-Unsubscribe-Post:").count(), 1);
+        assert!(raw.contains("List-Unsubscribe=One-Click"));
+        assert!(raw.contains("mailto:unsubscribe@ballotradar.com"));
+    }
+
+    #[test]
+    fn custom_headers_and_ses_tags_reject_injection_or_pii_shaped_values() {
+        let mut message = compliant_message();
+        message.headers[0].1.push_str("\r\nBcc: victim@example.com");
+        assert!(build_raw_message(&message, "<id@example.com>").is_err());
+        assert!(validate_ses_tag("outreach_message_id", "OM-OPAQUE").is_ok());
+        assert!(validate_ses_tag("outreach_message_id", "person name").is_err());
+        assert!(validate_ses_tag("outreach_message_id", "person@example.com").is_err());
+        assert!(validate_ses_tag("outreach_message_id", "").is_err());
+    }
 }
