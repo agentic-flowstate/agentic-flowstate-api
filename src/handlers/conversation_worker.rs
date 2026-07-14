@@ -109,14 +109,13 @@ fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile
     match agent_type {
         AgentType::HomePlanner
         | AgentType::Polymarket
-        | AgentType::MeetingAgent
         | AgentType::ConversationEvaluator
         | AgentType::Feedback
         | AgentType::EmailClassifier => CodexToolProfile::ConfiguredMcpOnly,
         AgentType::ScopedWorkspace | AgentType::WorkspaceManager => {
             CodexToolProfile::RestrictedMcpOnly
         }
-        _ => CodexToolProfile::Default,
+        _ => CodexToolProfile::Worker,
     }
 }
 
@@ -133,7 +132,7 @@ fn codex_sandbox_policy_for_chat_agent(
         (
             CodexSandboxMode::DangerFullAccess,
             true,
-            CodexToolProfile::Default,
+            CodexToolProfile::Worker,
         )
     }
 }
@@ -4145,14 +4144,44 @@ async fn build_fable_system_prompt(
     if let Some(index) = messages.iter().rposition(|message| message.role == "user") {
         messages.remove(index);
     }
+    let messages = fable_recovery_history_messages(messages);
     if !messages.is_empty() {
         system_prompt.push_str("\n\n## Audited session recovery context\n\n");
         system_prompt.push_str(
-            "This is an explicitly approved replacement native session. Rehydrate from the compact canonical transcript below, preserve existing commitments, and continue without claiming that the prior native context survived.\n\n",
+            "This is an explicitly approved replacement native session. Rehydrate from the filtered canonical coordinator transcript below. Worker completion cards, wake envelopes, worker output, and coordinator responses to worker wakes are intentionally excluded. Preserve the remaining commitments and continue without claiming that the prior native context survived.\n\n",
         );
         append_conversation_history(&mut system_prompt, &messages);
     }
     Ok(system_prompt)
+}
+
+fn fable_recovery_history_messages(messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
+    let mut suppress_wake_response = false;
+    let mut filtered = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        if super::child_completion_status::is_child_completion_status_message(&message) {
+            continue;
+        }
+        if super::child_completion_status::is_coordinator_wake_message(&message) {
+            suppress_wake_response = true;
+            continue;
+        }
+        if message.role == "forwarded" {
+            continue;
+        }
+        if suppress_wake_response && message.role == "assistant" {
+            suppress_wake_response = false;
+            continue;
+        }
+        if suppress_wake_response && message.role == "user" {
+            suppress_wake_response = false;
+        }
+
+        filtered.push(message);
+    }
+
+    filtered
 }
 
 async fn fail_runtime_before_spawn(
@@ -4378,6 +4407,31 @@ fn format_attachment_prompt_line(
 mod fable_prompt_scope_tests {
     use super::*;
 
+    fn history_message(
+        index: i32,
+        role: &str,
+        content: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> ConversationMessage {
+        ConversationMessage {
+            id: format!("fable-history-{index}"),
+            conversation_id: "fable-conversation".to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            attachments: None,
+            metadata: metadata.map(|value| value.to_string()),
+            tool_call_summaries: None,
+            tool_call_summary_count: None,
+            tool_call_summary_limit: None,
+            tool_call_summaries_truncated: None,
+            content_blocks_truncated: None,
+            content_blocks: None,
+            assistant_turn_duration_seconds: None,
+            created_at: i64::from(index),
+            message_index: index,
+        }
+    }
+
     #[test]
     fn fable_wake_does_not_preload_the_global_project_manual() {
         let vars = parent_coordinator_prompt_vars(&AgentType::FableCoordinator, "alex")
@@ -4388,6 +4442,64 @@ mod fable_prompt_scope_tests {
             Some(FABLE_PROMPT_VERSION)
         );
         assert!(!vars.contains_key("AGENTS_MD"));
+    }
+
+    #[test]
+    fn fable_recovery_excludes_worker_cards_wakes_and_wake_responses() {
+        let orchestration_metadata = |orchestration: &str| {
+            serde_json::json!({
+                "origin": "agent_orchestrated",
+                "orchestration": orchestration,
+                "child_conversation_id": "child-1",
+                "child_title": "Worker",
+                "child_agent": "code-execution",
+                "child_terminal_status": "completed",
+            })
+        };
+        let messages = vec![
+            history_message(0, "user", "Keep this commitment.", None),
+            history_message(1, "assistant", "I will keep it.", None),
+            history_message(
+                2,
+                "assistant",
+                "Worker-derived domain summary must not be rehydrated.",
+                Some(orchestration_metadata("child_completion_status")),
+            ),
+            history_message(
+                3,
+                "user",
+                "Coordinator wake metadata envelope.",
+                Some(orchestration_metadata("coordinator_child_completion_wake")),
+            ),
+            history_message(
+                4,
+                "assistant",
+                "Prior coordinator synthesis of worker output must not be rehydrated.",
+                None,
+            ),
+            history_message(5, "forwarded", "Automatic domain context.", None),
+            history_message(6, "user", "Continue with the safe plan.", None),
+            history_message(7, "assistant", "Continuing safely.", None),
+        ];
+
+        let filtered = fable_recovery_history_messages(messages);
+        let ids = filtered
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec![
+                "fable-history-0",
+                "fable-history-1",
+                "fable-history-6",
+                "fable-history-7"
+            ]
+        );
+        assert!(filtered.iter().all(|message| {
+            !message.content.contains("domain") && !message.content.contains("worker output")
+        }));
     }
 }
 

@@ -19,40 +19,16 @@ pub const FABLE_MCP_PROFILE: &str = "fable-coordinator";
 pub const FABLE_BUILTIN_TOOLS: &[&str] = &["ToolSearch"];
 pub const FABLE_ALLOWED_MCP_TOOLS: &[&str] = &[
     "mcp__agentic-mcp__list_conversations",
-    "mcp__agentic-mcp__get_conversation",
-    "mcp__agentic-mcp__create_child_conversations",
+    "mcp__agentic-mcp__queue_worker_conversations",
+    "mcp__agentic-mcp__queue_research_follow_up",
+    "mcp__agentic-mcp__cancel_conversation_work",
+    "mcp__agentic-mcp__cancel_queued_conversation_turn",
+    "mcp__agentic-mcp__archive_conversation",
+    "mcp__agentic-mcp__get_worker_coordination_evidence",
     "mcp__agentic-mcp__get_conversation_processing_status",
-    "mcp__agentic-mcp__get_runner_queue_capacity",
-    "mcp__agentic-mcp__list_message_tool_calls",
-    "mcp__agentic-mcp__get_tool_call",
-    "mcp__agentic-mcp__get_child_agent_context",
-    "mcp__agentic-mcp__list_organizations",
-    "mcp__agentic-mcp__list_epics",
-    "mcp__agentic-mcp__get_epic",
-    "mcp__agentic-mcp__list_slices",
-    "mcp__agentic-mcp__get_slice",
-    "mcp__agentic-mcp__list_tickets",
-    "mcp__agentic-mcp__list_tickets_by_due_date",
     "mcp__agentic-mcp__get_ticket",
     "mcp__agentic-mcp__search_tickets",
     "mcp__agentic-mcp__ensure_work_ticket",
-    "mcp__agentic-mcp__create_slice_tickets",
-    "mcp__agentic-mcp__update_ticket",
-    "mcp__agentic-mcp__update_ticket_status",
-    "mcp__agentic-mcp__add_ticket_relationship",
-    "mcp__agentic-mcp__remove_ticket_relationship",
-    "mcp__agentic-mcp__attach_ticket_documentation",
-    "mcp__agentic-mcp__list_repos",
-    "mcp__agentic-mcp__get_repo",
-    "mcp__agentic-mcp__create_artifact",
-    "mcp__agentic-mcp__update_artifact",
-    "mcp__agentic-mcp__get_artifact",
-    "mcp__agentic-mcp__list_artifacts",
-    "mcp__agentic-mcp__search_artifacts",
-    "mcp__agentic-mcp__agent_broadcast_post",
-    "mcp__agentic-mcp__agent_broadcast_list",
-    "mcp__agentic-mcp__agent_broadcast_update",
-    "mcp__agentic-mcp__agent_broadcast_expire",
 ];
 
 #[derive(Debug, Clone)]
@@ -928,11 +904,14 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(allowed_tools.contains("ToolSearch"));
         assert_eq!(allowed_tools.len(), runtime_tools.len() + 1);
-        assert!(runtime_tools.contains("mcp__agentic-mcp__create_child_conversations"));
+        assert!(runtime_tools.contains("mcp__agentic-mcp__queue_worker_conversations"));
+        assert!(runtime_tools.contains("mcp__agentic-mcp__queue_research_follow_up"));
         assert!(!runtime_tools.iter().any(|tool| tool.contains('*')));
         for forbidden in [
             "laminarforge",
-            "research_",
+            "research_search",
+            "research_get_contents",
+            "research_crawl",
             "build",
             "deploy",
             "manage_service",
@@ -940,6 +919,11 @@ mod tests {
             "workspace_",
             "web_automation",
             "email",
+            "create_artifact",
+            "update_artifact",
+            "update_ticket",
+            "create_slice_tickets",
+            "agent_broadcast_",
         ] {
             assert!(
                 runtime_tools.iter().all(|tool| !tool.contains(forbidden)),

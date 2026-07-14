@@ -56,6 +56,10 @@ impl AgentsConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum AgentType {
     Planning,
+    /// One-shot implementation worker used by Fable for code and operational changes
+    CodeExecution,
+    /// One-shot worker that repairs versioned agent prompts, profiles, and tool contracts
+    AgentProfileMaintainer,
     Execution,
     Evaluation,
     ConversationEvaluator,
@@ -106,6 +110,8 @@ impl AgentType {
             // during the migration, but the runnable Agentic chat agent is full-access.
             "codex" => Some(AgentType::FullAccess),
             "full-access" => Some(AgentType::FullAccess),
+            "code-execution" => Some(AgentType::CodeExecution),
+            "agent-profile-maintainer" => Some(AgentType::AgentProfileMaintainer),
             "home-planner" => Some(AgentType::HomePlanner),
             "workspace-manager" => Some(AgentType::WorkspaceManager),
             "meeting-agent" => Some(AgentType::MeetingAgent),
@@ -122,6 +128,8 @@ impl AgentType {
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentType::Planning => "planning",
+            AgentType::CodeExecution => "code-execution",
+            AgentType::AgentProfileMaintainer => "agent-profile-maintainer",
             AgentType::Execution => "execution",
             AgentType::Evaluation => "evaluation",
             AgentType::ConversationEvaluator => "conversation-evaluator",
@@ -369,6 +377,35 @@ mod tests {
         );
         assert_eq!(AgentType::FableCoordinator.as_str(), "fable-coordinator");
         assert_eq!(AgentType::from_chat_agent_key("fable"), None);
+    }
+
+    #[test]
+    fn fable_worker_profiles_are_explicit_and_non_orchestrating() {
+        for (name, agent_type, prompt_file) in [
+            (
+                "code-execution",
+                AgentType::CodeExecution,
+                "code-execution.txt",
+            ),
+            (
+                "agent-profile-maintainer",
+                AgentType::AgentProfileMaintainer,
+                "agent-profile-maintainer.txt",
+            ),
+        ] {
+            let config = AgentsConfig::get()
+                .agents
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name} profile"));
+            assert_eq!(AgentType::from_chat_agent_key(name), Some(agent_type));
+            assert_eq!(config.prompt_file, prompt_file);
+            assert!(config.tools.iter().all(|tool| {
+                !tool.contains("create_child_conversations")
+                    && !tool.contains("create_multi_agent_conversation")
+                    && !tool.contains("queue_worker_conversations")
+                    && tool != "Task"
+            }));
+        }
     }
 
     const RESEARCH_CONTRACT: [&str; 3] = [

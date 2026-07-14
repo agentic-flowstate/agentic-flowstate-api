@@ -100,10 +100,37 @@
         "Read",
         "Glob",
         "Grep",
-        "Task",
         "mcp__agentic-mcp__research_search",
         "mcp__agentic-mcp__research_get_contents",
         "mcp__agentic-mcp__research_crawl"
+      ]
+    },
+    "code-execution": {
+      "model": "codex",
+      "effort": "xhigh",
+      "prompt_file": "code-execution.txt",
+      "tools": [
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "Glob",
+        "Grep",
+        "mcp__agentic-mcp__*"
+      ]
+    },
+    "agent-profile-maintainer": {
+      "model": "codex",
+      "effort": "xhigh",
+      "prompt_file": "agent-profile-maintainer.txt",
+      "tools": [
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "Glob",
+        "Grep",
+        "mcp__agentic-mcp__*"
       ]
     },
     "execution": {
@@ -117,7 +144,6 @@
         "Bash",
         "Glob",
         "Grep",
-        "Task",
         "mcp__agentic-mcp__*"
       ]
     },
@@ -129,8 +155,7 @@
         "Read",
         "Glob",
         "Grep",
-        "Bash",
-        "Task"
+        "Bash"
       ]
     },
     "conversation-evaluator": {
@@ -288,7 +313,6 @@
         "Bash",
         "Glob",
         "Grep",
-        "Task",
         "mcp__agentic-mcp__*"
       ]
     },
@@ -303,7 +327,6 @@
         "Bash",
         "Glob",
         "Grep",
-        "Task",
         "mcp__agentic-mcp__*"
       ]
     },
@@ -313,40 +336,16 @@
       "prompt_file": "fable-coordinator.txt",
       "tools": [
         "mcp__agentic-mcp__list_conversations",
-        "mcp__agentic-mcp__get_conversation",
-        "mcp__agentic-mcp__create_child_conversations",
+        "mcp__agentic-mcp__queue_worker_conversations",
+        "mcp__agentic-mcp__queue_research_follow_up",
+        "mcp__agentic-mcp__cancel_conversation_work",
+        "mcp__agentic-mcp__cancel_queued_conversation_turn",
+        "mcp__agentic-mcp__archive_conversation",
+        "mcp__agentic-mcp__get_worker_coordination_evidence",
         "mcp__agentic-mcp__get_conversation_processing_status",
-        "mcp__agentic-mcp__get_runner_queue_capacity",
-        "mcp__agentic-mcp__list_message_tool_calls",
-        "mcp__agentic-mcp__get_tool_call",
-        "mcp__agentic-mcp__get_child_agent_context",
-        "mcp__agentic-mcp__list_organizations",
-        "mcp__agentic-mcp__list_epics",
-        "mcp__agentic-mcp__get_epic",
-        "mcp__agentic-mcp__list_slices",
-        "mcp__agentic-mcp__get_slice",
-        "mcp__agentic-mcp__list_tickets",
-        "mcp__agentic-mcp__list_tickets_by_due_date",
         "mcp__agentic-mcp__get_ticket",
         "mcp__agentic-mcp__search_tickets",
-        "mcp__agentic-mcp__ensure_work_ticket",
-        "mcp__agentic-mcp__create_slice_tickets",
-        "mcp__agentic-mcp__update_ticket",
-        "mcp__agentic-mcp__update_ticket_status",
-        "mcp__agentic-mcp__add_ticket_relationship",
-        "mcp__agentic-mcp__remove_ticket_relationship",
-        "mcp__agentic-mcp__attach_ticket_documentation",
-        "mcp__agentic-mcp__list_repos",
-        "mcp__agentic-mcp__get_repo",
-        "mcp__agentic-mcp__create_artifact",
-        "mcp__agentic-mcp__update_artifact",
-        "mcp__agentic-mcp__get_artifact",
-        "mcp__agentic-mcp__list_artifacts",
-        "mcp__agentic-mcp__search_artifacts",
-        "mcp__agentic-mcp__agent_broadcast_post",
-        "mcp__agentic-mcp__agent_broadcast_list",
-        "mcp__agentic-mcp__agent_broadcast_update",
-        "mcp__agentic-mcp__agent_broadcast_expire"
+        "mcp__agentic-mcp__ensure_work_ticket"
       ]
     },
     "scoped-workspace": {
@@ -391,7 +390,6 @@
       "effort": "xhigh",
       "prompt_file": "dep-update-reviewer.txt",
       "tools": [
-        "Task",
         "mcp__agentic-mcp__list_epics",
         "mcp__agentic-mcp__list_slices",
         "mcp__agentic-mcp__list_tickets",

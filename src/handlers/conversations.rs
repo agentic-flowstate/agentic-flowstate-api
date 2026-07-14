@@ -1,3 +1,4 @@
+use anyhow::Context;
 use async_stream::stream;
 use axum::{
     extract::{Extension, Path, Query, State},
@@ -1363,6 +1364,8 @@ fn prepare_initial_child_turns(
                 handoff.prompt_json().map_err(internal_error)?,
             );
         }
+        add_file_backed_worker_prompt_vars(prompt_name, &mut prompt_vars)
+            .map_err(internal_error)?;
 
         child_batch_index += 1;
         let metadata = orchestrated_child_turn_metadata(
@@ -1482,6 +1485,23 @@ fn default_child_prompt_name(agent: &str) -> &str {
         "conversation-evaluator" => "conversation-evaluator-system",
         _ => agent,
     }
+}
+
+fn add_file_backed_worker_prompt_vars(
+    prompt_name: &str,
+    prompt_vars: &mut HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let prompt_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("_prompts")
+        .join(format!("{prompt_name}.txt"));
+    let prompt = std::fs::read_to_string(&prompt_path)
+        .with_context(|| format!("read worker prompt template {}", prompt_path.display()))?;
+    if prompt.contains("{{AGENTS_MD}}") {
+        let agents_md = std::fs::read_to_string("/Users/jarvisgpt/projects/AGENTS.md")
+            .context("read /Users/jarvisgpt/projects/AGENTS.md for worker prompt")?;
+        prompt_vars.insert("AGENTS_MD".to_string(), agents_md);
+    }
+    Ok(())
 }
 
 fn canonical_child_prompt_name(prompt_name: &str) -> &str {

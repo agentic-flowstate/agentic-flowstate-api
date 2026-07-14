@@ -27,6 +27,8 @@ const APP_SERVER_CLIENT_NAME: &str = "agentic_flowstate_api";
 const APP_SERVER_CLIENT_TITLE: &str = "Agentic Flowstate API";
 const APP_SERVER_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_APP_SERVER_RUST_LOG: &str = "warn";
+const CODEX_WORKER_MCP_PROFILE: &str = "codex-worker";
+const NON_ORCHESTRATING_WORKER_DISABLED_FEATURES: &[&str] = &["multi_agent", "multi_agent_v2"];
 const REQUIRED_CODEX_PATH_ENTRIES: &[&str] = &[
     "/opt/homebrew/opt/node@20/bin",
     "/opt/homebrew/bin",
@@ -124,6 +126,7 @@ impl CodexSandboxMode {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CodexToolProfile {
     Default,
+    Worker,
     ConfiguredMcpOnly,
     RestrictedMcpOnly,
     NoTools,
@@ -133,6 +136,7 @@ impl CodexToolProfile {
     fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Worker => "worker",
             Self::ConfiguredMcpOnly => "configured_mcp_only",
             Self::RestrictedMcpOnly => "restricted_mcp_only",
             Self::NoTools => "no_tools",
@@ -141,7 +145,7 @@ impl CodexToolProfile {
 
     fn config_overrides(self) -> &'static [&'static str] {
         match self {
-            Self::Default => &[],
+            Self::Default | Self::Worker => &[],
             Self::ConfiguredMcpOnly | Self::RestrictedMcpOnly | Self::NoTools => {
                 &["web_search=\"disabled\""]
             }
@@ -151,6 +155,7 @@ impl CodexToolProfile {
     fn disabled_features(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
+            Self::Worker => NON_ORCHESTRATING_WORKER_DISABLED_FEATURES,
             Self::ConfiguredMcpOnly | Self::RestrictedMcpOnly | Self::NoTools => {
                 RESTRICTED_MCP_ONLY_DISABLED_FEATURES
             }
@@ -563,7 +568,7 @@ fn default_codex_home() -> Result<PathBuf, String> {
 
 fn app_server_codex_home(profile: CodexToolProfile) -> Result<PathBuf, String> {
     match profile {
-        CodexToolProfile::Default => {
+        CodexToolProfile::Default | CodexToolProfile::Worker => {
             if let Some(home) = std::env::var_os("AGENTIC_CODEX_HOME") {
                 return Ok(PathBuf::from(home));
             }
@@ -721,7 +726,9 @@ fn restricted_runtime_working_dir() -> Result<PathBuf, String> {
 
 fn effective_working_dir(options: &CodexAppServerOptions<'_>) -> Result<PathBuf, String> {
     match options.tool_profile {
-        CodexToolProfile::Default => Ok(options.working_dir.to_path_buf()),
+        CodexToolProfile::Default | CodexToolProfile::Worker => {
+            Ok(options.working_dir.to_path_buf())
+        }
         CodexToolProfile::ConfiguredMcpOnly
         | CodexToolProfile::RestrictedMcpOnly
         | CodexToolProfile::NoTools => restricted_runtime_working_dir(),
@@ -751,7 +758,11 @@ fn prepare_codex_app_server_home(
 
     let source_agents = source_home.join("AGENTS.md");
     let target_agents = target_home.join("AGENTS.md");
-    if profile == CodexToolProfile::Default && source_agents.is_file() {
+    if matches!(
+        profile,
+        CodexToolProfile::Default | CodexToolProfile::Worker
+    ) && source_agents.is_file()
+    {
         std::fs::copy(&source_agents, target_home.join("AGENTS.md")).map_err(|e| {
             format!(
                 "Failed to copy Codex AGENTS.md from {} to {}: {e}",
@@ -759,7 +770,11 @@ fn prepare_codex_app_server_home(
                 target_home.join("AGENTS.md").display()
             )
         })?;
-    } else if profile != CodexToolProfile::Default && target_agents.exists() {
+    } else if !matches!(
+        profile,
+        CodexToolProfile::Default | CodexToolProfile::Worker
+    ) && target_agents.exists()
+    {
         std::fs::remove_file(&target_agents).map_err(|e| {
             format!(
                 "Failed to remove AGENTS.md from restricted Codex home at {}: {e}",
@@ -1163,17 +1178,30 @@ fn build_codex_app_server_command(
         }
     }
 
-    if options.tool_profile == CodexToolProfile::RestrictedMcpOnly {
-        if options.scoped_user_id.is_none() {
-            return Err(
-                "Restricted MCP profile requires scoped_user_id for tool enforcement".to_string(),
-            );
+    match options.tool_profile {
+        CodexToolProfile::Worker => {
+            command.arg("-c").arg(mcp_server_env_override(
+                "agentic-mcp",
+                "AGENTIC_MCP_PROFILE",
+                CODEX_WORKER_MCP_PROFILE,
+            )?);
         }
-        command.arg("-c").arg(mcp_server_env_override(
-            "agentic-mcp",
-            "AGENTIC_MCP_PROFILE",
-            "scoped-workspace",
-        )?);
+        CodexToolProfile::RestrictedMcpOnly => {
+            if options.scoped_user_id.is_none() {
+                return Err(
+                    "Restricted MCP profile requires scoped_user_id for tool enforcement"
+                        .to_string(),
+                );
+            }
+            command.arg("-c").arg(mcp_server_env_override(
+                "agentic-mcp",
+                "AGENTIC_MCP_PROFILE",
+                "scoped-workspace",
+            )?);
+        }
+        CodexToolProfile::Default
+        | CodexToolProfile::ConfiguredMcpOnly
+        | CodexToolProfile::NoTools => {}
     }
 
     for config_override in options.tool_profile.config_overrides() {
@@ -2932,6 +2960,31 @@ approval_mode = "approve"
             .any(|arg| arg == "mcp_servers.agentic-mcp.enabled_tools=[\"read_email_content\"]"));
         assert!(args.iter().any(|arg| {
             arg == "mcp_servers.agentic-mcp.tools.read_email_content.approval_mode=\"approve\""
+        }));
+    }
+
+    #[test]
+    fn worker_profile_disables_native_orchestration_and_scopes_mcp() {
+        let mut options = sample_app_server_options(None);
+        options.tool_profile = CodexToolProfile::Worker;
+        let command = build_codex_app_server_command(
+            &options,
+            Path::new("/tmp/agentic_mcp"),
+            Path::new("/tmp/agentic_codex_home"),
+            Path::new("/tmp/agentic-codex-sqlite"),
+        )
+        .expect("build command");
+        let args = command_args(&command);
+
+        for feature in ["multi_agent", "multi_agent_v2"] {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--disable" && pair[1] == feature),
+                "worker did not disable {feature}"
+            );
+        }
+        assert!(args.iter().any(|arg| {
+            arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_PROFILE=\"codex-worker\""
         }));
     }
 

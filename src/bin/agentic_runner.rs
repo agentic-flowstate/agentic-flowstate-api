@@ -877,6 +877,8 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
     match prompt_name {
         "codex" => Ok("full-access"),
         "full-access" => Ok("full-access"),
+        "code-execution" => Ok("code-execution"),
+        "agent-profile-maintainer" => Ok("agent-profile-maintainer"),
         "workspace-manager" => Ok("workspace-manager"),
         "scoped-workspace" => Ok("scoped-workspace"),
         "meeting-agent" => Ok("meeting-agent"),

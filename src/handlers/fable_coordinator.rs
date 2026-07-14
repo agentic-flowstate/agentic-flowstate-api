@@ -440,7 +440,10 @@ mod tests {
 
         let prompt = crate::agents::prompts::load_prompt(config.prompt_name, config.prompt_vars)
             .expect("render Fable coordinator prompt");
-        assert!(prompt.contains("Prompt version: fable-coordinator/v2"));
+        assert!(prompt.contains(&format!(
+            "Prompt version: {}",
+            fable_coordinator::FABLE_PROMPT_VERSION
+        )));
         assert!(!prompt.contains("{{AGENTS_MD}}"));
         assert!(!prompt.contains("Open HSV-2 therapeutics research"));
     }

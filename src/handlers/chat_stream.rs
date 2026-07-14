@@ -617,7 +617,40 @@ async fn authorize_conversation_turn(
                 &conv,
                 runtime == ChatRuntime::ClaudeCodeFable,
             )
-            .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response())
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response())?;
+
+            if conv.conversation_role == "sub_agent"
+                && !worker_profile_allows_follow_up(conv.agent.as_deref())
+            {
+                let prior_turn_count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM conversation_turn_jobs WHERE conversation_id = ?",
+                )
+                .bind(&conv.id)
+                .fetch_one(db)
+                .await
+                .map_err(|error| {
+                    tracing::error!(
+                        conversation_id = conv.id.as_str(),
+                        error = %error,
+                        "failed to enforce one-shot worker turn policy"
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to enforce worker turn policy".to_string(),
+                    )
+                        .into_response()
+                })?;
+                if prior_turn_count > 0 {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "This worker profile is one-shot. Queue a fresh Fable-managed worker instead of continuing this conversation."
+                            .to_string(),
+                    )
+                        .into_response());
+                }
+            }
+
+            Ok(())
         }
         Ok(Some(_)) | Ok(None) => {
             Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()).into_response())
@@ -636,6 +669,10 @@ async fn authorize_conversation_turn(
                 .into_response())
         }
     }
+}
+
+fn worker_profile_allows_follow_up(agent: Option<&str>) -> bool {
+    matches!(agent, Some("research" | "codebase-research"))
 }
 
 /// Submit a chat turn to the conversation worker and return immediately.
@@ -1405,6 +1442,18 @@ mod conversation_authorization_tests {
 
         sqlx::query(
             r#"
+            CREATE TABLE conversation_turn_jobs (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create conversation turn jobs");
+
+        sqlx::query(
+            r#"
             INSERT INTO conversations
                 (id, user_id, organization, agent, title, started_at, updated_at)
             VALUES
@@ -1475,6 +1524,55 @@ mod conversation_authorization_tests {
             "conv-alex",
             "alex",
             ChatRuntime::ClaudeCodeFable,
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_follow_up_turns_for_one_shot_workers() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "UPDATE conversations SET agent = 'code-execution', conversation_role = 'sub_agent' WHERE id = 'conv-alex'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_turn_jobs (id, conversation_id) VALUES ('job-1', 'conv-alex')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let response =
+            authorize_conversation_turn(&pool, "conv-alex", "alex", ChatRuntime::CodexAppServer)
+                .await
+                .expect_err("code workers must be one-shot");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn permits_follow_up_turns_for_research_workers() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            "UPDATE conversations SET agent = 'codebase-research', conversation_role = 'sub_agent' WHERE id = 'conv-alex'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_turn_jobs (id, conversation_id) VALUES ('job-1', 'conv-alex')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(authorize_conversation_turn(
+            &pool,
+            "conv-alex",
+            "alex",
+            ChatRuntime::CodexAppServer,
         )
         .await
         .is_ok());

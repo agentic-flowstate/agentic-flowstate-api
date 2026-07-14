@@ -137,7 +137,7 @@ async fn run_codex_agent_turn_inner(
         resume_session_id,
         ephemeral: !persist_session,
         state_owner_id: result_session_id,
-        tool_profile: CodexToolProfile::Default,
+        tool_profile: CodexToolProfile::Worker,
         scoped_user_id: None,
         current_conversation_id: None,
         scoped_email_id: None,

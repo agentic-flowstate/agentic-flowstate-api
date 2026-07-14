@@ -9,7 +9,7 @@ use crate::agents::claude_code::{FABLE_EFFORT, FABLE_MCP_PROFILE, FABLE_MODEL};
 pub const ALEX_USER_ID: &str = "alex";
 pub const FABLE_CONVERSATION_TYPE: &str = "fable_coordinator";
 pub const FABLE_AGENT: &str = "fable-coordinator";
-pub const FABLE_PROMPT_VERSION: &str = "fable-coordinator/v2";
+pub const FABLE_PROMPT_VERSION: &str = "fable-coordinator/v3";
 pub const FABLE_ORGANIZATION: &str = "agentic-flowstate";
 pub const FABLE_TITLE: &str = "Alex";
 
