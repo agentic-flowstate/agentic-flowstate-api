@@ -1,28 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
 
-use crate::agents::claude_code::ClaudeCodeTurnHandle;
 use crate::agents::codex_app_server::CodexAppServerTurnHandle;
-
-#[derive(Clone)]
-enum RuntimeTurnHandle {
-    Codex(CodexAppServerTurnHandle),
-    Fable(ClaudeCodeTurnHandle),
-}
-
-impl RuntimeTurnHandle {
-    async fn terminate(&self) -> Result<(), String> {
-        match self {
-            Self::Codex(handle) => handle.terminate().await,
-            Self::Fable(handle) => handle.terminate().await,
-        }
-    }
-}
 
 /// Manages live conversation runtimes and cancellation markers.
 pub struct ChatClientManager {
     runner_generation_id: String,
-    runtime_turns: Mutex<HashMap<String, RuntimeTurnHandle>>,
+    runtime_turns: Mutex<HashMap<String, CodexAppServerTurnHandle>>,
     cancelled_turns: Mutex<HashSet<String>>,
 }
 
@@ -50,16 +34,7 @@ impl ChatClientManager {
         turn_handle: CodexAppServerTurnHandle,
     ) {
         let mut turns = self.runtime_turns.lock().await;
-        turns.insert(conversation_id, RuntimeTurnHandle::Codex(turn_handle));
-    }
-
-    pub async fn insert_fable_turn(
-        &self,
-        conversation_id: String,
-        turn_handle: ClaudeCodeTurnHandle,
-    ) {
-        let mut turns = self.runtime_turns.lock().await;
-        turns.insert(conversation_id, RuntimeTurnHandle::Fable(turn_handle));
+        turns.insert(conversation_id, turn_handle);
     }
 
     /// Remove a live runtime subprocess handle after the turn ends.

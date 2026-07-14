@@ -1,13 +1,10 @@
-//! Anthropic Messages API 8-event streaming vocabulary.
+//! Agentic Flowstate's persisted conversation streaming vocabulary.
 //!
 //! This module defines the typed enum that represents the events emitted by
-//! Anthropic's streaming Messages API, along with the four `content_block_delta`
-//! sub-variants. Serde serialization is configured to produce byte-exact
+//! the API, along with the four `content_block_delta` sub-variants. Serde
+//! serialization is configured to produce deterministic
 //! wire-format frames: flat objects with a `type` field as the discriminator,
 //! nested `delta` object for block deltas, snake_case field names throughout.
-//!
-//! The event names come from Anthropic's public docs:
-//! <https://docs.anthropic.com/en/api/messages-streaming>
 //!
 //! - `message_start` — first frame: carries the skeleton `Message` (id, role,
 //!   model, empty `content`).
@@ -28,20 +25,19 @@
 //! - `ping` — keepalive, no semantic payload.
 //! - `error` — terminal error frame with an `error` object.
 //!
-//! The shape is deliberately identical to what the Anthropic SDK emits so any
-//! consumer that already parses Anthropic streams can read our persisted
-//! frames directly.
+//! This is an internal, provider-neutral protocol shared by the Rust API and
+//! native clients. Agent runtimes are adapted into these events before durable
+//! persistence so changing the runtime does not change reconnect behavior.
 
 use serde::{Deserialize, Serialize};
 
 /// The 8-event top-level streaming vocabulary.
 ///
 /// Serialized as a flat object with `type` tag — e.g.
-/// `{"type":"message_start","message":{...}}` — matching Anthropic's
-/// wire format exactly.
+/// `{"type":"message_start","message":{...}}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum AnthropicEvent {
+pub enum ConversationEvent {
     /// First frame of a message. Payload is a skeleton `Message` with empty
     /// `content` array.
     MessageStart { message: MessageStub },
@@ -60,7 +56,7 @@ pub enum AnthropicEvent {
     /// Top-level message fields changed (stop_reason, usage, ...).
     MessageDelta {
         delta: MessageDeltaBody,
-        /// Optional usage snapshot. Anthropic emits this on the terminal
+        /// Optional usage snapshot. The API emits this on the terminal
         /// `message_delta` right before `message_stop`.
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
@@ -69,7 +65,7 @@ pub enum AnthropicEvent {
     MessageStop,
     /// Transport keepalive.
     Ping,
-    /// Terminal error. Body is the Anthropic `{type, message}` error shape.
+    /// Terminal error with a stable `{type, message}` body.
     Error { error: ApiError },
     /// Synthetic resumption snapshot for a mid-stream content block
     /// (T-F8F986A9). Emitted by the resume stream replay path BEFORE
@@ -81,7 +77,7 @@ pub enum AnthropicEvent {
     /// replace its half-rendered local copy authoritatively without
     /// having to replay every delta frame it already saw.
     ///
-    /// Wire shape mirrors Anthropic's documented snapshot event:
+    /// Wire shape mirrors the protocol's documented snapshot event:
     /// `{"type":"content_block_snapshot","index":N,"block":{...}}`.
     ///
     /// The event is transport-only — it is NOT persisted to
@@ -95,27 +91,27 @@ pub enum AnthropicEvent {
     ContentBlockSnapshot { index: u32, block: ContentBlockStub },
 }
 
-impl AnthropicEvent {
-    /// The Anthropic event-type string used for the `event_type`
+impl ConversationEvent {
+    /// The conversation event-type string used for the `event_type`
     /// column in `conversation_events`.
     pub fn event_type(&self) -> &'static str {
         match self {
-            AnthropicEvent::MessageStart { .. } => "message_start",
-            AnthropicEvent::ContentBlockStart { .. } => "content_block_start",
-            AnthropicEvent::ContentBlockDelta { .. } => "content_block_delta",
-            AnthropicEvent::ContentBlockStop { .. } => "content_block_stop",
-            AnthropicEvent::MessageDelta { .. } => "message_delta",
-            AnthropicEvent::MessageStop => "message_stop",
-            AnthropicEvent::Ping => "ping",
-            AnthropicEvent::Error { .. } => "error",
-            AnthropicEvent::ContentBlockSnapshot { .. } => "content_block_snapshot",
+            ConversationEvent::MessageStart { .. } => "message_start",
+            ConversationEvent::ContentBlockStart { .. } => "content_block_start",
+            ConversationEvent::ContentBlockDelta { .. } => "content_block_delta",
+            ConversationEvent::ContentBlockStop { .. } => "content_block_stop",
+            ConversationEvent::MessageDelta { .. } => "message_delta",
+            ConversationEvent::MessageStop => "message_stop",
+            ConversationEvent::Ping => "ping",
+            ConversationEvent::Error { .. } => "error",
+            ConversationEvent::ContentBlockSnapshot { .. } => "content_block_snapshot",
         }
     }
 }
 
 /// Skeleton `Message` emitted inside `message_start`.
 ///
-/// Anthropic sends the full Message header with an empty `content` array;
+/// The API sends the full message header with an empty `content` array;
 /// the content is streamed via `content_block_*` frames. Fields that aren't
 /// known yet (`stop_reason`, `stop_sequence`) are null.
 ///
@@ -134,7 +130,7 @@ pub struct MessageStub {
     /// Always `"assistant"` — server-to-client stream only carries assistant
     /// messages.
     pub role: String,
-    /// Model identifier (e.g., `"gpt-5.5"`). Optional because the previous SDK
+    /// Model identifier (e.g., `"gpt-5.5"`). Optional because the runtime adapter
     /// doesn't always surface it; we pass `None` when unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -157,7 +153,7 @@ pub struct MessageStub {
 
 impl MessageStub {
     /// Build a fresh `message_start` stub for an assistant message.
-    /// `model` can be `None` when the previous SDK doesn't surface the model id.
+    /// `model` can be `None` when the runtime adapter doesn't surface the model id.
     /// `client_id` defaults to `None`; use [`Self::with_client_id`] to
     /// attach the optimistic-echo reconciliation key (T-A819D36B).
     pub fn new_assistant(id: impl Into<String>, model: Option<String>) -> Self {
@@ -211,18 +207,18 @@ pub enum ContentBlockStub {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         signature: String,
     },
-    /// Tool-result block. In Anthropic's REST API this appears on USER
-    /// messages (the reply sent after a tool_use). the previous SDK surfaces the
+    /// Tool-result block. In the protocol's REST API this appears on USER
+    /// messages (the reply sent after a tool_use). The runtime adapter surfaces the
     /// result inline on the assistant stream as a separate Message with
     /// `role: "user"` content. We emit it as a `content_block_start`
     /// with the full result as initial content — no delta follow-ups.
     ToolResult {
         tool_use_id: String,
-        /// Inline text form of the result — the previous SDK flattens structured
+        /// Inline text form of the result — the runtime adapter flattens structured
         /// results into a JSON string before we see them.
         #[serde(default)]
         content: String,
-        /// Mirrors Anthropic's `is_error` flag on tool_result blocks.
+        /// Mirrors the protocol's `is_error` flag on tool_result blocks.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
@@ -246,7 +242,7 @@ pub enum ContentBlockDelta {
     SignatureDelta { signature: String },
 }
 
-/// Body of the top-level `message_delta` frame. Fields match Anthropic's
+/// Body of the top-level `message_delta` frame. Fields match the protocol's
 /// docs — any combination can be present. Only fields the server has
 /// learned about are serialized (others are skipped).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -257,7 +253,7 @@ pub struct MessageDeltaBody {
     pub stop_sequence: Option<String>,
 }
 
-/// Token-usage snapshot. Anthropic surfaces this on `message_start` (initial
+/// Token-usage snapshot. The API surfaces this on `message_start` (initial
 /// rate-limit bookkeeping) and on the terminal `message_delta` (final counts).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
@@ -271,7 +267,7 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
 }
 
-/// Body of an `error` frame. Anthropic uses
+/// Body of an `error` frame. The protocol uses
 /// `{"error":{"type":"overloaded_error","message":"..."}}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ApiError {
@@ -280,7 +276,7 @@ pub struct ApiError {
     pub message: String,
 }
 
-/// The valid Anthropic event-type strings, exposed as an array for tests
+/// The valid conversation event-type strings, exposed as an array for tests
 /// that want to enumerate the vocabulary. Consumed by the regression
 /// guard in `conversation_worker::streaming_persistence_tests` (pinned
 /// `ALLOWED_EVENT_TYPES`) and by the event-type round-trip test in this
@@ -306,10 +302,10 @@ mod tests {
     use serde_json::json;
 
     /// Byte-exact serialization: every variant round-trips through JSON and
-    /// the wire shape matches Anthropic's public Messages API documentation.
+    /// the wire shape matches the conversation protocol contract.
     #[test]
     fn message_start_wire_shape() {
-        let ev = AnthropicEvent::MessageStart {
+        let ev = ConversationEvent::MessageStart {
             message: MessageStub::new_assistant("msg_abc123", Some("gpt-5.5".to_string())),
         };
         let v = serde_json::to_value(&ev).unwrap();
@@ -326,7 +322,7 @@ mod tests {
                 }
             })
         );
-        let round: AnthropicEvent = serde_json::from_value(v).unwrap();
+        let round: ConversationEvent = serde_json::from_value(v).unwrap();
         assert_eq!(round, ev);
     }
 
@@ -335,7 +331,7 @@ mod tests {
     /// depends on for optimistic-echo reconciliation.
     #[test]
     fn message_start_with_client_id_wire_shape() {
-        let ev = AnthropicEvent::MessageStart {
+        let ev = ConversationEvent::MessageStart {
             message: MessageStub::new_assistant("msg_abc123", Some("gpt-5.5".to_string()))
                 .with_client_id(Some("test-abc-123".to_string())),
         };
@@ -355,13 +351,13 @@ mod tests {
             })
         );
         // Round-trip: deserialize preserves the client_id.
-        let round: AnthropicEvent = serde_json::from_value(v).unwrap();
+        let round: ConversationEvent = serde_json::from_value(v).unwrap();
         assert_eq!(round, ev);
     }
 
     #[test]
     fn message_start_without_client_id_skips_field() {
-        let ev = AnthropicEvent::MessageStart {
+        let ev = ConversationEvent::MessageStart {
             message: MessageStub::new_assistant("msg_abc123", None).with_client_id(None),
         };
         let v = serde_json::to_value(&ev).unwrap();
@@ -375,7 +371,7 @@ mod tests {
 
     #[test]
     fn content_block_start_text_wire_shape() {
-        let ev = AnthropicEvent::ContentBlockStart {
+        let ev = ConversationEvent::ContentBlockStart {
             index: 0,
             content_block: ContentBlockStub::Text {
                 text: String::new(),
@@ -394,7 +390,7 @@ mod tests {
 
     #[test]
     fn content_block_start_tool_use_wire_shape() {
-        let ev = AnthropicEvent::ContentBlockStart {
+        let ev = ConversationEvent::ContentBlockStart {
             index: 1,
             content_block: ContentBlockStub::ToolUse {
                 id: "toolu_01".to_string(),
@@ -420,7 +416,7 @@ mod tests {
 
     #[test]
     fn content_block_start_thinking_wire_shape() {
-        let ev = AnthropicEvent::ContentBlockStart {
+        let ev = ConversationEvent::ContentBlockStart {
             index: 0,
             content_block: ContentBlockStub::Thinking {
                 thinking: String::new(),
@@ -440,7 +436,7 @@ mod tests {
 
     #[test]
     fn content_block_delta_text_wire_shape() {
-        let ev = AnthropicEvent::ContentBlockDelta {
+        let ev = ConversationEvent::ContentBlockDelta {
             index: 0,
             delta: ContentBlockDelta::TextDelta {
                 text: "Hello".to_string(),
@@ -455,13 +451,13 @@ mod tests {
                 "delta": { "type": "text_delta", "text": "Hello" }
             })
         );
-        let round: AnthropicEvent = serde_json::from_value(v).unwrap();
+        let round: ConversationEvent = serde_json::from_value(v).unwrap();
         assert_eq!(round, ev);
     }
 
     #[test]
     fn content_block_delta_input_json_wire_shape() {
-        let ev = AnthropicEvent::ContentBlockDelta {
+        let ev = ConversationEvent::ContentBlockDelta {
             index: 1,
             delta: ContentBlockDelta::InputJsonDelta {
                 partial_json: "{\"location\":\"SF\"}".to_string(),
@@ -483,7 +479,7 @@ mod tests {
 
     #[test]
     fn content_block_delta_thinking_wire_shape() {
-        let ev = AnthropicEvent::ContentBlockDelta {
+        let ev = ConversationEvent::ContentBlockDelta {
             index: 0,
             delta: ContentBlockDelta::ThinkingDelta {
                 thinking: "Let me consider...".to_string(),
@@ -505,7 +501,7 @@ mod tests {
 
     #[test]
     fn content_block_delta_signature_wire_shape() {
-        let ev = AnthropicEvent::ContentBlockDelta {
+        let ev = ConversationEvent::ContentBlockDelta {
             index: 0,
             delta: ContentBlockDelta::SignatureDelta {
                 signature: "sig_abc".to_string(),
@@ -527,14 +523,14 @@ mod tests {
 
     #[test]
     fn content_block_stop_wire_shape() {
-        let ev = AnthropicEvent::ContentBlockStop { index: 2 };
+        let ev = ConversationEvent::ContentBlockStop { index: 2 };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v, json!({ "type": "content_block_stop", "index": 2 }));
     }
 
     #[test]
     fn message_delta_wire_shape() {
-        let ev = AnthropicEvent::MessageDelta {
+        let ev = ConversationEvent::MessageDelta {
             delta: MessageDeltaBody {
                 stop_reason: Some("end_turn".to_string()),
                 stop_sequence: None,
@@ -559,21 +555,21 @@ mod tests {
 
     #[test]
     fn message_stop_wire_shape() {
-        let ev = AnthropicEvent::MessageStop;
+        let ev = ConversationEvent::MessageStop;
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v, json!({ "type": "message_stop" }));
     }
 
     #[test]
     fn ping_wire_shape() {
-        let ev = AnthropicEvent::Ping;
+        let ev = ConversationEvent::Ping;
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v, json!({ "type": "ping" }));
     }
 
     #[test]
     fn error_wire_shape() {
-        let ev = AnthropicEvent::Error {
+        let ev = ConversationEvent::Error {
             error: ApiError {
                 error_type: "overloaded_error".to_string(),
                 message: "Overloaded".to_string(),
@@ -591,15 +587,15 @@ mod tests {
 
     #[test]
     fn event_type_string_matches_tag() {
-        let cases: &[(AnthropicEvent, &str)] = &[
+        let cases: &[(ConversationEvent, &str)] = &[
             (
-                AnthropicEvent::MessageStart {
+                ConversationEvent::MessageStart {
                     message: MessageStub::new_assistant("x", None),
                 },
                 "message_start",
             ),
             (
-                AnthropicEvent::ContentBlockStart {
+                ConversationEvent::ContentBlockStart {
                     index: 0,
                     content_block: ContentBlockStub::Text {
                         text: String::new(),
@@ -608,7 +604,7 @@ mod tests {
                 "content_block_start",
             ),
             (
-                AnthropicEvent::ContentBlockDelta {
+                ConversationEvent::ContentBlockDelta {
                     index: 0,
                     delta: ContentBlockDelta::TextDelta {
                         text: String::new(),
@@ -617,20 +613,20 @@ mod tests {
                 "content_block_delta",
             ),
             (
-                AnthropicEvent::ContentBlockStop { index: 0 },
+                ConversationEvent::ContentBlockStop { index: 0 },
                 "content_block_stop",
             ),
             (
-                AnthropicEvent::MessageDelta {
+                ConversationEvent::MessageDelta {
                     delta: MessageDeltaBody::default(),
                     usage: None,
                 },
                 "message_delta",
             ),
-            (AnthropicEvent::MessageStop, "message_stop"),
-            (AnthropicEvent::Ping, "ping"),
+            (ConversationEvent::MessageStop, "message_stop"),
+            (ConversationEvent::Ping, "ping"),
             (
-                AnthropicEvent::Error {
+                ConversationEvent::Error {
                     error: ApiError {
                         error_type: "x".into(),
                         message: "y".into(),

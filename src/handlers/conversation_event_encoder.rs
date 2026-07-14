@@ -1,30 +1,24 @@
-//! Encode internal [`StreamEvent`]s into the Anthropic Messages API
-//! streaming vocabulary.
+//! Encode internal [`StreamEvent`]s into Agentic Flowstate's durable
+//! conversation streaming vocabulary.
 //!
 //! ## Why this module exists
 //!
-//! the previous SDK (the runtime SDK we consume) does NOT expose the raw
-//! Anthropic SSE wire — it hands the application a `Message` enum
-//! (`User` / `Assistant` / `System` / `Result`) whose `Assistant` variant
-//! carries already-materialized `ContentBlock`s. Our `AgentExecutor`
-//! flattens that further into `StreamEvent` (`Text`, `ToolUse`,
-//! `Thinking`, `Result`, ...) so the rest of the worker can operate on a
-//! simple enum.
+//! Codex app-server emits runtime-specific thread, item, tool, and turn events.
+//! The conversation worker normalizes those into `StreamEvent` values so the
+//! persistence and native-client layers stay independent of the model runtime.
 //!
-//! Persistence and the live SSE wire, however, speak the Anthropic 8-event
+//! Persistence and the live SSE wire speak the internal 8-event
 //! vocabulary (`message_start` / `content_block_start` /
 //! `content_block_delta` / `content_block_stop` / `message_delta` /
 //! `message_stop` / `ping` / `error`). This module is the single bridge
-//! that reconstructs that vocabulary from the previous SDK's shape. It is NOT a
-//! legacy compatibility layer — there is no other vocabulary on the wire,
-//! no feature flag, no alternate writer. The encoder is a structural
-//! consequence of the previous SDK's API shape.
+//! that constructs that vocabulary. There is no alternate writer or
+//! provider-specific transport path.
 //!
 //! ## Mapping rules
 //!
-//! the previous SDK reports text/thinking/tool_use/tool_result content blocks on an
-//! assistant turn, terminated by a `Result`. We model the turn as a single
-//! Anthropic message:
+//! The runtime adapter reports text, thinking, tool-use, and tool-result events
+//! on an assistant turn, terminated by a `Result`. We model the turn as one
+//! durable assistant message:
 //!
 //! ```text
 //! Status("running")              → (no wire event — worker-internal lifecycle)
@@ -49,12 +43,12 @@
 //! ```
 //!
 //! Router result, title/org updates, user messages, and `ReplayComplete`
-//! have no Anthropic equivalent. The encoder returns an empty frame list
+//! have no durable-stream equivalent. The encoder returns an empty frame list
 //! for them — they are simply not persisted and not broadcast on the wire.
 
-use crate::agents::anthropic_events::{
-    AnthropicEvent, ApiError, ContentBlockDelta, ContentBlockStub, MessageDeltaBody, MessageStub,
-    Usage,
+use crate::agents::conversation_events::{
+    ApiError, ContentBlockDelta, ContentBlockStub, ConversationEvent, MessageDeltaBody,
+    MessageStub, Usage,
 };
 use crate::agents::StreamEvent;
 
@@ -67,10 +61,10 @@ enum OpenBlock {
 }
 
 /// Stateful encoder. One instance per assistant turn. After the
-/// terminal `Result`/`Error` is emitted, call [`AnthropicEventEncoder::reset`]
+/// terminal `Result`/`Error` is emitted, call [`ConversationEventEncoder::reset`]
 /// (or drop the encoder and build a fresh one) before the next turn —
 /// otherwise message_start / content-block indices will leak across turns.
-pub struct AnthropicEventEncoder {
+pub struct ConversationEventEncoder {
     /// True after `message_start` has been emitted for the current turn.
     message_open: bool,
     /// Next content-block index to allocate.
@@ -101,7 +95,7 @@ pub struct AnthropicEventEncoder {
     pending_client_id: Option<String>,
 }
 
-impl AnthropicEventEncoder {
+impl ConversationEventEncoder {
     pub fn new(_conversation_id: &str) -> Self {
         Self {
             message_open: false,
@@ -135,7 +129,7 @@ impl AnthropicEventEncoder {
         self.pending_client_id = client_id;
     }
 
-    /// Return the `message_id` of the most-recently-opened Anthropic
+    /// Return the `message_id` of the most-recently-opened Conversation
     /// message (format `msg_<conv_short>_<n>`), or `None` if
     /// `message_start` has never been emitted for this encoder.
     ///
@@ -151,11 +145,11 @@ impl AnthropicEventEncoder {
     }
 
     /// Encode a single internal `StreamEvent` into the sequence of
-    /// Anthropic events that should be emitted on the wire.
+    /// Conversation events that should be emitted on the wire.
     ///
-    /// Returns an empty `Vec` for events that have no Anthropic
+    /// Returns an empty `Vec` for events that have no Conversation
     /// equivalent (router events, title updates, replay markers).
-    pub fn encode(&mut self, event: &StreamEvent) -> Vec<AnthropicEvent> {
+    pub fn encode(&mut self, event: &StreamEvent) -> Vec<ConversationEvent> {
         match event {
             StreamEvent::Text { content } => self.on_text(content),
             StreamEvent::Thinking { content } => self.on_thinking(content),
@@ -169,7 +163,7 @@ impl AnthropicEventEncoder {
                 status, is_error, ..
             } => self.on_result(status, *is_error),
             StreamEvent::Status { status, message } => self.on_status(status, message.as_deref()),
-            // Router + metadata events have no Anthropic equivalent —
+            // Router + metadata events have no conversation-protocol equivalent —
             // they are not persisted and not broadcast on the wire.
             StreamEvent::RouterResult { .. }
             | StreamEvent::UserMessage { .. }
@@ -179,7 +173,7 @@ impl AnthropicEventEncoder {
         }
     }
 
-    fn open_message_if_needed(&mut self, out: &mut Vec<AnthropicEvent>) {
+    fn open_message_if_needed(&mut self, out: &mut Vec<ConversationEvent>) {
         if !self.message_open {
             let id = self
                 .pending_message_id
@@ -191,7 +185,7 @@ impl AnthropicEventEncoder {
             // turn (shouldn't happen, but guard it) doesn't re-echo a
             // stale client_id.
             let client_id = self.pending_client_id.take();
-            out.push(AnthropicEvent::MessageStart {
+            out.push(ConversationEvent::MessageStart {
                 message: MessageStub::new_assistant(id, None).with_client_id(client_id),
             });
             self.message_open = true;
@@ -200,23 +194,23 @@ impl AnthropicEventEncoder {
         }
     }
 
-    fn close_open_block(&mut self, out: &mut Vec<AnthropicEvent>) {
+    fn close_open_block(&mut self, out: &mut Vec<ConversationEvent>) {
         if self.open_kind != OpenBlock::None {
-            out.push(AnthropicEvent::ContentBlockStop {
+            out.push(ConversationEvent::ContentBlockStop {
                 index: self.current_block_index,
             });
             self.open_kind = OpenBlock::None;
         }
     }
 
-    fn on_text(&mut self, content: &str) -> Vec<AnthropicEvent> {
+    fn on_text(&mut self, content: &str) -> Vec<ConversationEvent> {
         let mut out = Vec::with_capacity(3);
         self.open_message_if_needed(&mut out);
         if self.open_kind != OpenBlock::Text {
             self.close_open_block(&mut out);
             let idx = self.next_block_index;
             self.next_block_index += 1;
-            out.push(AnthropicEvent::ContentBlockStart {
+            out.push(ConversationEvent::ContentBlockStart {
                 index: idx,
                 content_block: ContentBlockStub::Text {
                     text: String::new(),
@@ -225,7 +219,7 @@ impl AnthropicEventEncoder {
             self.current_block_index = idx;
             self.open_kind = OpenBlock::Text;
         }
-        out.push(AnthropicEvent::ContentBlockDelta {
+        out.push(ConversationEvent::ContentBlockDelta {
             index: self.current_block_index,
             delta: ContentBlockDelta::TextDelta {
                 text: content.to_string(),
@@ -234,14 +228,14 @@ impl AnthropicEventEncoder {
         out
     }
 
-    fn on_thinking(&mut self, content: &str) -> Vec<AnthropicEvent> {
+    fn on_thinking(&mut self, content: &str) -> Vec<ConversationEvent> {
         let mut out = Vec::with_capacity(3);
         self.open_message_if_needed(&mut out);
         if self.open_kind != OpenBlock::Thinking {
             self.close_open_block(&mut out);
             let idx = self.next_block_index;
             self.next_block_index += 1;
-            out.push(AnthropicEvent::ContentBlockStart {
+            out.push(ConversationEvent::ContentBlockStart {
                 index: idx,
                 content_block: ContentBlockStub::Thinking {
                     thinking: String::new(),
@@ -251,7 +245,7 @@ impl AnthropicEventEncoder {
             self.current_block_index = idx;
             self.open_kind = OpenBlock::Thinking;
         }
-        out.push(AnthropicEvent::ContentBlockDelta {
+        out.push(ConversationEvent::ContentBlockDelta {
             index: self.current_block_index,
             delta: ContentBlockDelta::ThinkingDelta {
                 thinking: content.to_string(),
@@ -265,7 +259,7 @@ impl AnthropicEventEncoder {
         id: &str,
         name: &str,
         input: &serde_json::Value,
-    ) -> Vec<AnthropicEvent> {
+    ) -> Vec<ConversationEvent> {
         let mut out = Vec::with_capacity(4);
         self.open_message_if_needed(&mut out);
         self.close_open_block(&mut out);
@@ -275,8 +269,8 @@ impl AnthropicEventEncoder {
 
         // content_block_start opens with an empty input; the input is
         // streamed as an input_json_delta so downstream consumers that
-        // parse Anthropic's wire format get the exact shape they expect.
-        out.push(AnthropicEvent::ContentBlockStart {
+        // parse the protocol's wire format get the exact shape they expect.
+        out.push(ConversationEvent::ContentBlockStart {
             index: idx,
             content_block: ContentBlockStub::ToolUse {
                 id: id.to_string(),
@@ -284,14 +278,14 @@ impl AnthropicEventEncoder {
                 input: serde_json::json!({}),
             },
         });
-        // Serialize the input as a single input_json_delta — the previous SDK
+        // Serialize the input as a single input_json_delta — the runtime adapter
         // gives us the complete input atomically, so one frame is enough.
         let partial_json = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
-        out.push(AnthropicEvent::ContentBlockDelta {
+        out.push(ConversationEvent::ContentBlockDelta {
             index: idx,
             delta: ContentBlockDelta::InputJsonDelta { partial_json },
         });
-        out.push(AnthropicEvent::ContentBlockStop { index: idx });
+        out.push(ConversationEvent::ContentBlockStop { index: idx });
 
         // Tool-use blocks are self-contained — the block is closed
         // before we move on. Leave `open_kind = None` so the next event
@@ -305,14 +299,14 @@ impl AnthropicEventEncoder {
         tool_use_id: &str,
         content: &str,
         is_error: bool,
-    ) -> Vec<AnthropicEvent> {
+    ) -> Vec<ConversationEvent> {
         let mut out = Vec::with_capacity(3);
         self.open_message_if_needed(&mut out);
         self.close_open_block(&mut out);
 
         let idx = self.next_block_index;
         self.next_block_index += 1;
-        out.push(AnthropicEvent::ContentBlockStart {
+        out.push(ConversationEvent::ContentBlockStart {
             index: idx,
             content_block: ContentBlockStub::ToolResult {
                 tool_use_id: tool_use_id.to_string(),
@@ -320,19 +314,19 @@ impl AnthropicEventEncoder {
                 is_error,
             },
         });
-        out.push(AnthropicEvent::ContentBlockStop { index: idx });
+        out.push(ConversationEvent::ContentBlockStop { index: idx });
 
         self.open_kind = OpenBlock::None;
         out
     }
 
-    fn on_result(&mut self, status: &str, is_error: bool) -> Vec<AnthropicEvent> {
+    fn on_result(&mut self, status: &str, is_error: bool) -> Vec<ConversationEvent> {
         let mut out = Vec::with_capacity(3);
         self.close_open_block(&mut out);
         if !self.message_open {
-            // the previous SDK can fire Result without any preceding content (e.g.,
+            // the runtime adapter can fire Result without any preceding content (e.g.,
             // an empty error turn). Open+close the message anyway so the
-            // Anthropic stream remains well-formed.
+            // Conversation stream remains well-formed.
             self.open_message_if_needed(&mut out);
         }
         let stop_reason = if is_error {
@@ -345,45 +339,45 @@ impl AnthropicEventEncoder {
                 other => other.to_string(),
             }
         };
-        out.push(AnthropicEvent::MessageDelta {
+        out.push(ConversationEvent::MessageDelta {
             delta: MessageDeltaBody {
                 stop_reason: Some(stop_reason),
                 stop_sequence: None,
             },
             usage: None,
         });
-        out.push(AnthropicEvent::MessageStop);
+        out.push(ConversationEvent::MessageStop);
         self.message_open = false;
         self.next_block_index = 0;
         self.open_kind = OpenBlock::None;
         out
     }
 
-    fn on_status(&mut self, status: &str, message: Option<&str>) -> Vec<AnthropicEvent> {
+    fn on_status(&mut self, status: &str, message: Option<&str>) -> Vec<ConversationEvent> {
         match status {
-            // Heartbeats map cleanly to Anthropic's `ping` frame.
-            "heartbeat" => vec![AnthropicEvent::Ping],
+            // Heartbeats map cleanly to the protocol's `ping` frame.
+            "heartbeat" => vec![ConversationEvent::Ping],
             // Failure states become an `error` frame + a terminal
             // `message_stop` if a message was open.
             "failed" | "resume_failed" | "timeout" => {
                 let mut out = Vec::with_capacity(3);
                 self.close_open_block(&mut out);
-                out.push(AnthropicEvent::Error {
+                out.push(ConversationEvent::Error {
                     error: ApiError {
                         error_type: status.to_string(),
                         message: message.unwrap_or(status).to_string(),
                     },
                 });
                 if self.message_open {
-                    out.push(AnthropicEvent::MessageStop);
+                    out.push(ConversationEvent::MessageStop);
                     self.message_open = false;
                     self.next_block_index = 0;
                 }
                 out
             }
             // "running" / "completed" are worker-lifecycle markers, not
-            // Anthropic events. Completion maps to the on_result path
-            // when the previous SDK sends a proper Result — if we see a bare
+            // Conversation events. Completion maps to the on_result path
+            // when the runtime adapter sends a proper Result — if we see a bare
             // Status("completed") without a Result (e.g., the trailing
             // status after the stream ends cleanly), synthesize a
             // message_stop if a message is still open.
@@ -391,14 +385,14 @@ impl AnthropicEventEncoder {
                 if self.message_open {
                     let mut out = Vec::with_capacity(3);
                     self.close_open_block(&mut out);
-                    out.push(AnthropicEvent::MessageDelta {
+                    out.push(ConversationEvent::MessageDelta {
                         delta: MessageDeltaBody {
                             stop_reason: Some("end_turn".to_string()),
                             stop_sequence: None,
                         },
                         usage: None,
                     });
-                    out.push(AnthropicEvent::MessageStop);
+                    out.push(ConversationEvent::MessageStop);
                     self.message_open = false;
                     self.next_block_index = 0;
                     self.open_kind = OpenBlock::None;
@@ -416,17 +410,17 @@ impl AnthropicEventEncoder {
     /// StreamEvent::Status("heartbeat") — callers should prefer the
     /// Status path, but this exists for direct emission.
     #[allow(dead_code)]
-    pub fn ping() -> AnthropicEvent {
-        AnthropicEvent::Ping
+    pub fn ping() -> ConversationEvent {
+        ConversationEvent::Ping
     }
 
     /// Attach a final usage snapshot to a just-emitted `message_delta`.
-    /// The worker computes token usage from the previous SDK's `Result` metadata;
+    /// The worker computes token usage from the runtime adapter's `Result` metadata;
     /// this is a small helper so callers can override the `usage: None`
     /// we emit from `on_result`.
     #[allow(dead_code)]
-    pub fn with_usage(ev: &mut AnthropicEvent, usage: Usage) {
-        if let AnthropicEvent::MessageDelta { usage: u, .. } = ev {
+    pub fn with_usage(ev: &mut ConversationEvent, usage: Usage) {
+        if let ConversationEvent::MessageDelta { usage: u, .. } = ev {
             *u = Some(usage);
         }
     }
@@ -438,12 +432,12 @@ mod tests {
     use crate::agents::StreamEvent;
     use serde_json::json;
 
-    fn event_types(events: &[AnthropicEvent]) -> Vec<&'static str> {
+    fn event_types(events: &[ConversationEvent]) -> Vec<&'static str> {
         events.iter().map(|e| e.event_type()).collect()
     }
 
-    fn encoder_with_message_id(message_id: &str) -> AnthropicEventEncoder {
-        let mut tx = AnthropicEventEncoder::new("conv-test");
+    fn encoder_with_message_id(message_id: &str) -> ConversationEventEncoder {
+        let mut tx = ConversationEventEncoder::new("conv-test");
         tx.set_pending_message_id(message_id.to_string());
         tx
     }
@@ -508,7 +502,7 @@ mod tests {
         );
 
         // Verify the inner delta is input_json_delta with the serialized input
-        if let AnthropicEvent::ContentBlockDelta { delta, .. } = &all[2] {
+        if let ConversationEvent::ContentBlockDelta { delta, .. } = &all[2] {
             if let ContentBlockDelta::InputJsonDelta { partial_json } = delta {
                 let parsed: serde_json::Value = serde_json::from_str(partial_json).unwrap();
                 assert_eq!(parsed, json!({"q": "rust"}));
@@ -556,7 +550,7 @@ mod tests {
                 "message_stop",
             ]
         );
-        if let AnthropicEvent::ContentBlockDelta { delta, .. } = &all[2] {
+        if let ConversationEvent::ContentBlockDelta { delta, .. } = &all[2] {
             assert!(matches!(delta, ContentBlockDelta::ThinkingDelta { .. }));
         } else {
             panic!("expected thinking_delta");
@@ -565,7 +559,7 @@ mod tests {
 
     #[test]
     fn heartbeat_maps_to_ping() {
-        let mut tx = AnthropicEventEncoder::new("c");
+        let mut tx = ConversationEventEncoder::new("c");
         let out = tx.encode(&StreamEvent::Status {
             status: "heartbeat".into(),
             message: None,
@@ -575,7 +569,7 @@ mod tests {
 
     #[test]
     fn router_events_are_not_emitted_on_wire() {
-        let mut tx = AnthropicEventEncoder::new("c");
+        let mut tx = ConversationEventEncoder::new("c");
         assert!(tx
             .encode(&StreamEvent::RouterResult {
                 enriched_message: "x".into(),

@@ -45,7 +45,7 @@
 //!
 //! This is the same idempotency pattern Ably uses for their resumption
 //! snapshots — see research artifact A-18DB4221 (§ "Resume Token
-//! Security, Gap Detection") and Anthropic's Messages streaming docs
+//! Security, Gap Detection") and the protocol's Messages streaming docs
 //! on `content_block_snapshot`.
 //!
 //! ## What gets reconstructed
@@ -83,14 +83,14 @@ use serde::Deserialize;
 
 use ticketing_system::{conversations, SqlitePool};
 
-use crate::agents::anthropic_events::{AnthropicEvent, ContentBlockStub};
+use crate::agents::conversation_events::{ContentBlockStub, ConversationEvent};
 use crate::observability::contracts::assert_metric_labels;
 
 /// Counter: `content_block_snapshot` frames emitted by the resume
 /// handler. Labeled by `block_kind` so operators can chart whether
 /// clients are predominantly resuming mid-text (common — streaming
 /// assistant reply) vs mid-tool_use (rarer — tool_use arguments are
-/// atomic in the previous SDK, but the Anthropic vocabulary still streams
+/// atomic in the runtime adapter, but the conversation protocol still streams
 /// `input_json_delta`s).
 pub const METRIC_STREAM_SNAPSHOT_EMITTED: &str = "stream_snapshot_emitted_total";
 
@@ -108,7 +108,7 @@ pub enum ContentBlockKind {
 
 impl ContentBlockKind {
     /// Label value for the `block_kind` Prometheus label. Must match
-    /// Anthropic's canonical block type string so dashboards can join
+    /// the protocol's canonical block type string so dashboards can join
     /// against the `event_type` column analytics.
     pub fn as_label(self) -> &'static str {
         match self {
@@ -168,7 +168,7 @@ struct StoredBlockStart {
 }
 
 /// Shape of the `content_block` field inside a persisted start frame.
-/// The `type` discriminator matches Anthropic's wire format
+/// The `type` discriminator matches the protocol's wire format
 /// (`text` / `tool_use` / `thinking` / `tool_result`).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -205,11 +205,11 @@ struct StoredBlockDelta {
     delta: StoredDeltaBody,
 }
 
-/// The four delta sub-variants Anthropic defines. Matches
-/// [`crate::agents::anthropic_events::ContentBlockDelta`] but uses owned
+/// The four delta sub-variants Conversation defines. Matches
+/// [`crate::agents::conversation_events::ContentBlockDelta`] but uses owned
 /// strings without the `PartialEq` hop so deserialization is zero-copy
 /// friendly on large text deltas. Variant names intentionally carry the
-/// `Delta` suffix so they round-trip with Anthropic's wire-format
+/// `Delta` suffix so they round-trip with the protocol's wire-format
 /// discriminator (`text_delta`, `input_json_delta`, etc.).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -363,7 +363,7 @@ pub async fn reconstruct_state_up_to_cursor(
 
 /// Turn every [`ContentBlockState`] produced by
 /// [`reconstruct_state_up_to_cursor`] into an
-/// [`AnthropicEvent::ContentBlockSnapshot`]. One snapshot per unstopped
+/// [`ConversationEvent::ContentBlockSnapshot`]. One snapshot per unstopped
 /// block, preserving the block's index on the wire so clients can route
 /// each snapshot to the correct half-rendered UI element.
 ///
@@ -371,7 +371,7 @@ pub async fn reconstruct_state_up_to_cursor(
 /// `block_kind`, so operators can chart resume-snapshot volume per block
 /// type. The counter is incremented once per snapshot (not once per
 /// call).
-pub fn synthesize_snapshot_events(states: &[ContentBlockState]) -> Vec<AnthropicEvent> {
+pub fn synthesize_snapshot_events(states: &[ContentBlockState]) -> Vec<ConversationEvent> {
     let mut out = Vec::with_capacity(states.len());
     for state in states {
         let block = match state.kind {
@@ -410,7 +410,7 @@ pub fn synthesize_snapshot_events(states: &[ContentBlockState]) -> Vec<Anthropic
         )
         .increment(1);
 
-        out.push(AnthropicEvent::ContentBlockSnapshot {
+        out.push(ConversationEvent::ContentBlockSnapshot {
             index: state.index as u32,
             block,
         });
@@ -434,11 +434,11 @@ fn new_state_from_start(parsed: StoredBlockStart) -> ContentBlockState {
             stopped: false,
         },
         StoredBlockStub::ToolUse { id, name, input } => {
-            // the previous SDK fires `content_block_start` with `input: {}` and
+            // the runtime adapter fires `content_block_start` with `input: {}` and
             // streams the payload via `input_json_delta`. We still seed
             // `accumulated_input_json` from any non-empty `input` we see
             // on start — defensive against events that emit a non-empty
-            // input eagerly on start (some the previous SDK versions do this).
+            // input eagerly on start (some the runtime adapter versions do this).
             let seed = if matches!(input, serde_json::Value::Object(ref m) if m.is_empty()) {
                 String::new()
             } else {
@@ -797,7 +797,7 @@ mod tests {
         let events = synthesize_snapshot_events(&states);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            AnthropicEvent::ContentBlockSnapshot { index, block } => {
+            ConversationEvent::ContentBlockSnapshot { index, block } => {
                 assert_eq!(*index, 0);
                 match block {
                     ContentBlockStub::Text { text } => {
@@ -880,7 +880,7 @@ mod tests {
         let events = synthesize_snapshot_events(&states);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            AnthropicEvent::ContentBlockSnapshot { index, block } => {
+            ConversationEvent::ContentBlockSnapshot { index, block } => {
                 assert_eq!(*index, 0);
                 match block {
                     ContentBlockStub::ToolUse { id, name, input } => {
@@ -963,7 +963,7 @@ mod tests {
         let events = synthesize_snapshot_events(&states);
         assert_eq!(events.len(), 1);
         match &events[0] {
-            AnthropicEvent::ContentBlockSnapshot { index, block } => {
+            ConversationEvent::ContentBlockSnapshot { index, block } => {
                 assert_eq!(*index, 0);
                 match block {
                     ContentBlockStub::Thinking {

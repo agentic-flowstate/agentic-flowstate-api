@@ -11,19 +11,15 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use super::anthropic_event_encoder::AnthropicEventEncoder;
 use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::{
     get_broadcast_sender, remove_broadcast_channel, ChatAttachmentData, ChatConfig, ChatRuntime,
 };
-use crate::agents::claude_code::{
-    spawn_claude_code, verify_claude_subscription_auth, ClaudeCodeEvent, ClaudeCodeOptions,
-    ClaudeCodeOutcome, RunningClaudeCode,
-};
+use super::conversation_event_encoder::ConversationEventEncoder;
 use crate::agents::codex_app_server::{
-    app_server_generated_images_dir, spawn_codex_app_server, CodexAppServerEvent,
-    CodexAppServerOptions, CodexAppServerOutcome, CodexSandboxMode, CodexToolProfile,
-    RunningCodexAppServer,
+    app_server_generated_images_dir, spawn_codex_app_server, verify_codex_subscription_auth,
+    CodexAppServerEvent, CodexAppServerOptions, CodexAppServerOutcome, CodexSandboxMode,
+    CodexToolProfile, RunningCodexAppServer,
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
@@ -139,7 +135,6 @@ fn codex_sandbox_policy_for_chat_agent(
 
 enum RunningConversationTurn {
     Codex(RunningCodexAppServer),
-    Fable(RunningClaudeCode),
 }
 
 enum ConversationRuntimeEvent {
@@ -174,7 +169,6 @@ enum ConversationRuntimeEvent {
 
 enum ConversationTurnOutcome {
     Codex(CodexAppServerOutcome),
-    Fable(ClaudeCodeOutcome),
 }
 
 impl RunningConversationTurn {
@@ -211,39 +205,12 @@ impl RunningConversationTurn {
                     ConversationRuntimeEvent::TurnCompleted { usage }
                 }
             }),
-            Self::Fable(turn) => turn.events.recv().await.map(|event| match event {
-                ClaudeCodeEvent::SessionStarted { session_id } => {
-                    ConversationRuntimeEvent::SessionStarted { session_id }
-                }
-                ClaudeCodeEvent::AgentMessageDelta { id, text } => {
-                    ConversationRuntimeEvent::AgentMessageDelta { id, text }
-                }
-                ClaudeCodeEvent::ReasoningDelta { text } => {
-                    ConversationRuntimeEvent::ReasoningDelta { text }
-                }
-                ClaudeCodeEvent::ToolCallStarted { id, name, input } => {
-                    ConversationRuntimeEvent::ToolCallStarted { id, name, input }
-                }
-                ClaudeCodeEvent::ToolCallCompleted {
-                    id,
-                    content,
-                    is_error,
-                } => ConversationRuntimeEvent::ToolCallCompleted {
-                    id,
-                    content,
-                    is_error,
-                },
-                ClaudeCodeEvent::TurnCompleted { usage, .. } => {
-                    ConversationRuntimeEvent::TurnCompleted { usage }
-                }
-            }),
         }
     }
 
     async fn terminate(&self) -> Result<(), String> {
         match self {
             Self::Codex(turn) => turn.terminate().await,
-            Self::Fable(turn) => turn.terminate().await,
         }
     }
 
@@ -254,18 +221,12 @@ impl RunningConversationTurn {
                     .insert_codex_turn(conversation_id.to_string(), turn.turn_handle())
                     .await;
             }
-            Self::Fable(turn) => {
-                manager
-                    .insert_fable_turn(conversation_id.to_string(), turn.turn_handle())
-                    .await;
-            }
         }
     }
 
     async fn wait(self) -> Result<ConversationTurnOutcome, String> {
         match self {
             Self::Codex(turn) => turn.wait().await.map(ConversationTurnOutcome::Codex),
-            Self::Fable(turn) => turn.wait().await.map(ConversationTurnOutcome::Fable),
         }
     }
 }
@@ -274,21 +235,12 @@ impl ConversationTurnOutcome {
     fn success(&self) -> bool {
         match self {
             Self::Codex(outcome) => outcome.success(),
-            Self::Fable(outcome) => outcome.success(),
         }
     }
 
     fn failure_summary(&self) -> String {
         match self {
             Self::Codex(outcome) => outcome.failure_summary("Codex app-server"),
-            Self::Fable(outcome) => outcome.failure_summary(),
-        }
-    }
-
-    fn fable_duration_ms(&self) -> Option<u64> {
-        match self {
-            Self::Fable(outcome) => Some(outcome.duration_ms()),
-            Self::Codex(_) => None,
         }
     }
 }
@@ -305,7 +257,7 @@ pub struct WorkerMessage {
     pub completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Optional `Idempotency-Key` the client supplied on the HTTP POST
     /// that triggered this turn (T-A819D36B). Threaded from the handler
-    /// → [`WorkerMessage`] → [`AnthropicEventEncoder::set_pending_client_id`]
+    /// → [`WorkerMessage`] → [`ConversationEventEncoder::set_pending_client_id`]
     /// so the `message_start` SSE frame echoes it back as
     /// `message.client_id`. iOS's `MessageEchoService.reconcileServerMessageStart`
     /// matches on this value to lock its optimistic-echo row.
@@ -386,7 +338,7 @@ pub struct ConversationWorker {
     /// Maintains message / content-block lifecycle across emit_event calls.
     /// One encoder instance per worker — it survives the entire
     /// conversation and is reset between turns by the runtime result event.
-    encoder: AnthropicEventEncoder,
+    encoder: ConversationEventEncoder,
     /// User id for the turn currently being processed. Populated at the
     /// top of `process_message` from the inbound `WorkerMessage.user_id`
     /// and consumed by `emit_event` to fan out silent pushes on
@@ -406,7 +358,7 @@ impl ConversationWorker {
         manager: Arc<ChatClientManager>,
         message_rx: mpsc::Receiver<WorkerMessage>,
     ) -> Self {
-        let encoder = AnthropicEventEncoder::new(&conversation_id);
+        let encoder = ConversationEventEncoder::new(&conversation_id);
         Self {
             db,
             conversation_id,
@@ -1321,10 +1273,9 @@ impl ConversationWorker {
                     return;
                 }
             };
-        if let Err(error) = fable_coordinator::validate_runtime_assignment(
-            &conversation,
-            msg.config.runtime == ChatRuntime::ClaudeCodeFable,
-        ) {
+        let is_fable = msg.config.agent_type == AgentType::FableCoordinator;
+        if let Err(error) = fable_coordinator::validate_runtime_assignment(&conversation, is_fable)
+        {
             fail_runtime_before_spawn(
                 self,
                 &assistant_message_id,
@@ -1337,9 +1288,9 @@ impl ConversationWorker {
             return;
         }
 
-        let fable_session_plan = if msg.config.runtime == ChatRuntime::ClaudeCodeFable {
-            let prepared = match verify_claude_subscription_auth().await {
-                Ok(()) => fable_coordinator::prepare_session(&self.db, &self.conversation_id).await,
+        let fable_thread_plan = if is_fable {
+            let prepared = match verify_codex_subscription_auth().await {
+                Ok(()) => fable_coordinator::prepare_thread(&self.db, &self.conversation_id).await,
                 Err(error) => {
                     fable_observability::record_auth_failure("auth_invalid");
                     Err(anyhow::Error::msg(error))
@@ -1353,7 +1304,7 @@ impl ConversationWorker {
                         &assistant_message_id,
                         msg.message_metadata.as_deref(),
                         RuntimeFailurePhase::BuildRuntimePrompt,
-                        "Fable session preparation failed",
+                        "Fable Codex thread preparation failed",
                         error,
                     )
                     .await;
@@ -1364,22 +1315,19 @@ impl ConversationWorker {
             None
         };
 
-        let system_prompt_result = match msg.config.runtime {
-            ChatRuntime::CodexAppServer => {
-                build_codex_system_prompt(&self.db, &self.conversation_id, &msg.config).await
-            }
-            ChatRuntime::ClaudeCodeFable => {
-                build_fable_system_prompt(
-                    &self.db,
-                    &self.conversation_id,
-                    &assistant_message_id,
-                    &msg.config,
-                    fable_session_plan
-                        .as_ref()
-                        .is_some_and(|plan| plan.rehydrate_required),
-                )
-                .await
-            }
+        let system_prompt_result = if is_fable {
+            build_fable_system_prompt(
+                &self.db,
+                &self.conversation_id,
+                &assistant_message_id,
+                &msg.config,
+                fable_thread_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.rehydrate_required),
+            )
+            .await
+        } else {
+            build_codex_system_prompt(&self.db, &self.conversation_id, &msg.config).await
         };
         let system_prompt = match system_prompt_result {
             Ok(prompt) => prompt,
@@ -1440,19 +1388,38 @@ impl ConversationWorker {
 
         let (sandbox, bypass_approvals_and_sandbox, tool_profile) =
             codex_sandbox_policy_for_chat_agent(&msg.config.agent_type);
-        let generated_images_root = match msg.config.runtime {
-            ChatRuntime::CodexAppServer => match app_server_generated_images_dir(tool_profile) {
-                Ok(path) => Some(path),
-                Err(e) => {
-                    tracing::warn!(
-                        "[WORKER] Failed to resolve Codex generated images dir for {:?}: {}",
-                        tool_profile,
-                        e
-                    );
-                    None
-                }
-            },
-            ChatRuntime::ClaudeCodeFable => None,
+        if let Some(plan) = fable_thread_plan.as_ref() {
+            if let Err(error) = fable_coordinator::record_turn_started(
+                &self.db,
+                &self.conversation_id,
+                plan,
+                is_coordinator_wake_metadata(msg.message_metadata.as_deref()),
+            )
+            .await
+            {
+                let _ = agent_runners::finish_turn(&self.db, &runner_turn_id, "failed").await;
+                fail_runtime_before_spawn(
+                    self,
+                    &assistant_message_id,
+                    msg.message_metadata.as_deref(),
+                    RuntimeFailurePhase::SpawnRuntime,
+                    "Failed to persist Fable Codex turn start",
+                    error,
+                )
+                .await;
+                return;
+            }
+        }
+        let generated_images_root = match app_server_generated_images_dir(tool_profile) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                tracing::warn!(
+                    "[WORKER] Failed to resolve Codex generated images dir for {:?}: {}",
+                    tool_profile,
+                    e
+                );
+                None
+            }
         };
 
         let runtime_spawn_start_ms = Utc::now().timestamp_millis();
@@ -1466,42 +1433,27 @@ impl ConversationWorker {
             runtime_spawn_start_ms,
         );
 
-        let spawn_result = match msg.config.runtime {
-            ChatRuntime::CodexAppServer => spawn_codex_app_server(CodexAppServerOptions {
-                model: &msg.config.codex_options.model,
-                reasoning_effort: &msg.config.codex_options.reasoning_effort,
-                system_prompt: &system_prompt,
-                working_dir: &msg.config.working_dir,
-                prompt: final_message,
-                sandbox,
-                bypass_approvals_and_sandbox,
-                resume_session_id: None,
-                ephemeral: true,
-                state_owner_id: &self.conversation_id,
-                tool_profile,
-                scoped_user_id: Some(&msg.user_id),
-                current_conversation_id: Some(&self.conversation_id),
-                scoped_email_id: None,
-                approved_mcp_tools: msg.config.agent_type.approved_mcp_tool_names(),
-            })
-            .await
-            .map(RunningConversationTurn::Codex),
-            ChatRuntime::ClaudeCodeFable => {
-                let plan = fable_session_plan
-                    .as_ref()
-                    .expect("Fable session plan must exist before spawn");
-                spawn_claude_code(ClaudeCodeOptions {
-                    system_prompt: &system_prompt,
-                    prompt: final_message,
-                    session_id: &plan.session_id,
-                    resume: plan.resume,
-                    conversation_id: &self.conversation_id,
-                    user_id: &msg.user_id,
-                })
-                .await
-                .map(RunningConversationTurn::Fable)
-            }
-        };
+        let spawn_result = spawn_codex_app_server(CodexAppServerOptions {
+            model: &msg.config.codex_options.model,
+            reasoning_effort: &msg.config.codex_options.reasoning_effort,
+            system_prompt: &system_prompt,
+            working_dir: &msg.config.working_dir,
+            prompt: final_message,
+            sandbox,
+            bypass_approvals_and_sandbox,
+            resume_session_id: fable_thread_plan
+                .as_ref()
+                .and_then(|plan| plan.resume_thread_id.as_deref()),
+            ephemeral: !is_fable,
+            state_owner_id: &self.conversation_id,
+            tool_profile,
+            scoped_user_id: Some(&msg.user_id),
+            current_conversation_id: Some(&self.conversation_id),
+            scoped_email_id: None,
+            approved_mcp_tools: msg.config.agent_type.approved_mcp_tool_names(),
+        })
+        .await
+        .map(RunningConversationTurn::Codex);
         let mut turn = match spawn_result {
             Ok(turn) => turn,
             Err(e) => {
@@ -1536,15 +1488,17 @@ impl ConversationWorker {
                     );
                 }
                 self.mark_checkpoint_interrupted().await;
-                if msg.config.runtime == ChatRuntime::ClaudeCodeFable {
+                if is_fable {
                     fable_observability::record_session_failure(
-                        "session_init_failed",
-                        fable_session_plan.as_ref().is_some_and(|plan| plan.resume),
+                        "codex_thread_start_failed",
+                        fable_thread_plan
+                            .as_ref()
+                            .is_some_and(|plan| plan.resume_thread_id.is_some()),
                     );
-                    if let Err(recovery_error) = fable_coordinator::require_session_recovery(
+                    if let Err(recovery_error) = fable_coordinator::require_thread_repair(
                         &self.db,
                         &self.conversation_id,
-                        "session_init_failed",
+                        "codex_thread_start_failed",
                     )
                     .await
                     {
@@ -1553,7 +1507,7 @@ impl ConversationWorker {
                             event = "fable.recovery_state_write_failed",
                             conversation_id = %self.conversation_id,
                             error = %recovery_error,
-                            "failed to persist Fable recovery incident"
+                            "failed to persist Fable Codex repair incident"
                         );
                     }
                 }
@@ -1580,48 +1534,6 @@ impl ConversationWorker {
             runtime_spawn_ready_ms,
         );
 
-        if let Some(plan) = fable_session_plan.as_ref() {
-            if let Err(error) = fable_coordinator::mark_session_ready(
-                &self.db,
-                &self.conversation_id,
-                &plan.session_id,
-            )
-            .await
-            {
-                turn.terminate().await.ok();
-                fail_runtime_before_spawn(
-                    self,
-                    &assistant_message_id,
-                    msg.message_metadata.as_deref(),
-                    RuntimeFailurePhase::SpawnRuntime,
-                    "Failed to persist Fable session readiness",
-                    error,
-                )
-                .await;
-                return;
-            }
-            if let Err(error) = fable_coordinator::record_turn_started(
-                &self.db,
-                &self.conversation_id,
-                &plan.session_id,
-                is_coordinator_wake_metadata(msg.message_metadata.as_deref()),
-            )
-            .await
-            {
-                turn.terminate().await.ok();
-                fail_runtime_before_spawn(
-                    self,
-                    &assistant_message_id,
-                    msg.message_metadata.as_deref(),
-                    RuntimeFailurePhase::SpawnRuntime,
-                    "Failed to persist Fable turn start",
-                    error,
-                )
-                .await;
-                return;
-            }
-        }
-
         turn.register(&self.manager, &self.conversation_id).await;
         tracing::info!(
             "[CANCEL] Registered live runtime turn for conversation {} runner_turn_id={} runtime={}",
@@ -1640,6 +1552,7 @@ impl ConversationWorker {
         let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
         let mut usage: Option<TokenUsageBreakdown> = None;
         let mut kill_requested = false;
+        let mut runtime_tracking_failure: Option<String> = None;
         let mut streamed_agent_message_items: HashSet<String> = HashSet::new();
         let mut generated_attachment_snapshots_by_tool: HashMap<String, HashSet<PathBuf>> =
             HashMap::new();
@@ -1681,6 +1594,16 @@ impl ConversationWorker {
                 maybe_event = turn.next_event() => {
                     match maybe_event {
                         Some(ConversationRuntimeEvent::SessionStarted { session_id: tid }) => {
+                            if let Some(existing_thread_id) = thread_id.as_deref() {
+                                if existing_thread_id == tid {
+                                    continue;
+                                }
+                                runtime_tracking_failure = Some(format!(
+                                    "Codex changed thread identity during one turn: expected {existing_thread_id}, received {tid}"
+                                ));
+                                let _ = turn.terminate().await;
+                                break;
+                            }
                             let started_at_ms = Utc::now().timestamp_millis();
                             if let Some(turn_started_at_ms) = self.current_turn_started_at_ms {
                                 runtime::record_latency_marker(
@@ -1716,6 +1639,36 @@ impl ConversationWorker {
                                     self.conversation_id,
                                     e
                                 );
+                            }
+                            if is_fable {
+                                if let Err(error) = fable_coordinator::mark_thread_ready(
+                                    &self.db,
+                                    &self.conversation_id,
+                                    &tid,
+                                )
+                                .await
+                                {
+                                    let failure = format!(
+                                        "Failed to persist Fable Codex thread readiness: {error}"
+                                    );
+                                    tracing::error!(
+                                        target: "agentic_api::fable",
+                                        event = "fable.thread_readiness_write_failed",
+                                        conversation_id = %self.conversation_id,
+                                        thread_id = %tid,
+                                        error = %error,
+                                        "failed to persist the active Fable Codex thread"
+                                    );
+                                    let _ = fable_coordinator::require_thread_repair(
+                                        &self.db,
+                                        &self.conversation_id,
+                                        "thread_readiness_write_failed",
+                                    )
+                                    .await;
+                                    runtime_tracking_failure = Some(failure);
+                                    let _ = turn.terminate().await;
+                                    break;
+                                }
                             }
                             thread_id = Some(tid);
                         }
@@ -1986,7 +1939,9 @@ impl ConversationWorker {
             Err(e) => {
                 let cancelled = kill_requested || self.consume_cancelled_turn().await;
                 let terminal_status = if cancelled { "cancelled" } else { "failed" };
-                let failure_message = format!("Agent runtime turn failed: {}", e);
+                let failure_message = runtime_tracking_failure
+                    .clone()
+                    .unwrap_or_else(|| format!("Agent runtime turn failed: {e}"));
                 if !cancelled {
                     log_user_visible_runtime_failure(
                         &self.db,
@@ -2019,41 +1974,42 @@ impl ConversationWorker {
                         accumulated_text.chars().count(),
                     );
                 }
-                if let Some(plan) = fable_session_plan.as_ref() {
+                if is_fable {
                     let finished_at_ms = Utc::now().timestamp_millis();
                     let duration_ms = self
                         .current_turn_started_at_ms
                         .map(|started| finished_at_ms.saturating_sub(started) as u64)
                         .unwrap_or_default();
-                    let requires_recovery = !cancelled
-                        && (e.contains("session continuity")
-                            || e.contains("terminal session mismatch"));
                     let error_class = if cancelled {
                         "cancelled"
-                    } else if requires_recovery {
-                        "session_stream_failed"
                     } else {
                         "stream_failed"
                     };
-                    if requires_recovery {
-                        let _ = fable_coordinator::require_session_recovery(
+                    let coordinator_thread_id = thread_id.as_deref().or_else(|| {
+                        fable_thread_plan
+                            .as_ref()
+                            .and_then(|plan| plan.resume_thread_id.as_deref())
+                    });
+                    let state_result = if let Some(coordinator_thread_id) = coordinator_thread_id {
+                        fable_coordinator::record_turn_terminal(
+                            &self.db,
+                            &self.conversation_id,
+                            coordinator_thread_id,
+                            terminal_status,
+                            duration_ms,
+                            tool_call_count,
+                            Some(error_class),
+                        )
+                        .await
+                    } else {
+                        fable_coordinator::require_thread_repair(
                             &self.db,
                             &self.conversation_id,
                             error_class,
                         )
-                        .await;
-                    }
-                    if let Err(state_error) = fable_coordinator::record_turn_terminal(
-                        &self.db,
-                        &self.conversation_id,
-                        &plan.session_id,
-                        terminal_status,
-                        duration_ms,
-                        tool_call_count,
-                        Some(error_class),
-                    )
-                    .await
-                    {
+                        .await
+                    };
+                    if let Err(state_error) = state_result {
                         tracing::error!(
                             target: "agentic_api::fable",
                             event = "fable.terminal_state_write_failed",
@@ -2069,9 +2025,9 @@ impl ConversationWorker {
                     );
                 }
                 if cancelled {
-                    let session_id = fable_session_plan
+                    let session_id = fable_thread_plan
                         .as_ref()
-                        .map(|plan| plan.session_id.clone())
+                        .and_then(|plan| plan.resume_thread_id.clone())
                         .or(thread_id)
                         .unwrap_or_else(|| self.conversation_id.clone());
                     self.emit_event(&StreamEvent::Result {
@@ -2130,13 +2086,15 @@ impl ConversationWorker {
                     .clone()
                     .unwrap_or_else(|| self.conversation_id.clone()),
             }
+        } else if let Some(message) = runtime_tracking_failure {
+            RuntimeTurnCompletion::Failed(message)
         } else if !outcome.success() {
             RuntimeTurnCompletion::Failed(outcome.failure_summary())
         } else if let Some(session_id) = thread_id.clone() {
             RuntimeTurnCompletion::Completed { session_id }
         } else {
             RuntimeTurnCompletion::Failed(
-                "Agent runtime completed without returning a native session id".to_string(),
+                "Codex runtime completed without returning a thread id".to_string(),
             )
         };
 
@@ -2176,47 +2134,55 @@ impl ConversationWorker {
                 accumulated_text.chars().count(),
             );
         }
-        if let Some(plan) = fable_session_plan.as_ref() {
-            let duration_ms = outcome.fable_duration_ms().unwrap_or_else(|| {
-                self.current_turn_started_at_ms
-                    .map(|started| Utc::now().timestamp_millis().saturating_sub(started) as u64)
-                    .unwrap_or_default()
-            });
+        if is_fable {
+            let duration_ms = self
+                .current_turn_started_at_ms
+                .map(|started| Utc::now().timestamp_millis().saturating_sub(started) as u64)
+                .unwrap_or_default();
             let error_class = match &completion {
                 RuntimeTurnCompletion::Failed(message)
-                    if message.contains("session continuity")
-                        || message.contains("session recovery") =>
+                    if message.contains("thread") || message.contains("resume") =>
                 {
-                    Some("session_resume_failed")
+                    Some("thread_resume_failed")
                 }
                 RuntimeTurnCompletion::Failed(_) => Some("turn_failed"),
                 RuntimeTurnCompletion::Cancelled { .. } => Some("cancelled"),
                 RuntimeTurnCompletion::Completed { .. } => None,
             };
-            if error_class == Some("session_resume_failed") {
-                let _ = fable_coordinator::require_session_recovery(
+            let coordinator_thread_id = match &completion {
+                RuntimeTurnCompletion::Completed { session_id }
+                | RuntimeTurnCompletion::Cancelled { session_id } => Some(session_id.as_str()),
+                RuntimeTurnCompletion::Failed(_) => thread_id.as_deref().or_else(|| {
+                    fable_thread_plan
+                        .as_ref()
+                        .and_then(|plan| plan.resume_thread_id.as_deref())
+                }),
+            };
+            let state_result = if let Some(coordinator_thread_id) = coordinator_thread_id {
+                fable_coordinator::record_turn_terminal(
                     &self.db,
                     &self.conversation_id,
-                    "session_resume_failed",
+                    coordinator_thread_id,
+                    runner_terminal_status,
+                    duration_ms,
+                    tool_call_count,
+                    error_class,
                 )
-                .await;
-            }
-            if let Err(error) = fable_coordinator::record_turn_terminal(
-                &self.db,
-                &self.conversation_id,
-                &plan.session_id,
-                runner_terminal_status,
-                duration_ms,
-                tool_call_count,
-                error_class,
-            )
-            .await
-            {
+                .await
+            } else {
+                fable_coordinator::require_thread_repair(
+                    &self.db,
+                    &self.conversation_id,
+                    error_class.unwrap_or("thread_missing"),
+                )
+                .await
+            };
+            if let Err(error) = state_result {
                 tracing::error!(
                     target: "agentic_api::fable",
                     event = "fable.terminal_state_write_failed",
                     conversation_id = %self.conversation_id,
-                    session_id = %plan.session_id,
+                    thread_id = coordinator_thread_id.unwrap_or("none"),
                     error = %error,
                     "failed to persist Fable terminal state"
                 );
@@ -2392,21 +2358,21 @@ impl ConversationWorker {
         }
     }
 
-    /// Emit a StreamEvent: encode to Anthropic events, persist, and broadcast.
+    /// Emit a StreamEvent: encode to Conversation events, persist, and broadcast.
     ///
     /// Uses the server-side allocator (`insert_conversation_event`) so the
     /// event_index comes from the DB under a BEGIN IMMEDIATE transaction —
     /// safe under concurrent writers for the same conversation_id.
     ///
     /// The encoder maps each internal `StreamEvent` to zero or more
-    /// Anthropic frames from the 8-event vocabulary (`message_start` /
+    /// Conversation frames from the 8-event vocabulary (`message_start` /
     /// `content_block_start` / `content_block_delta` / `content_block_stop`
     /// / `message_delta` / `message_stop` / `ping` / `error`).
     /// Router/metadata events produce zero frames; a text chunk produces
     /// one; a tool_use turn produces several. Every produced frame is
     /// persisted AND broadcast to live SSE subscribers.
     async fn emit_event(&mut self, event: &StreamEvent) {
-        // Encode the StreamEvent into a sequence of Anthropic events.
+        // Encode the StreamEvent into a sequence of Conversation events.
         // An event may produce zero frames (router/metadata events), one
         // frame (a text_delta), or many (tool_use: start + delta + stop).
         //
@@ -2417,14 +2383,14 @@ impl ConversationWorker {
         // — spawned onto its own tokio task so it never blocks the SSE
         // stream or holds the worker's state.
         let mut message_stop_persisted = false;
-        let anthropic_events = self.encoder.encode(event);
-        for ae in anthropic_events {
+        let conversation_events = self.encoder.encode(event);
+        for ae in conversation_events {
             let ae_type = ae.event_type();
             let ae_json = match serde_json::to_string(&ae) {
                 Ok(j) => j,
                 Err(e) => {
                     tracing::error!(
-                        "[WORKER] Failed to serialize AnthropicEvent for {}: {}",
+                        "[WORKER] Failed to serialize ConversationEvent for {}: {}",
                         self.conversation_id,
                         e
                     );
@@ -3665,11 +3631,6 @@ fn parent_coordinator_agent_type(parent: &ticketing_system::Conversation) -> Res
 fn parent_coordinator_runtime(
     parent: &ticketing_system::Conversation,
 ) -> Result<super::chat_stream::ChatRuntime> {
-    if parent.conversation_type.as_deref() == Some(fable_coordinator::FABLE_CONVERSATION_TYPE)
-        && parent.agent.as_deref() == Some(fable_coordinator::FABLE_AGENT)
-    {
-        return Ok(super::chat_stream::ChatRuntime::ClaudeCodeFable);
-    }
     if parent.agent.as_deref().is_some_and(|agent| {
         AgentType::from_chat_agent_key(agent).is_some()
             || serde_json::from_value::<AgentType>(serde_json::Value::String(agent.to_string()))
@@ -4678,25 +4639,25 @@ mod prompt_history_attachment_tests {
 // Streaming persistence invariants
 // =============================================================================
 //
-// These tests exercise the Anthropic 8-event persistence pipeline. They
+// These tests exercise the Conversation 8-event persistence pipeline. They
 // confirm:
 //
 //   1. Encoder → `insert_conversation_event` → `get_events` round-trips
-//      produce ONLY Anthropic vocabulary event_types — no the previous SDK
+//      produce ONLY conversation protocol event_types — no the runtime adapter
 //      discriminants (`text`, `tool_use`, `thinking`) ever land in the row.
 //   2. A text-only turn, a tool-use turn, and a thinking turn each produce
-//      the canonical Anthropic frame ordering when replayed off the DB.
-//   3. Every persisted `event_data` payload parses as valid Anthropic JSON
+//      the canonical Conversation frame ordering when replayed off the DB.
+//   3. Every persisted `event_data` payload parses as valid Conversation JSON
 //      whose `type` field matches the row's `event_type`.
 //
-// If a non-Anthropic discriminant ever regressed back into the emit
+// If a non-Conversation discriminant ever regressed back into the emit
 // pipeline these assertions would detect it — the replayed event_types
-// would include a non-Anthropic tag, or the row counts would diverge
+// would include a non-Conversation tag, or the row counts would diverge
 // from encoder output.
 #[cfg(test)]
 mod streaming_persistence_tests {
     use super::*;
-    use crate::agents::anthropic_events::ALL_EVENT_TYPES;
+    use crate::agents::conversation_events::ALL_EVENT_TYPES;
     use serde_json::json;
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::ConnectOptions;
@@ -4704,8 +4665,8 @@ mod streaming_persistence_tests {
     use std::str::FromStr;
 
     /// Allow-list of event_type strings any persisted row may carry.
-    /// These are the canonical 8 Anthropic streaming event type tags, as
-    /// exported by [`ALL_EVENT_TYPES`]. If a the previous SDK discriminant ever
+    /// These are the canonical 8 Conversation streaming event type tags, as
+    /// exported by [`ALL_EVENT_TYPES`]. If a runtime adapter discriminant ever
     /// sneaks through the persistence path, this allow-list is what
     /// trips first.
     const ALLOWED_EVENT_TYPES: &[&str] = ALL_EVENT_TYPES;
@@ -5046,7 +5007,7 @@ mod streaming_persistence_tests {
     }
 
     #[test]
-    fn designated_fable_parent_selects_only_the_fable_runtime() {
+    fn designated_fable_parent_selects_the_codex_runtime() {
         let mut coordinator = test_conversation("alex-coordinator", "Alex", None);
         coordinator.user_id = fable_coordinator::ALEX_USER_ID.to_string();
         coordinator.agent = Some(fable_coordinator::FABLE_AGENT.to_string());
@@ -5059,7 +5020,7 @@ mod streaming_persistence_tests {
         );
         assert_eq!(
             parent_coordinator_runtime(&coordinator).unwrap(),
-            ChatRuntime::ClaudeCodeFable
+            ChatRuntime::CodexAppServer
         );
 
         let worker = test_conversation("worker", "Worker", Some("alex-coordinator"));
@@ -5188,20 +5149,20 @@ mod streaming_persistence_tests {
         .to_string()
     }
 
-    /// Drive a sequence of the previous SDK StreamEvents through the encoder, persist
-    /// every emitted Anthropic event via `insert_conversation_event`, then
+    /// Drive a sequence of the runtime adapter StreamEvents through the encoder, persist
+    /// every emitted Conversation event via `insert_conversation_event`, then
     /// replay from the DB and return (event_types, parsed_json_values).
     async fn run_turn_and_replay(
         pool: &SqlitePool,
         conversation_id: &str,
         events: &[StreamEvent],
     ) -> (Vec<String>, Vec<serde_json::Value>) {
-        let mut encoder = AnthropicEventEncoder::new(conversation_id);
+        let mut encoder = ConversationEventEncoder::new(conversation_id);
         encoder.set_pending_message_id("assistant-test-message");
         for ev in events {
             for ae in encoder.encode(ev) {
                 let ae_type = ae.event_type();
-                let ae_json = serde_json::to_string(&ae).expect("serialize anthropic event");
+                let ae_json = serde_json::to_string(&ae).expect("serialize conversation event");
                 conversations::insert_conversation_event(
                     pool,
                     conversation_id,
@@ -5210,7 +5171,7 @@ mod streaming_persistence_tests {
                     None,
                 )
                 .await
-                .expect("persist anthropic event");
+                .expect("persist conversation event");
             }
         }
 
@@ -5489,7 +5450,7 @@ mod streaming_persistence_tests {
         assert_eq!(coordinator_wake_job_count(&pool).await, 2);
     }
 
-    fn assert_all_anthropic(types: &[String]) {
+    fn assert_all_conversation(types: &[String]) {
         for t in types {
             assert!(
                 ALLOWED_EVENT_TYPES.contains(&t.as_str()),
@@ -5514,10 +5475,10 @@ mod streaming_persistence_tests {
     }
 
     /// Turn 1: a text-only assistant reply.
-    /// Canonical Anthropic frame sequence: message_start, content_block_start(text),
+    /// Canonical Conversation frame sequence: message_start, content_block_start(text),
     /// content_block_delta(text_delta), content_block_stop, message_delta, message_stop.
     #[tokio::test]
-    async fn text_only_turn_persists_anthropic_frames_only() {
+    async fn text_only_turn_persists_conversation_frames_only() {
         let pool = fresh_test_pool().await;
         let (types, values) = run_turn_and_replay(
             &pool,
@@ -5535,7 +5496,7 @@ mod streaming_persistence_tests {
         )
         .await;
 
-        assert_all_anthropic(&types);
+        assert_all_conversation(&types);
         assert_eq!(
             types,
             vec![
@@ -5559,7 +5520,7 @@ mod streaming_persistence_tests {
     /// Turn 2: tool-use turn (assistant says something, invokes a tool,
     /// emits a text trailer, then Result closes the turn).
     #[tokio::test]
-    async fn tool_use_turn_persists_anthropic_frames_only() {
+    async fn tool_use_turn_persists_conversation_frames_only() {
         let pool = fresh_test_pool().await;
         let (types, values) = run_turn_and_replay(
             &pool,
@@ -5571,7 +5532,7 @@ mod streaming_persistence_tests {
                 StreamEvent::ToolUse {
                     id: "tool-xyz".into(),
                     name: "search".into(),
-                    input: json!({"q": "anthropic streaming"}),
+                    input: json!({"q": "conversation streaming"}),
                 },
                 StreamEvent::Text {
                     content: "Done.".into(),
@@ -5585,7 +5546,7 @@ mod streaming_persistence_tests {
         )
         .await;
 
-        assert_all_anthropic(&types);
+        assert_all_conversation(&types);
         assert_eq!(
             types,
             vec![
@@ -5617,14 +5578,14 @@ mod streaming_persistence_tests {
         let partial: serde_json::Value =
             serde_json::from_str(input_delta["delta"]["partial_json"].as_str().unwrap())
                 .expect("partial_json parses");
-        assert_eq!(partial, json!({"q": "anthropic streaming"}));
+        assert_eq!(partial, json!({"q": "conversation streaming"}));
     }
 
     /// Turn 3: thinking + text turn. Thinking opens a dedicated block that
     /// streams `thinking_delta` payloads, then closes before the text block
     /// takes over.
     #[tokio::test]
-    async fn thinking_turn_persists_anthropic_frames_only() {
+    async fn thinking_turn_persists_conversation_frames_only() {
         let pool = fresh_test_pool().await;
         let (types, values) = run_turn_and_replay(
             &pool,
@@ -5645,7 +5606,7 @@ mod streaming_persistence_tests {
         )
         .await;
 
-        assert_all_anthropic(&types);
+        assert_all_conversation(&types);
         assert_eq!(
             types,
             vec![
@@ -5669,7 +5630,7 @@ mod streaming_persistence_tests {
         assert_eq!(thinking_delta["delta"]["thinking"], "Reasoning step...");
     }
 
-    /// Silencer: confirm that the previous SDK router/replay tags are NOT
+    /// Silencer: confirm that the runtime adapter router/replay tags are NOT
     /// emitted onto the wire. If they ever regressed into the pipeline,
     /// this test would see extra rows with event_type outside the allow-list.
     #[tokio::test]
@@ -5704,7 +5665,7 @@ mod streaming_persistence_tests {
         )
         .await;
 
-        assert_all_anthropic(&types);
+        assert_all_conversation(&types);
         // Exactly the text-only canonical shape — router/title/replay frames
         // produced ZERO persisted rows.
         assert_eq!(
@@ -5721,15 +5682,15 @@ mod streaming_persistence_tests {
     }
 
     /// Sanity check: the allow-list we assert against is sourced directly
-    /// from the canonical `ALL_EVENT_TYPES` export in `anthropic_events`.
+    /// from the canonical `ALL_EVENT_TYPES` export in `conversation_events`.
     /// If the wire vocabulary ever grows or shrinks, both the enum surface
     /// and this allow-list must move in lock-step — and the test below
     /// will fail loudly if someone edits one without the other.
     #[test]
-    fn allow_list_matches_anthropic_event_surface() {
+    fn allow_list_matches_conversation_event_surface() {
         assert_eq!(
             ALLOWED_EVENT_TYPES, ALL_EVENT_TYPES,
-            "scope-cut allow-list drifted from canonical AnthropicEvent surface"
+            "scope-cut allow-list drifted from canonical ConversationEvent surface"
         );
     }
 

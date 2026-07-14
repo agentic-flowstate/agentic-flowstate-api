@@ -293,7 +293,7 @@ pub async fn resume_conversation_stream(
     // Layer the stream from inside out:
     //   (a) `build_resume_stream`: replay + live-tail events
     //   (b) `StreamCloseGuard`: RAII metric emission on drop
-    //   (c) `wrap_stream_with_keepalive`: Anthropic-vocab `ping` frames
+    //   (c) `wrap_stream_with_keepalive`: conversation-protocol `ping` frames
     //       every 15s, 10-minute server-side idle timeout, graceful
     //       shutdown on SIGTERM (T-CFFAF032).
     //

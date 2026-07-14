@@ -820,7 +820,7 @@ async fn verify_job_conversation_owner(
     }
     agentic_api::fable_coordinator::validate_runtime_assignment(
         &conversation,
-        job.payload.runtime == ChatRuntime::ClaudeCodeFable.as_job_runtime(),
+        job.payload.agent_type == agentic_api::fable_coordinator::FABLE_AGENT,
     )?;
     Ok(())
 }
@@ -832,9 +832,6 @@ fn worker_message_from_job(
     let runtime = match payload.runtime.as_str() {
         value if value == ChatRuntime::CodexAppServer.as_job_runtime() => {
             ChatRuntime::CodexAppServer
-        }
-        value if value == ChatRuntime::ClaudeCodeFable.as_job_runtime() => {
-            ChatRuntime::ClaudeCodeFable
         }
         _ => anyhow::bail!("Unsupported conversation job runtime: {}", payload.runtime),
     };

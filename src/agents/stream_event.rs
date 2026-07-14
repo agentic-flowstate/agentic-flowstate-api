@@ -1,12 +1,12 @@
 //! The internal `StreamEvent` enum emitted by the agent runtime.
 //!
-//! The agent runtime produces `StreamEvent`s; the [`AnthropicEventEncoder`]
+//! The agent runtime produces `StreamEvent`s; the [`ConversationEventEncoder`]
 //! consumes the enum and re-expresses each event as a sequence of
-//! Anthropic vocabulary frames (see `crate::handlers::anthropic_event_encoder`).
-//! `StreamEvent` itself is not persisted — only the encoded Anthropic
+//! provider-neutral frames (see `crate::handlers::conversation_event_encoder`).
+//! `StreamEvent` itself is not persisted — only the encoded conversation
 //! frames land in `conversation_events`.
 //!
-//! [`AnthropicEventEncoder`]: crate::handlers::anthropic_event_encoder::AnthropicEventEncoder
+//! [`ConversationEventEncoder`]: crate::handlers::conversation_event_encoder::ConversationEventEncoder
 
 use serde::Serialize;
 

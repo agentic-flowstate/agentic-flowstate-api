@@ -6,7 +6,7 @@
 //! axum's built-in `KeepAlive` helper only emits `: ping\n\n` comment
 //! lines. That works for keeping TCP middleboxes alive, but:
 //!
-//! 1. Anthropic's 8-event streaming vocabulary (A-18DB4221) defines
+//! 1. the protocol's 8-event streaming vocabulary (A-18DB4221) defines
 //!    `ping` as a proper named event with `event: ping\ndata: {}`, not a
 //!    comment. Clients that parse by event-type (including our own iOS
 //!    reader) ignore comment pings and will still trip their own idle
@@ -38,7 +38,7 @@
 //! A real event RESETS the ping timer. Rationale: the ping exists to
 //! prove liveness to middleboxes. If the server just shipped a real
 //! event, middleboxes already saw bytes — a ping in the next 15s window
-//! is redundant bandwidth. This matches Anthropic's own pattern (their
+//! is redundant bandwidth. This matches the protocol's own pattern (their
 //! streaming endpoint sends `ping` only during idle gaps) and Ably's
 //! heartbeat docs.
 //!
@@ -89,10 +89,10 @@ pub const ENV_KEEPALIVE_INTERVAL: &str = "SSE_KEEPALIVE_INTERVAL_SECS";
 pub const ENV_IDLE_TIMEOUT: &str = "SSE_IDLE_TIMEOUT_SECS";
 
 /// Wire-format payload for ping frames. The object is intentionally
-/// empty so that the Anthropic vocabulary stays byte-identical to
+/// empty so that the conversation protocol stays byte-identical to
 /// `{"type":"ping"}` when clients serialize the event back through
 /// their own parsers — the `event: ping` line plus `data: {}` matches
-/// the shape Anthropic's SDK emits.
+/// the shape the protocol's SDK emits.
 pub const PING_DATA: &str = "{}";
 
 /// Wire-format payload for the terminal `message:end reason:...` frame.
@@ -368,7 +368,7 @@ where
     }
 }
 
-/// Build a `ping` SSE frame per the Anthropic 8-event vocabulary. No
+/// Build a `ping` SSE frame per the Conversation 8-event vocabulary. No
 /// `.id()` — ping frames are ephemeral and must NOT advance the
 /// client's `Last-Event-ID` cursor (otherwise a resume would skip past
 /// real events).

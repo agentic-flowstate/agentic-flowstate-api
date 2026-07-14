@@ -169,14 +169,12 @@ pub type SseStream = Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatRuntime {
     CodexAppServer,
-    ClaudeCodeFable,
 }
 
 impl ChatRuntime {
     pub fn as_job_runtime(self) -> &'static str {
         match self {
             Self::CodexAppServer => "codex-app-server",
-            Self::ClaudeCodeFable => "claude-code-fable",
         }
     }
 }
@@ -609,13 +607,13 @@ async fn authorize_conversation_turn(
     db: &SqlitePool,
     conversation_id: &str,
     user_id: &str,
-    runtime: ChatRuntime,
+    agent_type: &AgentType,
 ) -> Result<(), Response> {
     match conversations::get_conversation(db, conversation_id, false).await {
         Ok(Some(conv)) if conv.user_id == user_id => {
             crate::fable_coordinator::validate_runtime_assignment(
                 &conv,
-                runtime == ChatRuntime::ClaudeCodeFable,
+                *agent_type == AgentType::FableCoordinator,
             )
             .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response())?;
 
@@ -732,7 +730,7 @@ pub async fn submit(
     );
 
     if let Err(response) =
-        authorize_conversation_turn(&db, &conv_id, &user_id, config.runtime).await
+        authorize_conversation_turn(&db, &conv_id, &user_id, &config.agent_type).await
     {
         return response;
     }
@@ -1018,7 +1016,7 @@ pub async fn chat(
     };
 
     if let Err(response) =
-        authorize_conversation_turn(&db, &conv_id, &user_id, config.runtime).await
+        authorize_conversation_turn(&db, &conv_id, &user_id, &config.agent_type).await
     {
         return response;
     }
@@ -1193,14 +1191,14 @@ fn rate_limited_response(
 /// Create SSE stream from raw (index, json) broadcast tuples.
 ///
 /// The inner event stream is wrapped with the production-hardening
-/// keepalive layer (T-CFFAF032): Anthropic-vocabulary `ping` frames
+/// keepalive layer (T-CFFAF032): conversation-protocol `ping` frames
 /// every 15s (cadence resets on every real event), a 10-minute idle
 /// timeout that emits a terminal `message:end reason:server_idle_timeout`
 /// frame, and a graceful-shutdown hook that emits
 /// `message:end reason:server_shutdown` when the process receives
 /// SIGTERM. The former in-tree `KeepAlive::new().text("ping")` helper
 /// emitted comment-style pings which our iOS reader ignores — we
-/// switched to the Anthropic-compatible named-event form so idle
+/// switched to the provider-neutral named-event form so idle
 /// tracking works end-to-end.
 fn create_sse_stream_raw(rx: mpsc::Receiver<(i32, String)>, conversation_id: String) -> SseStream {
     let stream = stream! {
@@ -1213,7 +1211,7 @@ fn create_sse_stream_raw(rx: mpsc::Receiver<(i32, String)>, conversation_id: Str
     let wrapped = wrap_stream_with_keepalive(inner, KeepaliveConfig::from_env(), conversation_id);
     // axum's built-in KeepAlive helper is disabled here (interval=1h) —
     // we own the ping cadence via wrap_stream_with_keepalive so the
-    // frames are Anthropic-vocab `ping` events, not `: ping\n\n`
+    // frames are conversation-protocol `ping` events, not `: ping\n\n`
     // comments.
     Sse::new(Box::pin(wrapped) as Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(3600)))
@@ -1470,14 +1468,11 @@ mod conversation_authorization_tests {
     #[tokio::test]
     async fn authorizes_owner_for_chat_turns() {
         let pool = fresh_pool().await;
-        assert!(authorize_conversation_turn(
-            &pool,
-            "conv-alex",
-            "alex",
-            ChatRuntime::CodexAppServer,
-        )
-        .await
-        .is_ok());
+        assert!(
+            authorize_conversation_turn(&pool, "conv-alex", "alex", &AgentType::FullAccess,)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -1487,7 +1482,7 @@ mod conversation_authorization_tests {
             &pool,
             "conv-alex",
             "jakegreene",
-            ChatRuntime::CodexAppServer,
+            &AgentType::FullAccess,
         )
         .await
         {
@@ -1514,16 +1509,16 @@ mod conversation_authorization_tests {
         .unwrap();
 
         let wrong_runtime =
-            authorize_conversation_turn(&pool, "conv-alex", "alex", ChatRuntime::CodexAppServer)
+            authorize_conversation_turn(&pool, "conv-alex", "alex", &AgentType::FullAccess)
                 .await
-                .expect_err("Chat/Codex must not enter the Fable singleton");
+                .expect_err("A non-coordinator agent must not enter the Fable singleton");
         assert_eq!(wrong_runtime.status(), StatusCode::CONFLICT);
 
         assert!(authorize_conversation_turn(
             &pool,
             "conv-alex",
             "alex",
-            ChatRuntime::ClaudeCodeFable,
+            &AgentType::FableCoordinator,
         )
         .await
         .is_ok());
@@ -1546,7 +1541,7 @@ mod conversation_authorization_tests {
         .unwrap();
 
         let response =
-            authorize_conversation_turn(&pool, "conv-alex", "alex", ChatRuntime::CodexAppServer)
+            authorize_conversation_turn(&pool, "conv-alex", "alex", &AgentType::CodeExecution)
                 .await
                 .expect_err("code workers must be one-shot");
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -1572,7 +1567,7 @@ mod conversation_authorization_tests {
             &pool,
             "conv-alex",
             "alex",
-            ChatRuntime::CodexAppServer,
+            &AgentType::CodebaseResearch,
         )
         .await
         .is_ok());

@@ -78,7 +78,7 @@ pub async fn pull_focus_ticket(
 
     let working_dir = PathBuf::from("/Users/jarvisgpt/projects");
 
-    // User message: data at top, query at bottom (per Anthropic best practices)
+    // User message: data at top, query at bottom (per Conversation best practices)
     let prompt = format!(
         "<current_focus>\n{}\n</current_focus>\n\n<organization_tickets>\n{}\n</organization_tickets>\n\nSelect the best next ticket to work on for the {} organization.",
         current_focus_str, org_data, org

@@ -12,7 +12,7 @@ use ticketing_system::Conversation;
 
 use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::{self, ChatAttachmentData, ChatCodexOptions, ChatConfig, ChatRuntime};
-use crate::agents::claude_code::{verify_claude_subscription_auth, FABLE_EFFORT, FABLE_MODEL};
+use crate::agents::codex_app_server::verify_codex_subscription_auth;
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 use crate::fable_coordinator::{self, FableRuntimeState, FABLE_PROMPT_VERSION};
@@ -37,10 +37,10 @@ pub struct FableCoordinatorHealth {
     pub pending_child_wake_count: i64,
     pub auth_state: String,
     pub auth_error: Option<String>,
-    pub model: &'static str,
-    pub effort: &'static str,
+    pub model: String,
+    pub effort: String,
     pub prompt_version: &'static str,
-    pub native_session_continuity: String,
+    pub thread_continuity: String,
     pub runtime: Option<FableRuntimeState>,
 }
 
@@ -99,7 +99,7 @@ async fn load_active_child_count(
 fn resolve_coordinator_status(
     auth_error: Option<String>,
     runtime: Option<&FableRuntimeState>,
-    untracked_native_session: bool,
+    untracked_codex_thread: bool,
     coordinator_busy: bool,
     active_child_count: i64,
 ) -> FableCoordinatorStatus {
@@ -110,13 +110,10 @@ fn resolve_coordinator_status(
         };
     }
 
-    if untracked_native_session {
+    if untracked_codex_thread {
         return FableCoordinatorStatus {
             state: "failed",
-            detail: Some(
-                "Fable session continuity requires an audited recovery from the prior runtime"
-                    .to_string(),
-            ),
+            detail: Some("Fable Codex thread continuity requires an explicit repair".to_string()),
         };
     }
 
@@ -133,10 +130,12 @@ fn resolve_coordinator_status(
                 };
             }
         }
-        if runtime.session_state == "recovery_required" {
+        if runtime.thread_state == "repair_required" {
             return FableCoordinatorStatus {
                 state: "failed",
-                detail: Some("Fable session continuity requires an audited recovery".to_string()),
+                detail: Some(
+                    "Fable Codex thread continuity requires an explicit repair".to_string(),
+                ),
             };
         }
         if runtime.last_terminal_status.as_deref() == Some("failed") {
@@ -205,14 +204,11 @@ fn chat_config(user_id: &str) -> Result<ChatConfig, Response> {
     );
     Ok(ChatConfig {
         agent_type: AgentType::FableCoordinator,
-        runtime: ChatRuntime::ClaudeCodeFable,
+        runtime: ChatRuntime::CodexAppServer,
         prompt_name: "fable-coordinator",
         working_dir: projects_root,
         prompt_vars,
-        codex_options: ChatCodexOptions {
-            model: FABLE_MODEL.to_string(),
-            reasoning_effort: FABLE_EFFORT.to_string(),
-        },
+        codex_options: ChatCodexOptions::default_for_agent(&AgentType::FableCoordinator),
     })
 }
 
@@ -237,7 +233,7 @@ pub async fn get_fable_coordinator(
         Ok(count) => count,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
-    let auth_error = verify_claude_subscription_auth()
+    let auth_error = verify_codex_subscription_auth()
         .await
         .err()
         .map(|error| error.to_string());
@@ -295,21 +291,17 @@ pub async fn get_fable_coordinator_health(
         Ok(count) => count,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
-    let (auth_state, auth_error) = match verify_claude_subscription_auth().await {
+    let (auth_state, auth_error) = match verify_codex_subscription_auth().await {
         Ok(()) => ("ready".to_string(), None),
         Err(error) => ("needs_login".to_string(), Some(error)),
     };
-    let native_session_continuity = match runtime.as_ref() {
-        Some(runtime) => runtime.session_state.clone(),
+    let thread_continuity = match runtime.as_ref() {
+        Some(runtime) => runtime.thread_state.clone(),
         None if conversation.session_id.is_some() => "untracked".to_string(),
         None => "uninitialized".to_string(),
     };
     let coordinator_busy = manager.has_runtime_turn(&conversation.id).await || queue_depth > 0;
-    crate::observability::fable::set_health(
-        coordinator_busy,
-        queue_depth,
-        &native_session_continuity,
-    );
+    crate::observability::fable::set_health(coordinator_busy, queue_depth, &thread_continuity);
 
     Json(FableCoordinatorHealth {
         conversation_id: conversation.id,
@@ -319,10 +311,10 @@ pub async fn get_fable_coordinator_health(
         pending_child_wake_count,
         auth_state,
         auth_error,
-        model: FABLE_MODEL,
-        effort: FABLE_EFFORT,
+        model: AgentType::FableCoordinator.model().to_string(),
+        effort: AgentType::FableCoordinator.effort().to_string(),
         prompt_version: FABLE_PROMPT_VERSION,
-        native_session_continuity,
+        thread_continuity,
         runtime,
     })
     .into_response()
@@ -403,21 +395,21 @@ pub async fn repair_fable_coordinator_session(
     if !request.confirm_recovery {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "confirm_recovery=true is required for an audited native-session replacement",
+            "confirm_recovery=true is required for a Codex thread reset",
         );
     }
     let conversation = match coordinator_for_user(&db, &user).await {
         Ok(conversation) => conversation,
         Err(response) => return response,
     };
-    match fable_coordinator::repair_session(&db, &conversation.id, &user.user_id).await {
-        Ok(plan) => (
+    match fable_coordinator::repair_thread(&db, &conversation.id, &user.user_id).await {
+        Ok(repair) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
                 "conversation_id": conversation.id,
-                "native_session_id": plan.session_id,
-                "status": "recovery_approved",
-                "rehydrate_required": plan.rehydrate_required,
+                "retired_codex_thread_id": repair.retired_thread_id,
+                "status": "reset",
+                "rehydrate_required": repair.rehydrate_required,
             })),
         )
             .into_response(),
@@ -430,12 +422,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coordinator_submits_to_the_anthropic_fable_runtime() {
+    fn coordinator_submits_to_the_codex_runtime() {
         let config = chat_config(fable_coordinator::ALEX_USER_ID).unwrap();
 
-        assert_eq!(config.runtime, ChatRuntime::ClaudeCodeFable);
-        assert_eq!(config.codex_options.model, FABLE_MODEL);
-        assert_eq!(config.codex_options.reasoning_effort, FABLE_EFFORT);
+        assert_eq!(config.runtime, ChatRuntime::CodexAppServer);
+        assert_eq!(
+            config.codex_options.model,
+            AgentType::FableCoordinator.model()
+        );
+        assert_eq!(
+            config.codex_options.reasoning_effort,
+            AgentType::FableCoordinator.effort()
+        );
         assert!(!config.prompt_vars.contains_key("AGENTS_MD"));
 
         let prompt = crate::agents::prompts::load_prompt(config.prompt_name, config.prompt_vars)
@@ -449,10 +447,10 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_v4_prompt_contains_workspace_ticket_and_efficiency_contracts() {
+    fn coordinator_v5_prompt_contains_workspace_ticket_and_efficiency_contracts() {
         assert_eq!(
             fable_coordinator::FABLE_PROMPT_VERSION,
-            "fable-coordinator/v4"
+            "fable-coordinator/v5"
         );
 
         let config = chat_config(fable_coordinator::ALEX_USER_ID).unwrap();
@@ -485,7 +483,7 @@ mod tests {
         ] {
             assert!(
                 prompt.contains(required),
-                "Fable v4 prompt is missing required contract text: {required}"
+                "Fable v5 prompt is missing required contract text: {required}"
             );
         }
 
@@ -500,27 +498,24 @@ mod tests {
         ] {
             assert!(
                 prompt.contains(preserved_boundary),
-                "Fable v4 prompt lost coordinator boundary text: {preserved_boundary}"
+                "Fable v5 prompt lost coordinator boundary text: {preserved_boundary}"
             );
         }
     }
 
     fn runtime_state(
-        session_state: &str,
+        thread_state: &str,
         terminal_status: Option<&str>,
         error: Option<&str>,
     ) -> FableRuntimeState {
         FableRuntimeState {
             conversation_id: "coordinator".to_string(),
-            native_session_id: "session".to_string(),
-            session_state: session_state.to_string(),
+            codex_thread_id: Some("thread".to_string()),
+            thread_state: thread_state.to_string(),
             prompt_version: FABLE_PROMPT_VERSION.to_string(),
-            model: FABLE_MODEL.to_string(),
-            effort: FABLE_EFFORT.to_string(),
-            auth_method: "claude.ai".to_string(),
-            subscription_type: "max".to_string(),
-            mcp_profile: "fable-coordinator".to_string(),
-            rehydrate_required: false,
+            model: AgentType::FableCoordinator.model().to_string(),
+            effort: AgentType::FableCoordinator.effort().to_string(),
+            auth_method: "chatgpt".to_string(),
             last_started_at: None,
             last_completed_at: None,
             last_success_at: None,
@@ -537,7 +532,7 @@ mod tests {
     #[test]
     fn coordinator_status_prioritizes_actionable_runtime_states() {
         let auth = resolve_coordinator_status(
-            Some("Claude subscription login required".to_string()),
+            Some("Codex ChatGPT login required".to_string()),
             None,
             false,
             true,
@@ -549,7 +544,7 @@ mod tests {
         let usage = resolve_coordinator_status(None, Some(&usage_runtime), false, false, 0);
         assert_eq!(usage.state, "usage_limited");
 
-        let recovery_runtime = runtime_state("recovery_required", Some("failed"), None);
+        let recovery_runtime = runtime_state("repair_required", Some("failed"), None);
         let recovery = resolve_coordinator_status(None, Some(&recovery_runtime), false, false, 0);
         assert_eq!(recovery.state, "failed");
 
@@ -558,7 +553,7 @@ mod tests {
         assert!(untracked
             .detail
             .as_deref()
-            .is_some_and(|detail| detail.contains("prior runtime")));
+            .is_some_and(|detail| detail.contains("Codex thread")));
     }
 
     #[test]

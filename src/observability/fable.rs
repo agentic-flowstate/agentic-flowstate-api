@@ -18,7 +18,7 @@ pub fn record_auth_failure(error_class: &'static str) {
         target: "agentic_api::fable",
         event = "fable.auth_failure",
         error_class,
-        "Fable subscription authentication failed"
+        "Fable Codex subscription authentication failed"
     );
 }
 
@@ -39,7 +39,7 @@ pub fn record_session_failure(error_class: &'static str, resume: bool) {
         event = "fable.session_failure",
         error_class,
         operation,
-        "Fable native session operation failed"
+        "Fable Codex thread operation failed"
     );
 }
 
@@ -63,13 +63,7 @@ pub fn set_health(busy: bool, queue_depth: i64, session_state: &str) {
     assert_metric_labels(QUEUE_DEPTH, &[]);
     gauge!(QUEUE_DEPTH).set(queue_depth.max(0) as f64);
 
-    for state in [
-        "uninitialized",
-        "provisioning",
-        "ready",
-        "recovery_required",
-        "recovery_approved",
-    ] {
+    for state in ["uninitialized", "starting", "ready", "repair_required"] {
         assert_metric_labels(SESSION_STATE, &[("state", state)]);
         gauge!(SESSION_STATE, "state" => state).set(if state == session_state { 1.0 } else { 0.0 });
     }

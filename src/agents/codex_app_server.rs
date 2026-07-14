@@ -433,6 +433,41 @@ pub fn normalize_reasoning_effort(effort: &str) -> &str {
     }
 }
 
+pub async fn verify_codex_subscription_auth() -> Result<(), String> {
+    let codex_home = default_codex_home()?;
+    let output = Command::new("codex")
+        .arg("-c")
+        .arg("forced_login_method=\"chatgpt\"")
+        .arg("login")
+        .arg("status")
+        .env("PATH", launchd_safe_path())
+        .env("CODEX_HOME", &codex_home)
+        .env_remove("OPENAI_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("CODEX_API_KEY")
+        .output()
+        .await
+        .map_err(|error| format!("Failed to read Codex subscription auth status: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() || !stdout.to_ascii_lowercase().contains("using chatgpt") {
+        let detail = [stdout.trim(), stderr.trim()]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(": ");
+        let detail = if detail.is_empty() {
+            "Codex did not report ChatGPT authentication".to_string()
+        } else {
+            detail
+        };
+        return Err(format!(
+            "Codex must use ChatGPT subscription authentication; run `codex login` from a trusted Mac Mini terminal and complete the Safari sign-in flow ({detail})"
+        ));
+    }
+    Ok(())
+}
+
 fn launchd_safe_path_from(existing_path: Option<&OsStr>) -> OsString {
     let mut entries: Vec<String> = REQUIRED_CODEX_PATH_ENTRIES
         .iter()
@@ -1122,6 +1157,9 @@ fn build_codex_app_server_command(
     let mut command = StdCommand::new("codex");
     command.current_dir(&working_dir);
     command.env_remove("EXA_API_KEY");
+    command.env_remove("OPENAI_KEY");
+    command.env_remove("OPENAI_API_KEY");
+    command.env_remove("CODEX_API_KEY");
     command.env("PATH", launchd_safe_path());
     command.env("CODEX_HOME", codex_home);
     command.env(
@@ -2653,6 +2691,9 @@ mod tests {
             .any(|arg| arg == "sqlite_home=\"/tmp/agentic-codex-sqlite\""));
         assert_eq!(command_env(&command, "RUST_LOG").as_deref(), Some("warn"));
         assert!(command_removes_env(&command, "EXA_API_KEY"));
+        assert!(command_removes_env(&command, "OPENAI_KEY"));
+        assert!(command_removes_env(&command, "OPENAI_API_KEY"));
+        assert!(command_removes_env(&command, "CODEX_API_KEY"));
     }
 
     #[test]

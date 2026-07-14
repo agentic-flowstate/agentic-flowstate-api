@@ -99,7 +99,7 @@ pub enum AgentType {
     FullAccess,
     /// Scoped workspace manager — restricted tool set for external users (no home/daily plan/focus/code)
     ScopedWorkspace,
-    /// Alex's single durable Claude Fable 5 coordinator
+    /// Alex's single durable Codex coordinator
     FableCoordinator,
 }
 
