@@ -16,6 +16,7 @@ use super::codex_app_server::{agentic_mcp_binary, launchd_safe_path, terminate_c
 pub const FABLE_MODEL: &str = "claude-fable-5";
 pub const FABLE_EFFORT: &str = "max";
 pub const FABLE_MCP_PROFILE: &str = "fable-coordinator";
+pub const FABLE_BUILTIN_TOOLS: &[&str] = &["ToolSearch"];
 pub const FABLE_ALLOWED_MCP_TOOLS: &[&str] = &[
     "mcp__agentic-mcp__list_conversations",
     "mcp__agentic-mcp__get_conversation",
@@ -241,7 +242,8 @@ pub async fn spawn_claude_code(
     let mcp_binary = agentic_mcp_binary()?;
     let mcp_config = build_mcp_config(&mcp_binary, options.conversation_id, options.user_id)?;
     let runtime_dir = isolated_fable_runtime_dir()?;
-    let allowed_tools = FABLE_ALLOWED_MCP_TOOLS.join(",");
+    let allowed_tools = fable_allowed_tools_argument();
+    let builtin_tools = FABLE_BUILTIN_TOOLS.join(",");
     let mut command = Command::new(&binary);
     command
         .arg("--print")
@@ -260,7 +262,8 @@ pub async fn spawn_claude_code(
         .arg("bypassPermissions")
         .arg("--allowedTools")
         .arg(allowed_tools)
-        .arg("--tools=")
+        .arg("--tools")
+        .arg(builtin_tools)
         .arg("--disable-slash-commands")
         .arg("--setting-sources")
         .arg("")
@@ -434,6 +437,15 @@ fn build_mcp_config(
     .map_err(|error| format!("Failed to build strict Fable MCP configuration: {error}"))
 }
 
+fn fable_allowed_tools_argument() -> String {
+    FABLE_BUILTIN_TOOLS
+        .iter()
+        .chain(FABLE_ALLOWED_MCP_TOOLS.iter())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 async fn read_claude_stdout(
     stdout: tokio::process::ChildStdout,
     expected_session_id: String,
@@ -558,18 +570,44 @@ impl ClaudeStreamParser {
                 "Claude Code reported apiKeySource={api_key_source}; refusing non-subscription Fable execution"
             ));
         }
-        let connected = value
+        let mcp_servers = value
             .get("mcp_servers")
             .and_then(Value::as_array)
-            .is_some_and(|servers| {
-                servers.iter().any(|server| {
-                    server.get("name").and_then(Value::as_str) == Some("agentic-mcp")
-                        && server.get("status").and_then(Value::as_str) == Some("connected")
-                })
-            });
-        if !connected {
+            .ok_or_else(|| "Claude Code Fable init is missing mcp_servers".to_string())?;
+        if mcp_servers.len() != 1
+            || mcp_servers[0].get("name").and_then(Value::as_str) != Some("agentic-mcp")
+        {
+            return Err("Claude Code Fable init did not preserve the single strict agentic-mcp server boundary".to_string());
+        }
+        let mcp_status = required_string(&mcp_servers[0], "status")?;
+        if mcp_status != "connected" && mcp_status != "pending" {
+            return Err(format!(
+                "Claude Code Fable strict agentic-mcp server reported status={mcp_status}"
+            ));
+        }
+
+        let init_tools = value
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Claude Code Fable init is missing tools".to_string())?;
+        let mut tool_search_enabled = false;
+        for tool in init_tools {
+            let tool = tool
+                .as_str()
+                .ok_or_else(|| "Claude Code Fable init contains a non-string tool".to_string())?;
+            if tool == "ToolSearch" {
+                tool_search_enabled = true;
+                continue;
+            }
+            if !FABLE_ALLOWED_MCP_TOOLS.contains(&tool) {
+                return Err(format!(
+                    "Claude Code Fable init exposed forbidden tool={tool}"
+                ));
+            }
+        }
+        if !tool_search_enabled {
             return Err(
-                "Claude Code Fable process did not connect the strict agentic-mcp server"
+                "Claude Code Fable init did not expose ToolSearch for lazy coordinator MCP loading"
                     .to_string(),
             );
         }
@@ -861,7 +899,8 @@ mod tests {
             "session_id": session_id,
             "model": FABLE_MODEL,
             "apiKeySource": api_key_source,
-            "mcp_servers": [{"name": "agentic-mcp", "status": "connected"}]
+            "mcp_servers": [{"name": "agentic-mcp", "status": "pending"}],
+            "tools": ["ToolSearch"]
         })
         .to_string()
     }
@@ -882,6 +921,13 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(registry_tools, runtime_tools);
+        assert_eq!(FABLE_BUILTIN_TOOLS, &["ToolSearch"]);
+        let allowed_tools = fable_allowed_tools_argument()
+            .split(',')
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        assert!(allowed_tools.contains("ToolSearch"));
+        assert_eq!(allowed_tools.len(), runtime_tools.len() + 1);
         assert!(runtime_tools.contains("mcp__agentic-mcp__create_child_conversations"));
         assert!(!runtime_tools.iter().any(|tool| tool.contains('*')));
         for forbidden in [
@@ -953,6 +999,54 @@ mod tests {
             ))
             .expect_err("API auth must fail")
             .contains("refusing non-subscription"));
+
+        let mut failed_mcp_parser = parser();
+        let failed_mcp = json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "model": FABLE_MODEL,
+            "apiKeySource": "none",
+            "mcp_servers": [{"name": "agentic-mcp", "status": "failed"}],
+            "tools": ["ToolSearch"]
+        })
+        .to_string();
+        assert!(failed_mcp_parser
+            .parse_line(&failed_mcp)
+            .expect_err("failed MCP must fail")
+            .contains("status=failed"));
+
+        let mut direct_tool_parser = parser();
+        let direct_tool = json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "model": FABLE_MODEL,
+            "apiKeySource": "none",
+            "mcp_servers": [{"name": "agentic-mcp", "status": "pending"}],
+            "tools": ["ToolSearch", "Bash"]
+        })
+        .to_string();
+        assert!(direct_tool_parser
+            .parse_line(&direct_tool)
+            .expect_err("direct implementation tool must fail")
+            .contains("forbidden tool=Bash"));
+
+        let mut missing_search_parser = parser();
+        let missing_search = json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "model": FABLE_MODEL,
+            "apiKeySource": "none",
+            "mcp_servers": [{"name": "agentic-mcp", "status": "pending"}],
+            "tools": []
+        })
+        .to_string();
+        assert!(missing_search_parser
+            .parse_line(&missing_search)
+            .expect_err("missing ToolSearch must fail")
+            .contains("did not expose ToolSearch"));
     }
 
     #[test]
