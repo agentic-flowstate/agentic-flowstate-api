@@ -448,6 +448,63 @@ mod tests {
         assert!(!prompt.contains("Open HSV-2 therapeutics research"));
     }
 
+    #[test]
+    fn coordinator_v4_prompt_contains_workspace_ticket_and_efficiency_contracts() {
+        assert_eq!(
+            fable_coordinator::FABLE_PROMPT_VERSION,
+            "fable-coordinator/v4"
+        );
+
+        let config = chat_config(fable_coordinator::ALEX_USER_ID).unwrap();
+        let prompt = crate::agents::prompts::load_prompt(config.prompt_name, config.prompt_vars)
+            .expect("render Fable coordinator prompt");
+
+        for required in [
+            "## Baseline workspace context",
+            "The organization is `agentic-flowstate`.",
+            "`agentic-flowstate-api`",
+            "`agentic-flowstate-mcp`",
+            "`agentic-flowstate-app`",
+            "`agentic-flowstate-ticketing-system`",
+            "`agentic-flowstate-setup`",
+            "`agentic-flowstate-templates`",
+            "`projects-agents`",
+            "`/Users/jarvisgpt/projects`",
+            "## Ticket conventions",
+            "explicit `due_date` in strict `YYYY-MM-DD` format",
+            "Pass `organization: \"agentic-flowstate\"` explicitly",
+            "Resolve creation milestones from `ensure_work_ticket` target candidates",
+            "## Coordination efficiency",
+            "batch-load all of their schemas in one `ToolSearch` call",
+            "full `mcp__agentic-mcp__<tool_name>` name",
+            "`mcp__agentic-mcp__search_tickets`",
+            "`mcp__agentic-mcp__get_ticket`",
+            "Keep FTS queries narrow and specific",
+            "do not re-probe that surface with an equivalent query",
+            "Never ask Alex for context available from those sources",
+        ] {
+            assert!(
+                prompt.contains(required),
+                "Fable v4 prompt is missing required contract text: {required}"
+            );
+        }
+
+        for preserved_boundary in [
+            "single permanent text-only entry point",
+            "You are a conversation manager, not an implementation agent.",
+            "You are the only coordinator.",
+            "There is no nested worker hierarchy.",
+            "A code worker's first terminal result ends that conversation.",
+            "Authentication, credential, billing, security, runtime, retention, and coordinator-session recovery changes require explicit Alex approval.",
+            "This experience is text-only. Do not create or invoke voice functionality.",
+        ] {
+            assert!(
+                prompt.contains(preserved_boundary),
+                "Fable v4 prompt lost coordinator boundary text: {preserved_boundary}"
+            );
+        }
+    }
+
     fn runtime_state(
         session_state: &str,
         terminal_status: Option<&str>,
