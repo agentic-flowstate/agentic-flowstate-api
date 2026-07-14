@@ -1264,6 +1264,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/dailies/window", get(handlers::get_daily_window))
         .route(
+            "/api/dailies/mounts/:unlock_id/equip",
+            post(handlers::equip_daily_mount),
+        )
+        .route(
             "/api/dailies/events",
             get(handlers::stream_daily_execution_events),
         )

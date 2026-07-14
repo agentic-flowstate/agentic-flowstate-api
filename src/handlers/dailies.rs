@@ -1,3 +1,4 @@
+use anyhow::Context;
 use async_stream::stream;
 use axum::{
     extract::{Path, Query, State},
@@ -140,6 +141,40 @@ pub struct DailyWindowDto {
     pub items: Vec<DailyWindowItemDto>,
     pub materialized_count: u64,
     pub sync_cursor: i64,
+    pub progression: DailyProgressionDto,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DailyProgressionDto {
+    pub quest_points: i64,
+    pub grant_count: i64,
+    pub unlocks: Vec<QuestUnlockStatusDto>,
+    pub mount: Option<QuestMountStateDto>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct QuestUnlockCatalogItemDto {
+    pub unlock_id: String,
+    pub unlock_type: String,
+    pub name: String,
+    pub description: String,
+    pub required_points: i64,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct QuestUnlockStatusDto {
+    pub item: QuestUnlockCatalogItemDto,
+    pub unlocked: bool,
+    pub unlocked_at: Option<i64>,
+    pub equipped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct QuestMountStateDto {
+    pub equipped_unlock_id: String,
+    pub equipped_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -178,13 +213,69 @@ pub async fn get_daily_window(
     .await
     {
         Ok(window) => {
+            let progression = match load_daily_progression(&pool, &user.user_id).await {
+                Ok(progression) => progression,
+                Err(error) => {
+                    return internal_daily_error(
+                        &pool,
+                        &user.user_id,
+                        "window_progression",
+                        "Failed to load durable Daily progression",
+                        error,
+                    )
+                    .await;
+                }
+            };
             record_daily_metric("window", "success", started.elapsed());
-            (StatusCode::OK, Json(DailyWindowDto::from(window))).into_response()
+            (
+                StatusCode::OK,
+                Json(DailyWindowDto::from_window(window, progression)),
+            )
+                .into_response()
         }
         Err(error) => {
             record_daily_core_error("window", &error, started.elapsed());
             log_daily_core_error(&pool, &user.user_id, "window", &error).await;
             daily_core_error_response(error)
+        }
+    }
+}
+
+pub async fn equip_daily_mount(
+    State(pool): State<Arc<SqlitePool>>,
+    Extension(user): Extension<AuthenticatedUser>,
+    Path(unlock_id): Path<String>,
+) -> Response {
+    let started = Instant::now();
+    match ticketing_system::quest_economy::equip_quest_mount(&pool, &user.user_id, &unlock_id).await
+    {
+        Ok(mount) => {
+            record_daily_metric("mount_equip", "success", started.elapsed());
+            (StatusCode::OK, Json(QuestMountStateDto::from(mount))).into_response()
+        }
+        Err(error) if error.to_string() == "mount is not unlocked for this account" => {
+            record_daily_metric("mount_equip", "rejected", started.elapsed());
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": {
+                        "code": "mount_locked",
+                        "message": "This mount is not unlocked for the account."
+                    }
+                })),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            record_daily_metric("mount_equip", "internal_error", started.elapsed());
+            internal_daily_error(
+                &pool,
+                &user.user_id,
+                "mount_equip",
+                "Failed to equip Daily mount",
+                error,
+            )
+            .await
         }
     }
 }
@@ -1139,8 +1230,8 @@ impl From<DailyActionExecutionSnapshot> for DailyExecutionDto {
     }
 }
 
-impl From<DailyOccurrenceWindow> for DailyWindowDto {
-    fn from(value: DailyOccurrenceWindow) -> Self {
+impl DailyWindowDto {
+    fn from_window(value: DailyOccurrenceWindow, progression: DailyProgressionDto) -> Self {
         Self {
             start_date: value.start_date,
             days: value.days,
@@ -1170,8 +1261,63 @@ impl From<DailyOccurrenceWindow> for DailyWindowDto {
                 .collect(),
             materialized_count: value.materialized_count,
             sync_cursor: value.sync_cursor,
+            progression,
         }
     }
+}
+
+impl TryFrom<ticketing_system::quest_economy::QuestUnlockStatus> for QuestUnlockStatusDto {
+    type Error = anyhow::Error;
+
+    fn try_from(
+        value: ticketing_system::quest_economy::QuestUnlockStatus,
+    ) -> Result<Self, Self::Error> {
+        let item = value.item;
+        Ok(Self {
+            item: QuestUnlockCatalogItemDto {
+                unlock_id: item.unlock_id,
+                unlock_type: item.unlock_type,
+                name: item.name,
+                description: item.description,
+                required_points: item.required_points,
+                metadata: serde_json::from_str(&item.metadata_json)
+                    .context("decode quest unlock metadata")?,
+            },
+            unlocked: value.unlocked,
+            unlocked_at: value.unlocked_at,
+            equipped: value.equipped,
+        })
+    }
+}
+
+impl From<ticketing_system::quest_economy::QuestMountState> for QuestMountStateDto {
+    fn from(value: ticketing_system::quest_economy::QuestMountState) -> Self {
+        Self {
+            equipped_unlock_id: value.equipped_unlock_id,
+            equipped_at: value.equipped_at,
+            updated_at: value.updated_at,
+        }
+    }
+}
+
+async fn load_daily_progression(
+    pool: &SqlitePool,
+    user_id: &str,
+) -> anyhow::Result<DailyProgressionDto> {
+    let (balance, unlocks, mount) = tokio::try_join!(
+        ticketing_system::quest_economy::get_quest_point_balance(pool, user_id),
+        ticketing_system::quest_economy::list_quest_unlock_status(pool, user_id),
+        ticketing_system::quest_economy::get_quest_mount_state(pool, user_id),
+    )?;
+    Ok(DailyProgressionDto {
+        quest_points: balance.balance,
+        grant_count: balance.grant_count,
+        unlocks: unlocks
+            .into_iter()
+            .map(QuestUnlockStatusDto::try_from)
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        mount: mount.map(QuestMountStateDto::from),
+    })
 }
 
 impl From<DailyActionExecutionEvent> for DailyExecutionEventDto {
@@ -1626,6 +1772,10 @@ mod tests {
         let body = response_json(response).await;
         assert_eq!(body["items"][0]["source_organization"], "org-a");
         assert_eq!(body["items"][0]["quest_points"], 100);
+        assert_eq!(body["progression"]["quest_points"], 0);
+        assert_eq!(body["progression"]["grant_count"], 0);
+        assert_eq!(body["progression"]["unlocks"].as_array().unwrap().len(), 7);
+        assert!(body["progression"]["mount"].is_null());
         let persisted: Option<String> =
             sqlx::query_scalar("SELECT occurrence_timezone FROM users WHERE user_id = 'alex'")
                 .fetch_one(&pool)
@@ -1720,6 +1870,45 @@ mod tests {
         let completed_json = response_json(completed).await;
         assert_eq!(completed_json["status"], "completed");
         assert_eq!(completed_json["version"], 3);
+        let progression = load_daily_progression(&pool, "alex").await.unwrap();
+        assert_eq!(progression.quest_points, 100);
+        assert_eq!(progression.grant_count, 1);
+        assert!(
+            progression
+                .unlocks
+                .iter()
+                .find(|unlock| unlock.item.unlock_id == "sunsteel")
+                .unwrap()
+                .unlocked
+        );
+        assert!(
+            !progression
+                .unlocks
+                .iter()
+                .find(|unlock| unlock.item.unlock_id == "stormglass")
+                .unwrap()
+                .unlocked
+        );
+        let equipped = equip_daily_mount(
+            State(Arc::new(pool.clone())),
+            Extension(AuthenticatedUser {
+                user_id: "alex".to_string(),
+            }),
+            Path("sunsteel".to_string()),
+        )
+        .await;
+        assert_eq!(equipped.status(), StatusCode::OK);
+        let equipped_json = response_json(equipped).await;
+        assert_eq!(equipped_json["equipped_unlock_id"], "sunsteel");
+        let locked = equip_daily_mount(
+            State(Arc::new(pool.clone())),
+            Extension(AuthenticatedUser {
+                user_id: "alex".to_string(),
+            }),
+            Path("stormglass".to_string()),
+        )
+        .await;
+        assert_eq!(locked.status(), StatusCode::CONFLICT);
         let by_key = get_daily_execution_by_idempotency_key(
             State(Arc::new(pool.clone())),
             Extension(AuthenticatedUser {
