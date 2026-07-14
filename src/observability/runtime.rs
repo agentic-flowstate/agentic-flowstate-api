@@ -1,4 +1,4 @@
-//! Chat/Codex runtime observability.
+//! Conversation runtime observability.
 //!
 //! Keep metric labels closed here. Conversation/user/client identifiers are
 //! useful in process logs, but they are intentionally not Prometheus labels.
@@ -27,11 +27,12 @@ pub enum RuntimeFailurePhase {
     CreateCheckpoint,
     CreateAssistantMessage,
     StartupContextPreflight,
-    BuildCodexPrompt,
+    RuntimeAuthorization,
+    BuildRuntimePrompt,
     ClaimRunnerTurn,
-    SpawnCodex,
-    WaitCodexTurn,
-    CodexTurnFailed,
+    SpawnRuntime,
+    WaitRuntimeTurn,
+    RuntimeTurnFailed,
     RunnerJobFailed,
 }
 
@@ -43,11 +44,12 @@ impl fmt::Display for RuntimeFailurePhase {
             Self::CreateCheckpoint => "create_checkpoint",
             Self::CreateAssistantMessage => "create_assistant_message",
             Self::StartupContextPreflight => "startup_context_preflight",
-            Self::BuildCodexPrompt => "build_codex_prompt",
+            Self::RuntimeAuthorization => "runtime_authorization",
+            Self::BuildRuntimePrompt => "build_runtime_prompt",
             Self::ClaimRunnerTurn => "claim_runner_turn",
-            Self::SpawnCodex => "spawn_codex",
-            Self::WaitCodexTurn => "wait_codex_turn",
-            Self::CodexTurnFailed => "codex_turn_failed",
+            Self::SpawnRuntime => "spawn_runtime",
+            Self::WaitRuntimeTurn => "wait_runtime_turn",
+            Self::RuntimeTurnFailed => "runtime_turn_failed",
             Self::RunnerJobFailed => "runner_job_failed",
         })
     }
@@ -56,9 +58,9 @@ impl fmt::Display for RuntimeFailurePhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeLatencyPhase {
     WorkerProcessMessageStart,
-    CodexSpawnStart,
-    CodexSpawnReady,
-    CodexThreadStarted,
+    RuntimeSpawnStart,
+    RuntimeSpawnReady,
+    NativeSessionStarted,
     MessageStartPersisted,
     FirstAssistantDeltaPersisted,
     HandlerReceived,
@@ -73,9 +75,9 @@ impl fmt::Display for RuntimeLatencyPhase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::WorkerProcessMessageStart => "worker_process_message_start",
-            Self::CodexSpawnStart => "codex_spawn_start",
-            Self::CodexSpawnReady => "codex_spawn_ready",
-            Self::CodexThreadStarted => "codex_thread_started",
+            Self::RuntimeSpawnStart => "runtime_spawn_start",
+            Self::RuntimeSpawnReady => "runtime_spawn_ready",
+            Self::NativeSessionStarted => "native_session_started",
             Self::MessageStartPersisted => "message_start_persisted",
             Self::FirstAssistantDeltaPersisted => "first_assistant_delta_persisted",
             Self::HandlerReceived => "handler_received",
@@ -226,7 +228,7 @@ pub fn record_spawn_started(
     tracing::info!(
         target: TARGET,
         event = "agent_runtime.spawn_started",
-        phase = %RuntimeLatencyPhase::CodexSpawnStart,
+        phase = %RuntimeLatencyPhase::RuntimeSpawnStart,
         conversation_id = %conversation_id,
         client_id = client_id.unwrap_or("none"),
         runner_turn_id = %runner_turn_id,
@@ -234,7 +236,7 @@ pub fn record_spawn_started(
         model,
         reasoning_effort,
         started_at_ms,
-        "Codex runtime spawn started"
+        "agent runtime spawn started"
     );
 }
 
@@ -266,7 +268,7 @@ pub fn record_spawn_finished(
     tracing::info!(
         target: TARGET,
         event = "agent_runtime.spawn_finished",
-        phase = %RuntimeLatencyPhase::CodexSpawnReady,
+        phase = %RuntimeLatencyPhase::RuntimeSpawnReady,
         conversation_id = %conversation_id,
         client_id = client_id.unwrap_or("none"),
         runner_turn_id = %runner_turn_id,
@@ -330,11 +332,21 @@ mod tests {
                 RuntimeFailurePhase::StartupContextPreflight,
                 "startup_context_preflight",
             ),
-            (RuntimeFailurePhase::BuildCodexPrompt, "build_codex_prompt"),
+            (
+                RuntimeFailurePhase::RuntimeAuthorization,
+                "runtime_authorization",
+            ),
+            (
+                RuntimeFailurePhase::BuildRuntimePrompt,
+                "build_runtime_prompt",
+            ),
             (RuntimeFailurePhase::ClaimRunnerTurn, "claim_runner_turn"),
-            (RuntimeFailurePhase::SpawnCodex, "spawn_codex"),
-            (RuntimeFailurePhase::WaitCodexTurn, "wait_codex_turn"),
-            (RuntimeFailurePhase::CodexTurnFailed, "codex_turn_failed"),
+            (RuntimeFailurePhase::SpawnRuntime, "spawn_runtime"),
+            (RuntimeFailurePhase::WaitRuntimeTurn, "wait_runtime_turn"),
+            (
+                RuntimeFailurePhase::RuntimeTurnFailed,
+                "runtime_turn_failed",
+            ),
             (RuntimeFailurePhase::RunnerJobFailed, "runner_job_failed"),
         ];
 
@@ -350,11 +362,17 @@ mod tests {
                 RuntimeLatencyPhase::WorkerProcessMessageStart,
                 "worker_process_message_start",
             ),
-            (RuntimeLatencyPhase::CodexSpawnStart, "codex_spawn_start"),
-            (RuntimeLatencyPhase::CodexSpawnReady, "codex_spawn_ready"),
             (
-                RuntimeLatencyPhase::CodexThreadStarted,
-                "codex_thread_started",
+                RuntimeLatencyPhase::RuntimeSpawnStart,
+                "runtime_spawn_start",
+            ),
+            (
+                RuntimeLatencyPhase::RuntimeSpawnReady,
+                "runtime_spawn_ready",
+            ),
+            (
+                RuntimeLatencyPhase::NativeSessionStarted,
+                "native_session_started",
             ),
             (
                 RuntimeLatencyPhase::MessageStartPersisted,

@@ -958,7 +958,7 @@ pub(crate) async fn conversation_run_status_snapshot(
 
     if is_processing {
         if let (Some(manager), Some(checkpoint_row)) = (manager, checkpoint.as_ref()) {
-            let has_live_turn = manager.has_app_server_turn(conversation_id).await;
+            let has_live_turn = manager.has_runtime_turn(conversation_id).await;
             let has_worker = WORKER_MANAGER.has_worker(conversation_id).await;
             let has_runner_turn =
                 agent_runners::has_active_turn_for_conversation(pool, conversation_id)
@@ -1087,6 +1087,16 @@ fn child_conversation_requests(
     specs
         .iter()
         .map(|child| {
+            if requests_fable_designation(
+                child.agent.as_deref(),
+                child.conversation_type.as_deref(),
+            ) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "The permanent Fable coordinator cannot be created as a child conversation"
+                        .to_string(),
+                ));
+            }
             let has_initial_message = child
                 .initial_message
                 .as_deref()
@@ -1121,6 +1131,11 @@ fn canonical_child_agent_key_for_storage(agent: &str) -> String {
     AgentType::from_chat_agent_key(agent)
         .map(|agent_type| agent_type.as_str().to_string())
         .unwrap_or_else(|| agent.to_string())
+}
+
+fn requests_fable_designation(agent: Option<&str>, conversation_type: Option<&str>) -> bool {
+    conversation_type == Some(crate::fable_coordinator::FABLE_CONVERSATION_TYPE)
+        || agent.and_then(AgentType::from_chat_agent_key) == Some(AgentType::FableCoordinator)
 }
 
 async fn resolve_child_context_handoffs(
@@ -1840,6 +1855,12 @@ pub async fn create_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Json(mut req): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, Json<Conversation>), (StatusCode, String)> {
+    if requests_fable_designation(req.agent.as_deref(), req.conversation_type.as_deref()) {
+        return Err((
+            StatusCode::CONFLICT,
+            "Use GET /api/alex/coordinator for the permanent Fable coordinator".to_string(),
+        ));
+    }
     ensure_agent_allowed(&pool, &user.user_id, req.agent.as_deref()).await?;
     if req.parent_conversation_id.is_some() {
         return Err((
@@ -1869,6 +1890,12 @@ pub async fn create_multi_agent_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<CreateMultiAgentConversationRequest>,
 ) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), Response> {
+    if requests_fable_designation(req.agent.as_deref(), req.conversation_type.as_deref()) {
+        return Err(text_error_response((
+            StatusCode::CONFLICT,
+            "Use GET /api/alex/coordinator for the permanent Fable coordinator".to_string(),
+        )));
+    }
     ensure_agent_allowed(&pool, &user.user_id, req.agent.as_deref())
         .await
         .map_err(text_error_response)?;
@@ -2080,6 +2107,7 @@ pub async fn branch_conversation(
     Path(id): Path<String>,
     Json(req): Json<BranchConversationRequest>,
 ) -> Result<(StatusCode, Json<Conversation>), (StatusCode, String)> {
+    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
     let conv = conversations::branch_conversation(&pool, &user.user_id, &id, req)
         .await
         .map_err(branch_conversation_error)?;
@@ -2102,6 +2130,7 @@ pub async fn update_conversation(
     Path(id): Path<String>,
     Json(req): Json<UpdateConversationRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
     conversations::update_conversation(&pool, &user.user_id, &id, req)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2115,6 +2144,7 @@ pub async fn wait_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
     conversations::wait_conversation(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2128,6 +2158,7 @@ pub async fn activate_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
     conversations::activate_conversation(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2142,11 +2173,34 @@ pub async fn delete_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
     conversations::archive_conversation(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn reject_permanent_fable_mutation(
+    pool: &SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+) -> Result<(), (StatusCode, String)> {
+    let conversation = conversations::get_conversation(pool, conversation_id, false)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or((StatusCode::NOT_FOUND, "Conversation not found".to_string()))?;
+    if conversation.user_id != user_id {
+        return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
+    }
+    if crate::fable_coordinator::is_fable_conversation(&conversation) {
+        return Err((
+            StatusCode::CONFLICT,
+            "The permanent Fable coordinator cannot be branched, edited, archived, or moved out of open state"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Cancel a running conversation's agent (POST /api/conversations/:id/cancel)
@@ -3585,6 +3639,29 @@ mod tests {
         .expect("child request");
 
         assert_eq!(requests[0].agent.as_deref(), Some("full-access"));
+    }
+
+    #[test]
+    fn child_request_rejects_fable_coordinator_aliases() {
+        for agent in ["fable", "fable-coordinator"] {
+            let error = child_conversation_requests(&[CreateChildConversationSpec {
+                title: "Invalid coordinator child".to_string(),
+                agent: Some(agent.to_string()),
+                conversation_type: None,
+                child_sort_order: None,
+                handoff: ContextHandoffRequest::default(),
+                initial_message: Some("Coordinate".to_string()),
+                prompt_name: None,
+                working_dir: None,
+                client_id: None,
+                model: None,
+                reasoning_effort: None,
+            }])
+            .expect_err("Fable must remain a singleton parent");
+
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("cannot be created as a child"));
+        }
     }
 
     fn conversation_with_activity(is_active: Option<bool>) -> Conversation {

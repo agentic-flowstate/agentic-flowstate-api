@@ -1,4 +1,5 @@
 pub mod anthropic_events;
+pub mod claude_code;
 pub mod codex_app_server;
 pub mod executor;
 pub mod oneshot;

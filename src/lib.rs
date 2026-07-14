@@ -10,6 +10,7 @@ pub mod email_fetcher;
 pub mod email_intake_scheduler;
 pub mod email_notification_dispatcher;
 pub mod email_threading;
+pub mod fable_coordinator;
 pub mod handlers;
 pub mod health_monitor;
 pub mod inbound_outreach;

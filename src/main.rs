@@ -11,6 +11,7 @@ mod email_intake_scheduler;
 mod email_notification_dispatcher;
 mod email_threading;
 mod email_tracking_consumer;
+mod fable_coordinator;
 mod handlers;
 mod health_monitor;
 mod inbound_outreach;
@@ -341,6 +342,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize SQLite database pool
     let db_pool = Arc::new(ticketing_system::init_db().await?);
+    fable_coordinator::ensure_schema(&db_pool).await?;
     tracing::info!("SQLite database pool initialized");
 
     match ticketing_system::daily_action_executions::reconcile_daily_action_executions(&db_pool)
@@ -1551,6 +1553,27 @@ async fn main() -> anyhow::Result<()> {
         )
         // Token usage tracking
         .route("/api/usage", get(handlers::usage::get_usage))
+        // Alex tab: one permanent subscription-authenticated Fable coordinator.
+        .route(
+            "/api/alex/coordinator",
+            get(handlers::get_fable_coordinator),
+        )
+        .route(
+            "/api/alex/coordinator/health",
+            get(handlers::get_fable_coordinator_health),
+        )
+        .route(
+            "/api/alex/coordinator/chat",
+            post(handlers::fable_coordinator_chat),
+        )
+        .route(
+            "/api/alex/coordinator/chat/submit",
+            post(handlers::fable_coordinator_chat_submit),
+        )
+        .route(
+            "/api/alex/coordinator/session/repair",
+            post(handlers::repair_fable_coordinator_session),
+        )
         // Conversation routes (user-scoped, filtered by authenticated user_id)
         .route(
             "/api/conversations",

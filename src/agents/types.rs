@@ -95,6 +95,8 @@ pub enum AgentType {
     FullAccess,
     /// Scoped workspace manager — restricted tool set for external users (no home/daily plan/focus/code)
     ScopedWorkspace,
+    /// Alex's single durable Claude Fable 5 coordinator
+    FableCoordinator,
 }
 
 impl AgentType {
@@ -112,6 +114,7 @@ impl AgentType {
             "feedback" => Some(AgentType::Feedback),
             "research" => Some(AgentType::Research),
             "polymarket" => Some(AgentType::Polymarket),
+            "fable" | "fable-coordinator" => Some(AgentType::FableCoordinator),
             _ => None,
         }
     }
@@ -143,6 +146,7 @@ impl AgentType {
             AgentType::MeetingAgent => "meeting-agent",
             AgentType::FullAccess => "full-access",
             AgentType::ScopedWorkspace => "scoped-workspace",
+            AgentType::FableCoordinator => "fable-coordinator",
         }
     }
 

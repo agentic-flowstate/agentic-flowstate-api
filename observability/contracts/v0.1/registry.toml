@@ -67,6 +67,7 @@ allowed_fields = [
   "document_id",
   "duration_ms",
   "elapsed_ms",
+  "error_class",
   "error_type",
   "event_id",
   "event_index",
@@ -90,6 +91,7 @@ allowed_fields = [
   "outcome",
   "phase",
   "platform",
+  "prompt_version",
   "queue",
   "reason",
   "received_at",
@@ -107,6 +109,7 @@ allowed_fields = [
   "severity",
   "span_id",
   "started_at_ms",
+  "state",
   "status",
   "status_class",
   "ticket_id",
@@ -788,6 +791,48 @@ name = "agent_runtime_event_latency_ms"
 kind = "histogram"
 contract_id = "C-OBS-004"
 labels = ["phase"]
+
+[[metrics]]
+name = "fable_coordinator_auth_failures_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["error_class"]
+
+[[metrics]]
+name = "fable_coordinator_session_failures_total"
+kind = "counter"
+contract_id = "C-OBS-004"
+labels = ["error_class", "operation"]
+
+[[metrics]]
+name = "fable_coordinator_turn_duration_ms"
+kind = "histogram"
+contract_id = "C-OBS-004"
+labels = ["status"]
+
+[[metrics]]
+name = "fable_coordinator_busy"
+kind = "gauge"
+contract_id = "C-OBS-004"
+labels = []
+
+[[metrics]]
+name = "fable_coordinator_queue_depth"
+kind = "gauge"
+contract_id = "C-OBS-004"
+labels = []
+
+[[metrics]]
+name = "fable_coordinator_session_state"
+kind = "gauge"
+contract_id = "C-OBS-004"
+labels = ["state"]
+
+[[metrics]]
+name = "fable_coordinator_prompt_info"
+kind = "gauge"
+contract_id = "C-OBS-004"
+labels = ["prompt_version"]
 
 [[metrics]]
 name = "stream_snapshot_emitted_total"

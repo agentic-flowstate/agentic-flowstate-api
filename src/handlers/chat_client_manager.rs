@@ -1,12 +1,28 @@
 use std::collections::{HashMap, HashSet};
 use tokio::sync::Mutex;
 
+use crate::agents::claude_code::ClaudeCodeTurnHandle;
 use crate::agents::codex_app_server::CodexAppServerTurnHandle;
 
-/// Manages live Codex app-server turns and cancellation markers.
+#[derive(Clone)]
+enum RuntimeTurnHandle {
+    Codex(CodexAppServerTurnHandle),
+    Fable(ClaudeCodeTurnHandle),
+}
+
+impl RuntimeTurnHandle {
+    async fn terminate(&self) -> Result<(), String> {
+        match self {
+            Self::Codex(handle) => handle.terminate().await,
+            Self::Fable(handle) => handle.terminate().await,
+        }
+    }
+}
+
+/// Manages live conversation runtimes and cancellation markers.
 pub struct ChatClientManager {
     runner_generation_id: String,
-    app_server_turns: Mutex<HashMap<String, CodexAppServerTurnHandle>>,
+    runtime_turns: Mutex<HashMap<String, RuntimeTurnHandle>>,
     cancelled_turns: Mutex<HashSet<String>>,
 }
 
@@ -18,7 +34,7 @@ impl ChatClientManager {
     pub fn with_runner_generation_id(runner_generation_id: String) -> Self {
         Self {
             runner_generation_id,
-            app_server_turns: Mutex::new(HashMap::new()),
+            runtime_turns: Mutex::new(HashMap::new()),
             cancelled_turns: Mutex::new(HashSet::new()),
         }
     }
@@ -27,27 +43,34 @@ impl ChatClientManager {
         &self.runner_generation_id
     }
 
-    /// Register a live Codex app-server subprocess for a conversation turn so the
-    /// cancel endpoint can kill it.
-    pub async fn insert_app_server_turn(
+    /// Register a live Codex app-server subprocess for cancellation.
+    pub async fn insert_codex_turn(
         &self,
         conversation_id: String,
         turn_handle: CodexAppServerTurnHandle,
     ) {
-        let mut turns = self.app_server_turns.lock().await;
-        turns.insert(conversation_id, turn_handle);
+        let mut turns = self.runtime_turns.lock().await;
+        turns.insert(conversation_id, RuntimeTurnHandle::Codex(turn_handle));
     }
 
-    /// Remove a live Codex app-server subprocess handle after the turn ends.
-    pub async fn remove_app_server_turn(&self, conversation_id: &str) {
-        let mut turns = self.app_server_turns.lock().await;
+    pub async fn insert_fable_turn(
+        &self,
+        conversation_id: String,
+        turn_handle: ClaudeCodeTurnHandle,
+    ) {
+        let mut turns = self.runtime_turns.lock().await;
+        turns.insert(conversation_id, RuntimeTurnHandle::Fable(turn_handle));
+    }
+
+    /// Remove a live runtime subprocess handle after the turn ends.
+    pub async fn remove_runtime_turn(&self, conversation_id: &str) {
+        let mut turns = self.runtime_turns.lock().await;
         turns.remove(conversation_id);
     }
 
-    /// Whether a live Codex app-server subprocess is currently registered for
-    /// this conversation.
-    pub async fn has_app_server_turn(&self, conversation_id: &str) -> bool {
-        let turns = self.app_server_turns.lock().await;
+    /// Whether a live runtime subprocess is registered for this conversation.
+    pub async fn has_runtime_turn(&self, conversation_id: &str) -> bool {
+        let turns = self.runtime_turns.lock().await;
         turns.contains_key(conversation_id)
     }
 
@@ -70,11 +93,11 @@ impl ChatClientManager {
         cancelled.remove(conversation_id)
     }
 
-    /// Interrupt a running conversation's Codex app-server turn.
+    /// Interrupt a running conversation runtime.
     /// Returns Ok(true) if interrupted, Ok(false) if no active turn found.
     pub async fn interrupt(&self, conversation_id: &str) -> Result<bool, String> {
         let turn_handle = {
-            let turns = self.app_server_turns.lock().await;
+            let turns = self.runtime_turns.lock().await;
             turns.get(conversation_id).cloned()
         };
 

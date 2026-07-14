@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting Agentic runner...");
     let db = Arc::new(ticketing_system::init_db().await?);
+    agentic_api::fable_coordinator::ensure_schema(&db).await?;
     init_apns()?;
 
     let generation_id = format!("runner-{}", uuid::Uuid::new_v4());
@@ -817,6 +818,10 @@ async fn verify_job_conversation_owner(
     if conversation.user_id != job.payload.user_id {
         anyhow::bail!("Conversation job user does not own the target conversation");
     }
+    agentic_api::fable_coordinator::validate_runtime_assignment(
+        &conversation,
+        job.payload.runtime == ChatRuntime::ClaudeCodeFable.as_job_runtime(),
+    )?;
     Ok(())
 }
 
@@ -824,9 +829,15 @@ fn worker_message_from_job(
     job: &conversation_turn_jobs::ConversationTurnJob,
 ) -> Result<WorkerMessage> {
     let payload = &job.payload;
-    if payload.runtime != ChatRuntime::CodexAppServer.as_job_runtime() {
-        anyhow::bail!("Unsupported conversation job runtime: {}", payload.runtime);
-    }
+    let runtime = match payload.runtime.as_str() {
+        value if value == ChatRuntime::CodexAppServer.as_job_runtime() => {
+            ChatRuntime::CodexAppServer
+        }
+        value if value == ChatRuntime::ClaudeCodeFable.as_job_runtime() => {
+            ChatRuntime::ClaudeCodeFable
+        }
+        _ => anyhow::bail!("Unsupported conversation job runtime: {}", payload.runtime),
+    };
 
     let agent_type: AgentType = AgentType::from_chat_agent_key(&payload.agent_type)
         .or_else(|| {
@@ -849,7 +860,7 @@ fn worker_message_from_job(
         message: payload.message.clone(),
         config: ChatConfig {
             agent_type,
-            runtime: ChatRuntime::CodexAppServer,
+            runtime,
             prompt_name: prompt_name_static(&payload.prompt_name)?,
             working_dir: PathBuf::from(&payload.working_dir),
             prompt_vars,
@@ -890,6 +901,7 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
         "pull-ticket" => Ok("pull-ticket"),
         "codebase-research" => Ok("codebase-research"),
         "doc-manager" => Ok("doc-manager"),
+        "fable-coordinator" => Ok("fable-coordinator"),
         other => anyhow::bail!("Unsupported conversation job prompt: {}", other),
     }
 }
@@ -904,6 +916,15 @@ mod tests {
             prompt_name_static("research").expect("research prompt"),
             "research"
         );
+    }
+
+    #[test]
+    fn runner_accepts_only_the_canonical_fable_prompt_name() {
+        assert_eq!(
+            prompt_name_static("fable-coordinator").expect("Fable coordinator prompt"),
+            "fable-coordinator"
+        );
+        assert!(prompt_name_static("fable").is_err());
     }
 
     #[test]

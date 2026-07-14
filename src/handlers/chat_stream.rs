@@ -169,12 +169,14 @@ pub type SseStream = Sse<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChatRuntime {
     CodexAppServer,
+    ClaudeCodeFable,
 }
 
 impl ChatRuntime {
     pub fn as_job_runtime(self) -> &'static str {
         match self {
             Self::CodexAppServer => "codex-app-server",
+            Self::ClaudeCodeFable => "claude-code-fable",
         }
     }
 }
@@ -577,7 +579,7 @@ async fn has_existing_active_conversation_turn(
     manager: &ChatClientManager,
     conversation_id: &str,
 ) -> bool {
-    if manager.has_app_server_turn(conversation_id).await {
+    if manager.has_runtime_turn(conversation_id).await {
         return true;
     }
     if WORKER_MANAGER.has_worker(conversation_id).await {
@@ -607,9 +609,16 @@ async fn authorize_conversation_turn(
     db: &SqlitePool,
     conversation_id: &str,
     user_id: &str,
+    runtime: ChatRuntime,
 ) -> Result<(), Response> {
     match conversations::get_conversation(db, conversation_id, false).await {
-        Ok(Some(conv)) if conv.user_id == user_id => Ok(()),
+        Ok(Some(conv)) if conv.user_id == user_id => {
+            crate::fable_coordinator::validate_runtime_assignment(
+                &conv,
+                runtime == ChatRuntime::ClaudeCodeFable,
+            )
+            .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response())
+        }
         Ok(Some(_)) | Ok(None) => {
             Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()).into_response())
         }
@@ -685,7 +694,9 @@ pub async fn submit(
         "chat submit received"
     );
 
-    if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
+    if let Err(response) =
+        authorize_conversation_turn(&db, &conv_id, &user_id, config.runtime).await
+    {
         return response;
     }
 
@@ -969,7 +980,9 @@ pub async fn chat(
         }
     };
 
-    if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
+    if let Err(response) =
+        authorize_conversation_turn(&db, &conv_id, &user_id, config.runtime).await
+    {
         return response;
     }
     if let Err(message) = validate_chat_attachments(attachments.as_deref()) {
@@ -1408,19 +1421,63 @@ mod conversation_authorization_tests {
     #[tokio::test]
     async fn authorizes_owner_for_chat_turns() {
         let pool = fresh_pool().await;
-        assert!(authorize_conversation_turn(&pool, "conv-alex", "alex")
-            .await
-            .is_ok());
+        assert!(authorize_conversation_turn(
+            &pool,
+            "conv-alex",
+            "alex",
+            ChatRuntime::CodexAppServer,
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
     async fn rejects_other_user_for_chat_turns() {
         let pool = fresh_pool().await;
-        let response = match authorize_conversation_turn(&pool, "conv-alex", "jakegreene").await {
+        let response = match authorize_conversation_turn(
+            &pool,
+            "conv-alex",
+            "jakegreene",
+            ChatRuntime::CodexAppServer,
+        )
+        .await
+        {
             Ok(()) => panic!("expected authorization failure"),
             Err(response) => response,
         };
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn enforces_runtime_boundary_before_chat_turn_persistence() {
+        let pool = fresh_pool().await;
+        sqlx::query(
+            r#"
+            UPDATE conversations
+            SET agent = 'fable', conversation_type = 'fable_coordinator',
+                conversation_role = 'multi_agent_parent',
+                organization = 'agentic-flowstate', title = 'Alex'
+            WHERE id = 'conv-alex'
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let wrong_runtime =
+            authorize_conversation_turn(&pool, "conv-alex", "alex", ChatRuntime::CodexAppServer)
+                .await
+                .expect_err("Chat/Codex must not enter the Fable singleton");
+        assert_eq!(wrong_runtime.status(), StatusCode::CONFLICT);
+
+        assert!(authorize_conversation_turn(
+            &pool,
+            "conv-alex",
+            "alex",
+            ChatRuntime::ClaudeCodeFable,
+        )
+        .await
+        .is_ok());
     }
 }
 

@@ -158,7 +158,7 @@ impl CodexToolProfile {
     }
 }
 
-fn agentic_mcp_binary() -> Result<PathBuf, String> {
+pub(crate) fn agentic_mcp_binary() -> Result<PathBuf, String> {
     if let Some(binary) = std::env::var_os("AGENTIC_MCP_COMMAND") {
         return validate_agentic_mcp_binary(PathBuf::from(binary), "AGENTIC_MCP_COMMAND");
     }
