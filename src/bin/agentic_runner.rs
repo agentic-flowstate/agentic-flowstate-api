@@ -820,7 +820,7 @@ async fn verify_job_conversation_owner(
     }
     agentic_api::fable_coordinator::validate_runtime_assignment(
         &conversation,
-        job.payload.runtime == ChatRuntime::ClaudeCodeFable.as_job_runtime(),
+        job.payload.agent_type == agentic_api::fable_coordinator::FABLE_AGENT,
     )?;
     Ok(())
 }

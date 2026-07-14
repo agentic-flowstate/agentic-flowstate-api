@@ -609,13 +609,15 @@ async fn authorize_conversation_turn(
     db: &SqlitePool,
     conversation_id: &str,
     user_id: &str,
-    runtime: ChatRuntime,
 ) -> Result<(), Response> {
     match conversations::get_conversation(db, conversation_id, false).await {
         Ok(Some(conv)) if conv.user_id == user_id => {
             crate::fable_coordinator::validate_runtime_assignment(
                 &conv,
-                runtime == ChatRuntime::ClaudeCodeFable,
+                matches!(
+                    conv.agent.as_deref(),
+                    Some(crate::fable_coordinator::FABLE_AGENT)
+                ),
             )
             .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response())
         }
@@ -694,9 +696,7 @@ pub async fn submit(
         "chat submit received"
     );
 
-    if let Err(response) =
-        authorize_conversation_turn(&db, &conv_id, &user_id, config.runtime).await
-    {
+    if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
         return response;
     }
 
@@ -980,9 +980,7 @@ pub async fn chat(
         }
     };
 
-    if let Err(response) =
-        authorize_conversation_turn(&db, &conv_id, &user_id, config.runtime).await
-    {
+    if let Err(response) = authorize_conversation_turn(&db, &conv_id, &user_id).await {
         return response;
     }
     if let Err(message) = validate_chat_attachments(attachments.as_deref()) {
@@ -1421,27 +1419,15 @@ mod conversation_authorization_tests {
     #[tokio::test]
     async fn authorizes_owner_for_chat_turns() {
         let pool = fresh_pool().await;
-        assert!(authorize_conversation_turn(
-            &pool,
-            "conv-alex",
-            "alex",
-            ChatRuntime::CodexAppServer,
-        )
-        .await
-        .is_ok());
+        assert!(authorize_conversation_turn(&pool, "conv-alex", "alex")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
     async fn rejects_other_user_for_chat_turns() {
         let pool = fresh_pool().await;
-        let response = match authorize_conversation_turn(
-            &pool,
-            "conv-alex",
-            "jakegreene",
-            ChatRuntime::CodexAppServer,
-        )
-        .await
-        {
+        let response = match authorize_conversation_turn(&pool, "conv-alex", "jakegreene").await {
             Ok(()) => panic!("expected authorization failure"),
             Err(response) => response,
         };
@@ -1464,20 +1450,9 @@ mod conversation_authorization_tests {
         .await
         .unwrap();
 
-        let wrong_runtime =
-            authorize_conversation_turn(&pool, "conv-alex", "alex", ChatRuntime::CodexAppServer)
-                .await
-                .expect_err("Chat/Codex must not enter the Fable singleton");
-        assert_eq!(wrong_runtime.status(), StatusCode::CONFLICT);
-
-        assert!(authorize_conversation_turn(
-            &pool,
-            "conv-alex",
-            "alex",
-            ChatRuntime::ClaudeCodeFable,
-        )
-        .await
-        .is_ok());
+        assert!(authorize_conversation_turn(&pool, "conv-alex", "alex")
+            .await
+            .is_ok());
     }
 }
 

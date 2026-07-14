@@ -125,15 +125,18 @@ pub fn is_fable_conversation(conversation: &Conversation) -> bool {
     conversation.conversation_type.as_deref() == Some(FABLE_CONVERSATION_TYPE)
 }
 
-pub fn validate_runtime_assignment(conversation: &Conversation, fable_runtime: bool) -> Result<()> {
+pub fn validate_runtime_assignment(
+    conversation: &Conversation,
+    fable_coordinator_agent: bool,
+) -> Result<()> {
     let has_fable_type = conversation.conversation_type.as_deref() == Some(FABLE_CONVERSATION_TYPE);
     let has_fable_agent = conversation.agent.as_deref() == Some(FABLE_AGENT);
     let designated = has_fable_type && has_fable_agent;
 
-    if fable_runtime {
+    if fable_coordinator_agent {
         if !designated {
             return Err(anyhow!(
-                "Claude Code Fable runtime is reserved for Alex's permanent coordinator"
+                "The Fable coordinator agent is reserved for Alex's permanent coordinator"
             ));
         }
         return validate_singleton(conversation);
@@ -141,7 +144,7 @@ pub fn validate_runtime_assignment(conversation: &Conversation, fable_runtime: b
 
     if has_fable_type || has_fable_agent {
         return Err(anyhow!(
-            "Alex's permanent coordinator must run through the Claude Code Fable runtime"
+            "Alex's permanent coordinator must run through the Fable coordinator agent"
         ));
     }
     Ok(())

@@ -1319,7 +1319,7 @@ impl ConversationWorker {
             };
         if let Err(error) = fable_coordinator::validate_runtime_assignment(
             &conversation,
-            msg.config.runtime == ChatRuntime::ClaudeCodeFable,
+            msg.config.agent_type == AgentType::FableCoordinator,
         ) {
             fail_runtime_before_spawn(
                 self,
