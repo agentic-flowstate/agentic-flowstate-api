@@ -155,14 +155,21 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: runner handoff bootstrap
     )
 }
 
-/// Build the launchd transition commands for `service`.
+fn client_owned_mcp_refresh_command() -> String {
+    r#"echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: Agentic MCP is client-owned stdio; staged binary activates when Codex reconnects""#
+        .to_string()
+}
+
+/// Build the service transition commands for `service`.
 ///
-/// This is the ONE path that moves services onto new binaries, and it is
-/// handoff-aware: the runner is never killed, it is handed off. Bootstrapping a
-/// replacement generation is enough on its own — the new runner registers itself
-/// and calls `mark_other_generations_draining` at startup (agentic_runner.rs), so
-/// the outgoing generation finishes its in-flight turns, exits, and `KeepAlive`
-/// brings `com.agentic.runner` back up on the new binary.
+/// This is the ONE path that moves long-running services onto new binaries, and
+/// it is handoff-aware: the runner is never killed, it is handed off.
+/// Bootstrapping a replacement generation is enough on its own — the new runner
+/// registers itself and calls `mark_other_generations_draining` at startup
+/// (agentic_runner.rs), so the outgoing generation finishes its in-flight turns,
+/// exits, and `KeepAlive` brings `com.agentic.runner` back up on the new binary.
+/// Agentic MCP is different: Codex owns each stdio process, so setup only stages
+/// its binary and the next client connection activates it.
 fn launchd_transition_commands(uid: &str, service: &str) -> Vec<String> {
     let mut commands = Vec::new();
     if matches!(service, "api-server" | "all") {
@@ -172,7 +179,7 @@ fn launchd_transition_commands(uid: &str, service: &str) -> Vec<String> {
         commands.push(launchd_runner_handoff_command(uid));
     }
     if matches!(service, "mcp-server" | "all") {
-        commands.push(launchd_restart_command(uid, "com.agentic.mcp"));
+        commands.push(client_owned_mcp_refresh_command());
     }
     commands
 }
@@ -340,6 +347,27 @@ mod tests {
         assert!(command.contains("launchctl print gui/501/com.agentic.api"));
         assert!(!command.contains("launchctl bootout"));
         assert!(!command.contains("launchctl bootstrap"));
+    }
+
+    #[test]
+    fn mcp_transition_is_client_owned_and_never_calls_launchd() {
+        let commands = launchd_transition_commands("501", "mcp-server");
+
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].contains("client-owned stdio"));
+        assert!(commands[0].contains("Codex reconnects"));
+        assert!(!commands[0].contains("launchctl"));
+        assert!(!commands[0].contains("com.agentic.mcp"));
+    }
+
+    #[test]
+    fn all_transition_handoffs_long_running_services_and_defers_mcp_to_client() {
+        let command = launchd_transition_commands("501", "all").join("\n");
+
+        assert!(command.contains("launchctl kickstart -k gui/501/com.agentic.api"));
+        assert!(command.contains("handoff bootstrap com.agentic.runner"));
+        assert!(command.contains("client-owned stdio"));
+        assert!(!command.contains("com.agentic.mcp"));
     }
 }
 
