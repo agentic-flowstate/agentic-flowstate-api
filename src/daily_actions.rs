@@ -97,7 +97,6 @@ async fn launch_in_core(
         pool,
         LaunchDailyActionExecutionRequest {
             user_id: daily.user_id.clone(),
-            organization: daily.organization.clone(),
             daily_id: daily.daily_id.clone(),
             occurrence_id: request.occurrence_id,
             action_key: request.action_key,
@@ -154,8 +153,8 @@ fn completion_policy_for_daily(daily: &ticketing_system::Daily) -> DailyActionCo
 }
 
 pub fn occurrence_date_for_timestamp(timezone: &str, timestamp: i64) -> anyhow::Result<String> {
-    let timezone = ticketing_system::schedule_offsets::parse_organization_timezone(timezone)
-        .context("Organization timezone is not a reviewed IANA timezone")?;
+    let timezone = ticketing_system::users::validate_occurrence_timezone(timezone)
+        .context("Account occurrence timezone is not a valid IANA timezone")?;
     let timestamp = DateTime::<Utc>::from_timestamp(timestamp, 0)
         .context("Daily occurrence timestamp is outside the supported range")?;
     Ok(timestamp
@@ -314,11 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn occurrence_dates_are_derived_in_reviewed_organization_timezone() {
+    fn occurrence_dates_are_derived_in_validated_account_timezone() {
         assert_eq!(
             occurrence_date_for_timestamp("America/Bogota", 1_783_980_000).unwrap(),
             "2026-07-13"
         );
+        assert!(occurrence_date_for_timestamp("UTC-5", 1_783_980_000).is_err());
     }
 
     #[test]

@@ -1230,7 +1230,34 @@ async fn main() -> anyhow::Result<()> {
             "/api/library/artifacts/:artifact_id",
             get(handlers::get_library_artifact),
         )
-        // Dailies scheduled automation routes
+        .route(
+            "/api/library/documents",
+            get(handlers::list_library_documents),
+        )
+        .route(
+            "/api/library/documents/search",
+            get(handlers::search_library_documents),
+        )
+        .route(
+            "/api/library/documents/:document_id/download",
+            get(handlers::download_library_document),
+        )
+        // Data events SSE (live updates)
+        .route("/api/data/subscribe", get(handlers::subscribe_data))
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.db.clone(),
+            auth_middleware::require_org_access,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.db.clone(),
+            auth_middleware::require_auth,
+        ));
+
+    // User-scoped routes (require valid session only, no org membership check)
+    let user_scoped_routes = Router::new()
+        // Dailies is an account-global surface. Each Daily retains its source
+        // organization, but authorization is resolved from that stored
+        // identity instead of the app's selected X-Organization value.
         .route(
             "/api/dailies",
             get(handlers::list_dailies).post(handlers::create_daily),
@@ -1281,31 +1308,6 @@ async fn main() -> anyhow::Result<()> {
             "/api/dailies/:daily_id/runs/:run_id/package-update-review/deny",
             post(handlers::deny_package_update_review),
         )
-        .route(
-            "/api/library/documents",
-            get(handlers::list_library_documents),
-        )
-        .route(
-            "/api/library/documents/search",
-            get(handlers::search_library_documents),
-        )
-        .route(
-            "/api/library/documents/:document_id/download",
-            get(handlers::download_library_document),
-        )
-        // Data events SSE (live updates)
-        .route("/api/data/subscribe", get(handlers::subscribe_data))
-        .layer(axum::middleware::from_fn_with_state(
-            app_state.db.clone(),
-            auth_middleware::require_org_access,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            app_state.db.clone(),
-            auth_middleware::require_auth,
-        ));
-
-    // User-scoped routes (require valid session only, no org membership check)
-    let user_scoped_routes = Router::new()
         // Password rotation — called after every Face ID sign-in so the
         // server-side secret never stays stable.
         .route(

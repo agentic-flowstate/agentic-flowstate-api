@@ -33,6 +33,7 @@ const SKIP_PATHS: &[&str] = &[
     "/api/dms/subscribe",
     "/api/meetings/subscribe",
     "/api/daily-plan/subscribe",
+    "/api/dailies/events",
     "/api/meetings/signaling",
     "/api/events/subscribe",
 ];

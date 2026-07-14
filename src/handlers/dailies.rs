@@ -12,6 +12,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -28,9 +29,8 @@ use crate::daily_actions::{self, DailyLaunchError, DailyLaunchRequest};
 use crate::package_updates::{self, PackageUpdateScanReport};
 use crate::system_log_helper;
 
-use super::{get_organization, runner_capacity};
+use super::runner_capacity;
 
-const DAILIES_STORAGE_ORGANIZATION: &str = "agentic-flowstate";
 const IDEMPOTENCY_KEY_HEADER: &str = "Idempotency-Key";
 const DEFAULT_WINDOW_DAYS: i64 = 7;
 const DEFAULT_EVENT_LIMIT: i64 = 100;
@@ -47,6 +47,7 @@ pub struct RunsQuery {
 pub struct DailyWindowQuery {
     pub start: String,
     pub days: Option<i64>,
+    pub timezone: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,11 +122,13 @@ pub struct LaunchDailyExecutionResponse {
 #[derive(Debug, Serialize)]
 pub struct DailyWindowItemDto {
     pub occurrence: DailyOccurrenceDto,
+    pub source_organization: String,
     pub title: String,
     pub description: String,
     pub kind: String,
     pub tags: Vec<String>,
     pub daily_status: String,
+    pub quest_points: i64,
     pub action: DailyOccurrenceAction,
     pub latest_execution: Option<DailyExecutionDto>,
 }
@@ -150,31 +153,25 @@ pub struct DailyExecutionEventDto {
 pub async fn get_daily_window(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Query(query): Query<DailyWindowQuery>,
 ) -> Response {
     let started = Instant::now();
-    let organization = get_organization(&headers);
-    if organization == DAILIES_STORAGE_ORGANIZATION {
-        if let Err(error) =
-            dailies_scheduler::ensure_package_update_daily(&pool, &user.user_id).await
-        {
-            return internal_daily_error(
-                &pool,
-                &user.user_id,
-                "window",
-                "Failed to ensure the default package update Daily",
-                error,
-            )
-            .await;
-        }
+    if let Err(error) = dailies_scheduler::ensure_package_update_daily(&pool, &user.user_id).await {
+        return internal_daily_error(
+            &pool,
+            &user.user_id,
+            "window",
+            "Failed to ensure the default package update Daily",
+            error,
+        )
+        .await;
     }
 
     let days = query.days.unwrap_or(DEFAULT_WINDOW_DAYS);
     match daily_action_executions::materialize_daily_occurrence_window(
         &pool,
         &user.user_id,
-        &organization,
+        &query.timezone,
         &query.start,
         days,
     )
@@ -199,12 +196,11 @@ pub async fn create_daily_execution(
     Path((daily_id, occurrence_id, action_key)): Path<(String, String, String)>,
     Json(body): Json<LaunchDailyExecutionBody>,
 ) -> Response {
-    let organization = get_organization(&headers);
     let idempotency_key = match required_idempotency_key(&headers) {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let daily = match scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    let daily = match authorized_daily(&pool, &user.user_id, &daily_id).await {
         Ok(daily) => daily,
         Err(response) => return response,
     };
@@ -226,18 +222,11 @@ pub async fn create_daily_execution(
 pub async fn get_daily_execution(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path(execution_id): Path<String>,
 ) -> Response {
     let started = Instant::now();
-    let organization = get_organization(&headers);
-    match daily_action_executions::get_daily_action_execution(
-        &pool,
-        &user.user_id,
-        &organization,
-        &execution_id,
-    )
-    .await
+    match daily_action_executions::get_daily_action_execution(&pool, &user.user_id, &execution_id)
+        .await
     {
         Ok(Some(execution)) => {
             record_daily_metric("execution_read", "success", started.elapsed());
@@ -258,15 +247,12 @@ pub async fn get_daily_execution(
 pub async fn get_daily_execution_by_idempotency_key(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Response {
     let started = Instant::now();
-    let organization = get_organization(&headers);
     match daily_action_executions::get_daily_action_execution_by_idempotency_key(
         &pool,
         &user.user_id,
-        &organization,
         &key,
     )
     .await
@@ -293,7 +279,6 @@ pub async fn stream_daily_execution_events(
     headers: HeaderMap,
     Query(query): Query<DailyEventsQuery>,
 ) -> Response {
-    let organization = get_organization(&headers);
     let header_cursor = match last_event_id(&headers) {
         Ok(value) => value,
         Err(response) => return response,
@@ -309,7 +294,6 @@ pub async fn stream_daily_execution_events(
     let initial = match daily_action_executions::list_daily_action_execution_events(
         &pool,
         &user.user_id,
-        &organization,
         starting_after,
         DEFAULT_EVENT_LIMIT,
     )
@@ -327,9 +311,17 @@ pub async fn stream_daily_execution_events(
         "outcome" => "opened"
     )
     .increment(1);
+    tracing::info!(
+        component = "dailies_api",
+        operation = "daily_action.sse_opened",
+        user_id = %user.user_id,
+        starting_after,
+        initial_event_count = initial.events.len(),
+        sync_cursor = initial.sync_cursor,
+        "opened account-global Daily execution event stream"
+    );
     let pool = pool.clone();
     let user_id = user.user_id;
-    let stream_organization = organization;
     let event_stream = stream! {
         let mut cursor = starting_after;
         if cursor > initial.sync_cursor {
@@ -364,7 +356,6 @@ pub async fn stream_daily_execution_events(
             match daily_action_executions::list_daily_action_execution_events(
                 &pool,
                 &user_id,
-                &stream_organization,
                 cursor,
                 DEFAULT_EVENT_LIMIT,
             )
@@ -392,6 +383,16 @@ pub async fn stream_daily_execution_events(
                         "outcome" => "poll_failed"
                     )
                     .increment(1);
+                    system_log_helper::log_event(
+                        &pool,
+                        "error",
+                        "dailies",
+                        "Daily execution event stream failed",
+                        Some(&format!("error_code={}", error.code.as_str())),
+                        Some(&user_id),
+                        None,
+                    )
+                    .await;
                     yield Ok(Event::default()
                         .event("daily_execution.error")
                         .data(json!({"error": "stream_unavailable"}).to_string()));
@@ -436,19 +437,27 @@ pub struct ResumeDailyRequest {
 pub async fn list_dailies(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
 ) -> Response {
-    let organization = get_organization(&headers);
-    if organization == DAILIES_STORAGE_ORGANIZATION {
-        if let Err(e) = dailies_scheduler::ensure_package_update_daily(&pool, &user.user_id).await {
-            return server_error("Failed to ensure package update Daily", e);
-        }
+    if let Err(e) = dailies_scheduler::ensure_package_update_daily(&pool, &user.user_id).await {
+        return server_error("Failed to ensure package update Daily", e);
     }
 
-    match ticketing_system::dailies::list_dailies(&pool, Some(&user.user_id), Some(&organization))
-        .await
-    {
-        Ok(dailies) => (StatusCode::OK, Json(json!(dailies))).into_response(),
+    let memberships =
+        match ticketing_system::memberships::list_user_organizations(&pool, &user.user_id).await {
+            Ok(memberships) => memberships
+                .into_iter()
+                .map(|membership| membership.organization)
+                .collect::<HashSet<_>>(),
+            Err(error) => return server_error("Failed to authorize dailies", error),
+        };
+    match ticketing_system::dailies::list_dailies(&pool, Some(&user.user_id), None).await {
+        Ok(dailies) => {
+            let authorized = dailies
+                .into_iter()
+                .filter(|daily| memberships.contains(&daily.organization))
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(json!(authorized))).into_response()
+        }
         Err(e) => server_error("Failed to list dailies", e),
     }
 }
@@ -456,11 +465,21 @@ pub async fn list_dailies(
 pub async fn create_daily(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Json(mut req): Json<ticketing_system::CreateDailyRequest>,
 ) -> Response {
     req.user_id = user.user_id;
-    req.organization = get_organization(&headers);
+    match ticketing_system::memberships::check_membership(&pool, &req.user_id, &req.organization)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return daily_forbidden(
+                "source_organization_forbidden",
+                "The source organization is not authorized for this account.",
+            )
+        }
+        Err(error) => return server_error("Failed to authorize source organization", error),
+    }
     match ticketing_system::dailies::create_daily(&pool, req).await {
         Ok(daily) => (StatusCode::CREATED, Json(json!(daily))).into_response(),
         Err(e) => bad_request("Failed to create daily", e),
@@ -470,12 +489,10 @@ pub async fn create_daily(
 pub async fn get_daily(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path(daily_id): Path<String>,
     Query(query): Query<RunsQuery>,
 ) -> Response {
-    let organization = get_organization(&headers);
-    let daily = match scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    let daily = match authorized_daily(&pool, &user.user_id, &daily_id).await {
         Ok(daily) => daily,
         Err(response) => return response,
     };
@@ -489,12 +506,10 @@ pub async fn get_daily(
 pub async fn update_daily(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path(daily_id): Path<String>,
     Json(req): Json<ticketing_system::UpdateDailyRequest>,
 ) -> Response {
-    let organization = get_organization(&headers);
-    if let Err(response) = scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    if let Err(response) = authorized_daily(&pool, &user.user_id, &daily_id).await {
         return response;
     }
     match ticketing_system::dailies::update_daily_for_user(&pool, &user.user_id, &daily_id, req)
@@ -509,12 +524,10 @@ pub async fn update_daily(
 pub async fn pause_daily(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path(daily_id): Path<String>,
     Json(req): Json<PauseDailyRequest>,
 ) -> Response {
-    let organization = get_organization(&headers);
-    if let Err(response) = scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    if let Err(response) = authorized_daily(&pool, &user.user_id, &daily_id).await {
         return response;
     }
     let reason = req.reason.unwrap_or_else(|| "Paused by user".to_string());
@@ -530,12 +543,10 @@ pub async fn pause_daily(
 pub async fn resume_daily(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path(daily_id): Path<String>,
     Json(req): Json<ResumeDailyRequest>,
 ) -> Response {
-    let organization = get_organization(&headers);
-    if let Err(response) = scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    if let Err(response) = authorized_daily(&pool, &user.user_id, &daily_id).await {
         return response;
     }
     match ticketing_system::dailies::resume_daily_for_user(
@@ -559,12 +570,11 @@ pub async fn run_daily_now(
     headers: HeaderMap,
     Path(daily_id): Path<String>,
 ) -> Response {
-    let organization = get_organization(&headers);
     let idempotency_key = match required_idempotency_key(&headers) {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let daily = match scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    let daily = match authorized_daily(&pool, &user.user_id, &daily_id).await {
         Ok(daily) => daily,
         Err(response) => return response,
     };
@@ -605,11 +615,9 @@ pub async fn run_daily_now(
 pub async fn mark_daily_run_read(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path((daily_id, run_id)): Path<(String, String)>,
 ) -> Response {
-    let organization = get_organization(&headers);
-    if let Err(response) = scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    if let Err(response) = authorized_daily(&pool, &user.user_id, &daily_id).await {
         return response;
     }
     match ticketing_system::dailies::get_run(&pool, &run_id).await {
@@ -627,11 +635,9 @@ pub async fn mark_daily_run_read(
 pub async fn get_package_update_review(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path((daily_id, run_id)): Path<(String, String)>,
 ) -> Response {
-    let organization = get_organization(&headers);
-    if let Err(response) = scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    if let Err(response) = authorized_daily(&pool, &user.user_id, &daily_id).await {
         return response;
     }
     match user_package_update_review(&pool, &user.user_id, &daily_id, &run_id).await {
@@ -644,11 +650,9 @@ pub async fn get_package_update_review(
 pub async fn deny_package_update_review(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path((daily_id, run_id)): Path<(String, String)>,
 ) -> Response {
-    let organization = get_organization(&headers);
-    if let Err(response) = scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    if let Err(response) = authorized_daily(&pool, &user.user_id, &daily_id).await {
         return response;
     }
     let Some(_) = (match user_package_update_review(&pool, &user.user_id, &daily_id, &run_id).await
@@ -671,11 +675,9 @@ pub async fn deny_package_update_review(
 pub async fn approve_package_update_review(
     State(pool): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    headers: HeaderMap,
     Path((daily_id, run_id)): Path<(String, String)>,
 ) -> Response {
-    let organization = get_organization(&headers);
-    if let Err(response) = scoped_daily(&pool, &user.user_id, &organization, &daily_id).await {
+    if let Err(response) = authorized_daily(&pool, &user.user_id, &daily_id).await {
         return response;
     }
     let detail = match user_package_update_review(&pool, &user.user_id, &daily_id, &run_id).await {
@@ -731,15 +733,27 @@ pub async fn approve_package_update_review(
         .into_response()
 }
 
-async fn scoped_daily(
+async fn authorized_daily(
     pool: &SqlitePool,
     user_id: &str,
-    organization: &str,
     daily_id: &str,
 ) -> Result<ticketing_system::Daily, Response> {
     match ticketing_system::dailies::get_daily_for_user(pool, user_id, daily_id).await {
-        Ok(Some(daily)) if daily.organization == organization => Ok(daily),
-        Ok(_) => Err(daily_not_found(
+        Ok(Some(daily)) => match ticketing_system::memberships::check_membership(
+            pool,
+            user_id,
+            &daily.organization,
+        )
+        .await
+        {
+            Ok(true) => Ok(daily),
+            Ok(false) => Err(daily_not_found(
+                "daily_occurrence_not_found",
+                "The Daily was not found.",
+            )),
+            Err(error) => Err(server_error("Failed to authorize Daily", error)),
+        },
+        Ok(None) => Err(daily_not_found(
             "daily_occurrence_not_found",
             "The Daily was not found.",
         )),
@@ -984,6 +998,17 @@ fn daily_bad_request(code: &'static str, message: &'static str) -> Response {
         .into_response()
 }
 
+fn daily_forbidden(code: &'static str, message: &'static str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "ok": false,
+            "error": {"code": code, "message": message, "details": {}}
+        })),
+    )
+        .into_response()
+}
+
 fn record_daily_metric(operation: &'static str, outcome: &'static str, elapsed: Duration) {
     metrics::counter!(
         "api_daily_action_requests_total",
@@ -1122,20 +1147,25 @@ impl From<DailyOccurrenceWindow> for DailyWindowDto {
             items: value
                 .items
                 .into_iter()
-                .map(|item| DailyWindowItemDto {
-                    occurrence: DailyOccurrenceDto {
-                        occurrence_id: item.occurrence.occurrence_id,
-                        daily_id: item.occurrence.daily_id,
-                        occurrence_date: item.occurrence.occurrence_date,
-                        action_key: item.occurrence.action_key,
-                    },
-                    title: item.title,
-                    description: item.description,
-                    kind: item.kind,
-                    tags: item.tags,
-                    daily_status: item.daily_status,
-                    action: item.action,
-                    latest_execution: item.latest_execution.map(DailyExecutionDto::from),
+                .map(|item| {
+                    let source_organization = item.occurrence.organization;
+                    DailyWindowItemDto {
+                        occurrence: DailyOccurrenceDto {
+                            occurrence_id: item.occurrence.occurrence_id,
+                            daily_id: item.occurrence.daily_id,
+                            occurrence_date: item.occurrence.occurrence_date,
+                            action_key: item.occurrence.action_key,
+                        },
+                        source_organization,
+                        title: item.title,
+                        description: item.description,
+                        kind: item.kind,
+                        tags: item.tags,
+                        daily_status: item.daily_status,
+                        quest_points: item.quest_points,
+                        action: item.action,
+                        latest_execution: item.latest_execution.map(DailyExecutionDto::from),
+                    }
                 })
                 .collect(),
             materialized_count: value.materialized_count,
@@ -1211,11 +1241,15 @@ fn server_error(context: &str, error: anyhow::Error) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
-    use axum::http::HeaderValue;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{HeaderValue, Request};
+    use axum::routing::get;
+    use axum::Router;
+    use futures::StreamExt;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::path::PathBuf;
     use std::str::FromStr;
+    use tower::ServiceExt;
 
     #[test]
     fn launch_transport_uses_202_only_for_new_execution() {
@@ -1303,7 +1337,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daily_scope_hides_cross_organization_resources() {
+    async fn daily_identity_authorizes_its_stored_source_organization() {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -1342,6 +1376,21 @@ mod tests {
         .expect("create dailies table");
         sqlx::query(
             r#"
+            CREATE TABLE organization_memberships (
+                user_id TEXT NOT NULL,
+                organization TEXT NOT NULL,
+                role TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, organization)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("create membership table");
+        sqlx::query(
+            r#"
             INSERT INTO dailies (
                 daily_id, user_id, organization, title, description, kind, tags,
                 status, cadence_unit, cadence_interval, run_until, next_run_at,
@@ -1358,15 +1407,19 @@ mod tests {
         .execute(&pool)
         .await
         .expect("seed Daily");
+        sqlx::query("INSERT INTO organization_memberships VALUES ('alex', 'org-a', 'owner', 1, 1)")
+            .execute(&pool)
+            .await
+            .expect("seed membership");
 
-        assert!(scoped_daily(&pool, "alex", "org-a", "DLY-1").await.is_ok());
-        let hidden = scoped_daily(&pool, "alex", "org-b", "DLY-1")
+        assert!(authorized_daily(&pool, "alex", "DLY-1").await.is_ok());
+        sqlx::query("DELETE FROM organization_memberships WHERE user_id = 'alex'")
+            .execute(&pool)
             .await
-            .unwrap_err();
+            .expect("revoke membership");
+        let hidden = authorized_daily(&pool, "alex", "DLY-1").await.unwrap_err();
         assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
-        let other_user = scoped_daily(&pool, "other", "org-a", "DLY-1")
-            .await
-            .unwrap_err();
+        let other_user = authorized_daily(&pool, "other", "DLY-1").await.unwrap_err();
         assert_eq!(other_user.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1427,12 +1480,31 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO organizations (name, description, timezone, created_at, updated_at)
-            VALUES ('org-a', NULL, 'America/Chicago', 1, 1)
+            VALUES ('org-a', NULL, NULL, 1, 1)
             "#,
         )
         .execute(&pool)
         .await
         .expect("seed organization");
+        sqlx::query(
+            r#"
+            INSERT INTO users (user_id, name, created_at, updated_at)
+            VALUES ('alex', 'Alex', '1', '1')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed user");
+        sqlx::query(
+            r#"
+            INSERT INTO organization_memberships (
+                user_id, organization, role, created_at, updated_at
+            ) VALUES ('alex', 'org-a', 'owner', 1, 1)
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed source organization membership");
         sqlx::query(
             r#"
             INSERT INTO dailies (
@@ -1472,7 +1544,6 @@ mod tests {
 
     fn daily_headers(idempotency_key: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        headers.insert("X-Organization", HeaderValue::from_static("org-a"));
         headers.insert(
             IDEMPOTENCY_KEY_HEADER,
             HeaderValue::from_str(idempotency_key).expect("valid idempotency header"),
@@ -1507,12 +1578,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn window_route_needs_timezone_but_never_an_organization_header() {
+        let pool = durable_daily_test_pool().await;
+        let app = Router::new()
+            .route("/api/dailies/window", get(get_daily_window))
+            .with_state(Arc::new(pool.clone()))
+            .layer(Extension(AuthenticatedUser {
+                user_id: "alex".to_string(),
+            }));
+
+        let missing_timezone = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dailies/window?start=2026-07-13&days=7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_timezone.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_timezone = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dailies/window?start=2026-07-13&days=7&timezone=UTC-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_timezone.status(), StatusCode::BAD_REQUEST);
+        let invalid_body = response_json(invalid_timezone).await;
+        assert_eq!(invalid_body["error"]["code"], "occurrence_timezone_invalid");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/dailies/window?start=2026-07-13&days=7&timezone=America%2FBogota")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["items"][0]["source_organization"], "org-a");
+        assert_eq!(body["items"][0]["quest_points"], 100);
+        let persisted: Option<String> =
+            sqlx::query_scalar("SELECT occurrence_timezone FROM users WHERE user_id = 'alex'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(persisted.as_deref(), Some("America/Bogota"));
+    }
+
+    #[tokio::test]
     async fn durable_route_contract_covers_replay_concurrency_rollback_and_job_transitions() {
         let pool = durable_daily_test_pool().await;
         let window = daily_action_executions::materialize_daily_occurrence_window(
             &pool,
             "alex",
-            "org-a",
+            "America/Bogota",
             "2026-07-13",
             7,
         )
@@ -1564,15 +1692,11 @@ mod tests {
                 .expect("claim queued Daily job")
                 .expect("Daily job available");
         assert_eq!(claimed.id, job_id);
-        let running = daily_action_executions::get_daily_action_execution(
-            &pool,
-            "alex",
-            "org-a",
-            &execution_id,
-        )
-        .await
-        .expect("read running execution")
-        .expect("running execution exists");
+        let running =
+            daily_action_executions::get_daily_action_execution(&pool, "alex", &execution_id)
+                .await
+                .expect("read running execution")
+                .expect("running execution exists");
         assert_eq!(running.status, DailyActionExecutionStatus::Running);
         assert_eq!(running.phase.as_deref(), Some("agent_running"));
 
@@ -1589,7 +1713,6 @@ mod tests {
             Extension(AuthenticatedUser {
                 user_id: "alex".to_string(),
             }),
-            daily_headers("unused-read-key"),
             Path(execution_id.clone()),
         )
         .await;
@@ -1602,18 +1725,16 @@ mod tests {
             Extension(AuthenticatedUser {
                 user_id: "alex".to_string(),
             }),
-            daily_headers("unused-read-key"),
             Path("request-created".to_string()),
         )
         .await;
         assert_eq!(by_key.status(), StatusCode::OK);
         let by_key_json = response_json(by_key).await;
         assert_eq!(by_key_json["execution_id"], execution_id);
-        let events = daily_action_executions::list_daily_action_execution_events(
-            &pool, "alex", "org-a", 0, 100,
-        )
-        .await
-        .expect("read durable Daily events");
+        let events =
+            daily_action_executions::list_daily_action_execution_events(&pool, "alex", 0, 100)
+                .await
+                .expect("read durable Daily events");
         assert_eq!(events.events.len(), 3);
         let event_stream = stream_daily_execution_events(
             State(Arc::new(pool.clone())),
@@ -1632,6 +1753,15 @@ mod tests {
             .get("content-type")
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("text/event-stream")));
+        let mut frames = event_stream.into_body().into_data_stream();
+        let first_frame = tokio::time::timeout(Duration::from_secs(1), frames.next())
+            .await
+            .expect("initial SSE frame timeout")
+            .expect("initial SSE frame")
+            .expect("initial SSE frame bytes");
+        let first_frame = String::from_utf8(first_frame.to_vec()).expect("UTF-8 SSE frame");
+        assert!(first_frame.contains("daily_execution.updated"));
+        assert!(first_frame.contains(&execution_id));
 
         let first = execute_for_occurrence(&pool, &occurrence_ids[1], "concurrent-a");
         let second = execute_for_occurrence(&pool, &occurrence_ids[1], "concurrent-b");

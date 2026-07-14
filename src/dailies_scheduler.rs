@@ -32,6 +32,16 @@ pub fn spawn_dailies_scheduler(pool: Arc<SqlitePool>, token: CancellationToken) 
                     error = %error,
                     "durable Dailies scheduler tick failed"
                 );
+                crate::system_log_helper::log_event(
+                    &pool,
+                    "error",
+                    "dailies",
+                    "Daily scheduler tick failed",
+                    Some(&format!("error={error}")),
+                    None,
+                    None,
+                )
+                .await;
             }
         }
     });
@@ -52,8 +62,17 @@ pub async fn run_due_once(pool: Arc<SqlitePool>) -> Result<()> {
     }
 
     let due = ticketing_system::dailies::due_dailies(&pool, now, 25).await?;
+    let mut launch_failures = 0u64;
+    let mut first_failed_daily_id = None;
     for daily in due {
         if let Err(error) = launch_due_occurrence(&pool, &daily, now).await {
+            launch_failures += 1;
+            first_failed_daily_id.get_or_insert_with(|| daily.daily_id.clone());
+            metrics::counter!(
+                "api_dailies_scheduler_launches_total",
+                "outcome" => "failed"
+            )
+            .increment(1);
             tracing::error!(
                 component = "dailies_scheduler",
                 operation = "daily_action.scheduler_launch_failed",
@@ -62,7 +81,29 @@ pub async fn run_due_once(pool: Arc<SqlitePool>) -> Result<()> {
                 error = %error,
                 "failed to queue due Daily through durable conversation runner"
             );
+        } else {
+            metrics::counter!(
+                "api_dailies_scheduler_launches_total",
+                "outcome" => "processed"
+            )
+            .increment(1);
         }
+    }
+
+    if launch_failures > 0 {
+        crate::system_log_helper::log_event(
+            &pool,
+            "error",
+            "dailies",
+            "Daily scheduler launch batch had failures",
+            Some(&format!(
+                "failure_count={launch_failures};first_daily_id={}",
+                first_failed_daily_id.as_deref().unwrap_or("none")
+            )),
+            None,
+            None,
+        )
+        .await;
     }
 
     Ok(())
@@ -73,23 +114,19 @@ async fn launch_due_occurrence(
     daily: &ticketing_system::Daily,
     now: i64,
 ) -> Result<()> {
-    let organization = ticketing_system::organizations::get_organization(pool, &daily.organization)
+    let timezone = ticketing_system::users::get_occurrence_timezone(pool, &daily.user_id)
         .await?
-        .with_context(|| format!("Organization '{}' was not found", daily.organization))?;
-    let timezone = organization
-        .timezone
-        .as_deref()
-        .context("Organization has no reviewed IANA timezone")?;
-    let date = daily_actions::occurrence_date_for_timestamp(timezone, now)?;
-    let window = daily_action_executions::materialize_daily_occurrence_window(
-        pool,
-        &daily.user_id,
-        &daily.organization,
-        &date,
-        1,
-    )
-    .await
-    .map_err(anyhow::Error::new)?;
+        .context("Account has no validated occurrence timezone")?;
+    let date = daily_actions::occurrence_date_for_timestamp(&timezone, now)?;
+    let window =
+        daily_action_executions::materialize_daily_occurrence_window_from_persisted_timezone(
+            pool,
+            &daily.user_id,
+            &date,
+            1,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
 
     let Some(item) = window
         .items
@@ -151,24 +188,20 @@ pub async fn materialize_run_now_occurrence(
     pool: &SqlitePool,
     daily: &ticketing_system::Daily,
 ) -> Result<Option<DailyOccurrenceWindowItem>> {
-    let organization = ticketing_system::organizations::get_organization(pool, &daily.organization)
+    let timezone = ticketing_system::users::get_occurrence_timezone(pool, &daily.user_id)
         .await?
-        .with_context(|| format!("Organization '{}' was not found", daily.organization))?;
-    let timezone = organization
-        .timezone
-        .as_deref()
-        .context("Organization has no reviewed IANA timezone")?;
+        .context("Account has no validated occurrence timezone")?;
     let target = daily.next_run_at.unwrap_or_else(|| Utc::now().timestamp());
-    let date = daily_actions::occurrence_date_for_timestamp(timezone, target)?;
-    let window = daily_action_executions::materialize_daily_occurrence_window(
-        pool,
-        &daily.user_id,
-        &daily.organization,
-        &date,
-        1,
-    )
-    .await
-    .map_err(anyhow::Error::new)?;
+    let date = daily_actions::occurrence_date_for_timestamp(&timezone, target)?;
+    let window =
+        daily_action_executions::materialize_daily_occurrence_window_from_persisted_timezone(
+            pool,
+            &daily.user_id,
+            &date,
+            1,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
     Ok(window
         .items
         .into_iter()

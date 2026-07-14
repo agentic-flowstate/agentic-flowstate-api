@@ -17,7 +17,7 @@ libc = "0.2"
 axum = { version = "0.7", features = ["default", "ws", "multipart"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7"
-tower = "0.4"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 tower-cookies = "0.10"
 http = "1"
