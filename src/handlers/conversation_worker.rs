@@ -4830,7 +4830,7 @@ mod streaming_persistence_tests {
             CREATE TABLE agent_checkpoints (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id TEXT NOT NULL,
-                cc_session_id TEXT NOT NULL,
+                runtime_session_id TEXT NOT NULL,
                 tool_call_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'running',
                 created_at INTEGER NOT NULL,
@@ -4865,7 +4865,7 @@ mod streaming_persistence_tests {
                 turn_id TEXT PRIMARY KEY,
                 generation_id TEXT NOT NULL,
                 conversation_id TEXT NOT NULL,
-                cc_session_id TEXT,
+                runtime_session_id TEXT,
                 status TEXT NOT NULL,
                 started_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,

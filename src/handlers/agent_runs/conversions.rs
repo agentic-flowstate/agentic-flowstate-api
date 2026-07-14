@@ -16,7 +16,7 @@ pub async fn store_agent_run(db: &SqlitePool, run: &AgentRun) -> anyhow::Result<
         input_message: run.input_message.clone(),
         output_summary: run.output_summary.clone(),
         tool_call_count: run.tool_call_count,
-        cc_session_id: run.cc_session_id.clone(),
+        runtime_session_id: run.runtime_session_id.clone(),
     };
 
     ticketing_system::agent_runs::update_agent_run(db, &db_run).await
@@ -47,7 +47,7 @@ pub fn db_run_to_api_run(db_run: ticketing_system::AgentRun) -> AgentRun {
         output_summary: db_run.output_summary,
         email_output,
         tool_call_count: db_run.tool_call_count,
-        cc_session_id: db_run.cc_session_id,
+        runtime_session_id: db_run.runtime_session_id,
     }
 }
 

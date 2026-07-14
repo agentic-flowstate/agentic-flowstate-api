@@ -361,7 +361,7 @@ pub async fn stream_agent_run(
                                 output_summary: Some(message),
                                 email_output: None,
                                 tool_call_count: 0,
-                                cc_session_id: None,
+                                runtime_session_id: None,
                             };
                             if let Err(store_err) = store_agent_run(&db_clone, &failed_run).await {
                                 tracing::error!(
@@ -482,7 +482,7 @@ pub async fn stream_agent_run(
                             input_message: String::new(),
                             output_summary: Some(format!("Agent failed: {}", e)),
                             tool_call_count: 0,
-                            cc_session_id: None,
+                            runtime_session_id: None,
                         };
 
                         let _ =
@@ -657,7 +657,7 @@ pub async fn send_message_to_agent(
             }
         }
 
-        let runtime_session_id = match &db_run.cc_session_id {
+        let runtime_session_id = match &db_run.runtime_session_id {
             Some(sid) => sid.clone(),
             None => {
                 let _ = tx

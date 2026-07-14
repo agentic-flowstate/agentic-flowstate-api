@@ -341,7 +341,7 @@ impl AgentExecutor {
             output_summary: Some(turn.output_summary),
             email_output,
             tool_call_count: turn.tool_call_count,
-            cc_session_id: turn.runtime_session_id,
+            runtime_session_id: turn.runtime_session_id,
         })
     }
 }

@@ -690,7 +690,7 @@ mod tests {
             r#"
             CREATE TABLE agent_checkpoints (
                 conversation_id TEXT PRIMARY KEY,
-                cc_session_id TEXT NOT NULL,
+                runtime_session_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -704,7 +704,7 @@ mod tests {
         let now_ts = Utc::now().timestamp();
         sqlx::query(
             "INSERT INTO agent_checkpoints \
-             (conversation_id, cc_session_id, status, created_at, updated_at) \
+             (conversation_id, runtime_session_id, status, created_at, updated_at) \
              VALUES (?, 'session-complete', 'completed', ?, ?)",
         )
         .bind("conv-completed-hot-tail")

@@ -4,7 +4,7 @@ use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use ticketing_system::daily_action_executions::{
-    self, DailyActionExecutionStatus, DailyOccurrenceWindowItem,
+    self, DailyActionError, DailyActionExecutionStatus, DailyOccurrenceWindowItem,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -64,10 +64,15 @@ pub async fn run_due_once(pool: Arc<SqlitePool>) -> Result<()> {
     let due = ticketing_system::dailies::due_dailies(&pool, now, 25).await?;
     let mut launch_failures = 0u64;
     let mut first_failed_daily_id = None;
+    let mut first_failed_error_code = None;
+    let mut first_failed_error_stage = None;
     for daily in due {
         if let Err(error) = launch_due_occurrence(&pool, &daily, now).await {
+            let (error_code, error_stage) = classify_daily_error(&error);
             launch_failures += 1;
             first_failed_daily_id.get_or_insert_with(|| daily.daily_id.clone());
+            first_failed_error_code.get_or_insert_with(|| error_code.to_string());
+            first_failed_error_stage.get_or_insert_with(|| error_stage.to_string());
             metrics::counter!(
                 "api_dailies_scheduler_launches_total",
                 "outcome" => "failed"
@@ -78,6 +83,8 @@ pub async fn run_due_once(pool: Arc<SqlitePool>) -> Result<()> {
                 operation = "daily_action.scheduler_launch_failed",
                 daily_id = %daily.daily_id,
                 organization = %daily.organization,
+                error_code,
+                error_stage,
                 error = %error,
                 "failed to queue due Daily through durable conversation runner"
             );
@@ -97,8 +104,10 @@ pub async fn run_due_once(pool: Arc<SqlitePool>) -> Result<()> {
             "dailies",
             "Daily scheduler launch batch had failures",
             Some(&format!(
-                "failure_count={launch_failures};first_daily_id={}",
-                first_failed_daily_id.as_deref().unwrap_or("none")
+                "failure_count={launch_failures};first_daily_id={};error_code={};error_stage={}",
+                first_failed_daily_id.as_deref().unwrap_or("none"),
+                first_failed_error_code.as_deref().unwrap_or("unknown"),
+                first_failed_error_stage.as_deref().unwrap_or("unknown")
             )),
             None,
             None,
@@ -107,6 +116,18 @@ pub async fn run_due_once(pool: Arc<SqlitePool>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn classify_daily_error(error: &anyhow::Error) -> (&'static str, &str) {
+    let Some(core) = error.downcast_ref::<DailyActionError>() else {
+        return ("daily_launch_error", "not_available");
+    };
+    let stage = core
+        .details
+        .get("stage")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("not_applicable");
+    (core.code.as_str(), stage)
 }
 
 async fn launch_due_occurrence(
@@ -180,6 +201,7 @@ async fn launch_due_occurrence(
             );
             Ok(())
         }
+        Err(daily_actions::DailyLaunchError::Core(error)) => Err(anyhow::Error::new(error)),
         Err(error) => Err(anyhow::anyhow!("{error:?}")),
     }
 }
@@ -251,4 +273,35 @@ pub async fn ensure_package_update_daily(pool: &SqlitePool, user_id: &str) -> Re
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use ticketing_system::daily_action_executions::DailyActionErrorCode;
+
+    #[test]
+    fn daily_core_error_classification_preserves_code_and_stage() {
+        let error = anyhow::Error::new(DailyActionError {
+            code: DailyActionErrorCode::Internal,
+            message: "diagnostic".to_string(),
+            details: json!({"stage": "window_execution_missing"}),
+        });
+
+        assert_eq!(
+            classify_daily_error(&error),
+            ("daily_action_internal", "window_execution_missing")
+        );
+    }
+
+    #[test]
+    fn non_core_daily_error_uses_stable_unknown_classification() {
+        let error = anyhow::anyhow!("untyped failure");
+
+        assert_eq!(
+            classify_daily_error(&error),
+            ("daily_launch_error", "not_available")
+        );
+    }
 }

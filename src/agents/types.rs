@@ -297,7 +297,7 @@ pub struct AgentRun {
     pub tool_call_count: i32,
     /// Runtime session ID for resuming after API restart
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cc_session_id: Option<String>,
+    pub runtime_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

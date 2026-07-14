@@ -131,7 +131,7 @@ pub async fn pull_focus_ticket(
                 input_message: String::new(),
                 output_summary: Some(format!("Agent failed: {}", e)),
                 tool_call_count: 0,
-                cc_session_id: None,
+                runtime_session_id: None,
             };
             let _ = ticketing_system::agent_runs::update_agent_run(&db, &failed_run).await;
             return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
@@ -161,7 +161,7 @@ pub async fn pull_focus_ticket(
             input_message: String::new(),
             output_summary: Some(truncate_output(&result_text)),
             tool_call_count,
-            cc_session_id: None,
+            runtime_session_id: None,
         };
         let db_clone = db.clone();
         tokio::spawn(async move {
@@ -188,7 +188,7 @@ pub async fn pull_focus_ticket(
             input_message: String::new(),
             output_summary: Some(truncate_output(&result_text)),
             tool_call_count,
-            cc_session_id: None,
+            runtime_session_id: None,
         };
         let _ = ticketing_system::agent_runs::update_agent_run(&db, &completed_run).await;
         return Err((
@@ -226,7 +226,7 @@ pub async fn pull_focus_ticket(
                     truncate_output(&result_text)
                 )),
                 tool_call_count,
-                cc_session_id: None,
+                runtime_session_id: None,
             };
             let db_clone = db.clone();
             tokio::spawn(async move {
@@ -276,7 +276,7 @@ pub async fn pull_focus_ticket(
         input_message: String::new(),
         output_summary: Some(truncate_output(&result_text)),
         tool_call_count,
-        cc_session_id: None,
+        runtime_session_id: None,
     };
     let _ = ticketing_system::agent_runs::update_agent_run(&db, &completed_run).await;
 
