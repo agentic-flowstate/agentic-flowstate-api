@@ -539,53 +539,106 @@ pub async fn repair_session(
         .await?
         .ok_or_else(|| anyhow!("Fable coordinator conversation not found"))?;
     validate_singleton(&conversation)?;
-    let state = runtime_state(pool, conversation_id)
-        .await?
-        .ok_or_else(|| anyhow!("Fable runtime state does not exist"))?;
-    if state.session_state != "recovery_required" {
-        return Err(anyhow!(
-            "Fable session repair is only allowed after a visible recovery incident"
-        ));
-    }
+    let state = runtime_state(pool, conversation_id).await?;
+    let untracked_session_id = match state.as_ref() {
+        Some(state) if state.session_state == "recovery_required" => None,
+        Some(_) => {
+            return Err(anyhow!(
+                "Fable session repair is only allowed after a visible recovery incident"
+            ));
+        }
+        None => Some(conversation.session_id.clone().ok_or_else(|| {
+            anyhow!("Fable session repair is only allowed after a visible recovery incident")
+        })?),
+    };
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now().timestamp();
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE conversations SET session_id = ?, updated_at = ? WHERE id = ?")
+    let conversation_updated = sqlx::query(
+        "UPDATE conversations SET session_id = ?, updated_at = ? WHERE id = ? AND session_id IS ?",
+    )
+    .bind(&session_id)
+    .bind(Utc::now().to_rfc3339())
+    .bind(conversation_id)
+    .bind(conversation.session_id.as_deref())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if conversation_updated != 1 {
+        return Err(anyhow!(
+            "Fable session repair raced with another coordinator operation"
+        ));
+    }
+
+    if state.is_some() {
+        let repaired = sqlx::query(
+            r#"
+            UPDATE fable_coordinator_runtime
+            SET native_session_id = ?, session_state = 'recovery_approved',
+                prompt_version = ?, model = ?, effort = ?, auth_method = 'claude.ai',
+                subscription_type = 'max', mcp_profile = ?, rehydrate_required = 1,
+                last_terminal_status = 'recovery_approved', last_error_class = NULL,
+                updated_at = ?
+            WHERE conversation_id = ? AND session_state = 'recovery_required'
+            "#,
+        )
         .bind(&session_id)
-        .bind(Utc::now().to_rfc3339())
+        .bind(FABLE_PROMPT_VERSION)
+        .bind(FABLE_MODEL)
+        .bind(FABLE_EFFORT)
+        .bind(FABLE_MCP_PROFILE)
+        .bind(now)
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
-    let repaired = sqlx::query(
-        r#"
-        UPDATE fable_coordinator_runtime
-        SET native_session_id = ?, session_state = 'recovery_approved',
-            prompt_version = ?, model = ?, effort = ?, auth_method = 'claude.ai',
-            subscription_type = 'max', mcp_profile = ?, rehydrate_required = 1,
-            last_terminal_status = 'recovery_approved', last_error_class = NULL,
-            updated_at = ?
-        WHERE conversation_id = ?
-        "#,
-    )
-    .bind(&session_id)
-    .bind(FABLE_PROMPT_VERSION)
-    .bind(FABLE_MODEL)
-    .bind(FABLE_EFFORT)
-    .bind(FABLE_MCP_PROFILE)
-    .bind(now)
-    .bind(conversation_id)
-    .execute(&mut *tx)
-    .await?;
-    if repaired.rows_affected() != 1 {
-        return Err(anyhow!(
-            "Fable session repair did not match durable runtime state"
-        ));
+        if repaired.rows_affected() != 1 {
+            return Err(anyhow!(
+                "Fable session repair did not match durable runtime state"
+            ));
+        }
+    } else {
+        sqlx::query(
+            r#"
+            INSERT INTO fable_coordinator_runtime (
+                conversation_id, native_session_id, session_state, prompt_version,
+                model, effort, auth_method, subscription_type, mcp_profile,
+                rehydrate_required, last_terminal_status, created_at, updated_at
+            ) VALUES (?, ?, 'recovery_approved', ?, ?, ?, 'claude.ai', 'max', ?, 1,
+                      'recovery_approved', ?, ?)
+            "#,
+        )
+        .bind(conversation_id)
+        .bind(&session_id)
+        .bind(FABLE_PROMPT_VERSION)
+        .bind(FABLE_MODEL)
+        .bind(FABLE_EFFORT)
+        .bind(FABLE_MCP_PROFILE)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        insert_event_tx(
+            &mut tx,
+            conversation_id,
+            "untracked_session_recovery_detected",
+            untracked_session_id.as_deref(),
+            Some("untracked"),
+            Some(actor),
+            now,
+        )
+        .await?;
     }
+
     insert_event_tx(
         &mut tx,
         conversation_id,
-        "session_repair_approved",
+        if state.is_some() {
+            "session_repair_approved"
+        } else {
+            "untracked_session_repair_approved"
+        },
         Some(&session_id),
         Some("recovery_approved"),
         Some(actor),
@@ -721,6 +774,70 @@ mod tests {
         assert_eq!(reprovisioned.session_id, repaired.session_id);
         assert!(!reprovisioned.resume);
         assert!(reprovisioned.rehydrate_required);
+    }
+
+    #[tokio::test]
+    async fn untracked_native_session_can_be_repaired_explicitly_and_audited() {
+        let pool = test_pool().await;
+        let conversation = ensure_singleton(&pool, ALEX_USER_ID).await.unwrap();
+        sqlx::query("UPDATE conversations SET session_id = ? WHERE id = ?")
+            .bind("retired-runtime-session")
+            .bind(&conversation.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = prepare_session(&pool, &conversation.id)
+            .await
+            .expect_err("an untracked native session must fail closed");
+        assert!(error.to_string().contains("audited recovery"));
+
+        let repaired = repair_session(&pool, &conversation.id, ALEX_USER_ID)
+            .await
+            .unwrap();
+        assert_ne!(repaired.session_id, "retired-runtime-session");
+        assert!(repaired.rehydrate_required);
+
+        let state = runtime_state(&pool, &conversation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.native_session_id, repaired.session_id);
+        assert_eq!(state.session_state, "recovery_approved");
+        assert!(state.rehydrate_required);
+
+        let detected_session_id: String = sqlx::query_scalar(
+            "SELECT session_id FROM fable_coordinator_events WHERE conversation_id = ? AND event_type = 'untracked_session_recovery_detected'",
+        )
+        .bind(&conversation.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(detected_session_id, "retired-runtime-session");
+        let approval_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fable_coordinator_events WHERE conversation_id = ? AND event_type = 'untracked_session_repair_approved'",
+        )
+        .bind(&conversation.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(approval_count, 1);
+
+        let reprovisioned = prepare_session(&pool, &conversation.id).await.unwrap();
+        assert_eq!(reprovisioned.session_id, repaired.session_id);
+        assert!(!reprovisioned.resume);
+        assert!(reprovisioned.rehydrate_required);
+    }
+
+    #[tokio::test]
+    async fn repair_rejects_a_clean_uninitialized_conversation() {
+        let pool = test_pool().await;
+        let conversation = ensure_singleton(&pool, ALEX_USER_ID).await.unwrap();
+
+        let error = repair_session(&pool, &conversation.id, ALEX_USER_ID)
+            .await
+            .expect_err("a clean conversation has no recovery incident");
+        assert!(error.to_string().contains("visible recovery incident"));
     }
 
     #[tokio::test]

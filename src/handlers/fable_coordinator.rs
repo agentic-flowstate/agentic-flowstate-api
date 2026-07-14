@@ -99,6 +99,7 @@ async fn load_active_child_count(
 fn resolve_coordinator_status(
     auth_error: Option<String>,
     runtime: Option<&FableRuntimeState>,
+    untracked_native_session: bool,
     coordinator_busy: bool,
     active_child_count: i64,
 ) -> FableCoordinatorStatus {
@@ -106,6 +107,16 @@ fn resolve_coordinator_status(
         return FableCoordinatorStatus {
             state: "needs_login",
             detail: Some(detail),
+        };
+    }
+
+    if untracked_native_session {
+        return FableCoordinatorStatus {
+            state: "failed",
+            detail: Some(
+                "Fable session continuity requires an audited recovery from the prior runtime"
+                    .to_string(),
+            ),
         };
     }
 
@@ -241,6 +252,7 @@ pub async fn get_fable_coordinator(
     let coordinator_status = resolve_coordinator_status(
         auth_error,
         runtime.as_ref(),
+        runtime.is_none() && conversation.session_id.is_some(),
         coordinator_busy,
         active_child_count,
     );
@@ -294,10 +306,11 @@ pub async fn get_fable_coordinator_health(
         Ok(()) => ("ready".to_string(), None),
         Err(error) => ("needs_login".to_string(), Some(error)),
     };
-    let native_session_continuity = runtime
-        .as_ref()
-        .map(|runtime| runtime.session_state.clone())
-        .unwrap_or_else(|| "uninitialized".to_string());
+    let native_session_continuity = match runtime.as_ref() {
+        Some(runtime) => runtime.session_state.clone(),
+        None if conversation.session_id.is_some() => "untracked".to_string(),
+        None => "uninitialized".to_string(),
+    };
     let coordinator_busy = manager.has_runtime_turn(&conversation.id).await || queue_depth > 0;
     crate::observability::fable::set_health(
         coordinator_busy,
@@ -466,32 +479,40 @@ mod tests {
         let auth = resolve_coordinator_status(
             Some("Claude subscription login required".to_string()),
             None,
+            false,
             true,
             2,
         );
         assert_eq!(auth.state, "needs_login");
 
         let usage_runtime = runtime_state("ready", Some("failed"), Some("usage_limit"));
-        let usage = resolve_coordinator_status(None, Some(&usage_runtime), false, 0);
+        let usage = resolve_coordinator_status(None, Some(&usage_runtime), false, false, 0);
         assert_eq!(usage.state, "usage_limited");
 
         let recovery_runtime = runtime_state("recovery_required", Some("failed"), None);
-        let recovery = resolve_coordinator_status(None, Some(&recovery_runtime), false, 0);
+        let recovery = resolve_coordinator_status(None, Some(&recovery_runtime), false, false, 0);
         assert_eq!(recovery.state, "failed");
+
+        let untracked = resolve_coordinator_status(None, None, true, false, 0);
+        assert_eq!(untracked.state, "failed");
+        assert!(untracked
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("prior runtime")));
     }
 
     #[test]
     fn coordinator_status_reports_children_work_and_ready() {
         assert_eq!(
-            resolve_coordinator_status(None, None, true, 2).state,
+            resolve_coordinator_status(None, None, false, true, 2).state,
             "waiting_on_children"
         );
         assert_eq!(
-            resolve_coordinator_status(None, None, true, 0).state,
+            resolve_coordinator_status(None, None, false, true, 0).state,
             "working"
         );
         assert_eq!(
-            resolve_coordinator_status(None, None, false, 0).state,
+            resolve_coordinator_status(None, None, false, false, 0).state,
             "ready"
         );
     }
