@@ -1,7 +1,7 @@
 {
   "models": {
     "codex": "gpt-5.6-sol",
-    "fable": "gpt-5.6-sol"
+    "fable": "claude-fable-5"
   },
   "agents": {
     "research": {
@@ -309,7 +309,7 @@
     },
     "fable-coordinator": {
       "model": "fable",
-      "effort": "xhigh",
+      "effort": "max",
       "prompt_file": "fable-coordinator.txt",
       "tools": [
         "mcp__agentic-mcp__*"

@@ -12,6 +12,7 @@ use ticketing_system::Conversation;
 
 use super::chat_client_manager::ChatClientManager;
 use super::chat_stream::{self, ChatAttachmentData, ChatCodexOptions, ChatConfig, ChatRuntime};
+use crate::agents::claude_code::{verify_claude_subscription_auth, FABLE_EFFORT, FABLE_MODEL};
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
 use crate::fable_coordinator::{self, FableRuntimeState, FABLE_PROMPT_VERSION};
@@ -36,8 +37,8 @@ pub struct FableCoordinatorHealth {
     pub pending_child_wake_count: i64,
     pub auth_state: String,
     pub auth_error: Option<String>,
-    pub model: String,
-    pub effort: String,
+    pub model: &'static str,
+    pub effort: &'static str,
     pub prompt_version: &'static str,
     pub native_session_continuity: String,
     pub runtime: Option<FableRuntimeState>,
@@ -200,11 +201,14 @@ fn chat_config(user_id: &str) -> Result<ChatConfig, Response> {
     );
     Ok(ChatConfig {
         agent_type: AgentType::FableCoordinator,
-        runtime: ChatRuntime::CodexAppServer,
+        runtime: ChatRuntime::ClaudeCodeFable,
         prompt_name: "fable-coordinator",
         working_dir: projects_root,
         prompt_vars,
-        codex_options: ChatCodexOptions::default_for_agent(&AgentType::FableCoordinator),
+        codex_options: ChatCodexOptions {
+            model: FABLE_MODEL.to_string(),
+            reasoning_effort: FABLE_EFFORT.to_string(),
+        },
     })
 }
 
@@ -217,6 +221,10 @@ pub async fn get_fable_coordinator(
         Ok(conversation) => conversation,
         Err(response) => return response,
     };
+    let runtime = match fable_coordinator::runtime_state(&db, &conversation.id).await {
+        Ok(runtime) => runtime,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
     let queue_depth = match coordinator_queue_depth(&db, &conversation.id).await {
         Ok(count) => count,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
@@ -225,9 +233,17 @@ pub async fn get_fable_coordinator(
         Ok(count) => count,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
+    let auth_error = verify_claude_subscription_auth()
+        .await
+        .err()
+        .map(|error| error.to_string());
     let coordinator_busy = manager.has_runtime_turn(&conversation.id).await || queue_depth > 0;
-    let coordinator_status =
-        resolve_coordinator_status(None, None, coordinator_busy, active_child_count);
+    let coordinator_status = resolve_coordinator_status(
+        auth_error,
+        runtime.as_ref(),
+        coordinator_busy,
+        active_child_count,
+    );
     Json(FableCoordinatorResponse {
         conversation,
         coordinator_status,
@@ -243,6 +259,10 @@ pub async fn get_fable_coordinator_health(
     let conversation = match coordinator_for_user(&db, &user).await {
         Ok(conversation) => conversation,
         Err(response) => return response,
+    };
+    let runtime = match fable_coordinator::runtime_state(&db, &conversation.id).await {
+        Ok(runtime) => runtime,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
     let queue_depth = match coordinator_queue_depth(&db, &conversation.id).await {
         Ok(count) => count,
@@ -270,9 +290,14 @@ pub async fn get_fable_coordinator_health(
         Ok(count) => count,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
-    let auth_state = "ready".to_string();
-    let auth_error = None;
-    let native_session_continuity = "codex-durable".to_string();
+    let (auth_state, auth_error) = match verify_claude_subscription_auth().await {
+        Ok(()) => ("ready".to_string(), None),
+        Err(error) => ("needs_login".to_string(), Some(error)),
+    };
+    let native_session_continuity = runtime
+        .as_ref()
+        .map(|runtime| runtime.session_state.clone())
+        .unwrap_or_else(|| "uninitialized".to_string());
     let coordinator_busy = manager.has_runtime_turn(&conversation.id).await || queue_depth > 0;
     crate::observability::fable::set_health(
         coordinator_busy,
@@ -288,11 +313,11 @@ pub async fn get_fable_coordinator_health(
         pending_child_wake_count,
         auth_state,
         auth_error,
-        model: AgentType::FableCoordinator.model().to_string(),
-        effort: AgentType::FableCoordinator.effort().to_string(),
+        model: FABLE_MODEL,
+        effort: FABLE_EFFORT,
         prompt_version: FABLE_PROMPT_VERSION,
         native_session_continuity,
-        runtime: None,
+        runtime,
     })
     .into_response()
 }
@@ -397,17 +422,14 @@ pub async fn repair_fable_coordinator_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::claude_code::{FABLE_EFFORT, FABLE_MODEL};
 
     #[test]
-    fn coordinator_submits_to_the_codex_durable_runtime() {
+    fn coordinator_submits_to_the_anthropic_fable_runtime() {
         let config = chat_config(fable_coordinator::ALEX_USER_ID).unwrap();
-        assert_eq!(config.runtime, ChatRuntime::CodexAppServer);
-        assert_eq!(
-            config.codex_options.model,
-            AgentType::FableCoordinator.model()
-        );
-        assert_ne!(config.codex_options.model, FABLE_MODEL);
+
+        assert_eq!(config.runtime, ChatRuntime::ClaudeCodeFable);
+        assert_eq!(config.codex_options.model, FABLE_MODEL);
+        assert_eq!(config.codex_options.reasoning_effort, FABLE_EFFORT);
     }
 
     fn runtime_state(
