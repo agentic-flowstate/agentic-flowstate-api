@@ -786,6 +786,16 @@ fn is_global_chat_conversation(conversation: &Conversation) -> bool {
             != Some(crate::fable_coordinator::FABLE_CONVERSATION_TYPE)
 }
 
+fn project_fable_worker_as_chat_root(mut conversation: Conversation) -> Conversation {
+    // This is a response-only projection. Durable parentage stays attached to
+    // the permanent coordinator so completion wakes and orchestration remain
+    // correct, while Chat can monitor each worker without exposing the
+    // coordinator transcript itself.
+    conversation.parent_conversation_id = None;
+    conversation.conversation_role = "standard".to_string();
+    conversation
+}
+
 fn hierarchy_scope_label(scope: ConversationHierarchyScope) -> &'static str {
     match scope {
         ConversationHierarchyScope::Roots => "roots",
@@ -1656,6 +1666,50 @@ pub async fn list_conversations(
     estimated_query_count += 1;
     let mut page = page_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut list = std::mem::take(&mut page.conversations);
+
+    // Fable's durable children are the implementation/research conversations
+    // Alex expects to monitor in Chat. Since their parent is intentionally
+    // excluded from Chat, project those workers as standalone list rows. The
+    // stored relationship is untouched and remains available to orchestration.
+    if applied_scope == ConversationHierarchyScope::Roots
+        && params.parent_conversation_id.is_none()
+        && params.agent.is_none()
+    {
+        let coordinator = list
+            .iter()
+            .find(|conversation| !is_global_chat_conversation(conversation))
+            .map(|conversation| (conversation.id.clone(), conversation.organization.clone()));
+        if let Some((coordinator_id, coordinator_organization)) = coordinator {
+            let workers_started = Instant::now();
+            let workers_result = conversations::list_conversations_with_hierarchy_page(
+                &pool,
+                Some(coordinator_organization.as_str()),
+                Some(&user.user_id),
+                None,
+                params.status.as_deref(),
+                params.updated_since.as_deref(),
+                ConversationHierarchyScope::Children,
+                Some(&coordinator_id),
+                conversations::ConversationListPageOptions::children(None, None),
+            )
+            .await;
+            record_db_operation(
+                ROUTE_CONVERSATIONS,
+                "conversation.list_fable_workers",
+                workers_started.elapsed(),
+                Outcome::from_result(&workers_result),
+            );
+            estimated_query_count += 1;
+            let workers =
+                workers_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            list.extend(
+                workers
+                    .conversations
+                    .into_iter()
+                    .map(project_fable_worker_as_chat_root),
+            );
+        }
+    }
 
     let active_count = list
         .iter()
@@ -3770,6 +3824,21 @@ mod tests {
 
         assert!(!is_global_chat_conversation(&agent_only));
         assert!(!is_global_chat_conversation(&type_only));
+    }
+
+    #[test]
+    fn fable_workers_are_projected_as_standalone_chat_rows() {
+        let mut worker = conversation_with_activity(Some(true));
+        worker.id = "worker-1".to_string();
+        worker.parent_conversation_id = Some("alex-coordinator".to_string());
+        worker.conversation_role = "sub_agent".to_string();
+
+        let projected = project_fable_worker_as_chat_root(worker.clone());
+
+        assert_eq!(projected.id, worker.id);
+        assert_eq!(projected.agent, worker.agent);
+        assert!(projected.parent_conversation_id.is_none());
+        assert_eq!(projected.conversation_role, "standard");
     }
 
     fn run_status(is_processing: bool) -> ConversationRunStatusResponse {
