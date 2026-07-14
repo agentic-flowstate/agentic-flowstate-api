@@ -27,14 +27,13 @@
       "effort": "xhigh",
       "prompt_file": "polymarket.txt",
       "tools": [
-        "Read",
-        "Write",
-        "Edit",
-        "Bash",
-        "Glob",
-        "Grep",
-        "Task",
-        "mcp__agentic-mcp__*"
+        "mcp__agentic-mcp__polymarket_tools",
+        "mcp__agentic-mcp__research_search",
+        "mcp__agentic-mcp__create_artifact",
+        "mcp__agentic-mcp__update_artifact",
+        "mcp__agentic-mcp__get_artifact",
+        "mcp__agentic-mcp__list_artifacts",
+        "mcp__agentic-mcp__search_artifacts"
       ]
     },
     "daily-research": {

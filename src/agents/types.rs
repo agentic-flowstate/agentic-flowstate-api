@@ -399,15 +399,11 @@ mod tests {
     }
 
     #[test]
-    fn polymarket_agent_is_runnable_with_full_access_tools() {
+    fn polymarket_agent_has_no_direct_network_tool_route() {
         let config = AgentsConfig::get()
             .agents
             .get("polymarket")
             .expect("polymarket agent config");
-        let full_access = AgentsConfig::get()
-            .agents
-            .get("full-access")
-            .expect("full-access agent config");
 
         assert_eq!(AgentType::Polymarket.as_str(), "polymarket");
         assert_eq!(
@@ -415,12 +411,22 @@ mod tests {
             Some(AgentType::Polymarket)
         );
         assert_eq!(config.prompt_file, "polymarket.txt");
-        assert_eq!(config.tools, full_access.tools);
-        assert!(config.tools.iter().any(|tool| tool == "Bash"));
         assert!(config
             .tools
             .iter()
-            .any(|tool| tool == "mcp__agentic-mcp__*"));
+            .any(|tool| tool == "mcp__agentic-mcp__polymarket_tools"));
+        for direct_route in [
+            "Bash",
+            "Task",
+            "mcp__agentic-mcp__*",
+            "mcp__agentic-mcp__research_get_contents",
+            "mcp__agentic-mcp__research_crawl",
+        ] {
+            assert!(
+                !config.tools.iter().any(|tool| tool == direct_route),
+                "polymarket agent must not have direct network route {direct_route}"
+            );
+        }
     }
 
     #[test]
