@@ -155,46 +155,77 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: runner handoff bootstrap
     )
 }
 
+/// Build the launchd transition commands for `service`.
+///
+/// This is the ONE path that moves services onto new binaries, and it is
+/// handoff-aware: the runner is never killed, it is handed off. Bootstrapping a
+/// replacement generation is enough on its own — the new runner registers itself
+/// and calls `mark_other_generations_draining` at startup (agentic_runner.rs), so
+/// the outgoing generation finishes its in-flight turns, exits, and `KeepAlive`
+/// brings `com.agentic.runner` back up on the new binary.
+fn launchd_transition_commands(uid: &str, service: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    if matches!(service, "api-server" | "all") {
+        commands.push(launchd_restart_command(uid, "com.agentic.api"));
+    }
+    if matches!(service, "agent-runner" | "all") {
+        commands.push(launchd_runner_handoff_command(uid));
+    }
+    if matches!(service, "mcp-server" | "all") {
+        commands.push(launchd_restart_command(uid, "com.agentic.mcp"));
+    }
+    commands
+}
+
 fn spawn_direct_restart_or_setup(service: &str, action: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/jarvisgpt".to_string());
     let log = "/tmp/agentic-restart-watcher.log";
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "501".to_string());
+
+    // `setup` restarts used to just exec setup.sh, whose only lever is
+    // `launchctl kickstart -k` — a SIGKILL that tore the runner down mid-turn
+    // instead of draining it. Split the two concerns instead: setup.sh *stages*
+    // (build + install binaries and plists) with AGENTIC_SETUP_STAGE_ONLY, then we
+    // perform the service transition through the same handoff-aware path a plain
+    // `restart` uses. Staging is idempotent and touches no running process, so it
+    // is safe to do while turns are in flight.
+    let transition = launchd_transition_commands(&uid, service);
+    if transition.is_empty() {
+        tracing::error!(
+            target: "agentic_api::restart_watcher",
+            event = "restart_watcher.unknown_service",
+            service,
+            action,
+            "refusing direct restart for unknown service"
+        );
+        return;
+    }
+    let commands = transition.join("\n");
+
     let script = if action == "setup" {
         format!(
             r#"exec > '{log}' 2>&1
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: setup started"
-exec bash -l '{home}/projects/agentic-flowstate/agentic-flowstate-setup/setup.sh'
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: setup staging started"
+AGENTIC_SETUP_STAGE_ONLY=1 bash -l '{home}/projects/agentic-flowstate/agentic-flowstate-setup/setup.sh'
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: setup staging failed rc=$rc — services left on the old binary"
+    exit "$rc"
+fi
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: setup staged; handing off {service}"
+{commands}
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: setup complete"
 "#,
             home = home,
-            log = log
+            log = log,
+            service = service,
+            commands = commands
         )
     } else {
-        let uid = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "501".to_string());
-        let mut commands = Vec::new();
-        if matches!(service, "api-server" | "all") {
-            commands.push(launchd_restart_command(&uid, "com.agentic.api"));
-        }
-        if matches!(service, "agent-runner" | "all") {
-            commands.push(launchd_runner_handoff_command(&uid));
-        }
-        if matches!(service, "mcp-server" | "all") {
-            commands.push(launchd_restart_command(&uid, "com.agentic.mcp"));
-        }
-
-        if commands.is_empty() {
-            tracing::error!(
-                target: "agentic_api::restart_watcher",
-                event = "restart_watcher.unknown_service",
-                service,
-                action,
-                "refusing direct restart for unknown service"
-            );
-            return;
-        }
-
         format!(
             r#"exec > '{log}' 2>&1
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: direct restart started for {service}"
@@ -203,7 +234,7 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] restart_watcher: direct restart complete"
 "#,
             log = log,
             service = service,
-            commands = commands.join("\n")
+            commands = commands
         )
     };
 
@@ -925,14 +956,12 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
-                // Pending restart found — check only work this restart would actually disrupt.
-                // A `restart` action hands the runner off to a fresh generation, so runner-owned
-                // turns survive and do not block. A `setup` action hard-restarts every LaunchAgent
-                // (`kickstart -k`) with no handoff, so it must block on runner turns too.
+                // Pending restart found — check only work this transition would disrupt.
+                // Runner-owned turns are preserved by the handoff path, which every
+                // transition (including `setup`) now goes through.
                 let active = match ticketing_system::restart_queue::count_restart_blocking_work(
                     &restart_pool,
                     &pending.service,
-                    &pending.action,
                 )
                 .await
                 {
