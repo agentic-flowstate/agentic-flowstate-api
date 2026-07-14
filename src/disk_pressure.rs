@@ -6,26 +6,16 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
 use sqlx::{Connection, FromRow, SqlitePool};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use ticketing_system::conversation_turn_jobs::ConversationTurnJobPayload;
-use ticketing_system::conversations::InitialChildTurnJobRequest;
-use ticketing_system::models::{
-    CreateChildConversationRequest, CreateConversationRequest, SystemLogIncidentStatus,
-};
+use ticketing_system::models::SystemLogIncidentStatus;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::agents::prompts::load_prompt;
-use crate::agents::working_dir::resolve_working_dir;
-use crate::agents::AgentType;
 use crate::apns::ApnsService;
-use crate::handlers::chat_stream::{encode_codex_options_for_job, ChatCodexOptions, ChatRuntime};
 
 const OWNER_USER_ID: &str = "alex";
-const ORGANIZATION: &str = "agentic-flowstate";
 const COMPONENT: &str = "disk_pressure";
 const DEFAULT_POLL_SECONDS: u64 = 5 * 60;
 const MAX_POLL_SECONDS: u64 = 5 * 60;
@@ -34,15 +24,12 @@ const WARNING_THRESHOLD: f64 = 75.0;
 const CRITICAL_THRESHOLD: f64 = 85.0;
 const EMERGENCY_THRESHOLD: f64 = 95.0;
 const RECOVERY_THRESHOLD: f64 = 70.0;
-const PARENT_CONVERSATION_TYPE: &str = "disk-pressure-monitor";
-const CHILD_CONVERSATION_TYPE: &str = "disk-pressure-diagnostic";
 
 const METRIC_POLLS: &str = "disk_pressure_polls_total";
 const METRIC_POLL_DURATION: &str = "disk_pressure_poll_duration_seconds";
 const METRIC_RESPONSE_DURATION: &str = "disk_pressure_response_duration_seconds";
 const METRIC_TRANSITIONS: &str = "disk_pressure_transitions_total";
 const METRIC_NOTIFICATIONS: &str = "disk_pressure_notifications_total";
-const METRIC_DIAGNOSTICS: &str = "disk_pressure_diagnostic_jobs_total";
 const METRIC_VOLUME_COUNT: &str = "disk_pressure_writable_volumes";
 const METRIC_MAX_USED_RATIO: &str = "disk_pressure_max_used_ratio";
 const METRIC_ACTIVE_INCIDENTS: &str = "disk_pressure_active_incidents";
@@ -201,8 +188,6 @@ struct StoredVolumeState {
     action_stage: Option<i64>,
     incident_id: Option<String>,
     notification_status: String,
-    diagnostic_status: String,
-    last_conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,8 +199,6 @@ struct PendingAction {
     sample: VolumeSample,
     incident_id: Option<String>,
     notification_status: String,
-    diagnostic_status: String,
-    last_conversation_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -224,18 +207,11 @@ struct ObserveResult {
     transition_created: bool,
 }
 
-#[derive(Debug, Clone)]
-struct DiagnosticJob {
-    conversation_id: String,
-    job_id: String,
-}
-
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PollSummary {
     sampled_volumes: usize,
     transitions: usize,
     notifications_sent: usize,
-    diagnostics_enqueued: usize,
     recoveries: usize,
     action_failures: usize,
 }
@@ -244,17 +220,7 @@ struct PollSummary {
 trait PressureResponder: Send + Sync {
     async fn ensure_incident(&self, action: &PendingAction) -> Result<String>;
     async fn recover_incident(&self, action: &PendingAction, incident_id: &str) -> Result<()>;
-    async fn enqueue_diagnostic(
-        &self,
-        action: &PendingAction,
-        incident_id: &str,
-    ) -> Result<DiagnosticJob>;
-    async fn send_notification(
-        &self,
-        action: &PendingAction,
-        incident_id: &str,
-        conversation_id: Option<&str>,
-    ) -> Result<()>;
+    async fn send_notification(&self, action: &PendingAction, incident_id: &str) -> Result<()>;
 }
 
 struct DiskPressureMonitor {
@@ -375,60 +341,9 @@ impl DiskPressureMonitor {
             return;
         }
 
-        let mut conversation_id = action.last_conversation_id.clone();
-        if action.diagnostic_status == "pending" {
-            let started = Instant::now();
-            let diagnostic_result = self
-                .responder
-                .enqueue_diagnostic(action, &incident_id)
-                .await;
-            record_response_duration("diagnostic", &diagnostic_result, started);
-            match diagnostic_result {
-                Ok(job) => {
-                    if let Err(error) = self.mark_diagnostic_enqueued(&action.action_id, &job).await
-                    {
-                        summary.action_failures += 1;
-                        self.record_action_failure(
-                            action,
-                            "diagnostic_state_update",
-                            &error.to_string(),
-                        )
-                        .await;
-                        return;
-                    }
-                    conversation_id = Some(job.conversation_id);
-                    summary.diagnostics_enqueued += 1;
-                    metrics::counter!(METRIC_DIAGNOSTICS, "result" => "enqueued").increment(1);
-                }
-                Err(error) => {
-                    let error_text = error.to_string();
-                    if let Err(state_error) = self
-                        .mark_diagnostic_failed(&action.action_id, &error_text)
-                        .await
-                    {
-                        tracing::error!(
-                            component = COMPONENT,
-                            operation = "disk_pressure.diagnostic_failure_state_failed",
-                            action_id = %action.action_id,
-                            error = %state_error,
-                            "failed to persist diagnostic enqueue failure"
-                        );
-                        return;
-                    }
-                    summary.action_failures += 1;
-                    metrics::counter!(METRIC_DIAGNOSTICS, "result" => "failed").increment(1);
-                    self.record_action_failure(action, "diagnostic_enqueue", &error_text)
-                        .await;
-                }
-            }
-        }
-
         if action.notification_status == "pending" {
             let started = Instant::now();
-            let notification_result = self
-                .responder
-                .send_notification(action, &incident_id, conversation_id.as_deref())
-                .await;
+            let notification_result = self.responder.send_notification(action, &incident_id).await;
             record_response_duration("notification", &notification_result, started);
             match notification_result {
                 Ok(()) => {
@@ -491,8 +406,7 @@ impl DiskPressureMonitor {
         let stored = sqlx::query_as::<_, StoredVolumeState>(
             r#"
             SELECT current_stage, cycle, action_id, action_kind, action_stage,
-                   incident_id, notification_status, diagnostic_status,
-                   last_conversation_id
+                   incident_id, notification_status
             FROM disk_pressure_volume_state
             WHERE volume_id = ?
             "#,
@@ -534,8 +448,6 @@ impl DiskPressureMonitor {
                     action_stage: None,
                     incident_id: None,
                     notification_status: "not_required".to_string(),
-                    diagnostic_status: "not_required".to_string(),
-                    last_conversation_id: None,
                 }
             }
         };
@@ -574,8 +486,6 @@ impl DiskPressureMonitor {
                 sample,
                 incident_id: stored.incident_id,
                 notification_status: stored.notification_status,
-                diagnostic_status: stored.diagnostic_status,
-                last_conversation_id: stored.last_conversation_id,
             };
             tx.commit().await?;
             return Ok(ObserveResult {
@@ -612,10 +522,10 @@ impl DiskPressureMonitor {
         };
 
         let action_id = stable_action_id(&sample.volume_id, cycle, kind, stage);
-        let (notification_status, diagnostic_status) = if kind == TransitionKind::Recovered {
-            ("not_required", "not_required")
+        let notification_status = if kind == TransitionKind::Recovered {
+            "not_required"
         } else {
-            ("pending", "pending")
+            "pending"
         };
         sqlx::query(
             r#"
@@ -633,7 +543,7 @@ impl DiskPressureMonitor {
         .bind(kind.as_str())
         .bind(stage.threshold())
         .bind(notification_status)
-        .bind(diagnostic_status)
+        .bind("not_required")
         .bind(now)
         .bind(&sample.volume_id)
         .execute(&mut *tx)
@@ -662,8 +572,6 @@ impl DiskPressureMonitor {
                 sample,
                 incident_id: stored.incident_id,
                 notification_status: notification_status.to_string(),
-                diagnostic_status: diagnostic_status.to_string(),
-                last_conversation_id: stored.last_conversation_id,
             }),
             transition_created: true,
         })
@@ -677,38 +585,6 @@ impl DiskPressureMonitor {
             incident_id,
         )
         .await
-    }
-
-    async fn mark_diagnostic_enqueued(&self, action_id: &str, job: &DiagnosticJob) -> Result<()> {
-        let result = sqlx::query(
-            r#"
-            UPDATE disk_pressure_volume_state
-            SET diagnostic_status = 'enqueued', last_conversation_id = ?,
-                last_job_id = ?, last_diagnostic_error = NULL
-            WHERE action_id = ? AND diagnostic_status = 'pending'
-            "#,
-        )
-        .bind(&job.conversation_id)
-        .bind(&job.job_id)
-        .bind(action_id)
-        .execute(self.pool.as_ref())
-        .await?;
-        ensure_action_row_updated(result.rows_affected(), action_id, "diagnostic enqueued")
-    }
-
-    async fn mark_diagnostic_failed(&self, action_id: &str, error: &str) -> Result<()> {
-        let result = sqlx::query(
-            r#"
-            UPDATE disk_pressure_volume_state
-            SET diagnostic_status = 'failed', last_diagnostic_error = ?
-            WHERE action_id = ? AND diagnostic_status = 'pending'
-            "#,
-        )
-        .bind(truncate_error(error))
-        .bind(action_id)
-        .execute(self.pool.as_ref())
-        .await?;
-        ensure_action_row_updated(result.rows_affected(), action_id, "diagnostic failed")
     }
 
     async fn mark_notification_sent(&self, action_id: &str) -> Result<()> {
@@ -909,68 +785,6 @@ impl ProductionResponder {
         Ok(())
     }
 
-    async fn existing_diagnostic_job(&self, action_id: &str) -> Result<Option<DiagnosticJob>> {
-        let row = sqlx::query_as::<_, (String, String)>(
-            r#"
-            SELECT id, conversation_id
-            FROM conversation_turn_jobs
-            WHERE message_metadata IS NOT NULL
-              AND json_valid(message_metadata)
-              AND json_extract(message_metadata, '$.disk_pressure_action_id') = ?
-            ORDER BY created_at ASC
-            LIMIT 1
-            "#,
-        )
-        .bind(action_id)
-        .fetch_optional(self.pool.as_ref())
-        .await
-        .context("find existing disk pressure diagnostic job")?;
-        Ok(row.map(|(job_id, conversation_id)| DiagnosticJob {
-            conversation_id,
-            job_id,
-        }))
-    }
-
-    async fn ensure_parent_conversation(&self) -> Result<String> {
-        if let Some(parent_id) = sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT id
-            FROM conversations
-            WHERE user_id = ? AND organization = ?
-              AND conversation_type = ? AND parent_conversation_id IS NULL
-              AND status IN ('open', 'waiting')
-            ORDER BY started_at ASC
-            LIMIT 1
-            "#,
-        )
-        .bind(OWNER_USER_ID)
-        .bind(ORGANIZATION)
-        .bind(PARENT_CONVERSATION_TYPE)
-        .fetch_optional(self.pool.as_ref())
-        .await?
-        {
-            return Ok(parent_id);
-        }
-
-        let parent = ticketing_system::conversations::create_conversation(
-            self.pool.as_ref(),
-            CreateConversationRequest {
-                user_id: OWNER_USER_ID.to_string(),
-                organization: ORGANIZATION.to_string(),
-                title: "Disk Pressure Monitor".to_string(),
-                session_id: None,
-                agent: Some("full-access".to_string()),
-                conversation_type: Some(PARENT_CONVERSATION_TYPE.to_string()),
-                parent_conversation_id: None,
-                conversation_role: Some("standard".to_string()),
-                child_sort_order: None,
-            },
-        )
-        .await
-        .context("create disk pressure monitor parent conversation")?;
-        Ok(parent.id)
-    }
-
     fn action_detail(action: &PendingAction, event: &str) -> String {
         json!({
             "event": event,
@@ -1097,161 +911,7 @@ impl PressureResponder for ProductionResponder {
         Ok(())
     }
 
-    async fn enqueue_diagnostic(
-        &self,
-        action: &PendingAction,
-        incident_id: &str,
-    ) -> Result<DiagnosticJob> {
-        if let Some(existing) = self.existing_diagnostic_job(&action.action_id).await? {
-            return Ok(existing);
-        }
-
-        let admission = ticketing_system::runner_capacity::admit_enqueue(
-            self.pool.as_ref(),
-            1,
-            "disk_pressure_monitor",
-        )
-        .await
-        .context("inspect runner capacity for disk pressure diagnostic")?;
-        if !admission.accepted {
-            bail!("runner queue rejected disk pressure diagnostic: {admission:?}");
-        }
-        if !ticketing_system::system_logs::is_admin(self.pool.as_ref(), OWNER_USER_ID).await? {
-            bail!("user {OWNER_USER_ID} is not authorized for full-access diagnostics");
-        }
-
-        let parent_id = self.ensure_parent_conversation().await?;
-        let agent_type = AgentType::FullAccess;
-        let working_dir = resolve_working_dir(self.pool.as_ref(), &agent_type, ORGANIZATION)
-            .await
-            .context("resolve full-access diagnostic working directory")?;
-        let message = load_prompt(
-            "disk-pressure-diagnostic",
-            HashMap::from([
-                ("INCIDENT_ID".to_string(), incident_id.to_string()),
-                ("ACTION_ID".to_string(), action.action_id.clone()),
-                ("VOLUME_ID".to_string(), action.sample.volume_id.clone()),
-                (
-                    "VOLUME_SOURCE".to_string(),
-                    action.sample.volume_source.clone(),
-                ),
-                ("MOUNT_PATH".to_string(), action.sample.mount_path.clone()),
-                (
-                    "FILESYSTEM_TYPE".to_string(),
-                    action.sample.filesystem_type.clone(),
-                ),
-                (
-                    "PRESSURE_STAGE".to_string(),
-                    action.stage.label().to_string(),
-                ),
-                (
-                    "USED_PERCENT".to_string(),
-                    format!("{:.2}", action.sample.used_percent),
-                ),
-                (
-                    "TOTAL_BYTES".to_string(),
-                    action.sample.total_bytes.to_string(),
-                ),
-                (
-                    "USED_BYTES".to_string(),
-                    action.sample.used_bytes.to_string(),
-                ),
-                (
-                    "AVAILABLE_BYTES".to_string(),
-                    action.sample.available_bytes.to_string(),
-                ),
-            ]),
-        )?;
-        let agents_md = std::fs::read_to_string("/Users/jarvisgpt/projects/AGENTS.md")
-            .context("read AGENTS.md for disk pressure full-access diagnostic")?;
-        let prompt_vars = encode_codex_options_for_job(
-            HashMap::from([
-                ("USER_ID".to_string(), OWNER_USER_ID.to_string()),
-                ("AGENTS_MD".to_string(), agents_md),
-                ("CONTEXT".to_string(), String::new()),
-            ]),
-            &ChatCodexOptions::default_for_agent(&agent_type),
-        );
-        let metadata = json!({
-            "origin": "agent_orchestrated",
-            "orchestrated_by": "disk_pressure_monitor",
-            "orchestration": "child_initial_turn",
-            "agent": "full-access",
-            "disk_pressure_action_id": action.action_id,
-            "disk_pressure_incident_id": incident_id,
-            "volume_id": action.sample.volume_id,
-            "report_id": format!("disk-pressure-{}", action.action_id),
-        })
-        .to_string();
-        let created =
-            ticketing_system::conversations::create_child_conversations_with_initial_turn_jobs(
-                self.pool.as_ref(),
-                OWNER_USER_ID,
-                &parent_id,
-                vec![CreateChildConversationRequest {
-                    title: format!(
-                        "{} disk pressure at {}% — {}",
-                        action.stage.label(),
-                        action.stage.threshold(),
-                        action.sample.mount_path
-                    ),
-                    agent: Some("full-access".to_string()),
-                    conversation_type: Some(CHILD_CONVERSATION_TYPE.to_string()),
-                    child_sort_order: None,
-                }],
-                vec![InitialChildTurnJobRequest {
-                    child_index: 0,
-                    payload: ConversationTurnJobPayload {
-                        user_id: OWNER_USER_ID.to_string(),
-                        message,
-                        agent_type: "full-access".to_string(),
-                        runtime: ChatRuntime::CodexAppServer.as_job_runtime().to_string(),
-                        prompt_name: "full-access".to_string(),
-                        working_dir: working_dir.to_string_lossy().into_owned(),
-                        prompt_vars,
-                        images_json: None,
-                        client_id: Some(format!("disk-pressure:{}", action.action_id)),
-                        message_metadata: Some(metadata),
-                    },
-                }],
-            )
-            .await
-            .context("create durable disk pressure diagnostic child job")?;
-        let queued = created
-            .queued_jobs
-            .into_iter()
-            .next()
-            .context("disk pressure child was created without a queued job")?;
-        crate::handlers::conversations::publish_conversation_run_status(
-            self.pool.as_ref(),
-            &queued.child_conversation_id,
-        )
-        .await?;
-
-        tracing::info!(
-            component = COMPONENT,
-            operation = "disk_pressure.diagnostic_enqueued",
-            incident_id,
-            action_id = %action.action_id,
-            volume_id = %action.sample.volume_id,
-            conversation_id = %queued.child_conversation_id,
-            job_id = %queued.job_id,
-            runtime = "codex-app-server",
-            agent = "full-access",
-            "enqueued subscription-backed Codex disk pressure diagnostic"
-        );
-        Ok(DiagnosticJob {
-            conversation_id: queued.child_conversation_id,
-            job_id: queued.job_id,
-        })
-    }
-
-    async fn send_notification(
-        &self,
-        action: &PendingAction,
-        incident_id: &str,
-        conversation_id: Option<&str>,
-    ) -> Result<()> {
+    async fn send_notification(&self, action: &PendingAction, incident_id: &str) -> Result<()> {
         let apns = ApnsService::global()
             .context("APNs alert service is unavailable for disk pressure notification")?;
         let title = match action.stage {
@@ -1260,17 +920,9 @@ impl PressureResponder for ProductionResponder {
             PressureStage::Emergency => "Disk space emergency",
             PressureStage::Healthy => bail!("cannot notify for a healthy disk pressure stage"),
         };
-        let diagnostic_text = if conversation_id.is_some() {
-            "A Codex diagnostic is queued."
-        } else {
-            "The diagnostic enqueue failed; the incident is recorded."
-        };
         let body = format!(
-            "{} is {:.1}% used at {}. {}",
-            action.sample.volume_source,
-            action.sample.used_percent,
-            action.sample.mount_path,
-            diagnostic_text
+            "{} is {:.1}% used at {}. The incident is recorded; no diagnostic agent was queued.",
+            action.sample.volume_source, action.sample.used_percent, action.sample.mount_path,
         );
         let report = apns
             .send_disk_pressure_notification_to_user(
@@ -1278,7 +930,7 @@ impl PressureResponder for ProductionResponder {
                 OWNER_USER_ID,
                 title,
                 &body,
-                conversation_id,
+                None,
                 &action.action_id,
             )
             .await
@@ -1309,12 +961,6 @@ pub async fn spawn_disk_pressure_monitor(
             "Automatic disk pressure response requires APNS_ALERT_ENABLED=true and a configured APNs alert service"
         );
     }
-    if !ticketing_system::system_logs::is_admin(pool.as_ref(), OWNER_USER_ID).await? {
-        bail!(
-            "Automatic disk pressure response requires '{OWNER_USER_ID}' to be an admin for full-access Codex diagnostics"
-        );
-    }
-
     let responder: Arc<dyn PressureResponder> = Arc::new(ProductionResponder::new(pool.clone()));
     let monitor = Arc::new(DiskPressureMonitor::new(pool, responder));
     tokio::spawn(async move {
@@ -1390,7 +1036,6 @@ async fn run_poll(monitor: Arc<DiskPressureMonitor>) {
                     sampled_volumes = summary.sampled_volumes,
                     transitions = summary.transitions,
                     notifications_sent = summary.notifications_sent,
-                    diagnostics_enqueued = summary.diagnostics_enqueued,
                     recoveries = summary.recoveries,
                     action_failures = summary.action_failures,
                     duration_ms = started.elapsed().as_millis() as u64,
@@ -1545,9 +1190,7 @@ mod tests {
     struct MockState {
         incident_actions: Vec<String>,
         notification_actions: Vec<String>,
-        diagnostic_actions: Vec<String>,
         recovery_actions: Vec<String>,
-        fail_diagnostic: bool,
     }
 
     #[derive(Debug, Default)]
@@ -1556,18 +1199,13 @@ mod tests {
     }
 
     impl MockResponder {
-        async fn counts(&self) -> (usize, usize, usize, usize) {
+        async fn counts(&self) -> (usize, usize, usize) {
             let state = self.state.lock().await;
             (
                 state.incident_actions.len(),
                 state.notification_actions.len(),
-                state.diagnostic_actions.len(),
                 state.recovery_actions.len(),
             )
-        }
-
-        async fn fail_diagnostics(&self) {
-            self.state.lock().await.fail_diagnostic = true;
         }
     }
 
@@ -1591,27 +1229,10 @@ mod tests {
             Ok(())
         }
 
-        async fn enqueue_diagnostic(
-            &self,
-            action: &PendingAction,
-            _incident_id: &str,
-        ) -> Result<DiagnosticJob> {
-            let mut state = self.state.lock().await;
-            state.diagnostic_actions.push(action.action_id.clone());
-            if state.fail_diagnostic {
-                bail!("injected diagnostic enqueue failure");
-            }
-            Ok(DiagnosticJob {
-                conversation_id: format!("conversation-{}", action.action_id),
-                job_id: format!("job-{}", action.action_id),
-            })
-        }
-
         async fn send_notification(
             &self,
             action: &PendingAction,
             _incident_id: &str,
-            _conversation_id: Option<&str>,
         ) -> Result<()> {
             self.state
                 .lock()
@@ -1683,8 +1304,6 @@ mod tests {
             sample: sample("disk-a", used_percent),
             incident_id: incident_id.map(str::to_string),
             notification_status: "pending".to_string(),
-            diagnostic_status: "pending".to_string(),
-            last_conversation_id: None,
         }
     }
 
@@ -1699,7 +1318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn threshold_crossing_triggers_one_incident_push_and_diagnostic() {
+    async fn threshold_crossing_triggers_one_incident_and_push_without_agent() {
         let (monitor, responder) = test_monitor().await;
         let healthy = monitor
             .process_samples(vec![sample("disk-a", 74.9)])
@@ -1713,8 +1332,7 @@ mod tests {
             .unwrap();
         assert_eq!(crossed.transitions, 1);
         assert_eq!(crossed.notifications_sent, 1);
-        assert_eq!(crossed.diagnostics_enqueued, 1);
-        assert_eq!(responder.counts().await, (1, 1, 1, 0));
+        assert_eq!(responder.counts().await, (1, 1, 0));
         assert_eq!(current_stage(&monitor, "disk-a").await, 75);
     }
 
@@ -1732,7 +1350,7 @@ mod tests {
                 .unwrap();
             assert_eq!(summary.transitions, 0);
         }
-        assert_eq!(responder.counts().await, (1, 1, 1, 0));
+        assert_eq!(responder.counts().await, (1, 1, 0));
     }
 
     #[tokio::test]
@@ -1744,7 +1362,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(responder.counts().await, (3, 3, 3, 0));
+        assert_eq!(responder.counts().await, (3, 3, 0));
         assert_eq!(current_stage(&monitor, "disk-a").await, 95);
     }
 
@@ -1769,7 +1387,7 @@ mod tests {
             .process_samples(vec![sample("disk-a", 76.0)])
             .await
             .unwrap();
-        assert_eq!(responder.counts().await, (2, 2, 2, 1));
+        assert_eq!(responder.counts().await, (2, 2, 1));
         assert_eq!(current_stage(&monitor, "disk-a").await, 75);
     }
 
@@ -1782,35 +1400,9 @@ mod tests {
             .unwrap();
         assert_eq!(summary.sampled_volumes, 2);
         assert_eq!(summary.transitions, 2);
-        assert_eq!(responder.counts().await, (2, 2, 2, 0));
+        assert_eq!(responder.counts().await, (2, 2, 0));
         assert_eq!(current_stage(&monitor, "disk-a").await, 75);
         assert_eq!(current_stage(&monitor, "disk-b").await, 85);
-    }
-
-    #[tokio::test]
-    async fn diagnostic_enqueue_failure_is_durable_and_not_retried_same_stage() {
-        let (monitor, responder) = test_monitor().await;
-        responder.fail_diagnostics().await;
-        let first = monitor
-            .process_samples(vec![sample("disk-a", 76.0)])
-            .await
-            .unwrap();
-        assert_eq!(first.action_failures, 1);
-        assert_eq!(first.notifications_sent, 1);
-        assert_eq!(first.diagnostics_enqueued, 0);
-
-        monitor
-            .process_samples(vec![sample("disk-a", 80.0)])
-            .await
-            .unwrap();
-        assert_eq!(responder.counts().await, (1, 1, 1, 0));
-        let failure_logs: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM system_logs WHERE component = 'disk_pressure' AND message = 'Disk pressure response action failed'",
-        )
-        .fetch_one(monitor.pool.as_ref())
-        .await
-        .unwrap();
-        assert_eq!(failure_logs, 1);
     }
 
     #[tokio::test]
