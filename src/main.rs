@@ -925,11 +925,14 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
-                // Pending restart found — check only work this service restart would disrupt.
-                // Runner-owned turns are preserved by the runner handoff bootstrap path.
+                // Pending restart found — check only work this restart would actually disrupt.
+                // A `restart` action hands the runner off to a fresh generation, so runner-owned
+                // turns survive and do not block. A `setup` action hard-restarts every LaunchAgent
+                // (`kickstart -k`) with no handoff, so it must block on runner turns too.
                 let active = match ticketing_system::restart_queue::count_restart_blocking_work(
                     &restart_pool,
                     &pending.service,
+                    &pending.action,
                 )
                 .await
                 {
