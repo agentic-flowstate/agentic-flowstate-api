@@ -751,6 +751,15 @@ pub(crate) async fn conversation_list_items(
     user_id: &str,
     conversations: Vec<Conversation>,
 ) -> anyhow::Result<Vec<ConversationListItem>> {
+    // The permanent coordinator is an Alex-surface singleton, not a Chat
+    // conversation. Keep this invariant at the shared list-enrichment
+    // boundary so REST, conversation SSE, and unified SSE can never publish
+    // its intentionally verbose transcript into Chat. The dedicated
+    // `/api/alex/coordinator` endpoint remains its only discovery surface.
+    let conversations = conversations
+        .into_iter()
+        .filter(is_global_chat_conversation)
+        .collect::<Vec<_>>();
     let metadata = conversation_run_metadata_maps(pool, &conversations).await?;
     let parent_ids = conversations
         .iter()
@@ -769,6 +778,12 @@ pub(crate) async fn conversation_list_items(
             ConversationListItem::from_conversation(conversation, &metadata, child_activity)
         })
         .collect())
+}
+
+fn is_global_chat_conversation(conversation: &Conversation) -> bool {
+    conversation.agent.as_deref() != Some(crate::fable_coordinator::FABLE_AGENT)
+        && conversation.conversation_type.as_deref()
+            != Some(crate::fable_coordinator::FABLE_CONVERSATION_TYPE)
 }
 
 fn hierarchy_scope_label(scope: ConversationHierarchyScope) -> &'static str {
@@ -1674,7 +1689,6 @@ pub async fn list_conversations(
         estimated_query_count += active_count.saturating_mul(8);
     }
 
-    let total = list.len() as i64;
     let enrichment_started = Instant::now();
     let conversations_result = conversation_list_items(&pool, &user.user_id, list).await;
     record_db_operation(
@@ -1686,6 +1700,7 @@ pub async fn list_conversations(
     estimated_query_count += 2 + active_count.saturating_mul(4);
     let conversations =
         conversations_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let total = conversations.len() as i64;
     page.returned_count = conversations.len() as i64;
 
     let response = ConversationListResponse {
@@ -3730,6 +3745,31 @@ mod tests {
         assert!(value.get("router_ticket_id").is_none());
         assert!(value.get("router_organization").is_none());
         assert!(value.get("messages").is_none());
+    }
+
+    #[test]
+    fn global_chat_list_excludes_the_permanent_fable_coordinator() {
+        let mut coordinator = conversation_with_activity(Some(false));
+        coordinator.agent = Some(crate::fable_coordinator::FABLE_AGENT.to_string());
+        coordinator.conversation_type =
+            Some(crate::fable_coordinator::FABLE_CONVERSATION_TYPE.to_string());
+
+        assert!(!is_global_chat_conversation(&coordinator));
+        assert!(is_global_chat_conversation(&conversation_with_activity(
+            Some(false)
+        )));
+    }
+
+    #[test]
+    fn global_chat_list_fails_closed_for_partial_coordinator_designation() {
+        let mut agent_only = conversation_with_activity(Some(false));
+        agent_only.agent = Some(crate::fable_coordinator::FABLE_AGENT.to_string());
+        let mut type_only = conversation_with_activity(Some(false));
+        type_only.conversation_type =
+            Some(crate::fable_coordinator::FABLE_CONVERSATION_TYPE.to_string());
+
+        assert!(!is_global_chat_conversation(&agent_only));
+        assert!(!is_global_chat_conversation(&type_only));
     }
 
     fn run_status(is_processing: bool) -> ConversationRunStatusResponse {
