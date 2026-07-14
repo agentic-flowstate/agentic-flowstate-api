@@ -9,7 +9,7 @@ use crate::agents::claude_code::{FABLE_EFFORT, FABLE_MCP_PROFILE, FABLE_MODEL};
 pub const ALEX_USER_ID: &str = "alex";
 pub const FABLE_CONVERSATION_TYPE: &str = "fable_coordinator";
 pub const FABLE_AGENT: &str = "fable-coordinator";
-pub const FABLE_PROMPT_VERSION: &str = "fable-coordinator/v1";
+pub const FABLE_PROMPT_VERSION: &str = "fable-coordinator/v2";
 pub const FABLE_ORGANIZATION: &str = "agentic-flowstate";
 pub const FABLE_TITLE: &str = "Alex";
 
@@ -232,6 +232,15 @@ pub async fn runtime_state(
     .context("load Fable coordinator runtime state")
 }
 
+fn runtime_policy_matches(state: &FableRuntimeState) -> bool {
+    state.prompt_version == FABLE_PROMPT_VERSION
+        && state.model == FABLE_MODEL
+        && state.effort == FABLE_EFFORT
+        && state.auth_method == "claude.ai"
+        && state.subscription_type == "max"
+        && state.mcp_profile == FABLE_MCP_PROFILE
+}
+
 pub async fn prepare_session(pool: &SqlitePool, conversation_id: &str) -> Result<FableSessionPlan> {
     ensure_schema(pool).await?;
     let conversation = conversations::get_conversation(pool, conversation_id, false)
@@ -243,6 +252,11 @@ pub async fn prepare_session(pool: &SqlitePool, conversation_id: &str) -> Result
         if conversation.session_id.as_deref() != Some(state.native_session_id.as_str()) {
             return Err(anyhow!(
                 "Fable native session metadata diverged from the canonical conversation; explicit repair is required"
+            ));
+        }
+        if !runtime_policy_matches(&state) {
+            return Err(anyhow!(
+                "Fable runtime policy changed; explicit audited recovery is required"
             ));
         }
         return match state.session_state.as_str() {
@@ -540,13 +554,20 @@ pub async fn repair_session(
         .ok_or_else(|| anyhow!("Fable coordinator conversation not found"))?;
     validate_singleton(&conversation)?;
     let state = runtime_state(pool, conversation_id).await?;
-    let untracked_session_id = match state.as_ref() {
-        Some(state) if state.session_state == "recovery_required" => None,
+    let repair_event_type = match state.as_ref() {
+        Some(state) if state.session_state == "recovery_required" => {
+            Some("session_repair_approved")
+        }
+        Some(state) if !runtime_policy_matches(state) => Some("runtime_policy_repair_approved"),
         Some(_) => {
             return Err(anyhow!(
-                "Fable session repair is only allowed after a visible recovery incident"
+                "Fable session repair is only allowed after a visible recovery incident or runtime policy change"
             ));
         }
+        None => None,
+    };
+    let untracked_session_id = match state.as_ref() {
+        Some(_) => None,
         None => Some(conversation.session_id.clone().ok_or_else(|| {
             anyhow!("Fable session repair is only allowed after a visible recovery incident")
         })?),
@@ -571,7 +592,7 @@ pub async fn repair_session(
         ));
     }
 
-    if state.is_some() {
+    if let Some(prior_state) = state.as_ref() {
         let repaired = sqlx::query(
             r#"
             UPDATE fable_coordinator_runtime
@@ -580,7 +601,9 @@ pub async fn repair_session(
                 subscription_type = 'max', mcp_profile = ?, rehydrate_required = 1,
                 last_terminal_status = 'recovery_approved', last_error_class = NULL,
                 updated_at = ?
-            WHERE conversation_id = ? AND session_state = 'recovery_required'
+            WHERE conversation_id = ? AND native_session_id = ? AND session_state = ?
+              AND prompt_version = ? AND model = ? AND effort = ?
+              AND auth_method = ? AND subscription_type = ? AND mcp_profile = ?
             "#,
         )
         .bind(&session_id)
@@ -590,6 +613,14 @@ pub async fn repair_session(
         .bind(FABLE_MCP_PROFILE)
         .bind(now)
         .bind(conversation_id)
+        .bind(&prior_state.native_session_id)
+        .bind(&prior_state.session_state)
+        .bind(&prior_state.prompt_version)
+        .bind(&prior_state.model)
+        .bind(&prior_state.effort)
+        .bind(&prior_state.auth_method)
+        .bind(&prior_state.subscription_type)
+        .bind(&prior_state.mcp_profile)
         .execute(&mut *tx)
         .await?;
         if repaired.rows_affected() != 1 {
@@ -634,11 +665,7 @@ pub async fn repair_session(
     insert_event_tx(
         &mut tx,
         conversation_id,
-        if state.is_some() {
-            "session_repair_approved"
-        } else {
-            "untracked_session_repair_approved"
-        },
+        repair_event_type.unwrap_or("untracked_session_repair_approved"),
         Some(&session_id),
         Some("recovery_approved"),
         Some(actor),
@@ -838,6 +865,50 @@ mod tests {
             .await
             .expect_err("a clean conversation has no recovery incident");
         assert!(error.to_string().contains("visible recovery incident"));
+    }
+
+    #[tokio::test]
+    async fn audited_repair_rotates_a_session_after_runtime_policy_change() {
+        let pool = test_pool().await;
+        let conversation = ensure_singleton(&pool, ALEX_USER_ID).await.unwrap();
+        let original = prepare_session(&pool, &conversation.id).await.unwrap();
+        mark_session_ready(&pool, &conversation.id, &original.session_id)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE fable_coordinator_runtime SET prompt_version = 'fable-coordinator/v1' WHERE conversation_id = ?",
+        )
+        .bind(&conversation.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = prepare_session(&pool, &conversation.id)
+            .await
+            .expect_err("policy drift must not resume the prior native session");
+        assert!(error.to_string().contains("runtime policy changed"));
+
+        let repaired = repair_session(&pool, &conversation.id, ALEX_USER_ID)
+            .await
+            .expect("explicit policy repair");
+        assert_ne!(repaired.session_id, original.session_id);
+        assert!(!repaired.resume);
+        assert!(repaired.rehydrate_required);
+
+        let state = runtime_state(&pool, &conversation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.prompt_version, FABLE_PROMPT_VERSION);
+        assert_eq!(state.session_state, "recovery_approved");
+        let approval_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fable_coordinator_events WHERE conversation_id = ? AND event_type = 'runtime_policy_repair_approved'",
+        )
+        .bind(&conversation.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(approval_count, 1);
     }
 
     #[tokio::test]

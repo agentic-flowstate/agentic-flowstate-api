@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -15,6 +16,43 @@ use super::codex_app_server::{agentic_mcp_binary, launchd_safe_path, terminate_c
 pub const FABLE_MODEL: &str = "claude-fable-5";
 pub const FABLE_EFFORT: &str = "max";
 pub const FABLE_MCP_PROFILE: &str = "fable-coordinator";
+pub const FABLE_ALLOWED_MCP_TOOLS: &[&str] = &[
+    "mcp__agentic-mcp__list_conversations",
+    "mcp__agentic-mcp__get_conversation",
+    "mcp__agentic-mcp__create_child_conversations",
+    "mcp__agentic-mcp__get_conversation_processing_status",
+    "mcp__agentic-mcp__get_runner_queue_capacity",
+    "mcp__agentic-mcp__list_message_tool_calls",
+    "mcp__agentic-mcp__get_tool_call",
+    "mcp__agentic-mcp__get_child_agent_context",
+    "mcp__agentic-mcp__list_organizations",
+    "mcp__agentic-mcp__list_epics",
+    "mcp__agentic-mcp__get_epic",
+    "mcp__agentic-mcp__list_slices",
+    "mcp__agentic-mcp__get_slice",
+    "mcp__agentic-mcp__list_tickets",
+    "mcp__agentic-mcp__list_tickets_by_due_date",
+    "mcp__agentic-mcp__get_ticket",
+    "mcp__agentic-mcp__search_tickets",
+    "mcp__agentic-mcp__ensure_work_ticket",
+    "mcp__agentic-mcp__create_slice_tickets",
+    "mcp__agentic-mcp__update_ticket",
+    "mcp__agentic-mcp__update_ticket_status",
+    "mcp__agentic-mcp__add_ticket_relationship",
+    "mcp__agentic-mcp__remove_ticket_relationship",
+    "mcp__agentic-mcp__attach_ticket_documentation",
+    "mcp__agentic-mcp__list_repos",
+    "mcp__agentic-mcp__get_repo",
+    "mcp__agentic-mcp__create_artifact",
+    "mcp__agentic-mcp__update_artifact",
+    "mcp__agentic-mcp__get_artifact",
+    "mcp__agentic-mcp__list_artifacts",
+    "mcp__agentic-mcp__search_artifacts",
+    "mcp__agentic-mcp__agent_broadcast_post",
+    "mcp__agentic-mcp__agent_broadcast_list",
+    "mcp__agentic-mcp__agent_broadcast_update",
+    "mcp__agentic-mcp__agent_broadcast_expire",
+];
 
 #[derive(Debug, Clone)]
 pub enum ClaudeCodeEvent {
@@ -46,7 +84,6 @@ pub enum ClaudeCodeEvent {
 
 pub struct ClaudeCodeOptions<'a> {
     pub system_prompt: &'a str,
-    pub working_dir: &'a Path,
     pub prompt: &'a str,
     pub session_id: &'a str,
     pub resume: bool,
@@ -203,6 +240,8 @@ pub async fn spawn_claude_code(
     let binary = claude_code_binary()?;
     let mcp_binary = agentic_mcp_binary()?;
     let mcp_config = build_mcp_config(&mcp_binary, options.conversation_id, options.user_id)?;
+    let runtime_dir = isolated_fable_runtime_dir()?;
+    let allowed_tools = FABLE_ALLOWED_MCP_TOOLS.join(",");
     let mut command = Command::new(&binary);
     command
         .arg("--print")
@@ -220,9 +259,14 @@ pub async fn spawn_claude_code(
         .arg("--permission-mode")
         .arg("bypassPermissions")
         .arg("--allowedTools")
-        .arg("mcp__agentic-mcp__*")
+        .arg(allowed_tools)
         .arg("--tools=")
         .arg("--disable-slash-commands")
+        .arg("--setting-sources")
+        .arg("")
+        .arg("--no-chrome")
+        .arg("--prompt-suggestions")
+        .arg("false")
         .arg("--system-prompt")
         .arg(options.system_prompt);
     if options.resume {
@@ -232,7 +276,7 @@ pub async fn spawn_claude_code(
     }
     command
         .arg(options.prompt)
-        .current_dir(options.working_dir)
+        .current_dir(runtime_dir)
         .env("PATH", launchd_safe_path())
         .env_remove("ANTHROPIC_API_KEY")
         .stdin(Stdio::null())
@@ -339,6 +383,33 @@ fn claude_code_binary() -> Result<PathBuf, String> {
         ));
     }
     Ok(binary)
+}
+
+fn isolated_fable_runtime_dir() -> Result<PathBuf, String> {
+    let runtime_dir = std::env::temp_dir().join("agentic-flowstate-fable-runtime");
+    fs::create_dir_all(&runtime_dir).map_err(|error| {
+        format!(
+            "Failed to create isolated Fable runtime directory {}: {error}",
+            runtime_dir.display()
+        )
+    })?;
+
+    for ancestor in runtime_dir.ancestors() {
+        for context_path in [
+            ancestor.join("CLAUDE.md"),
+            ancestor.join("CLAUDE.local.md"),
+            ancestor.join(".claude"),
+        ] {
+            if context_path.exists() {
+                return Err(format!(
+                    "Refusing to start Fable because isolated runtime path inherits Claude project context from {}",
+                    context_path.display()
+                ));
+            }
+        }
+    }
+
+    Ok(runtime_dir)
 }
 
 fn build_mcp_config(
@@ -777,6 +848,7 @@ fn classify_claude_failure(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn parser() -> ClaudeStreamParser {
         ClaudeStreamParser::new("11111111-1111-4111-8111-111111111111".to_string())
@@ -792,6 +864,72 @@ mod tests {
             "mcp_servers": [{"name": "agentic-mcp", "status": "connected"}]
         })
         .to_string()
+    }
+
+    #[test]
+    fn fable_tool_allowlist_matches_registry_and_excludes_direct_work_surfaces() {
+        let configured: Value =
+            serde_json::from_str(include_str!("../../agents.json")).expect("parse agents.json");
+        let registry_tools = configured["agents"]["fable-coordinator"]["tools"]
+            .as_array()
+            .expect("Fable tools array")
+            .iter()
+            .map(|tool| tool.as_str().expect("tool name"))
+            .collect::<HashSet<_>>();
+        let runtime_tools = FABLE_ALLOWED_MCP_TOOLS
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+
+        assert_eq!(registry_tools, runtime_tools);
+        assert!(runtime_tools.contains("mcp__agentic-mcp__create_child_conversations"));
+        assert!(!runtime_tools.iter().any(|tool| tool.contains('*')));
+        for forbidden in [
+            "laminarforge",
+            "research_",
+            "build",
+            "deploy",
+            "manage_service",
+            "run_setup",
+            "workspace_",
+            "web_automation",
+            "email",
+        ] {
+            assert!(
+                runtime_tools.iter().all(|tool| !tool.contains(forbidden)),
+                "Fable runtime allowlist contains forbidden surface: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn fable_prompt_and_runtime_directory_do_not_inherit_project_context() {
+        let prompt = include_str!("../../_prompts/fable-coordinator.txt").to_ascii_lowercase();
+        for forbidden in [
+            "{{agents_md}}",
+            "{{artifact_memory_handoff}}",
+            "laminarforge",
+            "biotech",
+            "biomedical",
+            "hsv-2",
+            "crispr",
+            "aav",
+            "cell culture",
+            "microfluidic",
+        ] {
+            assert!(
+                !prompt.contains(forbidden),
+                "Fable prompt leaked forbidden domain context: {forbidden}"
+            );
+        }
+
+        let runtime_dir = isolated_fable_runtime_dir().expect("isolated Fable runtime directory");
+        assert!(runtime_dir.is_dir());
+        assert!(runtime_dir
+            .ancestors()
+            .all(|ancestor| !ancestor.join("CLAUDE.md").exists()
+                && !ancestor.join("CLAUDE.local.md").exists()
+                && !ancestor.join(".claude").exists()));
     }
 
     #[test]

@@ -80,6 +80,7 @@ struct WorkContextPreflight {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkContextSkipReason {
     SupportAgent,
+    CoordinatorIsolation,
     ExistingArtifactHandoff,
     AlreadyRouted,
     TinyConversational,
@@ -89,6 +90,7 @@ impl WorkContextSkipReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::SupportAgent => "support_agent",
+            Self::CoordinatorIsolation => "coordinator_isolation",
             Self::ExistingArtifactHandoff => "existing_artifact_memory_handoff",
             Self::AlreadyRouted => "already_routed",
             Self::TinyConversational => "tiny_conversational",
@@ -96,7 +98,10 @@ impl WorkContextSkipReason {
     }
 
     fn persist_router_skip(self) -> bool {
-        matches!(self, Self::SupportAgent | Self::ExistingArtifactHandoff)
+        matches!(
+            self,
+            Self::SupportAgent | Self::CoordinatorIsolation | Self::ExistingArtifactHandoff
+        )
     }
 }
 
@@ -1488,7 +1493,6 @@ impl ConversationWorker {
                     .expect("Fable session plan must exist before spawn");
                 spawn_claude_code(ClaudeCodeOptions {
                     system_prompt: &system_prompt,
-                    working_dir: &msg.config.working_dir,
                     prompt: final_message,
                     session_id: &plan.session_id,
                     resume: plan.resume,
@@ -2673,6 +2677,9 @@ fn work_context_skip_reason(
     config: &ChatConfig,
     has_routed: bool,
 ) -> Option<WorkContextSkipReason> {
+    if matches!(config.agent_type, AgentType::FableCoordinator) {
+        return Some(WorkContextSkipReason::CoordinatorIsolation);
+    }
     if matches!(
         config.agent_type,
         AgentType::ConversationEvaluator | AgentType::Feedback
@@ -3801,10 +3808,7 @@ fn parent_coordinator_prompt_vars(
     let mut prompt_vars = HashMap::new();
     prompt_vars.insert("USER_ID".to_string(), user_id.to_string());
 
-    if matches!(
-        agent_type,
-        AgentType::FullAccess | AgentType::FableCoordinator
-    ) {
+    if matches!(agent_type, AgentType::FullAccess) {
         let agents_md = std::fs::read_to_string("/Users/jarvisgpt/projects/AGENTS.md")
             .context("read /Users/jarvisgpt/projects/AGENTS.md for full-access wake")?;
         prompt_vars.insert("AGENTS_MD".to_string(), agents_md);
@@ -4371,6 +4375,23 @@ fn format_attachment_prompt_line(
 }
 
 #[cfg(test)]
+mod fable_prompt_scope_tests {
+    use super::*;
+
+    #[test]
+    fn fable_wake_does_not_preload_the_global_project_manual() {
+        let vars = parent_coordinator_prompt_vars(&AgentType::FableCoordinator, "alex")
+            .expect("build Fable wake prompt variables");
+
+        assert_eq!(
+            vars.get("PROMPT_VERSION").map(String::as_str),
+            Some(FABLE_PROMPT_VERSION)
+        );
+        assert!(!vars.contains_key("AGENTS_MD"));
+    }
+}
+
+#[cfg(test)]
 mod completion_alert_push_tests {
     use super::*;
 
@@ -4498,6 +4519,17 @@ mod work_context_preflight_tests {
             work_context_skip_reason("Implement the ticket", &handoff_config, false),
             Some(WorkContextSkipReason::ExistingArtifactHandoff)
         );
+    }
+
+    #[test]
+    fn fable_coordinator_never_receives_automatic_artifact_context() {
+        let config = test_config(AgentType::FableCoordinator);
+
+        assert_eq!(
+            work_context_skip_reason("Coordinate this project request", &config, false),
+            Some(WorkContextSkipReason::CoordinatorIsolation)
+        );
+        assert!(WorkContextSkipReason::CoordinatorIsolation.persist_router_skip());
     }
 
     #[test]

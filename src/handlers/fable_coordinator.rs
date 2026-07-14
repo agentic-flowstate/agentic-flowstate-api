@@ -197,15 +197,8 @@ fn chat_config(user_id: &str) -> Result<ChatConfig, Response> {
             )
         })?
         .join("projects");
-    let agents_md = std::fs::read_to_string(projects_root.join("AGENTS.md")).map_err(|error| {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Required coordinator instructions are unavailable: {error}"),
-        )
-    })?;
     let mut prompt_vars = HashMap::new();
     prompt_vars.insert("USER_ID".to_string(), user_id.to_string());
-    prompt_vars.insert("AGENTS_MD".to_string(), agents_md);
     prompt_vars.insert(
         "PROMPT_VERSION".to_string(),
         FABLE_PROMPT_VERSION.to_string(),
@@ -443,6 +436,13 @@ mod tests {
         assert_eq!(config.runtime, ChatRuntime::ClaudeCodeFable);
         assert_eq!(config.codex_options.model, FABLE_MODEL);
         assert_eq!(config.codex_options.reasoning_effort, FABLE_EFFORT);
+        assert!(!config.prompt_vars.contains_key("AGENTS_MD"));
+
+        let prompt = crate::agents::prompts::load_prompt(config.prompt_name, config.prompt_vars)
+            .expect("render Fable coordinator prompt");
+        assert!(prompt.contains("Prompt version: fable-coordinator/v2"));
+        assert!(!prompt.contains("{{AGENTS_MD}}"));
+        assert!(!prompt.contains("Open HSV-2 therapeutics research"));
     }
 
     fn runtime_state(
