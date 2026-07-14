@@ -1,5 +1,5 @@
 //! Continuously monitors every writable mounted volume and turns pressure
-//! threshold transitions into durable incidents, APNs alerts, and Codex jobs.
+//! threshold transitions into durable incidents and APNs alerts.
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -17,9 +17,10 @@ use crate::apns::ApnsService;
 
 const OWNER_USER_ID: &str = "alex";
 const COMPONENT: &str = "disk_pressure";
-const DEFAULT_POLL_SECONDS: u64 = 5 * 60;
-const MAX_POLL_SECONDS: u64 = 5 * 60;
+const DEFAULT_POLL_SECONDS: u64 = 8 * 60 * 60;
+const MAX_POLL_SECONDS: u64 = 8 * 60 * 60;
 const STARTUP_DELAY_SECONDS: u64 = 5;
+const NON_CAPACITY_FILESYSTEM_TYPES: &[&str] = &["devfs"];
 const WARNING_THRESHOLD: f64 = 75.0;
 const CRITICAL_THRESHOLD: f64 = 85.0;
 const EMERGENCY_THRESHOLD: f64 = 95.0;
@@ -116,6 +117,13 @@ impl PressureStage {
     }
 }
 
+fn actionable_stage(used_percent: f64) -> PressureStage {
+    match PressureStage::from_used_percent(used_percent) {
+        PressureStage::Warning => PressureStage::Healthy,
+        stage => stage,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransitionKind {
     Detected,
@@ -167,7 +175,7 @@ impl DiskPressureConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromRow)]
 struct VolumeSample {
     volume_id: String,
     volume_source: String,
@@ -282,6 +290,59 @@ impl DiskPressureMonitor {
         .await
         .context("count active disk pressure incidents")?;
         metrics::gauge!(METRIC_ACTIVE_INCIDENTS).set(active_incidents as f64);
+        Ok(summary)
+    }
+
+    async fn recover_obsolete_monitor_states(&self) -> Result<PollSummary> {
+        let passive_volume_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT volume_id FROM disk_pressure_volume_state WHERE current_stage = 75",
+        )
+        .fetch_all(self.pool.as_ref())
+        .await
+        .context("load obsolete passive-threshold states")?;
+        let mut samples = sqlx::query_as::<_, VolumeSample>(
+            r#"
+            SELECT volume_id, volume_source, mount_path, filesystem_type,
+                   total_bytes, used_bytes, available_bytes, used_percent
+            FROM disk_pressure_volume_state
+            WHERE current_stage > 0
+            "#,
+        )
+        .fetch_all(self.pool.as_ref())
+        .await
+        .context("load active disk pressure states")?;
+        samples.retain(|sample| {
+            passive_volume_ids.contains(&sample.volume_id)
+                || !is_capacity_bearing_filesystem(&sample.filesystem_type)
+        });
+        if samples.is_empty() {
+            return Ok(PollSummary::default());
+        }
+
+        for sample in &mut samples {
+            // Pseudo-filesystems such as devfs report allocation counters that
+            // do not describe consumable disk capacity. Driving the normal
+            // recovery path also closes any 75% incidents created before the
+            // corrected 85% action threshold became authoritative.
+            sample.used_bytes = 0;
+            sample.available_bytes = sample.total_bytes;
+            sample.used_percent = 0.0;
+        }
+        let retired_count = samples.len();
+        let summary = self.process_samples(samples).await?;
+        if summary.action_failures > 0 || summary.recoveries != retired_count {
+            bail!(
+                "failed to durably recover all obsolete disk pressure incidents: expected {retired_count}, recovered {}, failures {}",
+                summary.recoveries,
+                summary.action_failures
+            );
+        }
+        tracing::info!(
+            component = COMPONENT,
+            operation = "disk_pressure.obsolete_states_recovered",
+            recovered_volumes = summary.recoveries,
+            "recovered obsolete passive-threshold or pseudo-filesystem disk pressure incidents"
+        );
         Ok(summary)
     }
 
@@ -495,7 +556,7 @@ impl DiskPressureMonitor {
         }
 
         let current_stage = PressureStage::from_db(stored.current_stage)?;
-        let observed_stage = PressureStage::from_used_percent(sample.used_percent);
+        let observed_stage = actionable_stage(sample.used_percent);
         let transition = if current_stage == PressureStage::Healthy
             && observed_stage > PressureStage::Healthy
         {
@@ -522,11 +583,12 @@ impl DiskPressureMonitor {
         };
 
         let action_id = stable_action_id(&sample.volume_id, cycle, kind, stage);
-        let notification_status = if kind == TransitionKind::Recovered {
-            "not_required"
-        } else {
-            "pending"
-        };
+        let notification_status =
+            if matches!(kind, TransitionKind::Recovered | TransitionKind::Escalated) {
+                "not_required"
+            } else {
+                "pending"
+            };
         sqlx::query(
             r#"
             UPDATE disk_pressure_volume_state
@@ -812,7 +874,9 @@ impl PressureResponder for ProductionResponder {
     async fn ensure_incident(&self, action: &PendingAction) -> Result<String> {
         let detail = Self::action_detail(action, action.kind.as_str());
         let level = match action.stage {
-            PressureStage::Warning => "error",
+            PressureStage::Warning => {
+                bail!("cannot create an incident at the passive 75% telemetry stage")
+            }
             PressureStage::Critical | PressureStage::Emergency => "critical",
             PressureStage::Healthy => bail!("cannot create a pressure incident at healthy stage"),
         };
@@ -915,7 +979,9 @@ impl PressureResponder for ProductionResponder {
         let apns = ApnsService::global()
             .context("APNs alert service is unavailable for disk pressure notification")?;
         let title = match action.stage {
-            PressureStage::Warning => "Disk space warning",
+            PressureStage::Warning => {
+                bail!("cannot notify at the passive 75% telemetry stage")
+            }
             PressureStage::Critical => "Disk space critical",
             PressureStage::Emergency => "Disk space emergency",
             PressureStage::Healthy => bail!("cannot notify for a healthy disk pressure stage"),
@@ -963,6 +1029,7 @@ pub async fn spawn_disk_pressure_monitor(
     }
     let responder: Arc<dyn PressureResponder> = Arc::new(ProductionResponder::new(pool.clone()));
     let monitor = Arc::new(DiskPressureMonitor::new(pool, responder));
+    monitor.recover_obsolete_monitor_states().await?;
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(STARTUP_DELAY_SECONDS)).await;
         let mut interval = tokio::time::interval(config.poll_interval);
@@ -971,8 +1038,8 @@ pub async fn spawn_disk_pressure_monitor(
             component = COMPONENT,
             operation = "disk_pressure.monitor_started",
             poll_seconds = config.poll_interval.as_secs(),
-            warning_threshold = WARNING_THRESHOLD,
-            critical_threshold = CRITICAL_THRESHOLD,
+            passive_observation_threshold = WARNING_THRESHOLD,
+            action_threshold = CRITICAL_THRESHOLD,
             emergency_threshold = EMERGENCY_THRESHOLD,
             recovery_threshold = RECOVERY_THRESHOLD,
             "automatic disk pressure monitor started"
@@ -1125,6 +1192,12 @@ fn sample_writable_volumes() -> Result<Vec<VolumeSample>> {
         if (entry.f_flags as u64 & libc::MNT_RDONLY as u64) != 0 || entry.f_blocks == 0 {
             continue;
         }
+        let filesystem_type = unsafe { CStr::from_ptr(entry.f_fstypename.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        if !is_capacity_bearing_filesystem(&filesystem_type) {
+            continue;
+        }
         let block_size = entry.f_bsize as u128;
         if block_size == 0 {
             continue;
@@ -1141,9 +1214,6 @@ fn sample_writable_volumes() -> Result<Vec<VolumeSample>> {
             .to_string_lossy()
             .into_owned();
         let mount_path = unsafe { CStr::from_ptr(entry.f_mntonname.as_ptr()) }
-            .to_string_lossy()
-            .into_owned();
-        let filesystem_type = unsafe { CStr::from_ptr(entry.f_fstypename.as_ptr()) }
             .to_string_lossy()
             .into_owned();
         // libc intentionally keeps fsid_t's two-word payload private, but
@@ -1168,6 +1238,10 @@ fn sample_writable_volumes() -> Result<Vec<VolumeSample>> {
     // pressure contract is per stable volume identity, so process it once.
     samples.dedup_by(|left, right| left.volume_id == right.volume_id);
     Ok(samples)
+}
+
+fn is_capacity_bearing_filesystem(filesystem_type: &str) -> bool {
+    !NON_CAPACITY_FILESYSTEM_TYPES.contains(&filesystem_type)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1320,30 +1394,31 @@ mod tests {
     #[tokio::test]
     async fn threshold_crossing_triggers_one_incident_and_push_without_agent() {
         let (monitor, responder) = test_monitor().await;
-        let healthy = monitor
-            .process_samples(vec![sample("disk-a", 74.9)])
+        let passive = monitor
+            .process_samples(vec![sample("disk-a", 75.0)])
             .await
             .unwrap();
-        assert_eq!(healthy.transitions, 0);
+        assert_eq!(passive.transitions, 0);
+        assert_eq!(responder.counts().await, (0, 0, 0));
 
         let crossed = monitor
-            .process_samples(vec![sample("disk-a", 75.0)])
+            .process_samples(vec![sample("disk-a", 85.0)])
             .await
             .unwrap();
         assert_eq!(crossed.transitions, 1);
         assert_eq!(crossed.notifications_sent, 1);
         assert_eq!(responder.counts().await, (1, 1, 0));
-        assert_eq!(current_stage(&monitor, "disk-a").await, 75);
+        assert_eq!(current_stage(&monitor, "disk-a").await, 85);
     }
 
     #[tokio::test]
     async fn repeated_polls_are_deduplicated_at_the_same_stage() {
         let (monitor, responder) = test_monitor().await;
         monitor
-            .process_samples(vec![sample("disk-a", 76.0)])
+            .process_samples(vec![sample("disk-a", 86.0)])
             .await
             .unwrap();
-        for used in [77.0, 80.0, 84.99] {
+        for used in [87.0, 90.0, 94.99] {
             let summary = monitor
                 .process_samples(vec![sample("disk-a", used)])
                 .await
@@ -1354,7 +1429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn higher_thresholds_each_allow_one_escalation_action() {
+    async fn emergency_escalation_updates_incident_without_repeat_push() {
         let (monitor, responder) = test_monitor().await;
         for used in [75.0, 85.0, 90.0, 95.0, 99.0] {
             monitor
@@ -1362,7 +1437,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(responder.counts().await, (3, 3, 0));
+        assert_eq!(responder.counts().await, (2, 1, 0));
         assert_eq!(current_stage(&monitor, "disk-a").await, 95);
     }
 
@@ -1370,39 +1445,92 @@ mod tests {
     async fn recovery_uses_hysteresis_and_rearms_future_pressure() {
         let (monitor, responder) = test_monitor().await;
         monitor
-            .process_samples(vec![sample("disk-a", 76.0)])
+            .process_samples(vec![sample("disk-a", 86.0)])
             .await
             .unwrap();
         monitor
             .process_samples(vec![sample("disk-a", 72.0)])
             .await
             .unwrap();
-        assert_eq!(current_stage(&monitor, "disk-a").await, 75);
+        assert_eq!(current_stage(&monitor, "disk-a").await, 85);
         monitor
             .process_samples(vec![sample("disk-a", 69.9)])
             .await
             .unwrap();
         assert_eq!(current_stage(&monitor, "disk-a").await, 0);
         monitor
-            .process_samples(vec![sample("disk-a", 76.0)])
+            .process_samples(vec![sample("disk-a", 86.0)])
             .await
             .unwrap();
         assert_eq!(responder.counts().await, (2, 2, 1));
-        assert_eq!(current_stage(&monitor, "disk-a").await, 75);
+        assert_eq!(current_stage(&monitor, "disk-a").await, 85);
     }
 
     #[tokio::test]
     async fn multiple_writable_volumes_are_tracked_independently() {
         let (monitor, responder) = test_monitor().await;
         let summary = monitor
-            .process_samples(vec![sample("disk-a", 76.0), sample("disk-b", 86.0)])
+            .process_samples(vec![sample("disk-a", 86.0), sample("disk-b", 96.0)])
             .await
             .unwrap();
         assert_eq!(summary.sampled_volumes, 2);
         assert_eq!(summary.transitions, 2);
         assert_eq!(responder.counts().await, (2, 2, 0));
-        assert_eq!(current_stage(&monitor, "disk-a").await, 75);
-        assert_eq!(current_stage(&monitor, "disk-b").await, 85);
+        assert_eq!(current_stage(&monitor, "disk-a").await, 85);
+        assert_eq!(current_stage(&monitor, "disk-b").await, 95);
+    }
+
+    #[tokio::test]
+    async fn prior_devfs_false_incident_is_durably_recovered_once() {
+        let (monitor, responder) = test_monitor().await;
+        let mut devfs = sample("devfs", 100.0);
+        devfs.filesystem_type = "devfs".to_string();
+        monitor.process_samples(vec![devfs]).await.unwrap();
+        assert_eq!(current_stage(&monitor, "devfs").await, 95);
+
+        let recovered = monitor.recover_obsolete_monitor_states().await.unwrap();
+        assert_eq!(recovered.recoveries, 1);
+        assert_eq!(current_stage(&monitor, "devfs").await, 0);
+        assert_eq!(responder.counts().await, (1, 1, 1));
+
+        let repeated = monitor.recover_obsolete_monitor_states().await.unwrap();
+        assert_eq!(repeated.recoveries, 0);
+        assert_eq!(responder.counts().await, (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn prior_75_percent_incident_is_recovered_under_corrected_contract() {
+        let (monitor, responder) = test_monitor().await;
+        monitor
+            .process_samples(vec![sample("disk-a", 75.0)])
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE disk_pressure_volume_state SET current_stage = 75, cycle = 1, incident_id = 'incident-old-warning' WHERE volume_id = 'disk-a'",
+        )
+        .execute(monitor.pool.as_ref())
+        .await
+        .unwrap();
+
+        let recovered = monitor.recover_obsolete_monitor_states().await.unwrap();
+        assert_eq!(recovered.recoveries, 1);
+        assert_eq!(current_stage(&monitor, "disk-a").await, 0);
+        assert_eq!(responder.counts().await, (0, 0, 1));
+    }
+
+    #[test]
+    fn devfs_allocation_counters_are_not_disk_capacity() {
+        assert!(!is_capacity_bearing_filesystem("devfs"));
+        assert!(is_capacity_bearing_filesystem("apfs"));
+    }
+
+    #[test]
+    fn corrected_contract_uses_eight_hour_polling_and_85_percent_actions() {
+        assert_eq!(DEFAULT_POLL_SECONDS, 8 * 60 * 60);
+        assert_eq!(MAX_POLL_SECONDS, 8 * 60 * 60);
+        assert_eq!(actionable_stage(75.0), PressureStage::Healthy);
+        assert_eq!(actionable_stage(84.99), PressureStage::Healthy);
+        assert_eq!(actionable_stage(85.0), PressureStage::Critical);
     }
 
     #[tokio::test]
@@ -1423,16 +1551,16 @@ mod tests {
         let detected = pending_action(
             "action-detected",
             TransitionKind::Detected,
-            PressureStage::Warning,
-            76.0,
+            PressureStage::Critical,
+            86.0,
             None,
         );
         let incident_id = responder.ensure_incident(&detected).await.unwrap();
         let escalated = pending_action(
             "action-escalated",
             TransitionKind::Escalated,
-            PressureStage::Critical,
-            86.0,
+            PressureStage::Emergency,
+            96.0,
             Some(&incident_id),
         );
         let escalated_incident_id = responder.ensure_incident(&escalated).await.unwrap();
