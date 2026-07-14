@@ -3,6 +3,7 @@ pub mod apns;
 mod auth_middleware;
 mod dailies_scheduler;
 mod daily_actions;
+mod disk_pressure;
 mod email_attachment_safety;
 mod email_classifier;
 mod email_delivery;
@@ -692,6 +693,14 @@ async fn main() -> anyhow::Result<()> {
             "APNs alert push disabled"
         );
     }
+
+    tracing::info!(
+        component = "disk_pressure",
+        operation = "disk_pressure.monitor_starting",
+        "starting automatic disk pressure monitor"
+    );
+    disk_pressure::spawn_disk_pressure_monitor(db_pool.clone(), shutdown_token.child_token())
+        .await?;
 
     tracing::info!("Starting email notification dispatcher");
     email_notification_dispatcher::spawn_email_notification_dispatcher(

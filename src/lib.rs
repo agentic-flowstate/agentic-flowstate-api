@@ -3,6 +3,7 @@ pub mod apns;
 pub mod auth_middleware;
 pub mod dailies_scheduler;
 pub mod daily_actions;
+pub mod disk_pressure;
 pub mod email_attachment_safety;
 pub mod email_classifier;
 pub mod email_delivery;

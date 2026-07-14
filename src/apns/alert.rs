@@ -225,6 +225,13 @@ pub struct ApnsService {
     cached_token: RwLock<Option<CachedToken>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApnsAlertFanoutReport {
+    pub registered_devices: usize,
+    pub delivered_devices: usize,
+    pub failed_devices: usize,
+}
+
 impl ApnsService {
     /// Get the global APNs service instance (set during init).
     pub fn global() -> Option<&'static Arc<ApnsService>> {
@@ -364,6 +371,46 @@ impl ApnsService {
         };
         self.send_to_user_with_metadata(db, user_id, title, body, &metadata)
             .await
+            .map(|_| ())
+    }
+
+    /// Send one visible disk-pressure alert to every active device for a user.
+    ///
+    /// The caller supplies a stable action ID for `apns-collapse-id`, so a
+    /// retried delivery attempt for the same durable pressure transition is
+    /// coalesced by APNs instead of appearing as a new alert.
+    pub async fn send_disk_pressure_notification_to_user(
+        &self,
+        db: &sqlx::SqlitePool,
+        user_id: &str,
+        title: &str,
+        body: &str,
+        conversation_id: Option<&str>,
+        action_id: &str,
+    ) -> Result<ApnsAlertFanoutReport, String> {
+        let metadata = AlertMetadata {
+            conversation_id,
+            agent_name: Some("full-access"),
+            notification_type: Some("disk_pressure"),
+            collapse_id: Some(format!("disk-pressure-{action_id}")),
+            apns_thread_id: "disk-pressure",
+            ..Default::default()
+        };
+        let report = self
+            .send_to_user_with_metadata(db, user_id, title, body, &metadata)
+            .await?;
+        if report.registered_devices == 0 {
+            return Err(format!(
+                "No active APNs device tokens are registered for user {user_id}"
+            ));
+        }
+        if report.failed_devices > 0 {
+            return Err(format!(
+                "APNs disk-pressure fan-out delivered to {} of {} registered devices",
+                report.delivered_devices, report.registered_devices
+            ));
+        }
+        Ok(report)
     }
 
     async fn send_with_endpoint_retry(
@@ -610,7 +657,7 @@ impl ApnsService {
         title: &str,
         body: &str,
         metadata: &AlertMetadata<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<ApnsAlertFanoutReport, String> {
         let tokens =
             match ticketing_system::device_tokens::get_active_tokens_for_user(db, user_id).await {
                 Ok(t) => t,
@@ -630,12 +677,16 @@ impl ApnsService {
             user_id
         );
 
+        let mut delivered_devices = 0usize;
+        let mut failed_devices = 0usize;
+
         for token in &tokens {
             match self
                 .send_with_endpoint_retry(token, title, body, metadata)
                 .await
             {
                 Ok(delivery) => {
+                    delivered_devices += 1;
                     if delivery.endpoint != self.endpoint {
                         tracing::warn!(
                             "[APNS] Token for user {} delivered via {} APNs while configured endpoint is {}",
@@ -646,6 +697,7 @@ impl ApnsService {
                     }
                 }
                 Err(failure) => {
+                    failed_devices += 1;
                     tracing::warn!("[APNS] Send failed for user {}: {}", user_id, failure);
                     if failure.should_soft_delete_token() {
                         tracing::info!("[APNS] Soft-deleting invalid token for user {}", user_id);
@@ -658,7 +710,11 @@ impl ApnsService {
             }
         }
 
-        Ok(())
+        Ok(ApnsAlertFanoutReport {
+            registered_devices: tokens.len(),
+            delivered_devices,
+            failed_devices,
+        })
     }
 }
 

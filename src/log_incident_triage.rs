@@ -234,7 +234,8 @@ async fn ensure_ticket(pool: &SqlitePool, incident: &SystemLogIncident) -> Resul
 fn should_skip_log(log: &SystemLog) -> bool {
     let component = log.component.trim().to_ascii_lowercase();
     let message = log.message.trim().to_ascii_lowercase();
-    component.contains("health")
+    component == "disk_pressure"
+        || component.contains("health")
         || message.contains("[health_monitor]")
         || message.contains("health endpoint")
         || message.contains("automated health check")
@@ -316,6 +317,14 @@ mod tests {
             "GET /health/ready → 503 (0ms)"
         )));
         assert!(!should_skip_log(&test_log("chat", "Codex runtime failed")));
+    }
+
+    #[test]
+    fn disk_pressure_logs_are_owned_by_the_disk_pressure_monitor() {
+        assert!(should_skip_log(&test_log(
+            "disk_pressure",
+            "Writable volume disk pressure detected"
+        )));
     }
 
     #[test]
