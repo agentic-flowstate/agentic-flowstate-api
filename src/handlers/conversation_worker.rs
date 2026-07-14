@@ -3313,167 +3313,50 @@ async fn insert_child_completion_status_to_parent(
         terminal_status
     );
 
-    if let Err(e) = maybe_enqueue_parent_coordinator_wake(
-        db,
-        &parent,
-        &child,
-        child_agent,
-        child_conversation_type,
-        terminal_status,
-        child_assistant_message_id,
-        &status_message.id,
-        batch_context,
-        &report_id,
-    )
-    .await
-    {
-        let error_text = e.to_string();
-        let wake_kind = if batch_context.is_some() {
-            WakeKind::BatchCompletion
-        } else {
-            WakeKind::SingleChild
-        };
-        let child_batch_id = batch_context.map(|context| context.batch_id.as_str());
-        agent_lifecycle::record_wake_missed(
+    if let Some(batch_context) = batch_context {
+        if let Err(e) =
+            enqueue_parent_coordinator_batch_wake_if_complete(db, &parent, batch_context).await
+        {
+            let error_text = e.to_string();
+            agent_lifecycle::record_wake_missed(
+                db,
+                WakeKind::BatchCompletion,
+                &parent.id,
+                Some(&child.id),
+                Some(&batch_context.batch_id),
+                runner_capacity::classify_failure_message(&error_text),
+                &safe_error_summary(&error_text),
+            )
+            .await;
+            tracing::error!(
+                "[WORKER] Failed to enqueue parent coordinator batch wake parent={} child={} child_batch_id={} status={}: {}",
+                parent.id,
+                child.id,
+                batch_context.batch_id,
+                terminal_status,
+                e
+            );
+        }
+    } else {
+        agent_lifecycle::record_wake_suppressed(
             db,
-            wake_kind,
-            &parent.id,
+            WakeKind::SingleChild,
+            Some(&parent.id),
             Some(&child.id),
-            child_batch_id,
-            runner_capacity::classify_failure_message(&error_text),
-            &safe_error_summary(&error_text),
+            None,
+            "completion_not_in_batch",
+            None,
+            None,
         )
         .await;
-        tracing::error!(
-            "[WORKER] Failed to enqueue parent coordinator wake parent={} child={} status={}: {}",
+        tracing::info!(
+            "[WORKER] Suppressed per-child coordinator wake parent={} child={} status={} reason=completion_not_in_batch",
             parent.id,
             child.id,
-            terminal_status,
-            e
+            terminal_status
         );
     }
 
-    Ok(())
-}
-
-async fn maybe_enqueue_parent_coordinator_wake(
-    db: &SqlitePool,
-    parent: &ticketing_system::Conversation,
-    child: &ticketing_system::Conversation,
-    child_agent: &str,
-    child_conversation_type: &str,
-    terminal_status: &str,
-    child_assistant_message_id: &str,
-    status_message_id: &str,
-    batch_context: Option<&ChildBatchContext>,
-    report_id: &str,
-) -> Result<()> {
-    if let Some(batch_context) = batch_context {
-        return enqueue_parent_coordinator_batch_wake_if_complete(db, parent, batch_context).await;
-    }
-
-    enqueue_parent_coordinator_wake(
-        db,
-        parent,
-        child,
-        child_agent,
-        child_conversation_type,
-        terminal_status,
-        child_assistant_message_id,
-        status_message_id,
-        report_id,
-    )
-    .await
-}
-
-async fn enqueue_parent_coordinator_wake(
-    db: &SqlitePool,
-    parent: &ticketing_system::Conversation,
-    child: &ticketing_system::Conversation,
-    child_agent: &str,
-    child_conversation_type: &str,
-    terminal_status: &str,
-    child_assistant_message_id: &str,
-    status_message_id: &str,
-    report_id: &str,
-) -> Result<()> {
-    let agent_type = parent_coordinator_agent_type(parent)?;
-    let coordinator_runtime = parent_coordinator_runtime(parent)?;
-    let prompt_vars = parent_coordinator_prompt_vars(&agent_type, &parent.user_id)?;
-    let message = format_parent_coordinator_wake_message(
-        child,
-        child_agent,
-        child_conversation_type,
-        terminal_status,
-        child_assistant_message_id,
-        status_message_id,
-    );
-    let metadata = parent_coordinator_wake_metadata(
-        &child.id,
-        &child.title,
-        child_agent,
-        child_conversation_type,
-        terminal_status,
-        child_assistant_message_id,
-        status_message_id,
-        report_id,
-    )?;
-
-    checkpoints::upsert_checkpoint(db, &parent.id, "queued", 0)
-        .await
-        .with_context(|| format!("queue parent coordinator checkpoint {}", parent.id))?;
-
-    let payload = conversation_turn_jobs::ConversationTurnJobPayload {
-        user_id: parent.user_id.clone(),
-        message,
-        agent_type: agent_type.as_str().to_string(),
-        runtime: coordinator_runtime.as_job_runtime().to_string(),
-        prompt_name: agent_type.as_str().to_string(),
-        working_dir: "/Users/jarvisgpt/projects".to_string(),
-        prompt_vars: super::chat_stream::encode_codex_options_for_job(
-            prompt_vars,
-            &super::chat_stream::ChatCodexOptions::default_for_agent(&agent_type),
-        ),
-        images_json: None,
-        client_id: Some(format!(
-            "coordinator-wake:{}:{}",
-            child.id, child_assistant_message_id
-        )),
-        message_metadata: Some(metadata),
-    };
-
-    let enqueued = conversation_turn_jobs::enqueue_job_with_outcome(db, &parent.id, payload)
-        .await
-        .with_context(|| {
-            format!(
-                "enqueue parent coordinator wake parent={} child={}",
-                parent.id, child.id
-            )
-        })?;
-    if enqueued.outcome == conversation_turn_jobs::ConversationTurnJobEnqueueOutcome::Inserted {
-        agent_lifecycle::record_wake_fired(
-            db,
-            WakeKind::SingleChild,
-            &parent.id,
-            Some(&child.id),
-            None,
-            &enqueued.id,
-            Some(report_id),
-            None,
-            None,
-        )
-        .await;
-    }
-    super::conversations::publish_conversation_run_status(db, &parent.id)
-        .await
-        .with_context(|| format!("publish parent coordinator wake status {}", parent.id))?;
-    tracing::info!(
-        "[WORKER] Enqueued parent coordinator wake job={} parent={} child={} status={}",
-        enqueued.id,
-        parent.id,
-        child.id,
-        terminal_status
-    );
     Ok(())
 }
 
@@ -3822,21 +3705,6 @@ fn parent_coordinator_prompt_vars(
     Ok(prompt_vars)
 }
 
-fn format_parent_coordinator_wake_message(
-    child: &ticketing_system::Conversation,
-    child_agent: &str,
-    child_conversation_type: &str,
-    terminal_status: &str,
-    child_assistant_message_id: &str,
-    status_message_id: &str,
-) -> String {
-    format!(
-        "Coordinator wake: child agent {terminal_status}.\n\nChild: {child_title}\nChild conversation: `{child_conversation_id}`\nChild agent: `{child_agent}`\nChild type: `{child_conversation_type}`\nCompletion card message: `{status_message_id}`\nChild assistant message: `{child_assistant_message_id}`\n\nReview the child conversation, then decide the next orchestration step. If the output is incomplete, ask for targeted follow-up. If it is sufficient, queue any unblocked dependent child agents or report the decision back to Alex. Keep the parent response concise.",
-        child_title = child.title,
-        child_conversation_id = child.id,
-    )
-}
-
 fn format_parent_coordinator_batch_wake_message(
     batch_context: &ChildBatchContext,
     completed_children: &[CompletedChildCompletion],
@@ -3871,33 +3739,6 @@ fn format_parent_coordinator_batch_wake_message(
         completed_count = completed_children.len(),
         expected_count = batch_context.expected_count,
     )
-}
-
-fn parent_coordinator_wake_metadata(
-    child_conversation_id: &str,
-    child_title: &str,
-    child_agent: &str,
-    child_conversation_type: &str,
-    terminal_status: &str,
-    child_assistant_message_id: &str,
-    status_message_id: &str,
-    report_id: &str,
-) -> Result<String> {
-    serde_json::to_string(&serde_json::json!({
-        "origin": "agent_orchestrated",
-        "orchestrated_by": "agent-runner",
-        "orchestration": "coordinator_child_completion_wake",
-        "display": "coordinator_wake_request",
-        "report_id": report_id,
-        "child_conversation_id": child_conversation_id,
-        "child_title": child_title,
-        "child_agent": child_agent,
-        "child_conversation_type": child_conversation_type,
-        "child_terminal_status": terminal_status,
-        "child_assistant_message_id": child_assistant_message_id,
-        "child_completion_message_id": status_message_id,
-    }))
-    .context("serialize parent coordinator wake metadata")
 }
 
 fn parent_coordinator_batch_wake_metadata(
@@ -4966,11 +4807,14 @@ mod streaming_persistence_tests {
             CREATE TABLE conversations (
                 id TEXT PRIMARY KEY,
                 user_id TEXT,
+                session_id TEXT,
                 organization TEXT,
                 agent TEXT,
                 conversation_type TEXT,
                 parent_conversation_id TEXT,
                 conversation_role TEXT NOT NULL DEFAULT 'standard',
+                child_conversation_count INTEGER,
+                child_sort_order INTEGER,
                 title TEXT,
                 started_at TEXT,
                 updated_at TEXT,
@@ -5240,6 +5084,110 @@ mod streaming_persistence_tests {
         .expect("count coordinator wake jobs")
     }
 
+    async fn coordinator_wake_job_count_for_batch(pool: &SqlitePool, batch_id: &str) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM conversation_turn_jobs
+            WHERE message_metadata IS NOT NULL
+              AND json_valid(message_metadata)
+              AND json_extract(message_metadata, '$.orchestration') = 'coordinator_child_completion_wake'
+              AND json_extract(message_metadata, '$.child_batch_id') = ?
+            "#,
+        )
+        .bind(batch_id)
+        .fetch_one(pool)
+        .await
+        .expect("count coordinator wake jobs for batch")
+    }
+
+    async fn child_completion_card_count(pool: &SqlitePool, batch_id: Option<&str>) -> i64 {
+        match batch_id {
+            Some(batch_id) => sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*)
+                FROM conversation_messages
+                WHERE metadata IS NOT NULL
+                  AND json_valid(metadata)
+                  AND json_extract(metadata, '$.orchestration') = 'child_completion_status'
+                  AND json_extract(metadata, '$.child_batch_id') = ?
+                "#,
+            )
+            .bind(batch_id)
+            .fetch_one(pool)
+            .await
+            .expect("count child completion cards for batch"),
+            None => sqlx::query_scalar(
+                r#"
+                SELECT COUNT(*)
+                FROM conversation_messages
+                WHERE metadata IS NOT NULL
+                  AND json_valid(metadata)
+                  AND json_extract(metadata, '$.orchestration') = 'child_completion_status'
+                  AND json_extract(metadata, '$.child_batch_id') IS NULL
+                "#,
+            )
+            .fetch_one(pool)
+            .await
+            .expect("count unbatched child completion cards"),
+        }
+    }
+
+    async fn seed_fable_parent_with_children(pool: &SqlitePool, child_ids: &[&str]) {
+        sqlx::query(
+            r#"
+            INSERT INTO conversations (
+                id, user_id, organization, agent, conversation_type,
+                parent_conversation_id, conversation_role, title,
+                started_at, updated_at, status, message_count, last_event_index
+            ) VALUES (
+                'parent-1', 'alex', 'agentic-flowstate', 'fable-coordinator',
+                'fable_coordinator', NULL, 'multi_agent_parent', 'Alex',
+                '2026-07-14T00:00:00Z', '2026-07-14T00:00:00Z', 'open', 0, -1
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("seed Fable parent");
+
+        for (index, child_id) in child_ids.iter().enumerate() {
+            sqlx::query(
+                r#"
+                INSERT INTO conversations (
+                    id, user_id, organization, agent, conversation_type,
+                    parent_conversation_id, conversation_role, child_sort_order, title,
+                    started_at, updated_at, status, message_count, last_event_index
+                ) VALUES (
+                    ?, 'alex', 'agentic-flowstate', 'code-execution', 'implementation',
+                    'parent-1', 'sub_agent', ?, ?,
+                    '2026-07-14T00:00:00Z', '2026-07-14T00:00:00Z', 'open', 0, -1
+                )
+                "#,
+            )
+            .bind(child_id)
+            .bind(index as i64)
+            .bind(format!("Worker {}", index + 1))
+            .execute(pool)
+            .await
+            .expect("seed child conversation");
+        }
+    }
+
+    fn child_initial_turn_metadata(batch_id: &str, batch_size: usize, index: usize) -> String {
+        serde_json::json!({
+            "origin": "agent_orchestrated",
+            "orchestrated_by": "api",
+            "orchestration": "child_initial_turn",
+            "agent": "code-execution",
+            "child_batch_id": batch_id,
+            "child_batch_size": batch_size,
+            "child_batch_index": index,
+            "report_id": format!("af-report-{batch_id}"),
+        })
+        .to_string()
+    }
+
     /// Drive a sequence of the previous SDK StreamEvents through the encoder, persist
     /// every emitted Anthropic event via `insert_conversation_event`, then
     /// replay from the DB and return (event_types, parsed_json_values).
@@ -5278,26 +5226,24 @@ mod streaming_persistence_tests {
     }
 
     #[tokio::test]
-    async fn parent_coordinator_single_wake_persists_when_runner_queue_is_saturated() {
-        let pool = parent_wake_test_pool(true).await;
-        let parent = test_conversation("parent-1", "Parent", None);
-        let child = test_conversation("child-1", "Child", Some("parent-1"));
+    async fn unbatched_child_completion_records_card_without_coordinator_wake() {
+        let pool = parent_wake_test_pool(false).await;
+        seed_fable_parent_with_children(&pool, &["child-1"]).await;
 
-        enqueue_parent_coordinator_wake(
+        maybe_insert_child_completion_status_to_parent(
             &pool,
-            &parent,
-            &child,
-            "full-access",
-            "implementation",
-            "completed",
+            "child-1",
             "assistant-1",
-            "status-1",
-            "af-report-test",
+            "completed",
+            "Finished",
+            None,
+            None,
         )
         .await
-        .expect("single coordinator wake should persist");
+        .expect("record unbatched child completion");
 
-        assert_eq!(coordinator_wake_job_count(&pool).await, 1);
+        assert_eq!(child_completion_card_count(&pool, None).await, 1);
+        assert_eq!(coordinator_wake_job_count(&pool).await, 0);
     }
 
     #[tokio::test]
@@ -5390,6 +5336,157 @@ mod streaming_persistence_tests {
             .expect("batch coordinator wake should enqueue");
 
         assert_eq!(coordinator_wake_job_count(&pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn three_child_mixed_terminal_batch_wakes_once_after_last_completion() {
+        let pool = parent_wake_test_pool(false).await;
+        let batch_id = "child-batch-mixed-terminal";
+        seed_fable_parent_with_children(&pool, &["child-1", "child-2", "child-3"]).await;
+
+        let terminal_children = [
+            ("child-1", "completed", None),
+            ("child-2", "failed", Some("worker failed")),
+            ("child-3", "cancelled", None),
+        ];
+        for (index, (child_id, terminal_status, error_message)) in
+            terminal_children.iter().enumerate()
+        {
+            let metadata = child_initial_turn_metadata(batch_id, 3, index + 1);
+            maybe_insert_child_completion_status_to_parent(
+                &pool,
+                child_id,
+                &format!("assistant-{}", index + 1),
+                terminal_status,
+                "Worker terminal output",
+                *error_message,
+                Some(&metadata),
+            )
+            .await
+            .expect("record batched child completion");
+
+            assert_eq!(
+                child_completion_card_count(&pool, Some(batch_id)).await,
+                (index + 1) as i64
+            );
+            assert_eq!(
+                coordinator_wake_job_count_for_batch(&pool, batch_id).await,
+                i64::from(index == terminal_children.len() - 1),
+                "batch must wake only after its final terminal child"
+            );
+        }
+
+        let wake_metadata: String = sqlx::query_scalar(
+            r#"
+            SELECT message_metadata
+            FROM conversation_turn_jobs
+            WHERE json_extract(message_metadata, '$.child_batch_id') = ?
+            "#,
+        )
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load aggregate wake metadata");
+        let wake_metadata: serde_json::Value =
+            serde_json::from_str(&wake_metadata).expect("parse aggregate wake metadata");
+        assert_eq!(wake_metadata["child_completion_count"], 3);
+        assert_eq!(
+            wake_metadata["child_conversations"]
+                .as_array()
+                .expect("child completion list")
+                .iter()
+                .map(|child| child["child_terminal_status"]
+                    .as_str()
+                    .expect("terminal status"))
+                .collect::<Vec<_>>(),
+            vec!["completed", "failed", "cancelled"]
+        );
+    }
+
+    #[tokio::test]
+    async fn single_child_batch_still_wakes_once() {
+        let pool = parent_wake_test_pool(false).await;
+        let batch_id = "child-batch-single";
+        seed_fable_parent_with_children(&pool, &["child-1"]).await;
+        let metadata = child_initial_turn_metadata(batch_id, 1, 1);
+
+        maybe_insert_child_completion_status_to_parent(
+            &pool,
+            "child-1",
+            "assistant-1",
+            "completed",
+            "Finished",
+            None,
+            Some(&metadata),
+        )
+        .await
+        .expect("record single-child batch completion");
+
+        assert_eq!(child_completion_card_count(&pool, Some(batch_id)).await, 1);
+        assert_eq!(
+            coordinator_wake_job_count_for_batch(&pool, batch_id).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_batches_wake_once_each_on_independent_completion() {
+        let pool = parent_wake_test_pool(false).await;
+        let batch_a = "child-batch-a";
+        let batch_b = "child-batch-b";
+        seed_fable_parent_with_children(&pool, &["child-a1", "child-a2", "child-b1", "child-b2"])
+            .await;
+
+        for (child_id, assistant_id, batch_id, index) in [
+            ("child-a1", "assistant-a1", batch_a, 1),
+            ("child-b1", "assistant-b1", batch_b, 1),
+            ("child-a2", "assistant-a2", batch_a, 2),
+        ] {
+            let metadata = child_initial_turn_metadata(batch_id, 2, index);
+            maybe_insert_child_completion_status_to_parent(
+                &pool,
+                child_id,
+                assistant_id,
+                "completed",
+                "Finished",
+                None,
+                Some(&metadata),
+            )
+            .await
+            .expect("record overlapping batch completion");
+        }
+
+        assert_eq!(
+            coordinator_wake_job_count_for_batch(&pool, batch_a).await,
+            1
+        );
+        assert_eq!(
+            coordinator_wake_job_count_for_batch(&pool, batch_b).await,
+            0
+        );
+
+        let metadata = child_initial_turn_metadata(batch_b, 2, 2);
+        maybe_insert_child_completion_status_to_parent(
+            &pool,
+            "child-b2",
+            "assistant-b2",
+            "failed",
+            "Worker failed",
+            Some("worker failed"),
+            Some(&metadata),
+        )
+        .await
+        .expect("finish second overlapping batch");
+
+        assert_eq!(
+            coordinator_wake_job_count_for_batch(&pool, batch_a).await,
+            1
+        );
+        assert_eq!(
+            coordinator_wake_job_count_for_batch(&pool, batch_b).await,
+            1
+        );
+        assert_eq!(coordinator_wake_job_count(&pool).await, 2);
     }
 
     fn assert_all_anthropic(types: &[String]) {
@@ -5847,32 +5944,6 @@ mod streaming_persistence_tests {
         assert!(suppress_parent_completion_relay(Some(&metadata)));
         assert!(!suppress_parent_completion_relay(None));
         assert!(!suppress_parent_completion_relay(Some("{not json")));
-    }
-
-    #[test]
-    fn parent_coordinator_wake_metadata_marks_review_request() {
-        let metadata = parent_coordinator_wake_metadata(
-            "child-1",
-            "Architecture Synthesis",
-            "codebase-research",
-            "research",
-            "completed",
-            "assistant-1",
-            "status-message-1",
-            "af-report-test",
-        )
-        .expect("serialize wake metadata");
-        let value: serde_json::Value =
-            serde_json::from_str(&metadata).expect("parse wake metadata");
-
-        assert_eq!(value["origin"], "agent_orchestrated");
-        assert_eq!(value["orchestration"], "coordinator_child_completion_wake");
-        assert_eq!(value["display"], "coordinator_wake_request");
-        assert_eq!(value["child_conversation_id"], "child-1");
-        assert_eq!(value["child_agent"], "codebase-research");
-        assert_eq!(value["child_terminal_status"], "completed");
-        assert_eq!(value["child_completion_message_id"], "status-message-1");
-        assert_eq!(value["report_id"], "af-report-test");
     }
 
     #[test]
