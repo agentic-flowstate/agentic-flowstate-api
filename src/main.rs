@@ -1563,11 +1563,11 @@ async fn main() -> anyhow::Result<()> {
             get(handlers::get_fable_coordinator_health),
         )
         .route(
-            "/api/alex/coordinator/chat",
+            "/api/fable-coordinator/chat",
             post(handlers::fable_coordinator_chat),
         )
         .route(
-            "/api/alex/coordinator/chat/submit",
+            "/api/fable-coordinator/chat/submit",
             post(handlers::fable_coordinator_chat_submit),
         )
         .route(

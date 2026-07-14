@@ -114,7 +114,7 @@ impl AgentType {
             "feedback" => Some(AgentType::Feedback),
             "research" => Some(AgentType::Research),
             "polymarket" => Some(AgentType::Polymarket),
-            "fable" | "fable-coordinator" => Some(AgentType::FableCoordinator),
+            "fable-coordinator" => Some(AgentType::FableCoordinator),
             _ => None,
         }
     }
@@ -360,6 +360,16 @@ pub struct AgentRunsResponse {
 #[cfg(test)]
 mod tests {
     use super::{AgentType, AgentsConfig};
+
+    #[test]
+    fn fable_coordinator_uses_one_canonical_agent_key() {
+        assert_eq!(
+            AgentType::from_chat_agent_key("fable-coordinator"),
+            Some(AgentType::FableCoordinator)
+        );
+        assert_eq!(AgentType::FableCoordinator.as_str(), "fable-coordinator");
+        assert_eq!(AgentType::from_chat_agent_key("fable"), None);
+    }
 
     const RESEARCH_CONTRACT: [&str; 3] = [
         "mcp__agentic-mcp__research_search",

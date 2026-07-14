@@ -1454,7 +1454,7 @@ mod conversation_authorization_tests {
         sqlx::query(
             r#"
             UPDATE conversations
-            SET agent = 'fable', conversation_type = 'fable_coordinator',
+            SET agent = 'fable-coordinator', conversation_type = 'fable_coordinator',
                 conversation_role = 'multi_agent_parent',
                 organization = 'agentic-flowstate', title = 'Alex'
             WHERE id = 'conv-alex'

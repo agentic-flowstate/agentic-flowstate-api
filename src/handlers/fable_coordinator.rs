@@ -44,12 +44,121 @@ pub struct FableCoordinatorHealth {
     pub runtime: Option<FableRuntimeState>,
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct FableCoordinatorStatus {
+    pub state: &'static str,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FableCoordinatorResponse {
+    pub conversation: Conversation,
+    pub coordinator_status: FableCoordinatorStatus,
+}
+
 fn error_response(status: StatusCode, error: impl ToString) -> Response {
     (
         status,
         Json(serde_json::json!({"error": error.to_string()})),
     )
         .into_response()
+}
+
+async fn coordinator_queue_depth(
+    db: &SqlitePool,
+    conversation_id: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM conversation_turn_jobs WHERE conversation_id = ? AND status IN ('pending', 'running')",
+    )
+    .bind(conversation_id)
+    .fetch_one(db)
+    .await
+}
+
+async fn load_active_child_count(
+    db: &SqlitePool,
+    conversation_id: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(DISTINCT child.id)
+        FROM conversations child
+        LEFT JOIN conversation_turn_jobs job ON job.conversation_id = child.id
+        LEFT JOIN agent_runner_turns turn ON turn.conversation_id = child.id
+        WHERE child.parent_conversation_id = ?
+          AND child.status <> 'archived'
+          AND (job.status IN ('pending', 'running') OR turn.status IN ('queued', 'running'))
+        "#,
+    )
+    .bind(conversation_id)
+    .fetch_one(db)
+    .await
+}
+
+fn resolve_coordinator_status(
+    auth_error: Option<String>,
+    runtime: Option<&FableRuntimeState>,
+    coordinator_busy: bool,
+    active_child_count: i64,
+) -> FableCoordinatorStatus {
+    if let Some(detail) = auth_error {
+        return FableCoordinatorStatus {
+            state: "needs_login",
+            detail: Some(detail),
+        };
+    }
+
+    if let Some(runtime) = runtime {
+        if let Some(error_class) = runtime.last_error_class.as_deref() {
+            let normalized = error_class.to_ascii_lowercase();
+            if normalized.contains("usage")
+                || normalized.contains("capacity")
+                || normalized.contains("rate_limit")
+            {
+                return FableCoordinatorStatus {
+                    state: "usage_limited",
+                    detail: Some(error_class.to_string()),
+                };
+            }
+        }
+        if runtime.session_state == "recovery_required" {
+            return FableCoordinatorStatus {
+                state: "failed",
+                detail: Some("Fable session continuity requires an audited recovery".to_string()),
+            };
+        }
+        if runtime.last_terminal_status.as_deref() == Some("failed") {
+            return FableCoordinatorStatus {
+                state: "failed",
+                detail: runtime.last_error_class.clone(),
+            };
+        }
+    }
+
+    if active_child_count > 0 {
+        return FableCoordinatorStatus {
+            state: "waiting_on_children",
+            detail: Some(format!(
+                "{active_child_count} worker{} active",
+                if active_child_count == 1 {
+                    " is"
+                } else {
+                    "s are"
+                }
+            )),
+        };
+    }
+    if coordinator_busy {
+        return FableCoordinatorStatus {
+            state: "working",
+            detail: None,
+        };
+    }
+    FableCoordinatorStatus {
+        state: "ready",
+        detail: None,
+    }
 }
 
 async fn coordinator_for_user(
@@ -105,12 +214,41 @@ fn chat_config(user_id: &str) -> Result<ChatConfig, Response> {
 
 pub async fn get_fable_coordinator(
     State(db): State<Arc<SqlitePool>>,
+    State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
-    match coordinator_for_user(&db, &user).await {
-        Ok(conversation) => Json(conversation).into_response(),
-        Err(response) => response,
-    }
+    let conversation = match coordinator_for_user(&db, &user).await {
+        Ok(conversation) => conversation,
+        Err(response) => return response,
+    };
+    let runtime = match fable_coordinator::runtime_state(&db, &conversation.id).await {
+        Ok(runtime) => runtime,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let queue_depth = match coordinator_queue_depth(&db, &conversation.id).await {
+        Ok(count) => count,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let active_child_count = match load_active_child_count(&db, &conversation.id).await {
+        Ok(count) => count,
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let auth_error = verify_claude_subscription_auth()
+        .await
+        .err()
+        .map(|error| error.to_string());
+    let coordinator_busy = manager.has_runtime_turn(&conversation.id).await || queue_depth > 0;
+    let coordinator_status = resolve_coordinator_status(
+        auth_error,
+        runtime.as_ref(),
+        coordinator_busy,
+        active_child_count,
+    );
+    Json(FableCoordinatorResponse {
+        conversation,
+        coordinator_status,
+    })
+    .into_response()
 }
 
 pub async fn get_fable_coordinator_health(
@@ -126,31 +264,11 @@ pub async fn get_fable_coordinator_health(
         Ok(runtime) => runtime,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
-    let queue_depth = match sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM conversation_turn_jobs WHERE conversation_id = ? AND status IN ('pending', 'running')",
-    )
-    .bind(&conversation.id)
-    .fetch_one(db.as_ref())
-    .await
-    {
+    let queue_depth = match coordinator_queue_depth(&db, &conversation.id).await {
         Ok(count) => count,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
-    let active_child_count = match sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT COUNT(DISTINCT child.id)
-        FROM conversations child
-        LEFT JOIN conversation_turn_jobs job ON job.conversation_id = child.id
-        LEFT JOIN agent_runner_turns turn ON turn.conversation_id = child.id
-        WHERE child.parent_conversation_id = ?
-          AND child.status <> 'archived'
-          AND (job.status IN ('pending', 'running') OR turn.status IN ('queued', 'running'))
-        "#,
-    )
-    .bind(&conversation.id)
-    .fetch_one(db.as_ref())
-    .await
-    {
+    let active_child_count = match load_active_child_count(&db, &conversation.id).await {
         Ok(count) => count,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
@@ -298,5 +416,74 @@ pub async fn repair_fable_coordinator_session(
         )
             .into_response(),
         Err(error) => error_response(StatusCode::CONFLICT, error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime_state(
+        session_state: &str,
+        terminal_status: Option<&str>,
+        error: Option<&str>,
+    ) -> FableRuntimeState {
+        FableRuntimeState {
+            conversation_id: "coordinator".to_string(),
+            native_session_id: "session".to_string(),
+            session_state: session_state.to_string(),
+            prompt_version: FABLE_PROMPT_VERSION.to_string(),
+            model: FABLE_MODEL.to_string(),
+            effort: FABLE_EFFORT.to_string(),
+            auth_method: "claude.ai".to_string(),
+            subscription_type: "max".to_string(),
+            mcp_profile: "fable-coordinator".to_string(),
+            rehydrate_required: false,
+            last_started_at: None,
+            last_completed_at: None,
+            last_success_at: None,
+            last_turn_duration_ms: None,
+            last_tool_call_count: 0,
+            last_terminal_status: terminal_status.map(str::to_string),
+            last_error_class: error.map(str::to_string),
+            last_wake_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn coordinator_status_prioritizes_actionable_runtime_states() {
+        let auth = resolve_coordinator_status(
+            Some("Claude subscription login required".to_string()),
+            None,
+            true,
+            2,
+        );
+        assert_eq!(auth.state, "needs_login");
+
+        let usage_runtime = runtime_state("ready", Some("failed"), Some("usage_limit"));
+        let usage = resolve_coordinator_status(None, Some(&usage_runtime), false, 0);
+        assert_eq!(usage.state, "usage_limited");
+
+        let recovery_runtime = runtime_state("recovery_required", Some("failed"), None);
+        let recovery = resolve_coordinator_status(None, Some(&recovery_runtime), false, 0);
+        assert_eq!(recovery.state, "failed");
+    }
+
+    #[test]
+    fn coordinator_status_reports_children_work_and_ready() {
+        assert_eq!(
+            resolve_coordinator_status(None, None, true, 2).state,
+            "waiting_on_children"
+        );
+        assert_eq!(
+            resolve_coordinator_status(None, None, true, 0).state,
+            "working"
+        );
+        assert_eq!(
+            resolve_coordinator_status(None, None, false, 0).state,
+            "ready"
+        );
     }
 }

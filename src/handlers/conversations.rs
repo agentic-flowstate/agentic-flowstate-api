@@ -3642,26 +3642,24 @@ mod tests {
     }
 
     #[test]
-    fn child_request_rejects_fable_coordinator_aliases() {
-        for agent in ["fable", "fable-coordinator"] {
-            let error = child_conversation_requests(&[CreateChildConversationSpec {
-                title: "Invalid coordinator child".to_string(),
-                agent: Some(agent.to_string()),
-                conversation_type: None,
-                child_sort_order: None,
-                handoff: ContextHandoffRequest::default(),
-                initial_message: Some("Coordinate".to_string()),
-                prompt_name: None,
-                working_dir: None,
-                client_id: None,
-                model: None,
-                reasoning_effort: None,
-            }])
-            .expect_err("Fable must remain a singleton parent");
+    fn child_request_rejects_fable_coordinator() {
+        let error = child_conversation_requests(&[CreateChildConversationSpec {
+            title: "Invalid coordinator child".to_string(),
+            agent: Some("fable-coordinator".to_string()),
+            conversation_type: None,
+            child_sort_order: None,
+            handoff: ContextHandoffRequest::default(),
+            initial_message: Some("Coordinate".to_string()),
+            prompt_name: None,
+            working_dir: None,
+            client_id: None,
+            model: None,
+            reasoning_effort: None,
+        }])
+        .expect_err("Fable must remain a singleton parent");
 
-            assert_eq!(error.0, StatusCode::BAD_REQUEST);
-            assert!(error.1.contains("cannot be created as a child"));
-        }
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("cannot be created as a child"));
     }
 
     fn conversation_with_activity(is_active: Option<bool>) -> Conversation {
