@@ -1067,7 +1067,7 @@ fn build_app_server_config(
     );
     root.insert(
         "web_search".to_string(),
-        toml::Value::String("disabled".to_string()),
+        toml::Value::String("live".to_string()),
     );
     if profile != CodexToolProfile::NoTools {
         let mut agentic_mcp = source_agentic_mcp_table(source_home)?.unwrap_or_default();
@@ -2713,6 +2713,7 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "mcp_servers.agentic-mcp.command=\"/tmp/agentic_mcp\""));
+        assert!(args.iter().any(|arg| arg == "web_search=\"disabled\""));
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--disable" && pair[1] == "apps"));
@@ -2817,6 +2818,10 @@ mod tests {
             Some("/tmp/source-codex-home")
         );
         assert!(parsed.get("sqlite_home").is_none());
+        assert_eq!(
+            parsed.get("web_search").and_then(|value| value.as_str()),
+            Some("live")
+        );
     }
 
     #[test]

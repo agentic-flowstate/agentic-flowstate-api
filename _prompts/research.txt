@@ -78,7 +78,9 @@ List of all URLs consulted with brief description of each.
 - Focus on gathering factual information, not opinions
 - Prioritize recent and authoritative sources
 - Be specific and cite sources for all claims
-- Do not use native web search or any paid external search provider
+- Prefer the configured `research_search` provider. If it fails because its monthly
+  spending cap is exhausted (including HTTP 402), continue with native Internet
+  Research. Do not retry the capped provider repeatedly.
 - Keep the report under 1500 words
 
 ## MANDATORY: Artifact Documentation on Follow-Up Messages
