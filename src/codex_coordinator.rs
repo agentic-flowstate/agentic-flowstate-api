@@ -14,8 +14,6 @@ pub const CODEX_COORDINATOR_ORGANIZATION: &str = "agentic-flowstate";
 pub const CODEX_COORDINATOR_TITLE: &str = "Alex";
 
 const CODEX_AUTH_METHOD: &str = "chatgpt";
-const LEGACY_FABLE_CONVERSATION_TYPE: &str = "fable_coordinator";
-const LEGACY_FABLE_AGENT: &str = "fable-coordinator";
 
 #[derive(Debug, Clone, FromRow, Serialize)]
 pub struct CodexCoordinatorRuntimeState {
@@ -55,61 +53,6 @@ pub async fn ensure_schema(pool: &SqlitePool) -> Result<()> {
         .begin()
         .await
         .context("begin Codex coordinator schema migration")?;
-    let schema_exists: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'codex_coordinator_runtime'",
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .context("inspect Codex coordinator runtime schema")?;
-
-    if schema_exists == 0 {
-        let migrated = sqlx::query(
-            r#"
-            UPDATE conversations
-            SET agent = ?, conversation_type = ?, session_id = NULL, updated_at = ?
-            WHERE user_id = ?
-              AND (
-                agent IN (?, ?)
-                OR conversation_type IN (?, ?)
-              )
-            "#,
-        )
-        .bind(CODEX_COORDINATOR_AGENT)
-        .bind(CODEX_COORDINATOR_CONVERSATION_TYPE)
-        .bind(Utc::now().to_rfc3339())
-        .bind(ALEX_USER_ID)
-        .bind(LEGACY_FABLE_AGENT)
-        .bind(CODEX_COORDINATOR_AGENT)
-        .bind(LEGACY_FABLE_CONVERSATION_TYPE)
-        .bind(CODEX_COORDINATOR_CONVERSATION_TYPE)
-        .execute(&mut *tx)
-        .await
-        .context("migrate Alex to the Codex coordinator designation")?
-        .rows_affected();
-
-        sqlx::query("DROP TABLE IF EXISTS fable_codex_events")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DROP TABLE IF EXISTS fable_codex_runtime")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DROP TABLE IF EXISTS fable_coordinator_events")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DROP TABLE IF EXISTS fable_coordinator_runtime")
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DROP INDEX IF EXISTS idx_fable_coordinator_singleton")
-            .execute(&mut *tx)
-            .await?;
-
-        tracing::info!(
-            event = "codex_coordinator.runtime_migrated",
-            migrated_conversation_count = migrated,
-            "migrated Alex to the Codex-only coordinator runtime"
-        );
-    }
-
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS codex_coordinator_runtime (
@@ -713,64 +656,6 @@ mod tests {
         let pool = test_pool_without_coordinator_schema().await;
         ensure_schema(&pool).await.unwrap();
         pool
-    }
-
-    #[tokio::test]
-    async fn legacy_fable_runtime_is_replaced_with_codex_only_state() {
-        let pool = test_pool_without_coordinator_schema().await;
-        sqlx::query("CREATE TABLE fable_codex_runtime (conversation_id TEXT PRIMARY KEY)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "CREATE UNIQUE INDEX idx_fable_coordinator_singleton ON conversations(user_id) WHERE conversation_type = 'fable_coordinator'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            INSERT INTO conversations (
-                id, user_id, session_id, organization, agent, conversation_type,
-                parent_conversation_id, conversation_role, title, started_at,
-                updated_at, status
-            ) VALUES (
-                'alex-coordinator', 'alex', 'legacy-thread', 'agentic-flowstate',
-                'fable-coordinator', 'fable_coordinator', NULL,
-                'multi_agent_parent', 'Alex', '2026-07-19T00:00:00Z',
-                '2026-07-19T00:00:00Z', 'open'
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        ensure_schema(&pool).await.unwrap();
-
-        let designation: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT agent, conversation_type, session_id FROM conversations WHERE id = 'alex-coordinator'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(designation.0.as_deref(), Some(CODEX_COORDINATOR_AGENT));
-        assert_eq!(
-            designation.1.as_deref(),
-            Some(CODEX_COORDINATOR_CONVERSATION_TYPE)
-        );
-        assert!(designation.2.is_none());
-
-        let legacy_objects: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'fable_%'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(legacy_objects, 0);
-
-        let plan = prepare_thread(&pool, "alex-coordinator").await.unwrap();
-        assert!(plan.resume_thread_id.is_none());
-        assert!(plan.rehydrate_required);
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ pub struct TtsRequest {
 }
 
 const MAX_INPUT_LENGTH: usize = 16000;
-const VALID_VOICES: &[&str] = &["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
+const VALID_VOICES: &[&str] = &["alloy", "echo", "onyx", "nova", "shimmer"];
 const VALID_FORMATS: &[&str] = &["mp3", "opus", "aac", "flac", "wav", "pcm"];
 
 /// Clean raw text into a speakable transcript using a one-shot LLM call.
