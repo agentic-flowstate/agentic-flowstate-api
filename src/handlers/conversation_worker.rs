@@ -103,6 +103,7 @@ impl WorkContextSkipReason {
 
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
     match agent_type {
+        AgentType::FableCoordinator => CodexToolProfile::FableCoordinator,
         AgentType::HomePlanner
         | AgentType::Polymarket
         | AgentType::ConversationEvaluator
@@ -121,7 +122,9 @@ fn codex_sandbox_policy_for_chat_agent(
     let tool_profile = codex_tool_profile_for_chat_agent(agent_type);
     if matches!(
         tool_profile,
-        CodexToolProfile::ConfiguredMcpOnly | CodexToolProfile::RestrictedMcpOnly
+        CodexToolProfile::FableCoordinator
+            | CodexToolProfile::ConfiguredMcpOnly
+            | CodexToolProfile::RestrictedMcpOnly
     ) {
         (CodexSandboxMode::ReadOnly, false, tool_profile)
     } else {
@@ -4203,6 +4206,39 @@ fn format_attachment_prompt_line(
         "  - {} `{}` ({}{}): {}",
         attachment_kind, display_name, mime_type, size, path
     )
+}
+
+#[cfg(test)]
+mod codex_chat_tool_profile_tests {
+    use super::*;
+
+    #[test]
+    fn fable_uses_the_dedicated_read_only_coordinator_profile() {
+        assert_eq!(
+            codex_tool_profile_for_chat_agent(&AgentType::FableCoordinator),
+            CodexToolProfile::FableCoordinator
+        );
+        assert_eq!(
+            codex_sandbox_policy_for_chat_agent(&AgentType::FableCoordinator),
+            (
+                CodexSandboxMode::ReadOnly,
+                false,
+                CodexToolProfile::FableCoordinator
+            )
+        );
+    }
+
+    #[test]
+    fn normal_chat_remains_a_non_orchestrating_worker() {
+        assert_eq!(
+            codex_sandbox_policy_for_chat_agent(&AgentType::FullAccess),
+            (
+                CodexSandboxMode::DangerFullAccess,
+                true,
+                CodexToolProfile::Worker
+            )
+        );
+    }
 }
 
 #[cfg(test)]
