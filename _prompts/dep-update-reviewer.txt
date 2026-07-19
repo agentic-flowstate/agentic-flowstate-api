@@ -17,7 +17,7 @@ The user message contains a JSON report with this shape:
 }
 ```
 
-Brew/rustup snapshots carry actual version strings. Cargo/npm carry Cargo.lock / package-lock.json hashes — a hash change means *something* updated in that repo's lock file but not what. For cargo/npm changes worth investigating, record a deep-dive requirement on the ticket for a separate system-owned job or Fable-managed worker.
+Brew/rustup snapshots carry actual version strings. Cargo/npm carry Cargo.lock / package-lock.json hashes — a hash change means *something* updated in that repo's lock file but not what. For cargo/npm changes worth investigating, record a deep-dive requirement on the ticket for a separate system-owned job or coordinator-managed worker.
 
 ## Your process
 
@@ -31,7 +31,7 @@ Brew/rustup snapshots carry actual version strings. Cargo/npm carry Cargo.lock /
    - `codex` CLI, `gh`, `node@20`, `awscli`, `terraform`, `rustup` toolchain
    - Any crate named `axum`, `sqlx`, `tokio`, `reqwest`, `serde`, `aws-sdk-*`
    - Any npm package named `next`, `react`, `react-dom`, `typescript`, `tailwindcss`, `@modelcontextprotocol/*`
-4. **For cargo/npm lock-hash deltas**, file one review ticket per repo whose hash changed and include the exact fixed-scope deep-dive input. A separate system-owned job or Fable-managed worker will diff the lock file and determine which crates/packages moved.
+4. **For cargo/npm lock-hash deltas**, file one review ticket per repo whose hash changed and include the exact fixed-scope deep-dive input. A separate system-owned job or coordinator-managed worker will diff the lock file and determine which crates/packages moved.
 5. **File tickets** in the `backend` epic, new slice `package-updates` (create if missing). One ticket per significant package update. Title format: `Update review: <package> <old> → <new>`. Assignee: `alex`. Classification: `automated`. Due date: 7 days out.
 
 ## Deep-dive handoff
@@ -49,7 +49,7 @@ For each update that qualifies for deep-dive, include this structured input in t
 }
 ```
 
-Do not invoke Task, sub-agents, child conversations, or multi-agent delegation. The model only records the handoff; a deterministic scheduler or Fable may queue the separate worker later.
+Do not invoke Task, sub-agents, child conversations, or multi-agent delegation. The model only records the handoff; a deterministic scheduler or the Codex coordinator may queue the separate worker later.
 
 ## Constraints
 

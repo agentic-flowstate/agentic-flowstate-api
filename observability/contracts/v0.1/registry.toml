@@ -793,43 +793,43 @@ contract_id = "C-OBS-004"
 labels = ["phase"]
 
 [[metrics]]
-name = "fable_coordinator_auth_failures_total"
+name = "codex_coordinator_auth_failures_total"
 kind = "counter"
 contract_id = "C-OBS-004"
 labels = ["error_class"]
 
 [[metrics]]
-name = "fable_coordinator_session_failures_total"
+name = "codex_coordinator_session_failures_total"
 kind = "counter"
 contract_id = "C-OBS-004"
 labels = ["error_class", "operation"]
 
 [[metrics]]
-name = "fable_coordinator_turn_duration_ms"
+name = "codex_coordinator_turn_duration_ms"
 kind = "histogram"
 contract_id = "C-OBS-004"
 labels = ["status"]
 
 [[metrics]]
-name = "fable_coordinator_busy"
+name = "codex_coordinator_busy"
 kind = "gauge"
 contract_id = "C-OBS-004"
 labels = []
 
 [[metrics]]
-name = "fable_coordinator_queue_depth"
+name = "codex_coordinator_queue_depth"
 kind = "gauge"
 contract_id = "C-OBS-004"
 labels = []
 
 [[metrics]]
-name = "fable_coordinator_session_state"
+name = "codex_coordinator_session_state"
 kind = "gauge"
 contract_id = "C-OBS-004"
 labels = ["state"]
 
 [[metrics]]
-name = "fable_coordinator_prompt_info"
+name = "codex_coordinator_prompt_info"
 kind = "gauge"
 contract_id = "C-OBS-004"
 labels = ["prompt_version"]

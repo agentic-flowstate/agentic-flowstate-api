@@ -1,7 +1,6 @@
 {
   "models": {
-    "codex": "gpt-5.6-sol",
-    "fable": "gpt-5.6-sol"
+    "codex": "gpt-5.6-sol"
   },
   "agents": {
     "research": {
@@ -330,10 +329,10 @@
         "mcp__agentic-mcp__*"
       ]
     },
-    "fable-coordinator": {
-      "model": "fable",
+    "codex-coordinator": {
+      "model": "codex",
       "effort": "xhigh",
-      "prompt_file": "fable-coordinator.txt",
+      "prompt_file": "codex-coordinator.txt",
       "tools": [
         "mcp__agentic-mcp__list_conversations",
         "mcp__agentic-mcp__queue_worker_conversations",

@@ -15,21 +15,23 @@ use super::chat_stream::{self, ChatAttachmentData, ChatCodexOptions, ChatConfig,
 use crate::agents::codex_app_server::verify_codex_subscription_auth;
 use crate::agents::AgentType;
 use crate::auth_middleware::AuthenticatedUser;
-use crate::fable_coordinator::{self, FableRuntimeState, FABLE_PROMPT_VERSION};
+use crate::codex_coordinator::{
+    self, CodexCoordinatorRuntimeState, CODEX_COORDINATOR_PROMPT_VERSION,
+};
 
 #[derive(Debug, Deserialize)]
-pub struct FableChatRequest {
+pub struct CodexCoordinatorChatRequest {
     pub message: String,
     pub attachments: Option<Vec<ChatAttachmentData>>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RepairFableSessionRequest {
+pub struct RepairCodexCoordinatorSessionRequest {
     pub confirm_recovery: bool,
 }
 
 #[derive(Debug, Serialize)]
-pub struct FableCoordinatorHealth {
+pub struct CodexCoordinatorHealth {
     pub conversation_id: String,
     pub coordinator_busy: bool,
     pub queue_depth: i64,
@@ -41,19 +43,19 @@ pub struct FableCoordinatorHealth {
     pub effort: String,
     pub prompt_version: &'static str,
     pub thread_continuity: String,
-    pub runtime: Option<FableRuntimeState>,
+    pub runtime: Option<CodexCoordinatorRuntimeState>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct FableCoordinatorStatus {
+pub struct CodexCoordinatorStatus {
     pub state: &'static str,
     pub detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct FableCoordinatorResponse {
+pub struct CodexCoordinatorResponse {
     pub conversation: Conversation,
-    pub coordinator_status: FableCoordinatorStatus,
+    pub coordinator_status: CodexCoordinatorStatus,
 }
 
 fn error_response(status: StatusCode, error: impl ToString) -> Response {
@@ -98,22 +100,24 @@ async fn load_active_child_count(
 
 fn resolve_coordinator_status(
     auth_error: Option<String>,
-    runtime: Option<&FableRuntimeState>,
+    runtime: Option<&CodexCoordinatorRuntimeState>,
     untracked_codex_thread: bool,
     coordinator_busy: bool,
     active_child_count: i64,
-) -> FableCoordinatorStatus {
+) -> CodexCoordinatorStatus {
     if let Some(detail) = auth_error {
-        return FableCoordinatorStatus {
+        return CodexCoordinatorStatus {
             state: "needs_login",
             detail: Some(detail),
         };
     }
 
     if untracked_codex_thread {
-        return FableCoordinatorStatus {
+        return CodexCoordinatorStatus {
             state: "failed",
-            detail: Some("Fable Codex thread continuity requires an explicit repair".to_string()),
+            detail: Some(
+                "Codex coordinator thread continuity requires an explicit repair".to_string(),
+            ),
         };
     }
 
@@ -124,22 +128,22 @@ fn resolve_coordinator_status(
                 || normalized.contains("capacity")
                 || normalized.contains("rate_limit")
             {
-                return FableCoordinatorStatus {
+                return CodexCoordinatorStatus {
                     state: "usage_limited",
                     detail: Some(error_class.to_string()),
                 };
             }
         }
         if runtime.thread_state == "repair_required" {
-            return FableCoordinatorStatus {
+            return CodexCoordinatorStatus {
                 state: "failed",
                 detail: Some(
-                    "Fable Codex thread continuity requires an explicit repair".to_string(),
+                    "Codex coordinator thread continuity requires an explicit repair".to_string(),
                 ),
             };
         }
         if runtime.last_terminal_status.as_deref() == Some("failed") {
-            return FableCoordinatorStatus {
+            return CodexCoordinatorStatus {
                 state: "failed",
                 detail: runtime.last_error_class.clone(),
             };
@@ -147,7 +151,7 @@ fn resolve_coordinator_status(
     }
 
     if active_child_count > 0 {
-        return FableCoordinatorStatus {
+        return CodexCoordinatorStatus {
             state: "waiting_on_children",
             detail: Some(format!(
                 "{active_child_count} worker{} active",
@@ -160,12 +164,12 @@ fn resolve_coordinator_status(
         };
     }
     if coordinator_busy {
-        return FableCoordinatorStatus {
+        return CodexCoordinatorStatus {
             state: "working",
             detail: None,
         };
     }
-    FableCoordinatorStatus {
+    CodexCoordinatorStatus {
         state: "ready",
         detail: None,
     }
@@ -175,10 +179,10 @@ async fn coordinator_for_user(
     db: &SqlitePool,
     user: &AuthenticatedUser,
 ) -> Result<Conversation, Response> {
-    fable_coordinator::ensure_singleton(db, &user.user_id)
+    codex_coordinator::ensure_singleton(db, &user.user_id)
         .await
         .map_err(|error| {
-            let status = if user.user_id == fable_coordinator::ALEX_USER_ID {
+            let status = if user.user_id == codex_coordinator::ALEX_USER_ID {
                 StatusCode::INTERNAL_SERVER_ERROR
             } else {
                 StatusCode::FORBIDDEN
@@ -192,7 +196,7 @@ fn chat_config(user_id: &str) -> Result<ChatConfig, Response> {
         .ok_or_else(|| {
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Cannot resolve the projects root for the Fable coordinator",
+                "Cannot resolve the projects root for the Codex coordinator",
             )
         })?
         .join("projects");
@@ -200,19 +204,19 @@ fn chat_config(user_id: &str) -> Result<ChatConfig, Response> {
     prompt_vars.insert("USER_ID".to_string(), user_id.to_string());
     prompt_vars.insert(
         "PROMPT_VERSION".to_string(),
-        FABLE_PROMPT_VERSION.to_string(),
+        CODEX_COORDINATOR_PROMPT_VERSION.to_string(),
     );
     Ok(ChatConfig {
-        agent_type: AgentType::FableCoordinator,
+        agent_type: AgentType::CodexCoordinator,
         runtime: ChatRuntime::CodexAppServer,
-        prompt_name: "fable-coordinator",
+        prompt_name: "codex-coordinator",
         working_dir: projects_root,
         prompt_vars,
-        codex_options: ChatCodexOptions::default_for_agent(&AgentType::FableCoordinator),
+        codex_options: ChatCodexOptions::default_for_agent(&AgentType::CodexCoordinator),
     })
 }
 
-pub async fn get_fable_coordinator(
+pub async fn get_codex_coordinator(
     State(db): State<Arc<SqlitePool>>,
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -221,7 +225,7 @@ pub async fn get_fable_coordinator(
         Ok(conversation) => conversation,
         Err(response) => return response,
     };
-    let runtime = match fable_coordinator::runtime_state(&db, &conversation.id).await {
+    let runtime = match codex_coordinator::runtime_state(&db, &conversation.id).await {
         Ok(runtime) => runtime,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
@@ -245,14 +249,14 @@ pub async fn get_fable_coordinator(
         coordinator_busy,
         active_child_count,
     );
-    Json(FableCoordinatorResponse {
+    Json(CodexCoordinatorResponse {
         conversation,
         coordinator_status,
     })
     .into_response()
 }
 
-pub async fn get_fable_coordinator_health(
+pub async fn get_codex_coordinator_health(
     State(db): State<Arc<SqlitePool>>,
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
@@ -261,7 +265,7 @@ pub async fn get_fable_coordinator_health(
         Ok(conversation) => conversation,
         Err(response) => return response,
     };
-    let runtime = match fable_coordinator::runtime_state(&db, &conversation.id).await {
+    let runtime = match codex_coordinator::runtime_state(&db, &conversation.id).await {
         Ok(runtime) => runtime,
         Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
@@ -301,9 +305,13 @@ pub async fn get_fable_coordinator_health(
         None => "uninitialized".to_string(),
     };
     let coordinator_busy = manager.has_runtime_turn(&conversation.id).await || queue_depth > 0;
-    crate::observability::fable::set_health(coordinator_busy, queue_depth, &thread_continuity);
+    crate::observability::codex_coordinator::set_health(
+        coordinator_busy,
+        queue_depth,
+        &thread_continuity,
+    );
 
-    Json(FableCoordinatorHealth {
+    Json(CodexCoordinatorHealth {
         conversation_id: conversation.id,
         coordinator_busy,
         queue_depth,
@@ -311,31 +319,31 @@ pub async fn get_fable_coordinator_health(
         pending_child_wake_count,
         auth_state,
         auth_error,
-        model: AgentType::FableCoordinator.model().to_string(),
-        effort: AgentType::FableCoordinator.effort().to_string(),
-        prompt_version: FABLE_PROMPT_VERSION,
+        model: AgentType::CodexCoordinator.model().to_string(),
+        effort: AgentType::CodexCoordinator.effort().to_string(),
+        prompt_version: CODEX_COORDINATOR_PROMPT_VERSION,
         thread_continuity,
         runtime,
     })
     .into_response()
 }
 
-pub async fn fable_coordinator_chat_submit(
+pub async fn codex_coordinator_chat_submit(
     State(db): State<Arc<SqlitePool>>,
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     headers: HeaderMap,
-    Json(request): Json<FableChatRequest>,
+    Json(request): Json<CodexCoordinatorChatRequest>,
 ) -> Response {
     run_chat(db, manager, user, headers, request, true).await
 }
 
-pub async fn fable_coordinator_chat(
+pub async fn codex_coordinator_chat(
     State(db): State<Arc<SqlitePool>>,
     State(manager): State<Arc<ChatClientManager>>,
     Extension(user): Extension<AuthenticatedUser>,
     headers: HeaderMap,
-    Json(request): Json<FableChatRequest>,
+    Json(request): Json<CodexCoordinatorChatRequest>,
 ) -> Response {
     run_chat(db, manager, user, headers, request, false).await
 }
@@ -345,7 +353,7 @@ async fn run_chat(
     manager: Arc<ChatClientManager>,
     user: AuthenticatedUser,
     headers: HeaderMap,
-    request: FableChatRequest,
+    request: CodexCoordinatorChatRequest,
     submit: bool,
 ) -> Response {
     let conversation = match coordinator_for_user(&db, &user).await {
@@ -387,10 +395,10 @@ async fn run_chat(
     }
 }
 
-pub async fn repair_fable_coordinator_session(
+pub async fn repair_codex_coordinator_session(
     State(db): State<Arc<SqlitePool>>,
     Extension(user): Extension<AuthenticatedUser>,
-    Json(request): Json<RepairFableSessionRequest>,
+    Json(request): Json<RepairCodexCoordinatorSessionRequest>,
 ) -> Response {
     if !request.confirm_recovery {
         return error_response(
@@ -402,7 +410,7 @@ pub async fn repair_fable_coordinator_session(
         Ok(conversation) => conversation,
         Err(response) => return response,
     };
-    match fable_coordinator::repair_thread(&db, &conversation.id, &user.user_id).await {
+    match codex_coordinator::repair_thread(&db, &conversation.id, &user.user_id).await {
         Ok(repair) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
@@ -423,39 +431,39 @@ mod tests {
 
     #[test]
     fn coordinator_submits_to_the_codex_runtime() {
-        let config = chat_config(fable_coordinator::ALEX_USER_ID).unwrap();
+        let config = chat_config(codex_coordinator::ALEX_USER_ID).unwrap();
 
         assert_eq!(config.runtime, ChatRuntime::CodexAppServer);
         assert_eq!(
             config.codex_options.model,
-            AgentType::FableCoordinator.model()
+            AgentType::CodexCoordinator.model()
         );
         assert_eq!(
             config.codex_options.reasoning_effort,
-            AgentType::FableCoordinator.effort()
+            AgentType::CodexCoordinator.effort()
         );
         assert!(!config.prompt_vars.contains_key("AGENTS_MD"));
 
         let prompt = crate::agents::prompts::load_prompt(config.prompt_name, config.prompt_vars)
-            .expect("render Fable coordinator prompt");
+            .expect("render Codex coordinator prompt");
         assert!(prompt.contains(&format!(
             "Prompt version: {}",
-            fable_coordinator::FABLE_PROMPT_VERSION
+            codex_coordinator::CODEX_COORDINATOR_PROMPT_VERSION
         )));
         assert!(!prompt.contains("{{AGENTS_MD}}"));
         assert!(!prompt.contains("Open HSV-2 therapeutics research"));
     }
 
     #[test]
-    fn coordinator_v5_prompt_contains_workspace_ticket_and_efficiency_contracts() {
+    fn coordinator_v1_prompt_contains_workspace_ticket_and_efficiency_contracts() {
         assert_eq!(
-            fable_coordinator::FABLE_PROMPT_VERSION,
-            "fable-coordinator/v5"
+            codex_coordinator::CODEX_COORDINATOR_PROMPT_VERSION,
+            "codex-coordinator/v1"
         );
 
-        let config = chat_config(fable_coordinator::ALEX_USER_ID).unwrap();
+        let config = chat_config(codex_coordinator::ALEX_USER_ID).unwrap();
         let prompt = crate::agents::prompts::load_prompt(config.prompt_name, config.prompt_vars)
-            .expect("render Fable coordinator prompt");
+            .expect("render Codex coordinator prompt");
 
         for required in [
             "## Baseline workspace context",
@@ -483,7 +491,7 @@ mod tests {
         ] {
             assert!(
                 prompt.contains(required),
-                "Fable v5 prompt is missing required contract text: {required}"
+                "Codex coordinator v1 prompt is missing required contract text: {required}"
             );
         }
 
@@ -498,7 +506,7 @@ mod tests {
         ] {
             assert!(
                 prompt.contains(preserved_boundary),
-                "Fable v5 prompt lost coordinator boundary text: {preserved_boundary}"
+                "Codex coordinator v1 prompt lost boundary text: {preserved_boundary}"
             );
         }
     }
@@ -507,14 +515,14 @@ mod tests {
         thread_state: &str,
         terminal_status: Option<&str>,
         error: Option<&str>,
-    ) -> FableRuntimeState {
-        FableRuntimeState {
+    ) -> CodexCoordinatorRuntimeState {
+        CodexCoordinatorRuntimeState {
             conversation_id: "coordinator".to_string(),
             codex_thread_id: Some("thread".to_string()),
             thread_state: thread_state.to_string(),
-            prompt_version: FABLE_PROMPT_VERSION.to_string(),
-            model: AgentType::FableCoordinator.model().to_string(),
-            effort: AgentType::FableCoordinator.effort().to_string(),
+            prompt_version: CODEX_COORDINATOR_PROMPT_VERSION.to_string(),
+            model: AgentType::CodexCoordinator.model().to_string(),
+            effort: AgentType::CodexCoordinator.effort().to_string(),
             auth_method: "chatgpt".to_string(),
             last_started_at: None,
             last_completed_at: None,
@@ -553,7 +561,7 @@ mod tests {
         assert!(untracked
             .detail
             .as_deref()
-            .is_some_and(|detail| detail.contains("Codex thread")));
+            .is_some_and(|detail| detail.contains("Codex coordinator thread")));
     }
 
     #[test]

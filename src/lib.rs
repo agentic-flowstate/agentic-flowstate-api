@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod apns;
 pub mod auth_middleware;
+pub mod codex_coordinator;
 pub mod dailies_scheduler;
 pub mod daily_actions;
 pub mod disk_pressure;
@@ -11,7 +12,6 @@ pub mod email_fetcher;
 pub mod email_intake_scheduler;
 pub mod email_notification_dispatcher;
 pub mod email_threading;
-pub mod fable_coordinator;
 pub mod handlers;
 pub mod health_monitor;
 pub mod inbound_outreach;

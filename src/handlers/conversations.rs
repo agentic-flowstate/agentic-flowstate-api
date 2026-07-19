@@ -782,12 +782,12 @@ pub(crate) async fn conversation_list_items(
 }
 
 fn is_global_chat_conversation(conversation: &Conversation) -> bool {
-    conversation.agent.as_deref() != Some(crate::fable_coordinator::FABLE_AGENT)
+    conversation.agent.as_deref() != Some(crate::codex_coordinator::CODEX_COORDINATOR_AGENT)
         && conversation.conversation_type.as_deref()
-            != Some(crate::fable_coordinator::FABLE_CONVERSATION_TYPE)
+            != Some(crate::codex_coordinator::CODEX_COORDINATOR_CONVERSATION_TYPE)
 }
 
-fn project_fable_worker_as_chat_root(mut conversation: Conversation) -> Conversation {
+fn project_coordinator_worker_as_chat_root(mut conversation: Conversation) -> Conversation {
     // This is a response-only projection. Durable parentage stays attached to
     // the permanent coordinator so completion wakes and orchestration remain
     // correct, while Chat can monitor each worker without exposing the
@@ -1113,13 +1113,13 @@ fn child_conversation_requests(
     specs
         .iter()
         .map(|child| {
-            if requests_fable_designation(
+            if requests_codex_coordinator_designation(
                 child.agent.as_deref(),
                 child.conversation_type.as_deref(),
             ) {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "The permanent Fable coordinator cannot be created as a child conversation"
+                    "The permanent Codex coordinator cannot be created as a child conversation"
                         .to_string(),
                 ));
             }
@@ -1159,9 +1159,12 @@ fn canonical_child_agent_key_for_storage(agent: &str) -> String {
         .unwrap_or_else(|| agent.to_string())
 }
 
-fn requests_fable_designation(agent: Option<&str>, conversation_type: Option<&str>) -> bool {
-    conversation_type == Some(crate::fable_coordinator::FABLE_CONVERSATION_TYPE)
-        || agent.and_then(AgentType::from_chat_agent_key) == Some(AgentType::FableCoordinator)
+fn requests_codex_coordinator_designation(
+    agent: Option<&str>,
+    conversation_type: Option<&str>,
+) -> bool {
+    conversation_type == Some(crate::codex_coordinator::CODEX_COORDINATOR_CONVERSATION_TYPE)
+        || agent.and_then(AgentType::from_chat_agent_key) == Some(AgentType::CodexCoordinator)
 }
 
 async fn resolve_child_context_handoffs(
@@ -1687,7 +1690,7 @@ pub async fn list_conversations(
     let mut page = page_result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut list = std::mem::take(&mut page.conversations);
 
-    // Fable's durable children are the implementation/research conversations
+    // Codex's durable children are the implementation/research conversations
     // Alex expects to monitor in Chat. Since their parent is intentionally
     // excluded from Chat, project those workers as standalone list rows. The
     // stored relationship is untouched and remains available to orchestration.
@@ -1715,7 +1718,7 @@ pub async fn list_conversations(
             .await;
             record_db_operation(
                 ROUTE_CONVERSATIONS,
-                "conversation.list_fable_workers",
+                "conversation.list_codex_coordinator_workers",
                 workers_started.elapsed(),
                 Outcome::from_result(&workers_result),
             );
@@ -1726,7 +1729,7 @@ pub async fn list_conversations(
                 workers
                     .conversations
                     .into_iter()
-                    .map(project_fable_worker_as_chat_root),
+                    .map(project_coordinator_worker_as_chat_root),
             );
         }
     }
@@ -1944,10 +1947,13 @@ pub async fn create_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Json(mut req): Json<CreateConversationRequest>,
 ) -> Result<(StatusCode, Json<Conversation>), (StatusCode, String)> {
-    if requests_fable_designation(req.agent.as_deref(), req.conversation_type.as_deref()) {
+    if requests_codex_coordinator_designation(
+        req.agent.as_deref(),
+        req.conversation_type.as_deref(),
+    ) {
         return Err((
             StatusCode::CONFLICT,
-            "Use GET /api/alex/coordinator for the permanent Fable coordinator".to_string(),
+            "Use GET /api/alex/coordinator for the permanent Codex coordinator".to_string(),
         ));
     }
     ensure_agent_allowed(&pool, &user.user_id, req.agent.as_deref()).await?;
@@ -1979,10 +1985,13 @@ pub async fn create_multi_agent_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Json(req): Json<CreateMultiAgentConversationRequest>,
 ) -> Result<(StatusCode, Json<MultiAgentConversationResponse>), Response> {
-    if requests_fable_designation(req.agent.as_deref(), req.conversation_type.as_deref()) {
+    if requests_codex_coordinator_designation(
+        req.agent.as_deref(),
+        req.conversation_type.as_deref(),
+    ) {
         return Err(text_error_response((
             StatusCode::CONFLICT,
-            "Use GET /api/alex/coordinator for the permanent Fable coordinator".to_string(),
+            "Use GET /api/alex/coordinator for the permanent Codex coordinator".to_string(),
         )));
     }
     ensure_agent_allowed(&pool, &user.user_id, req.agent.as_deref())
@@ -2196,7 +2205,7 @@ pub async fn branch_conversation(
     Path(id): Path<String>,
     Json(req): Json<BranchConversationRequest>,
 ) -> Result<(StatusCode, Json<Conversation>), (StatusCode, String)> {
-    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
+    reject_permanent_codex_coordinator_mutation(&pool, &user.user_id, &id).await?;
     let conv = conversations::branch_conversation(&pool, &user.user_id, &id, req)
         .await
         .map_err(branch_conversation_error)?;
@@ -2219,7 +2228,7 @@ pub async fn update_conversation(
     Path(id): Path<String>,
     Json(req): Json<UpdateConversationRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
+    reject_permanent_codex_coordinator_mutation(&pool, &user.user_id, &id).await?;
     conversations::update_conversation(&pool, &user.user_id, &id, req)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2233,7 +2242,7 @@ pub async fn wait_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
+    reject_permanent_codex_coordinator_mutation(&pool, &user.user_id, &id).await?;
     conversations::wait_conversation(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2247,7 +2256,7 @@ pub async fn activate_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
+    reject_permanent_codex_coordinator_mutation(&pool, &user.user_id, &id).await?;
     conversations::activate_conversation(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2262,7 +2271,7 @@ pub async fn delete_conversation(
     Extension(user): Extension<AuthenticatedUser>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    reject_permanent_fable_mutation(&pool, &user.user_id, &id).await?;
+    reject_permanent_codex_coordinator_mutation(&pool, &user.user_id, &id).await?;
     conversations::archive_conversation(&pool, &user.user_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -2270,7 +2279,7 @@ pub async fn delete_conversation(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn reject_permanent_fable_mutation(
+async fn reject_permanent_codex_coordinator_mutation(
     pool: &SqlitePool,
     user_id: &str,
     conversation_id: &str,
@@ -2282,10 +2291,10 @@ async fn reject_permanent_fable_mutation(
     if conversation.user_id != user_id {
         return Err((StatusCode::NOT_FOUND, "Conversation not found".to_string()));
     }
-    if crate::fable_coordinator::is_fable_conversation(&conversation) {
+    if crate::codex_coordinator::is_codex_coordinator_conversation(&conversation) {
         return Err((
             StatusCode::CONFLICT,
-            "The permanent Fable coordinator cannot be branched, edited, archived, or moved out of open state"
+            "The permanent Codex coordinator cannot be branched, edited, archived, or moved out of open state"
                 .to_string(),
         ));
     }
@@ -3731,10 +3740,10 @@ mod tests {
     }
 
     #[test]
-    fn child_request_rejects_fable_coordinator() {
+    fn child_request_rejects_codex_coordinator() {
         let error = child_conversation_requests(&[CreateChildConversationSpec {
             title: "Invalid coordinator child".to_string(),
-            agent: Some("fable-coordinator".to_string()),
+            agent: Some("codex-coordinator".to_string()),
             conversation_type: None,
             child_sort_order: None,
             handoff: ContextHandoffRequest::default(),
@@ -3745,7 +3754,7 @@ mod tests {
             model: None,
             reasoning_effort: None,
         }])
-        .expect_err("Fable must remain a singleton parent");
+        .expect_err("Codex must remain a singleton parent");
 
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
         assert!(error.1.contains("cannot be created as a child"));
@@ -3822,11 +3831,11 @@ mod tests {
     }
 
     #[test]
-    fn global_chat_list_excludes_the_permanent_fable_coordinator() {
+    fn global_chat_list_excludes_the_permanent_codex_coordinator() {
         let mut coordinator = conversation_with_activity(Some(false));
-        coordinator.agent = Some(crate::fable_coordinator::FABLE_AGENT.to_string());
+        coordinator.agent = Some(crate::codex_coordinator::CODEX_COORDINATOR_AGENT.to_string());
         coordinator.conversation_type =
-            Some(crate::fable_coordinator::FABLE_CONVERSATION_TYPE.to_string());
+            Some(crate::codex_coordinator::CODEX_COORDINATOR_CONVERSATION_TYPE.to_string());
 
         assert!(!is_global_chat_conversation(&coordinator));
         assert!(is_global_chat_conversation(&conversation_with_activity(
@@ -3837,23 +3846,23 @@ mod tests {
     #[test]
     fn global_chat_list_fails_closed_for_partial_coordinator_designation() {
         let mut agent_only = conversation_with_activity(Some(false));
-        agent_only.agent = Some(crate::fable_coordinator::FABLE_AGENT.to_string());
+        agent_only.agent = Some(crate::codex_coordinator::CODEX_COORDINATOR_AGENT.to_string());
         let mut type_only = conversation_with_activity(Some(false));
         type_only.conversation_type =
-            Some(crate::fable_coordinator::FABLE_CONVERSATION_TYPE.to_string());
+            Some(crate::codex_coordinator::CODEX_COORDINATOR_CONVERSATION_TYPE.to_string());
 
         assert!(!is_global_chat_conversation(&agent_only));
         assert!(!is_global_chat_conversation(&type_only));
     }
 
     #[test]
-    fn fable_workers_are_projected_as_standalone_chat_rows() {
+    fn codex_coordinator_workers_are_projected_as_standalone_chat_rows() {
         let mut worker = conversation_with_activity(Some(true));
         worker.id = "worker-1".to_string();
         worker.parent_conversation_id = Some("alex-coordinator".to_string());
         worker.conversation_role = "sub_agent".to_string();
 
-        let projected = project_fable_worker_as_chat_root(worker.clone());
+        let projected = project_coordinator_worker_as_chat_root(worker.clone());
 
         assert_eq!(projected.id, worker.id);
         assert_eq!(projected.agent, worker.agent);

@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting Agentic runner...");
     let db = Arc::new(ticketing_system::init_db().await?);
-    agentic_api::fable_coordinator::ensure_schema(&db).await?;
+    agentic_api::codex_coordinator::ensure_schema(&db).await?;
     init_apns()?;
 
     let generation_id = format!("runner-{}", uuid::Uuid::new_v4());
@@ -818,9 +818,9 @@ async fn verify_job_conversation_owner(
     if conversation.user_id != job.payload.user_id {
         anyhow::bail!("Conversation job user does not own the target conversation");
     }
-    agentic_api::fable_coordinator::validate_runtime_assignment(
+    agentic_api::codex_coordinator::validate_runtime_assignment(
         &conversation,
-        job.payload.agent_type == agentic_api::fable_coordinator::FABLE_AGENT,
+        job.payload.agent_type == agentic_api::codex_coordinator::CODEX_COORDINATOR_AGENT,
     )?;
     Ok(())
 }
@@ -900,7 +900,7 @@ fn prompt_name_static(prompt_name: &str) -> Result<&'static str> {
         "pull-ticket" => Ok("pull-ticket"),
         "codebase-research" => Ok("codebase-research"),
         "doc-manager" => Ok("doc-manager"),
-        "fable-coordinator" => Ok("fable-coordinator"),
+        "codex-coordinator" => Ok("codex-coordinator"),
         other => anyhow::bail!("Unsupported conversation job prompt: {}", other),
     }
 }
@@ -918,12 +918,12 @@ mod tests {
     }
 
     #[test]
-    fn runner_accepts_only_the_canonical_fable_prompt_name() {
+    fn runner_accepts_only_the_canonical_codex_coordinator_prompt_name() {
         assert_eq!(
-            prompt_name_static("fable-coordinator").expect("Fable coordinator prompt"),
-            "fable-coordinator"
+            prompt_name_static("codex-coordinator").expect("Codex coordinator prompt"),
+            "codex-coordinator"
         );
-        assert!(prompt_name_static("fable").is_err());
+        assert!(prompt_name_static("codex_coordinator").is_err());
     }
 
     #[test]

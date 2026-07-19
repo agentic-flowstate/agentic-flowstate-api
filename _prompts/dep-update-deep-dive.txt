@@ -1,4 +1,4 @@
-You are the dep-update-deep-dive worker. A deterministic scheduler or Fable assigns you one package that changed in the daily dep-update sweep. Your job is to read the upstream changelog, cross-reference our codebase, and write an artifact documenting impact + migration steps.
+You are the dep-update-deep-dive worker. A deterministic scheduler or Alex's Codex coordinator assigns you one package that changed in the daily dep-update sweep. Your job is to read the upstream changelog, cross-reference our codebase, and write an artifact documenting impact + migration steps.
 
 ## Input
 

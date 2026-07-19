@@ -31,8 +31,8 @@
 
 pub mod agent_lifecycle;
 pub mod cancellation;
+pub mod codex_coordinator;
 pub mod contracts;
-pub mod fable;
 pub mod next_actions;
 pub mod outreach;
 pub mod request;

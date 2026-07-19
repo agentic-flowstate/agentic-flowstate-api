@@ -28,7 +28,7 @@ const APP_SERVER_CLIENT_TITLE: &str = "Agentic Flowstate API";
 const APP_SERVER_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_APP_SERVER_RUST_LOG: &str = "warn";
 const CODEX_WORKER_MCP_PROFILE: &str = "codex-worker";
-const FABLE_COORDINATOR_MCP_PROFILE: &str = "fable-coordinator";
+const CODEX_COORDINATOR_MCP_PROFILE: &str = "codex-coordinator";
 const NON_ORCHESTRATING_WORKER_DISABLED_FEATURES: &[&str] = &["multi_agent", "multi_agent_v2"];
 const REQUIRED_CODEX_PATH_ENTRIES: &[&str] = &[
     "/opt/homebrew/opt/node@20/bin",
@@ -128,7 +128,7 @@ impl CodexSandboxMode {
 pub enum CodexToolProfile {
     Default,
     Worker,
-    FableCoordinator,
+    CodexCoordinator,
     ConfiguredMcpOnly,
     RestrictedMcpOnly,
     NoTools,
@@ -139,7 +139,7 @@ impl CodexToolProfile {
         match self {
             Self::Default => "default",
             Self::Worker => "worker",
-            Self::FableCoordinator => "fable_coordinator",
+            Self::CodexCoordinator => "codex_coordinator",
             Self::ConfiguredMcpOnly => "configured_mcp_only",
             Self::RestrictedMcpOnly => "restricted_mcp_only",
             Self::NoTools => "no_tools",
@@ -149,7 +149,7 @@ impl CodexToolProfile {
     fn config_overrides(self) -> &'static [&'static str] {
         match self {
             Self::Default | Self::Worker => &[],
-            Self::FableCoordinator
+            Self::CodexCoordinator
             | Self::ConfiguredMcpOnly
             | Self::RestrictedMcpOnly
             | Self::NoTools => &["web_search=\"disabled\""],
@@ -160,7 +160,7 @@ impl CodexToolProfile {
         match self {
             Self::Default => &[],
             Self::Worker => NON_ORCHESTRATING_WORKER_DISABLED_FEATURES,
-            Self::FableCoordinator
+            Self::CodexCoordinator
             | Self::ConfiguredMcpOnly
             | Self::RestrictedMcpOnly
             | Self::NoTools => RESTRICTED_MCP_ONLY_DISABLED_FEATURES,
@@ -571,9 +571,9 @@ fn mcp_tool_config_overrides(
     if tools.is_empty() && profile == CodexToolProfile::RestrictedMcpOnly {
         tools = SCOPED_MCP_ALLOWED_TOOLS.to_vec();
     }
-    if tools.is_empty() && profile == CodexToolProfile::FableCoordinator {
+    if tools.is_empty() && profile == CodexToolProfile::CodexCoordinator {
         return Err(
-            "Fable coordinator profile requires an explicit MCP tool allow-list".to_string(),
+            "Codex coordinator profile requires an explicit MCP tool allow-list".to_string(),
         );
     }
 
@@ -651,18 +651,18 @@ fn app_server_codex_home(profile: CodexToolProfile) -> Result<PathBuf, String> {
                         .to_string()
                 })
         }
-        CodexToolProfile::FableCoordinator => {
-            if let Some(home) = std::env::var_os("AGENTIC_CODEX_FABLE_COORDINATOR_HOME") {
+        CodexToolProfile::CodexCoordinator => {
+            if let Some(home) = std::env::var_os("AGENTIC_CODEX_COORDINATOR_HOME") {
                 return Ok(PathBuf::from(home));
             }
 
             dirs::home_dir()
                 .map(|home| {
                     home.join(".agentic-flowstate")
-                        .join("codex-fable-coordinator-home")
+                        .join("codex-coordinator-home")
                 })
                 .ok_or_else(|| {
-                    "Failed to resolve home directory for AGENTIC_CODEX_FABLE_COORDINATOR_HOME"
+                    "Failed to resolve home directory for AGENTIC_CODEX_COORDINATOR_HOME"
                         .to_string()
                 })
         }
@@ -798,7 +798,7 @@ fn effective_working_dir(options: &CodexAppServerOptions<'_>) -> Result<PathBuf,
         CodexToolProfile::Default | CodexToolProfile::Worker => {
             Ok(options.working_dir.to_path_buf())
         }
-        CodexToolProfile::FableCoordinator
+        CodexToolProfile::CodexCoordinator
         | CodexToolProfile::ConfiguredMcpOnly
         | CodexToolProfile::RestrictedMcpOnly
         | CodexToolProfile::NoTools => restricted_runtime_working_dir(),
@@ -1259,17 +1259,17 @@ fn build_codex_app_server_command(
                 CODEX_WORKER_MCP_PROFILE,
             )?);
         }
-        CodexToolProfile::FableCoordinator => {
+        CodexToolProfile::CodexCoordinator => {
             if options.scoped_user_id.is_none() || options.current_conversation_id.is_none() {
                 return Err(
-                    "Fable coordinator MCP profile requires scoped_user_id and current_conversation_id"
+                    "Codex coordinator MCP profile requires scoped_user_id and current_conversation_id"
                         .to_string(),
                 );
             }
             command.arg("-c").arg(mcp_server_env_override(
                 "agentic-mcp",
                 "AGENTIC_MCP_PROFILE",
-                FABLE_COORDINATOR_MCP_PROFILE,
+                CODEX_COORDINATOR_MCP_PROFILE,
             )?);
         }
         CodexToolProfile::RestrictedMcpOnly => {
@@ -1661,7 +1661,7 @@ pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits, 
 fn effective_sandbox(options: &CodexAppServerOptions<'_>) -> CodexSandboxMode {
     if matches!(
         options.tool_profile,
-        CodexToolProfile::FableCoordinator
+        CodexToolProfile::CodexCoordinator
             | CodexToolProfile::RestrictedMcpOnly
             | CodexToolProfile::NoTools
     ) {
@@ -3110,13 +3110,13 @@ approval_mode = "approve"
     }
 
     #[test]
-    fn fable_profile_is_read_only_and_scopes_the_coordinator_mcp() {
+    fn codex_coordinator_profile_is_read_only_and_scopes_the_coordinator_mcp() {
         let mut options = sample_app_server_options(None);
-        options.tool_profile = CodexToolProfile::FableCoordinator;
+        options.tool_profile = CodexToolProfile::CodexCoordinator;
         options.sandbox = CodexSandboxMode::DangerFullAccess;
         options.bypass_approvals_and_sandbox = true;
         options.scoped_user_id = Some("alex");
-        options.current_conversation_id = Some("fable-conversation");
+        options.current_conversation_id = Some("codex-coordinator-conversation");
         options.approved_mcp_tools = vec![
             "queue_worker_conversations".to_string(),
             "get_worker_coordination_evidence".to_string(),
@@ -3127,18 +3127,18 @@ approval_mode = "approve"
             Path::new("/tmp/agentic_codex_home"),
             Path::new("/tmp/agentic-codex-sqlite"),
         )
-        .expect("build Fable command");
+        .expect("build Codex command");
         let args = command_args(&command);
 
         assert_eq!(effective_sandbox(&options), CodexSandboxMode::ReadOnly);
         assert!(args.iter().any(|arg| {
-            arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_PROFILE=\"fable-coordinator\""
+            arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_PROFILE=\"codex-coordinator\""
         }));
         assert!(args
             .iter()
             .any(|arg| { arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_USER_ID=\"alex\"" }));
         assert!(args.iter().any(|arg| {
-            arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_CONVERSATION_ID=\"fable-conversation\""
+            arg == "mcp_servers.agentic-mcp.env.AGENTIC_MCP_CONVERSATION_ID=\"codex-coordinator-conversation\""
         }));
         assert!(args.iter().any(|arg| {
             arg == "mcp_servers.agentic-mcp.enabled_tools=[\"get_worker_coordination_evidence\", \"queue_worker_conversations\"]"
@@ -3152,22 +3152,22 @@ approval_mode = "approve"
             assert!(
                 args.windows(2)
                     .any(|pair| pair[0] == "--disable" && pair[1] == feature),
-                "Fable profile did not disable {feature}"
+                "Codex profile did not disable {feature}"
             );
         }
     }
 
     #[test]
-    fn fable_profile_fails_closed_without_tools_or_identity_scope() {
+    fn codex_coordinator_profile_fails_closed_without_tools_or_identity_scope() {
         let mut options = sample_app_server_options(None);
-        options.tool_profile = CodexToolProfile::FableCoordinator;
+        options.tool_profile = CodexToolProfile::CodexCoordinator;
         let missing_tools_error = build_codex_app_server_command(
             &options,
             Path::new("/tmp/agentic_mcp"),
             Path::new("/tmp/agentic_codex_home"),
             Path::new("/tmp/agentic-codex-sqlite"),
         )
-        .expect_err("Fable must require an explicit allow-list");
+        .expect_err("Codex must require an explicit allow-list");
         assert!(missing_tools_error.contains("explicit MCP tool allow-list"));
 
         options.approved_mcp_tools = vec!["queue_worker_conversations".to_string()];
@@ -3177,7 +3177,7 @@ approval_mode = "approve"
             Path::new("/tmp/agentic_codex_home"),
             Path::new("/tmp/agentic-codex-sqlite"),
         )
-        .expect_err("Fable must require user and conversation scope");
+        .expect_err("Codex must require user and conversation scope");
         assert!(missing_scope_error.contains("scoped_user_id and current_conversation_id"));
     }
 

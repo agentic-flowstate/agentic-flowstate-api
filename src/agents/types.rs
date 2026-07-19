@@ -56,7 +56,7 @@ impl AgentsConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum AgentType {
     Planning,
-    /// One-shot implementation worker used by Fable for code and operational changes
+    /// One-shot implementation worker used by Codex for code and operational changes
     CodeExecution,
     /// One-shot worker that repairs versioned agent prompts, profiles, and tool contracts
     AgentProfileMaintainer,
@@ -100,7 +100,7 @@ pub enum AgentType {
     /// Scoped workspace manager — restricted tool set for external users (no home/daily plan/focus/code)
     ScopedWorkspace,
     /// Alex's single durable Codex coordinator
-    FableCoordinator,
+    CodexCoordinator,
 }
 
 impl AgentType {
@@ -120,7 +120,7 @@ impl AgentType {
             "feedback" => Some(AgentType::Feedback),
             "research" => Some(AgentType::Research),
             "polymarket" => Some(AgentType::Polymarket),
-            "fable-coordinator" => Some(AgentType::FableCoordinator),
+            "codex-coordinator" => Some(AgentType::CodexCoordinator),
             _ => None,
         }
     }
@@ -154,7 +154,7 @@ impl AgentType {
             AgentType::MeetingAgent => "meeting-agent",
             AgentType::FullAccess => "full-access",
             AgentType::ScopedWorkspace => "scoped-workspace",
-            AgentType::FableCoordinator => "fable-coordinator",
+            AgentType::CodexCoordinator => "codex-coordinator",
         }
     }
 
@@ -370,17 +370,20 @@ mod tests {
     use super::{AgentType, AgentsConfig};
 
     #[test]
-    fn fable_coordinator_uses_one_canonical_agent_key() {
+    fn codex_coordinator_uses_a_distinct_canonical_agent_key() {
         assert_eq!(
-            AgentType::from_chat_agent_key("fable-coordinator"),
-            Some(AgentType::FableCoordinator)
+            AgentType::from_chat_agent_key("codex-coordinator"),
+            Some(AgentType::CodexCoordinator)
         );
-        assert_eq!(AgentType::FableCoordinator.as_str(), "fable-coordinator");
-        assert_eq!(AgentType::from_chat_agent_key("fable"), None);
+        assert_eq!(AgentType::CodexCoordinator.as_str(), "codex-coordinator");
+        assert_eq!(
+            AgentType::from_chat_agent_key("codex"),
+            Some(AgentType::FullAccess)
+        );
     }
 
     #[test]
-    fn fable_worker_profiles_are_explicit_and_non_orchestrating() {
+    fn codex_coordinator_worker_profiles_are_explicit_and_non_orchestrating() {
         for (name, agent_type, prompt_file) in [
             (
                 "code-execution",

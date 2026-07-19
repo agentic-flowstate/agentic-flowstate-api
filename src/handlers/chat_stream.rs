@@ -611,9 +611,9 @@ async fn authorize_conversation_turn(
 ) -> Result<(), Response> {
     match conversations::get_conversation(db, conversation_id, false).await {
         Ok(Some(conv)) if conv.user_id == user_id => {
-            crate::fable_coordinator::validate_runtime_assignment(
+            crate::codex_coordinator::validate_runtime_assignment(
                 &conv,
-                *agent_type == AgentType::FableCoordinator,
+                *agent_type == AgentType::CodexCoordinator,
             )
             .map_err(|error| (StatusCode::CONFLICT, error.to_string()).into_response())?;
 
@@ -641,7 +641,7 @@ async fn authorize_conversation_turn(
                 if prior_turn_count > 0 {
                     return Err((
                         StatusCode::CONFLICT,
-                        "This worker profile is one-shot. Queue a fresh Fable-managed worker instead of continuing this conversation."
+                        "This worker profile is one-shot. Queue a fresh coordinator-managed worker instead of continuing this conversation."
                             .to_string(),
                     )
                         .into_response());
@@ -1498,7 +1498,7 @@ mod conversation_authorization_tests {
         sqlx::query(
             r#"
             UPDATE conversations
-            SET agent = 'fable-coordinator', conversation_type = 'fable_coordinator',
+            SET agent = 'codex-coordinator', conversation_type = 'codex_coordinator',
                 conversation_role = 'multi_agent_parent',
                 organization = 'agentic-flowstate', title = 'Alex'
             WHERE id = 'conv-alex'
@@ -1511,14 +1511,14 @@ mod conversation_authorization_tests {
         let wrong_runtime =
             authorize_conversation_turn(&pool, "conv-alex", "alex", &AgentType::FullAccess)
                 .await
-                .expect_err("A non-coordinator agent must not enter the Fable singleton");
+                .expect_err("A non-coordinator agent must not enter the Codex singleton");
         assert_eq!(wrong_runtime.status(), StatusCode::CONFLICT);
 
         assert!(authorize_conversation_turn(
             &pool,
             "conv-alex",
             "alex",
-            &AgentType::FableCoordinator,
+            &AgentType::CodexCoordinator,
         )
         .await
         .is_ok());

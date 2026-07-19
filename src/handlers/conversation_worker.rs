@@ -23,10 +23,10 @@ use crate::agents::codex_app_server::{
 };
 use crate::agents::prompts::load_prompt;
 use crate::agents::{AgentType, StreamEvent};
-use crate::fable_coordinator::{self, FABLE_PROMPT_VERSION};
+use crate::codex_coordinator::{self, CODEX_COORDINATOR_PROMPT_VERSION};
 use crate::observability::agent_lifecycle::{self, WakeKind};
 use crate::observability::cancellation;
-use crate::observability::fable as fable_observability;
+use crate::observability::codex_coordinator as codex_coordinator_observability;
 use crate::observability::next_actions::{record_clear, NextActionClearReason};
 use crate::observability::runtime::{self, RuntimeFailurePhase, RuntimeLatencyPhase};
 use crate::observability::streaming::{
@@ -103,7 +103,7 @@ impl WorkContextSkipReason {
 
 fn codex_tool_profile_for_chat_agent(agent_type: &AgentType) -> CodexToolProfile {
     match agent_type {
-        AgentType::FableCoordinator => CodexToolProfile::FableCoordinator,
+        AgentType::CodexCoordinator => CodexToolProfile::CodexCoordinator,
         AgentType::HomePlanner
         | AgentType::Polymarket
         | AgentType::ConversationEvaluator
@@ -122,7 +122,7 @@ fn codex_sandbox_policy_for_chat_agent(
     let tool_profile = codex_tool_profile_for_chat_agent(agent_type);
     if matches!(
         tool_profile,
-        CodexToolProfile::FableCoordinator
+        CodexToolProfile::CodexCoordinator
             | CodexToolProfile::ConfiguredMcpOnly
             | CodexToolProfile::RestrictedMcpOnly
     ) {
@@ -786,7 +786,7 @@ impl ConversationWorker {
                     .is_some()
                     || current_conversation
                         .as_ref()
-                        .is_some_and(fable_coordinator::is_fable_conversation)
+                        .is_some_and(codex_coordinator::is_codex_coordinator_conversation)
                 {
                     tracing::info!(
                         "[WORKER] Skipping title generation for child/permanent coordinator conversation {}",
@@ -1276,8 +1276,9 @@ impl ConversationWorker {
                     return;
                 }
             };
-        let is_fable = msg.config.agent_type == AgentType::FableCoordinator;
-        if let Err(error) = fable_coordinator::validate_runtime_assignment(&conversation, is_fable)
+        let is_codex_coordinator = msg.config.agent_type == AgentType::CodexCoordinator;
+        if let Err(error) =
+            codex_coordinator::validate_runtime_assignment(&conversation, is_codex_coordinator)
         {
             fail_runtime_before_spawn(
                 self,
@@ -1291,11 +1292,11 @@ impl ConversationWorker {
             return;
         }
 
-        let fable_thread_plan = if is_fable {
+        let codex_coordinator_thread_plan = if is_codex_coordinator {
             let prepared = match verify_codex_subscription_auth().await {
-                Ok(()) => fable_coordinator::prepare_thread(&self.db, &self.conversation_id).await,
+                Ok(()) => codex_coordinator::prepare_thread(&self.db, &self.conversation_id).await,
                 Err(error) => {
-                    fable_observability::record_auth_failure("auth_invalid");
+                    codex_coordinator_observability::record_auth_failure("auth_invalid");
                     Err(anyhow::Error::msg(error))
                 }
             };
@@ -1307,7 +1308,7 @@ impl ConversationWorker {
                         &assistant_message_id,
                         msg.message_metadata.as_deref(),
                         RuntimeFailurePhase::BuildRuntimePrompt,
-                        "Fable Codex thread preparation failed",
+                        "Codex coordinator thread preparation failed",
                         error,
                     )
                     .await;
@@ -1318,13 +1319,13 @@ impl ConversationWorker {
             None
         };
 
-        let system_prompt_result = if is_fable {
-            build_fable_system_prompt(
+        let system_prompt_result = if is_codex_coordinator {
+            build_codex_coordinator_system_prompt(
                 &self.db,
                 &self.conversation_id,
                 &assistant_message_id,
                 &msg.config,
-                fable_thread_plan
+                codex_coordinator_thread_plan
                     .as_ref()
                     .is_some_and(|plan| plan.rehydrate_required),
             )
@@ -1391,8 +1392,8 @@ impl ConversationWorker {
 
         let (sandbox, bypass_approvals_and_sandbox, tool_profile) =
             codex_sandbox_policy_for_chat_agent(&msg.config.agent_type);
-        if let Some(plan) = fable_thread_plan.as_ref() {
-            if let Err(error) = fable_coordinator::record_turn_started(
+        if let Some(plan) = codex_coordinator_thread_plan.as_ref() {
+            if let Err(error) = codex_coordinator::record_turn_started(
                 &self.db,
                 &self.conversation_id,
                 plan,
@@ -1406,7 +1407,7 @@ impl ConversationWorker {
                     &assistant_message_id,
                     msg.message_metadata.as_deref(),
                     RuntimeFailurePhase::SpawnRuntime,
-                    "Failed to persist Fable Codex turn start",
+                    "Failed to persist Codex coordinator turn start",
                     error,
                 )
                 .await;
@@ -1444,10 +1445,10 @@ impl ConversationWorker {
             prompt: final_message,
             sandbox,
             bypass_approvals_and_sandbox,
-            resume_session_id: fable_thread_plan
+            resume_session_id: codex_coordinator_thread_plan
                 .as_ref()
                 .and_then(|plan| plan.resume_thread_id.as_deref()),
-            ephemeral: !is_fable,
+            ephemeral: !is_codex_coordinator,
             state_owner_id: &self.conversation_id,
             tool_profile,
             scoped_user_id: Some(&msg.user_id),
@@ -1491,14 +1492,14 @@ impl ConversationWorker {
                     );
                 }
                 self.mark_checkpoint_interrupted().await;
-                if is_fable {
-                    fable_observability::record_session_failure(
+                if is_codex_coordinator {
+                    codex_coordinator_observability::record_session_failure(
                         "codex_thread_start_failed",
-                        fable_thread_plan
+                        codex_coordinator_thread_plan
                             .as_ref()
                             .is_some_and(|plan| plan.resume_thread_id.is_some()),
                     );
-                    if let Err(recovery_error) = fable_coordinator::require_thread_repair(
+                    if let Err(recovery_error) = codex_coordinator::require_thread_repair(
                         &self.db,
                         &self.conversation_id,
                         "codex_thread_start_failed",
@@ -1506,11 +1507,11 @@ impl ConversationWorker {
                     .await
                     {
                         tracing::error!(
-                            target: "agentic_api::fable",
-                            event = "fable.recovery_state_write_failed",
+                            target: "agentic_api::codex_coordinator",
+                            event = "codex_coordinator.recovery_state_write_failed",
                             conversation_id = %self.conversation_id,
                             error = %recovery_error,
-                            "failed to persist Fable Codex repair incident"
+                            "failed to persist Codex coordinator repair incident"
                         );
                     }
                 }
@@ -1643,8 +1644,8 @@ impl ConversationWorker {
                                     e
                                 );
                             }
-                            if is_fable {
-                                if let Err(error) = fable_coordinator::mark_thread_ready(
+                            if is_codex_coordinator {
+                                if let Err(error) = codex_coordinator::mark_thread_ready(
                                     &self.db,
                                     &self.conversation_id,
                                     &tid,
@@ -1652,17 +1653,17 @@ impl ConversationWorker {
                                 .await
                                 {
                                     let failure = format!(
-                                        "Failed to persist Fable Codex thread readiness: {error}"
+                                        "Failed to persist Codex coordinator thread readiness: {error}"
                                     );
                                     tracing::error!(
-                                        target: "agentic_api::fable",
-                                        event = "fable.thread_readiness_write_failed",
+                                        target: "agentic_api::codex_coordinator",
+                                        event = "codex_coordinator.thread_readiness_write_failed",
                                         conversation_id = %self.conversation_id,
                                         thread_id = %tid,
                                         error = %error,
-                                        "failed to persist the active Fable Codex thread"
+                                        "failed to persist the active Codex coordinator thread"
                                     );
-                                    let _ = fable_coordinator::require_thread_repair(
+                                    let _ = codex_coordinator::require_thread_repair(
                                         &self.db,
                                         &self.conversation_id,
                                         "thread_readiness_write_failed",
@@ -1977,7 +1978,7 @@ impl ConversationWorker {
                         accumulated_text.chars().count(),
                     );
                 }
-                if is_fable {
+                if is_codex_coordinator {
                     let finished_at_ms = Utc::now().timestamp_millis();
                     let duration_ms = self
                         .current_turn_started_at_ms
@@ -1989,12 +1990,12 @@ impl ConversationWorker {
                         "stream_failed"
                     };
                     let coordinator_thread_id = thread_id.as_deref().or_else(|| {
-                        fable_thread_plan
+                        codex_coordinator_thread_plan
                             .as_ref()
                             .and_then(|plan| plan.resume_thread_id.as_deref())
                     });
                     let state_result = if let Some(coordinator_thread_id) = coordinator_thread_id {
-                        fable_coordinator::record_turn_terminal(
+                        codex_coordinator::record_turn_terminal(
                             &self.db,
                             &self.conversation_id,
                             coordinator_thread_id,
@@ -2005,7 +2006,7 @@ impl ConversationWorker {
                         )
                         .await
                     } else {
-                        fable_coordinator::require_thread_repair(
+                        codex_coordinator::require_thread_repair(
                             &self.db,
                             &self.conversation_id,
                             error_class,
@@ -2014,21 +2015,21 @@ impl ConversationWorker {
                     };
                     if let Err(state_error) = state_result {
                         tracing::error!(
-                            target: "agentic_api::fable",
-                            event = "fable.terminal_state_write_failed",
+                            target: "agentic_api::codex_coordinator",
+                            event = "codex_coordinator.terminal_state_write_failed",
                             conversation_id = %self.conversation_id,
                             error = %state_error,
-                            "failed to persist Fable terminal state after stream failure"
+                            "failed to persist Codex terminal state after stream failure"
                         );
                     }
-                    fable_observability::record_turn_terminal(
+                    codex_coordinator_observability::record_turn_terminal(
                         terminal_status,
                         duration_ms,
                         tool_call_count,
                     );
                 }
                 if cancelled {
-                    let session_id = fable_thread_plan
+                    let session_id = codex_coordinator_thread_plan
                         .as_ref()
                         .and_then(|plan| plan.resume_thread_id.clone())
                         .or(thread_id)
@@ -2137,7 +2138,7 @@ impl ConversationWorker {
                 accumulated_text.chars().count(),
             );
         }
-        if is_fable {
+        if is_codex_coordinator {
             let duration_ms = self
                 .current_turn_started_at_ms
                 .map(|started| Utc::now().timestamp_millis().saturating_sub(started) as u64)
@@ -2156,13 +2157,13 @@ impl ConversationWorker {
                 RuntimeTurnCompletion::Completed { session_id }
                 | RuntimeTurnCompletion::Cancelled { session_id } => Some(session_id.as_str()),
                 RuntimeTurnCompletion::Failed(_) => thread_id.as_deref().or_else(|| {
-                    fable_thread_plan
+                    codex_coordinator_thread_plan
                         .as_ref()
                         .and_then(|plan| plan.resume_thread_id.as_deref())
                 }),
             };
             let state_result = if let Some(coordinator_thread_id) = coordinator_thread_id {
-                fable_coordinator::record_turn_terminal(
+                codex_coordinator::record_turn_terminal(
                     &self.db,
                     &self.conversation_id,
                     coordinator_thread_id,
@@ -2173,7 +2174,7 @@ impl ConversationWorker {
                 )
                 .await
             } else {
-                fable_coordinator::require_thread_repair(
+                codex_coordinator::require_thread_repair(
                     &self.db,
                     &self.conversation_id,
                     error_class.unwrap_or("thread_missing"),
@@ -2182,15 +2183,15 @@ impl ConversationWorker {
             };
             if let Err(error) = state_result {
                 tracing::error!(
-                    target: "agentic_api::fable",
-                    event = "fable.terminal_state_write_failed",
+                    target: "agentic_api::codex_coordinator",
+                    event = "codex_coordinator.terminal_state_write_failed",
                     conversation_id = %self.conversation_id,
                     thread_id = coordinator_thread_id.unwrap_or("none"),
                     error = %error,
-                    "failed to persist Fable terminal state"
+                    "failed to persist Codex terminal state"
                 );
             }
-            fable_observability::record_turn_terminal(
+            codex_coordinator_observability::record_turn_terminal(
                 runner_terminal_status,
                 duration_ms,
                 tool_call_count,
@@ -2645,7 +2646,7 @@ fn work_context_skip_reason(
     config: &ChatConfig,
     has_routed: bool,
 ) -> Option<WorkContextSkipReason> {
-    if matches!(config.agent_type, AgentType::FableCoordinator) {
+    if matches!(config.agent_type, AgentType::CodexCoordinator) {
         return Some(WorkContextSkipReason::CoordinatorIsolation);
     }
     if matches!(
@@ -3662,10 +3663,10 @@ fn parent_coordinator_prompt_vars(
             .context("read /Users/jarvisgpt/projects/AGENTS.md for full-access wake")?;
         prompt_vars.insert("AGENTS_MD".to_string(), agents_md);
     }
-    if matches!(agent_type, AgentType::FableCoordinator) {
+    if matches!(agent_type, AgentType::CodexCoordinator) {
         prompt_vars.insert(
             "PROMPT_VERSION".to_string(),
-            FABLE_PROMPT_VERSION.to_string(),
+            CODEX_COORDINATOR_PROMPT_VERSION.to_string(),
         );
     }
 
@@ -3924,7 +3925,7 @@ async fn build_codex_system_prompt(
     Ok(system_prompt)
 }
 
-async fn build_fable_system_prompt(
+async fn build_codex_coordinator_system_prompt(
     db: &SqlitePool,
     conversation_id: &str,
     assistant_message_id: &str,
@@ -3934,7 +3935,7 @@ async fn build_fable_system_prompt(
     let mut prompt_vars = config.prompt_vars.clone();
     prompt_vars.insert(
         "PROMPT_VERSION".to_string(),
-        FABLE_PROMPT_VERSION.to_string(),
+        CODEX_COORDINATOR_PROMPT_VERSION.to_string(),
     );
     let mut system_prompt = load_prompt(config.prompt_name, prompt_vars)?;
     if !rehydrate_required {
@@ -3952,7 +3953,7 @@ async fn build_fable_system_prompt(
     if let Some(index) = messages.iter().rposition(|message| message.role == "user") {
         messages.remove(index);
     }
-    let messages = fable_recovery_history_messages(messages);
+    let messages = codex_coordinator_recovery_history_messages(messages);
     if !messages.is_empty() {
         system_prompt.push_str("\n\n## Audited session recovery context\n\n");
         system_prompt.push_str(
@@ -3963,7 +3964,9 @@ async fn build_fable_system_prompt(
     Ok(system_prompt)
 }
 
-fn fable_recovery_history_messages(messages: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
+fn codex_coordinator_recovery_history_messages(
+    messages: Vec<ConversationMessage>,
+) -> Vec<ConversationMessage> {
     let mut suppress_wake_response = false;
     let mut filtered = Vec::with_capacity(messages.len());
 
@@ -4216,17 +4219,17 @@ mod codex_chat_tool_profile_tests {
     use super::*;
 
     #[test]
-    fn fable_uses_the_dedicated_read_only_coordinator_profile() {
+    fn codex_coordinator_uses_the_dedicated_read_only_coordinator_profile() {
         assert_eq!(
-            codex_tool_profile_for_chat_agent(&AgentType::FableCoordinator),
-            CodexToolProfile::FableCoordinator
+            codex_tool_profile_for_chat_agent(&AgentType::CodexCoordinator),
+            CodexToolProfile::CodexCoordinator
         );
         assert_eq!(
-            codex_sandbox_policy_for_chat_agent(&AgentType::FableCoordinator),
+            codex_sandbox_policy_for_chat_agent(&AgentType::CodexCoordinator),
             (
                 CodexSandboxMode::ReadOnly,
                 false,
-                CodexToolProfile::FableCoordinator
+                CodexToolProfile::CodexCoordinator
             )
         );
     }
@@ -4245,7 +4248,7 @@ mod codex_chat_tool_profile_tests {
 }
 
 #[cfg(test)]
-mod fable_prompt_scope_tests {
+mod codex_coordinator_prompt_scope_tests {
     use super::*;
 
     fn history_message(
@@ -4255,8 +4258,8 @@ mod fable_prompt_scope_tests {
         metadata: Option<serde_json::Value>,
     ) -> ConversationMessage {
         ConversationMessage {
-            id: format!("fable-history-{index}"),
-            conversation_id: "fable-conversation".to_string(),
+            id: format!("codex-coordinator-history-{index}"),
+            conversation_id: "codex-coordinator-conversation".to_string(),
             role: role.to_string(),
             content: content.to_string(),
             attachments: None,
@@ -4274,19 +4277,19 @@ mod fable_prompt_scope_tests {
     }
 
     #[test]
-    fn fable_wake_does_not_preload_the_global_project_manual() {
-        let vars = parent_coordinator_prompt_vars(&AgentType::FableCoordinator, "alex")
-            .expect("build Fable wake prompt variables");
+    fn codex_coordinator_wake_does_not_preload_the_global_project_manual() {
+        let vars = parent_coordinator_prompt_vars(&AgentType::CodexCoordinator, "alex")
+            .expect("build Codex wake prompt variables");
 
         assert_eq!(
             vars.get("PROMPT_VERSION").map(String::as_str),
-            Some(FABLE_PROMPT_VERSION)
+            Some(CODEX_COORDINATOR_PROMPT_VERSION)
         );
         assert!(!vars.contains_key("AGENTS_MD"));
     }
 
     #[test]
-    fn fable_recovery_excludes_worker_cards_wakes_and_wake_responses() {
+    fn codex_coordinator_recovery_excludes_worker_cards_wakes_and_wake_responses() {
         let orchestration_metadata = |orchestration: &str| {
             serde_json::json!({
                 "origin": "agent_orchestrated",
@@ -4323,7 +4326,7 @@ mod fable_prompt_scope_tests {
             history_message(7, "assistant", "Continuing safely.", None),
         ];
 
-        let filtered = fable_recovery_history_messages(messages);
+        let filtered = codex_coordinator_recovery_history_messages(messages);
         let ids = filtered
             .iter()
             .map(|message| message.id.as_str())
@@ -4332,10 +4335,10 @@ mod fable_prompt_scope_tests {
         assert_eq!(
             ids,
             vec![
-                "fable-history-0",
-                "fable-history-1",
-                "fable-history-6",
-                "fable-history-7"
+                "codex-coordinator-history-0",
+                "codex-coordinator-history-1",
+                "codex-coordinator-history-6",
+                "codex-coordinator-history-7"
             ]
         );
         assert!(filtered.iter().all(|message| {
@@ -4475,8 +4478,8 @@ mod work_context_preflight_tests {
     }
 
     #[test]
-    fn fable_coordinator_never_receives_automatic_artifact_context() {
-        let config = test_config(AgentType::FableCoordinator);
+    fn codex_coordinator_never_receives_automatic_artifact_context() {
+        let config = test_config(AgentType::CodexCoordinator);
 
         assert_eq!(
             work_context_skip_reason("Coordinate this project request", &config, false),
@@ -5046,16 +5049,16 @@ mod streaming_persistence_tests {
     }
 
     #[test]
-    fn designated_fable_parent_selects_the_codex_runtime() {
+    fn designated_codex_coordinator_parent_selects_the_codex_runtime() {
         let mut coordinator = test_conversation("alex-coordinator", "Alex", None);
-        coordinator.user_id = fable_coordinator::ALEX_USER_ID.to_string();
-        coordinator.agent = Some(fable_coordinator::FABLE_AGENT.to_string());
+        coordinator.user_id = codex_coordinator::ALEX_USER_ID.to_string();
+        coordinator.agent = Some(codex_coordinator::CODEX_COORDINATOR_AGENT.to_string());
         coordinator.conversation_type =
-            Some(fable_coordinator::FABLE_CONVERSATION_TYPE.to_string());
+            Some(codex_coordinator::CODEX_COORDINATOR_CONVERSATION_TYPE.to_string());
 
         assert_eq!(
             parent_coordinator_agent_type(&coordinator).unwrap(),
-            AgentType::FableCoordinator
+            AgentType::CodexCoordinator
         );
         assert_eq!(
             parent_coordinator_runtime(&coordinator).unwrap(),
@@ -5133,7 +5136,7 @@ mod streaming_persistence_tests {
         }
     }
 
-    async fn seed_fable_parent_with_children(pool: &SqlitePool, child_ids: &[&str]) {
+    async fn seed_codex_coordinator_parent_with_children(pool: &SqlitePool, child_ids: &[&str]) {
         sqlx::query(
             r#"
             INSERT INTO conversations (
@@ -5141,15 +5144,15 @@ mod streaming_persistence_tests {
                 parent_conversation_id, conversation_role, title,
                 started_at, updated_at, status, message_count, last_event_index
             ) VALUES (
-                'parent-1', 'alex', 'agentic-flowstate', 'fable-coordinator',
-                'fable_coordinator', NULL, 'multi_agent_parent', 'Alex',
+                'parent-1', 'alex', 'agentic-flowstate', 'codex-coordinator',
+                'codex_coordinator', NULL, 'multi_agent_parent', 'Alex',
                 '2026-07-14T00:00:00Z', '2026-07-14T00:00:00Z', 'open', 0, -1
             )
             "#,
         )
         .execute(pool)
         .await
-        .expect("seed Fable parent");
+        .expect("seed Codex parent");
 
         for (index, child_id) in child_ids.iter().enumerate() {
             sqlx::query(
@@ -5241,7 +5244,7 @@ mod streaming_persistence_tests {
     #[tokio::test]
     async fn unbatched_child_completion_records_card_without_coordinator_wake() {
         let pool = parent_wake_test_pool(false).await;
-        seed_fable_parent_with_children(&pool, &["child-1"]).await;
+        seed_codex_coordinator_parent_with_children(&pool, &["child-1"]).await;
 
         maybe_insert_child_completion_status_to_parent(
             &pool,
@@ -5355,7 +5358,8 @@ mod streaming_persistence_tests {
     async fn three_child_mixed_terminal_batch_wakes_once_after_last_completion() {
         let pool = parent_wake_test_pool(false).await;
         let batch_id = "child-batch-mixed-terminal";
-        seed_fable_parent_with_children(&pool, &["child-1", "child-2", "child-3"]).await;
+        seed_codex_coordinator_parent_with_children(&pool, &["child-1", "child-2", "child-3"])
+            .await;
 
         let terminal_children = [
             ("child-1", "completed", None),
@@ -5420,7 +5424,7 @@ mod streaming_persistence_tests {
     async fn single_child_batch_still_wakes_once() {
         let pool = parent_wake_test_pool(false).await;
         let batch_id = "child-batch-single";
-        seed_fable_parent_with_children(&pool, &["child-1"]).await;
+        seed_codex_coordinator_parent_with_children(&pool, &["child-1"]).await;
         let metadata = child_initial_turn_metadata(batch_id, 1, 1);
 
         maybe_insert_child_completion_status_to_parent(
@@ -5473,8 +5477,11 @@ mod streaming_persistence_tests {
         let pool = parent_wake_test_pool(false).await;
         let batch_a = "child-batch-a";
         let batch_b = "child-batch-b";
-        seed_fable_parent_with_children(&pool, &["child-a1", "child-a2", "child-b1", "child-b2"])
-            .await;
+        seed_codex_coordinator_parent_with_children(
+            &pool,
+            &["child-a1", "child-a2", "child-b1", "child-b2"],
+        )
+        .await;
 
         for (child_id, assistant_id, batch_id, index) in [
             ("child-a1", "assistant-a1", batch_a, 1),

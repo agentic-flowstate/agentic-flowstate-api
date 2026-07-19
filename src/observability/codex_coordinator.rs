@@ -2,23 +2,23 @@ use metrics::{counter, gauge, histogram};
 
 use super::contracts::assert_metric_labels;
 
-pub const AUTH_FAILURES: &str = "fable_coordinator_auth_failures_total";
-pub const SESSION_FAILURES: &str = "fable_coordinator_session_failures_total";
-pub const TURN_DURATION_MS: &str = "fable_coordinator_turn_duration_ms";
-pub const BUSY: &str = "fable_coordinator_busy";
-pub const QUEUE_DEPTH: &str = "fable_coordinator_queue_depth";
-pub const SESSION_STATE: &str = "fable_coordinator_session_state";
-pub const PROMPT_INFO: &str = "fable_coordinator_prompt_info";
+pub const AUTH_FAILURES: &str = "codex_coordinator_auth_failures_total";
+pub const SESSION_FAILURES: &str = "codex_coordinator_session_failures_total";
+pub const TURN_DURATION_MS: &str = "codex_coordinator_turn_duration_ms";
+pub const BUSY: &str = "codex_coordinator_busy";
+pub const QUEUE_DEPTH: &str = "codex_coordinator_queue_depth";
+pub const SESSION_STATE: &str = "codex_coordinator_session_state";
+pub const PROMPT_INFO: &str = "codex_coordinator_prompt_info";
 const PROMPT_METRIC_VERSION: &str = "v1";
 
 pub fn record_auth_failure(error_class: &'static str) {
     assert_metric_labels(AUTH_FAILURES, &[("error_class", error_class)]);
     counter!(AUTH_FAILURES, "error_class" => error_class).increment(1);
     tracing::error!(
-        target: "agentic_api::fable",
-        event = "fable.auth_failure",
+        target: "agentic_api::codex_coordinator",
+        event = "codex_coordinator.auth_failure",
         error_class,
-        "Fable Codex subscription authentication failed"
+        "Codex coordinator subscription authentication failed"
     );
 }
 
@@ -35,11 +35,11 @@ pub fn record_session_failure(error_class: &'static str, resume: bool) {
     )
     .increment(1);
     tracing::error!(
-        target: "agentic_api::fable",
-        event = "fable.session_failure",
+        target: "agentic_api::codex_coordinator",
+        event = "codex_coordinator.session_failure",
         error_class,
         operation,
-        "Fable Codex thread operation failed"
+        "Codex coordinator thread operation failed"
     );
 }
 
@@ -48,12 +48,12 @@ pub fn record_turn_terminal(status: &str, duration_ms: u64, tool_call_count: i32
     assert_metric_labels(TURN_DURATION_MS, &[("status", status.as_str())]);
     histogram!(TURN_DURATION_MS, "status" => status.clone()).record(duration_ms as f64);
     tracing::info!(
-        target: "agentic_api::fable",
-        event = "fable.turn_terminal",
+        target: "agentic_api::codex_coordinator",
+        event = "codex_coordinator.turn_terminal",
         status,
         duration_ms,
         tool_call_count,
-        "Fable coordinator turn reached terminal state"
+        "Codex coordinator turn reached terminal state"
     );
 }
 
@@ -76,7 +76,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fable_metric_contracts_accept_only_low_cardinality_labels() {
+    fn codex_coordinator_metric_contracts_accept_only_low_cardinality_labels() {
         assert_metric_labels(AUTH_FAILURES, &[("error_class", "auth_invalid")]);
         assert_metric_labels(
             SESSION_FAILURES,
