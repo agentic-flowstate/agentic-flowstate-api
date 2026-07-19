@@ -455,22 +455,31 @@ pub async fn verify_codex_subscription_auth() -> Result<(), String> {
         .map_err(|error| format!("Failed to read Codex subscription auth status: {error}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() || !stdout.to_ascii_lowercase().contains("using chatgpt") {
-        let detail = [stdout.trim(), stderr.trim()]
-            .into_iter()
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join(": ");
-        let detail = if detail.is_empty() {
-            "Codex did not report ChatGPT authentication".to_string()
-        } else {
-            detail
-        };
-        return Err(format!(
-            "Codex must use ChatGPT subscription authentication; run `codex login` from a trusted Mac Mini terminal and complete the Safari sign-in flow ({detail})"
-        ));
+    validate_codex_subscription_auth_status(output.status.success(), &stdout, &stderr)
+}
+
+fn validate_codex_subscription_auth_status(
+    command_succeeded: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
+    let detail = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(": ");
+    if command_succeeded && detail.to_ascii_lowercase().contains("using chatgpt") {
+        return Ok(());
     }
-    Ok(())
+
+    let detail = if detail.is_empty() {
+        "Codex did not report ChatGPT authentication".to_string()
+    } else {
+        detail
+    };
+    Err(format!(
+        "Codex must use ChatGPT subscription authentication; run `codex login` from a trusted Mac Mini terminal and complete the Safari sign-in flow ({detail})"
+    ))
 }
 
 fn launchd_safe_path_from(existing_path: Option<&OsStr>) -> OsString {
@@ -2668,6 +2677,31 @@ mod tests {
         assert_eq!(normalize_reasoning_effort("max"), "max");
         assert_eq!(normalize_reasoning_effort("ultra"), "ultra");
         assert_eq!(normalize_reasoning_effort("unknown"), "medium");
+    }
+
+    #[test]
+    fn codex_subscription_auth_accepts_chatgpt_status_on_either_stream() {
+        assert!(
+            validate_codex_subscription_auth_status(true, "Logged in using ChatGPT\n", "").is_ok()
+        );
+        assert!(
+            validate_codex_subscription_auth_status(true, "", "Logged in using ChatGPT\n").is_ok()
+        );
+    }
+
+    #[test]
+    fn codex_subscription_auth_rejects_failed_or_non_chatgpt_status() {
+        let failed = validate_codex_subscription_auth_status(
+            false,
+            "Logged in using ChatGPT",
+            "status command failed",
+        )
+        .expect_err("a failed status command must not authenticate");
+        assert!(failed.contains("status command failed"));
+
+        let wrong_method = validate_codex_subscription_auth_status(true, "Logged out", "")
+            .expect_err("non-ChatGPT auth must be rejected");
+        assert!(wrong_method.contains("Logged out"));
     }
 
     #[tokio::test]
