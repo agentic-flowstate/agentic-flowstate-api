@@ -3094,7 +3094,7 @@ async fn maybe_insert_child_completion_status_to_parent(
         return Ok(());
     }
 
-    let batch_context = child_batch_context_from_initial_metadata(message_metadata);
+    let batch_context = child_batch_context_from_turn_metadata(message_metadata);
     insert_child_completion_status_to_parent(
         db,
         child_conversation_id,
@@ -3140,14 +3140,17 @@ struct CompletedChildCompletion {
     status_created_at: Option<i64>,
 }
 
-fn child_batch_context_from_initial_metadata(
+fn child_batch_context_from_turn_metadata(
     message_metadata: Option<&str>,
 ) -> Option<ChildBatchContext> {
     let value: serde_json::Value = serde_json::from_str(message_metadata?).ok()?;
     if value.get("origin")?.as_str()? != "agent_orchestrated" {
         return None;
     }
-    if value.get("orchestration")?.as_str()? != "child_initial_turn" {
+    if !matches!(
+        value.get("orchestration")?.as_str()?,
+        "child_initial_turn" | "child_follow_up_turn"
+    ) {
         return None;
     }
 
@@ -5185,6 +5188,19 @@ mod streaming_persistence_tests {
         .to_string()
     }
 
+    fn child_follow_up_turn_metadata(batch_id: &str) -> String {
+        serde_json::json!({
+            "origin": "agent_orchestrated",
+            "orchestrated_by": "fable-coordinator",
+            "orchestration": "child_follow_up_turn",
+            "agent": "codebase-research",
+            "child_batch_id": batch_id,
+            "child_batch_size": 1,
+            "child_batch_index": 1,
+        })
+        .to_string()
+    }
+
     /// Drive a sequence of the runtime adapter StreamEvents through the encoder, persist
     /// every emitted Conversation event via `insert_conversation_event`, then
     /// replay from the DB and return (event_types, parsed_json_values).
@@ -5418,6 +5434,32 @@ mod streaming_persistence_tests {
         )
         .await
         .expect("record single-child batch completion");
+
+        assert_eq!(child_completion_card_count(&pool, Some(batch_id)).await, 1);
+        assert_eq!(
+            coordinator_wake_job_count_for_batch(&pool, batch_id).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn single_research_follow_up_batch_wakes_once() {
+        let pool = parent_wake_test_pool(false).await;
+        let batch_id = "child-batch-follow-up";
+        seed_fable_parent_with_children(&pool, &["child-1"]).await;
+        let metadata = child_follow_up_turn_metadata(batch_id);
+
+        maybe_insert_child_completion_status_to_parent(
+            &pool,
+            "child-1",
+            "assistant-follow-up",
+            "completed",
+            "Follow-up finished",
+            None,
+            Some(&metadata),
+        )
+        .await
+        .expect("record research follow-up completion");
 
         assert_eq!(child_completion_card_count(&pool, Some(batch_id)).await, 1);
         assert_eq!(
