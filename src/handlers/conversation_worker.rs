@@ -5194,7 +5194,7 @@ mod streaming_persistence_tests {
     fn child_follow_up_turn_metadata(batch_id: &str) -> String {
         serde_json::json!({
             "origin": "agent_orchestrated",
-            "orchestrated_by": "fable-coordinator",
+            "orchestrated_by": codex_coordinator::CODEX_COORDINATOR_AGENT,
             "orchestration": "child_follow_up_turn",
             "agent": "codebase-research",
             "child_batch_id": batch_id,
@@ -5450,7 +5450,7 @@ mod streaming_persistence_tests {
     async fn single_research_follow_up_batch_wakes_once() {
         let pool = parent_wake_test_pool(false).await;
         let batch_id = "child-batch-follow-up";
-        seed_fable_parent_with_children(&pool, &["child-1"]).await;
+        seed_codex_coordinator_parent_with_children(&pool, &["child-1"]).await;
         let metadata = child_follow_up_turn_metadata(batch_id);
 
         maybe_insert_child_completion_status_to_parent(
